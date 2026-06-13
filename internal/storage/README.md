@@ -1,10 +1,9 @@
-```markdown
+
 # 📦 Storage Package – README
 
 **Location:** `internal/storage/README.md`
 **Purpose:** Explain the design, usage, and performance characteristics of the ultra-high-performance, zero-allocation in‑memory storage engine and its flattened timing‑wheel (`Chronometer`).
 
----
 
 ## 🚀 Overview
 
