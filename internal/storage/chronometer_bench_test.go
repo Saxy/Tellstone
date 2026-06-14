@@ -7,7 +7,7 @@ import (
 )
 
 func BenchmarkChronometerEvictionPipeline(b *testing.B) {
-	engine := NewEngine(1*time.Millisecond, 1000)
+	engine := NewEngine(1*time.Millisecond, 1000, nil)
 	defer engine.Close()
 	payload := []byte("raw_protobuf_bytes_32_bytes_long")
 	numKeys := 50000
@@ -33,7 +33,7 @@ func BenchmarkChronometerEvictionPipeline(b *testing.B) {
 }
 
 func BenchmarkChronometerEvictionPipelineSequential(b *testing.B) {
-	engine := NewEngine(1*time.Millisecond, 1000)
+	engine := NewEngine(1*time.Millisecond, 1000, nil)
 	defer engine.Close()
 	payload := []byte("raw_protobuf_bytes_32_bytes_long")
 	numKeys := 50000
