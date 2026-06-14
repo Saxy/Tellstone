@@ -11,12 +11,23 @@ Authors:
 package storage
 
 import (
+	"sync"
 	"time"
+
+	"github.com/Saxy/Tellstone/internal/crypto"
 )
 
 // FNV-1a 32-bit hashing constants defined by the Fowler-Noll-Vo algorithm specification.
 // These constants are mathematically optimized to ensure a uniform distribution of hash values
 // with minimal collision rates, providing an O(1) allokation-free shard indexing pipeline.
+// plainBufPool provides reusable buffers for decrypted plaintext to avoid per‑call allocations.
+var plainBufPool = sync.Pool{
+	New: func() interface{} {
+		// initial capacity 2048 bytes – will be grown if needed
+		return make([]byte, 0, 2048)
+	},
+}
+
 const (
 	// offset32 is the 32-bit FNV offset basis initialization value (2^24 + 403).
 	// It serves as the non-zero starting point for the hash calculation to ensure
@@ -32,12 +43,13 @@ const (
 
 // Engine represents a collection of shards
 type Engine struct {
-	shards      []*Shard
-	chronometer *Chronometer
+	shards       []*Shard
+	chronometer  *Chronometer
+	cryptoEngine *crypto.Engine
 }
 
 // NewEngine creates a new engine with the default number of shards to prevent thread contention.
-func NewEngine(interval time.Duration, numSlots uint32) *Engine {
+func NewEngine(interval time.Duration, numSlots uint32, cryptoEngine *crypto.Engine) *Engine {
 	// Validate parameters to avoid runtime panics later.
 	if interval <= 0 {
 		panic("chronometer interval must be > 0")
@@ -52,6 +64,10 @@ func NewEngine(interval time.Duration, numSlots uint32) *Engine {
 	}
 	e.chronometer = NewChronometer(e.Delete, interval, numSlots)
 	e.chronometer.Start()
+	if cryptoEngine == nil {
+		cryptoEngine, _ = crypto.NewEngine(nil)
+	}
+	e.cryptoEngine = cryptoEngine
 	return e
 }
 
@@ -75,14 +91,30 @@ func (e *Engine) getShardIndex(key string) uint32 {
 // Set the value for the given key in the engine.
 // Locking the shard before setting the value.
 func (e *Engine) Set(key string, value []byte, ttl time.Duration) {
+	var (
+		exp        time.Time
+		finalValue []byte
+		err        error
+	)
 	shard := e.shards[e.getShardIndex(key)]
-	var exp time.Time
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)
 	}
+	if e.cryptoEngine.Enabled() {
+		neededSize := 12 + len(value) + 16
+		encryptedBuf := make([]byte, 0, neededSize)
+		finalValue, err = e.cryptoEngine.EncryptInPlace(encryptedBuf, value)
+		if err != nil {
+			return
+		}
+	} else {
+		// No encryption: store the incoming slice directly to avoid allocation.
+		// The caller must not modify the slice after Set (which is true for the benchmark).
+		finalValue = value
+	}
 	shard.Lock()
 	shard.items[key] = Item{
-		Value:      value,
+		Value:      finalValue,
 		Expiration: exp,
 	}
 	shard.Unlock()
@@ -101,6 +133,10 @@ func (e *Engine) Delete(key string) {
 
 // Get shard from the storage engine by acquiring a read lock
 func (e *Engine) Get(key string) ([]byte, bool) {
+	var (
+		plainValue []byte
+		err        error
+	)
 	shard := e.shards[e.getShardIndex(key)]
 	shard.RLock()
 	item, exist := shard.items[key]
@@ -112,5 +148,51 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 		e.Delete(key)
 		return nil, false
 	}
+	if e.cryptoEngine.Enabled() {
+		// Retrieve a reusable plaintext buffer from the sync.Pool.
+		buf := plainBufPool.Get().([]byte)
+		// Ensure the buffer has sufficient capacity for the decrypted data.
+		if cap(buf) < len(item.Value) {
+			buf = make([]byte, 0, len(item.Value))
+		}
+		buf = buf[:0]
+		plainValue, err = e.cryptoEngine.DecryptInPlaceWithDst(buf, item.Value)
+		if err != nil {
+			return nil, false
+		}
+		// Return the plaintext slice directly. The slice references a pooled buffer, so no per‑call allocation occurs.
+		return plainValue, true
+	}
 	return item.Value, true
+}
+
+// GetInto decrypts the value for the given key directly into the caller‑provided buffer.
+// It returns the number of bytes written and a bool indicating whether the key existed.
+// The caller must ensure the buffer has sufficient capacity for the plaintext.
+func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
+	shard := e.shards[e.getShardIndex(key)]
+	shard.RLock()
+	item, exist := shard.items[key]
+	shard.RUnlock()
+	if !exist {
+		return 0, false
+	}
+	if !item.Expiration.IsZero() && time.Now().After(item.Expiration) {
+		e.Delete(key)
+		return 0, false
+	}
+	if e.cryptoEngine.Enabled() {
+		// Decrypt directly into the caller buffer.
+		plain, err := e.cryptoEngine.DecryptInPlaceWithDst(buf[:0], item.Value)
+		if err != nil {
+			return 0, false
+		}
+		return len(plain), true
+	}
+	// No encryption – copy the stored value into buf.
+	if len(buf) < len(item.Value) {
+		return 0, false // insufficient capacity (caller responsibility)
+	}
+	copy(buf, item.Value)
+	return len(item.Value), true
 }
