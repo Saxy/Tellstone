@@ -136,7 +136,3 @@ go test -bench=. -benchmem ./internal/protocol
 * Support for batch `IN` queries and optional `IF NOT EXISTS` clauses.
 * Auto‑generated `BENCHMARKS.md` from benchmark output.
 * Integration tests exercising zero‑copy parsing from network sockets.
-
----
-
-*This document mirrors the look‑and‑feel of the storage package README and includes up‑to‑date benchmark results.*
