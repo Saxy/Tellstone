@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/crypto"
+	"github.com/Saxy/Tellstone/internal/log"
 )
 
 // FNV-1a 32-bit hashing constants defined by the Fowler-Noll-Vo algorithm specification.
@@ -46,10 +47,11 @@ type Engine struct {
 	shards       []*Shard
 	chronometer  *Chronometer
 	cryptoEngine *crypto.Engine
+	logger       log.Logger
 }
 
 // NewEngine creates a new engine with the default number of shards to prevent thread contention.
-func NewEngine(interval time.Duration, numSlots uint32, cryptoEngine *crypto.Engine) *Engine {
+func NewEngine(interval time.Duration, numSlots uint32, cryptoEngine *crypto.Engine, logger log.Logger) *Engine {
 	// Validate parameters to avoid runtime panics later.
 	if interval <= 0 {
 		panic("chronometer interval must be > 0")
@@ -62,12 +64,19 @@ func NewEngine(interval time.Duration, numSlots uint32, cryptoEngine *crypto.Eng
 	for i := ShardCount(0); i < shardCount; i++ {
 		e.shards[i] = &Shard{items: make(map[string]Item)}
 	}
-	e.chronometer = NewChronometer(e.Delete, interval, numSlots)
+	e.chronometer = NewChronometer(e.Delete, interval, numSlots, logger)
 	e.chronometer.Start()
 	if cryptoEngine == nil {
-		cryptoEngine, _ = crypto.NewEngine(nil)
+		cryptoEngine, _ = crypto.NewEngine(nil, logger)
 	}
 	e.cryptoEngine = cryptoEngine
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
+	e.logger = logger
+	if e.logger.Enabled(log.LevelInfo) {
+		e.logger.Info("storage engine created")
+	}
 	return e
 }
 
@@ -75,6 +84,9 @@ func NewEngine(interval time.Duration, numSlots uint32, cryptoEngine *crypto.Eng
 func (e *Engine) Close() {
 	if e.chronometer != nil {
 		e.chronometer.Stop()
+	}
+	if e.logger.Enabled(log.LevelInfo) {
+		e.logger.Info("storage engine and background chronometer stopped")
 	}
 }
 
@@ -96,7 +108,8 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) {
 		finalValue []byte
 		err        error
 	)
-	shard := e.shards[e.getShardIndex(key)]
+	idx := e.getShardIndex(key)
+	shard := e.shards[idx]
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)
 	}
@@ -105,6 +118,12 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) {
 		encryptedBuf := make([]byte, 0, neededSize)
 		finalValue, err = e.cryptoEngine.EncryptInPlace(encryptedBuf, value)
 		if err != nil {
+			if e.logger.Enabled(log.LevelError) {
+				e.logger.Log(log.LevelError, "in-place encryption failed during Set operation",
+					log.String("key", key),
+					log.Int("shard", int(idx)),
+				)
+			}
 			return
 		}
 	} else {
@@ -118,6 +137,13 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) {
 		Expiration: exp,
 	}
 	shard.Unlock()
+	if e.logger.Enabled(log.LevelDebug) {
+		e.logger.Log(log.LevelDebug, "key written to engine state",
+			log.String("key", key),
+			log.Int("shard", int(idx)),
+			log.Int64("ttl_ms", ttl.Milliseconds()),
+		)
+	}
 	if ttl > 0 && e.chronometer != nil {
 		e.chronometer.Register(key, ttl)
 	}
@@ -125,10 +151,17 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) {
 
 // Delete the shard from the storage engine
 func (e *Engine) Delete(key string) {
-	shard := e.shards[e.getShardIndex(key)]
+	idx := e.getShardIndex(key)
+	shard := e.shards[idx]
 	shard.Lock()
 	delete(shard.items, key)
 	shard.Unlock()
+	if e.logger.Enabled(log.LevelDebug) {
+		e.logger.Log(log.LevelDebug, "key deleted from engine state",
+			log.String("key", key),
+			log.Int("shard", int(idx)),
+		)
+	}
 }
 
 // Get shard from the storage engine by acquiring a read lock
@@ -145,6 +178,9 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 		return nil, false
 	}
 	if !item.Expiration.IsZero() && time.Now().After(item.Expiration) {
+		if e.logger.Enabled(log.LevelDebug) {
+			e.logger.Log(log.LevelDebug, "lazy eviction triggered during Get", log.String("key", key))
+		}
 		e.Delete(key)
 		return nil, false
 	}
@@ -158,6 +194,11 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 		buf = buf[:0]
 		plainValue, err = e.cryptoEngine.DecryptInPlaceWithDst(buf, item.Value)
 		if err != nil {
+			if e.logger.Enabled(log.LevelError) {
+				e.logger.Log(log.LevelError, "in-place decryption failed (integrity violation / corrupted memory)",
+					log.String("key", key),
+				)
+			}
 			return nil, false
 		}
 		// Return the plaintext slice directly. The slice references a pooled buffer, so no per‑call allocation occurs.
@@ -178,6 +219,9 @@ func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
 		return 0, false
 	}
 	if !item.Expiration.IsZero() && time.Now().After(item.Expiration) {
+		if e.logger.Enabled(log.LevelDebug) {
+			e.logger.Log(log.LevelDebug, "lazy eviction triggered during GetInto", log.String("key", key))
+		}
 		e.Delete(key)
 		return 0, false
 	}
@@ -185,12 +229,24 @@ func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
 		// Decrypt directly into the caller buffer.
 		plain, err := e.cryptoEngine.DecryptInPlaceWithDst(buf[:0], item.Value)
 		if err != nil {
+			if e.logger.Enabled(log.LevelError) {
+				e.logger.Log(log.LevelError, "in-place decryption failed inside GetInto target stream",
+					log.String("key", key),
+				)
+			}
 			return 0, false
 		}
 		return len(plain), true
 	}
 	// No encryption – copy the stored value into buf.
 	if len(buf) < len(item.Value) {
+		if e.logger.Enabled(log.LevelWarn) {
+			e.logger.Log(log.LevelWarn, "insufficient buffer capacity provided by caller for GetInto",
+				log.String("key", key),
+				log.Int("available_cap", len(buf)),
+				log.Int("required_len", len(item.Value)),
+			)
+		}
 		return 0, false // insufficient capacity (caller responsibility)
 	}
 	copy(buf, item.Value)

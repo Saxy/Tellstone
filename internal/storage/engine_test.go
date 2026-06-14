@@ -7,7 +7,7 @@ import (
 )
 
 func TestEngine_TableDriven(t *testing.T) {
-	engine := NewEngine(10*time.Millisecond, 100, nil)
+	engine := NewEngine(10*time.Millisecond, 100, nil, nil)
 	defer engine.Close()
 
 	type testCase struct {
@@ -136,7 +136,7 @@ func TestEngine_NewPanic(t *testing.T) {
 				t.Errorf("expected panic for interval <= 0")
 			}
 		}()
-		NewEngine(0, 100, nil)
+		NewEngine(0, 100, nil, nil)
 	})
 
 	t.Run("Panic on invalid numSlots", func(t *testing.T) {
@@ -145,7 +145,7 @@ func TestEngine_NewPanic(t *testing.T) {
 				t.Errorf("expected panic for numSlots == 0")
 			}
 		}()
-		NewEngine(1*time.Second, 0, nil)
+		NewEngine(1*time.Second, 0, nil, nil)
 	})
 }
 
@@ -154,7 +154,7 @@ func FuzzEngine_Operations(f *testing.F) {
 	f.Add("normal_key", []byte("normal_value"))
 	f.Add("", []byte("")) // Edge-Cases
 	f.Add("special_#!@*&_chars", []byte{0x00, 0xFF, 0xDE, 0xAD})
-	engine := NewEngine(50*time.Millisecond, 100, nil)
+	engine := NewEngine(50*time.Millisecond, 100, nil, nil)
 	defer engine.Close()
 	f.Fuzz(func(t *testing.T, key string, value []byte) {
 		engine.Set(key, value, 0)

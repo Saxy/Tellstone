@@ -17,7 +17,7 @@ func TestChronometer_BasicEviction(t *testing.T) {
 		mu.Unlock()
 	}
 	interval := 5 * time.Millisecond
-	c := NewChronometer(mockDeletion, interval, 10)
+	c := NewChronometer(mockDeletion, interval, 10, nil)
 	c.Start()
 	defer c.Stop()
 	c.Register("key:alpha", 5*time.Millisecond)
@@ -59,7 +59,7 @@ func TestChronometer_TTLRefresh(t *testing.T) {
 		}
 	}
 	interval := 10 * time.Millisecond
-	c := NewChronometer(mockDeletion, interval, 20)
+	c := NewChronometer(mockDeletion, interval, 20, nil)
 	c.Start()
 	defer c.Stop()
 	c.Register("session:user_1", 15*time.Millisecond)
@@ -80,7 +80,7 @@ func TestChronometer_Concurrency_Race(t *testing.T) {
 	mockDeletion := func(key string) {}
 
 	interval := 2 * time.Millisecond
-	c := NewChronometer(mockDeletion, interval, 50)
+	c := NewChronometer(mockDeletion, interval, 50, nil)
 	c.Start()
 	defer c.Stop()
 
