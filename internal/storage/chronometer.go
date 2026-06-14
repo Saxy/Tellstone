@@ -15,6 +15,8 @@ package storage
 import (
 	"sync"
 	"time"
+
+	"github.com/Saxy/Tellstone/internal/log"
 )
 
 const (
@@ -44,17 +46,22 @@ type Chronometer struct {
 	stop      chan struct{}
 	deletion  func(key string)
 	wg        sync.WaitGroup // tracks the background ticker goroutine
+	logger    log.Logger
 }
 
 // NewChronometer instantiates a precision time‑tracking wheel bound to a specific storage Engine.
 // The interval dictates the time resolution per tick, while numSlots defines the maximum future horizon.
-func NewChronometer(deletion func(key string), interval time.Duration, numSlots uint32) *Chronometer {
+func NewChronometer(deletion func(key string), interval time.Duration, numSlots uint32, logger log.Logger) *Chronometer {
 	c := &Chronometer{
 		deletion: deletion,
 		interval: interval,
 		numSlots: numSlots,
 		stop:     make(chan struct{}),
 	}
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
+	c.logger = logger
 	return c
 }
 
@@ -64,6 +71,12 @@ func (c *Chronometer) advance() {
 	c.mutex.Lock()
 	size := c.slotSizes[c.curSlot]
 	if size > 0 {
+		if c.logger.Enabled(log.LevelDebug) {
+			c.logger.Log(log.LevelDebug, "active eviction wave triggered by chronometer tick",
+				log.Int("slot_index", int(c.curSlot)),
+				log.Int("evicted_keys_count", size),
+			)
+		}
 		for i := 0; i < size; i++ {
 			c.deletion(c.slots[c.curSlot][i])
 		}
@@ -79,6 +92,9 @@ func (c *Chronometer) Start() {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
+		if c.logger.Enabled(log.LevelInfo) {
+			c.logger.Log(log.LevelInfo, "chronometer timeline loop started")
+		}
 		for {
 			select {
 			case <-c.ticker.C:
@@ -98,7 +114,11 @@ func (c *Chronometer) Stop() {
 	case <-c.stop:
 		// already closed
 	default:
+
 		close(c.stop)
+		if c.logger.Enabled(log.LevelInfo) {
+			c.logger.Log(log.LevelInfo, "stopping chronometer background routine")
+		}
 	}
 	c.mutex.Unlock()
 	c.wg.Wait()
@@ -119,5 +139,20 @@ func (c *Chronometer) Register(key string, ttl time.Duration) {
 	if size < SlotCapacity {
 		c.slots[targetSlot][size] = key
 		c.slotSizes[targetSlot] = size + 1
+		if c.logger.Enabled(log.LevelDebug) {
+			c.logger.Log(log.LevelDebug, "key registered in eviction timeline",
+				log.String("key", key),
+				log.Int("target_slot", int(targetSlot)),
+				log.Int64("steps_ahead", int64(steps)),
+			)
+		}
+	} else {
+		if c.logger.Enabled(log.LevelWarn) {
+			c.logger.Log(log.LevelWarn, "chronometer slot capacity exceeded! eviction will be delayed for key",
+				log.String("key", key),
+				log.Int("target_slot", int(targetSlot)),
+				log.Int("slot_limit", SlotCapacity),
+			)
+		}
 	}
 }

@@ -18,6 +18,8 @@ package protocol
 import (
 	"errors"
 	"time"
+
+	"github.com/Saxy/Tellstone/internal/log"
 )
 
 // ErrParse is returned when the input SQL cannot be parsed into a valid query.
@@ -64,10 +66,16 @@ func indexByte(b []byte, c byte) int {
 //
 // DESIGN NOTE: To survive unthrottled CPU load, all child matchers work entirely
 // inline on the 'raw' memory segment without duplicating slices or creating heap-escaped objects.
-func ParseQuery(raw []byte) (ParsedQuery, error) {
+func ParseQuery(raw []byte, logger log.Logger) (ParsedQuery, error) {
 	var q ParsedQuery
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
 	trimmed := trimSpaceInline(raw)
 	if len(trimmed) == 0 {
+		if logger.Enabled(log.LevelDebug) {
+			logger.Log(log.LevelDebug, "empty or whitespace-only buffer passed to parser")
+		}
 		return q, ErrParse
 	}
 	// Micro-Optimized Static Byte-Tokens to circumvent dynamic runtime generation
@@ -80,6 +88,11 @@ func ParseQuery(raw []byte) (ParsedQuery, error) {
 		q.Type = CmdGet
 		q.Key = extractSelectKeyInline(trimmed)
 		if q.Key == nil {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "failed to extract key from SQL SELECT statement",
+					log.Int("raw_len", len(raw)),
+				)
+			}
 			return q, ErrParse
 		}
 	case hasPrefixCase(trimmed, kwInsert):
@@ -87,21 +100,41 @@ func ParseQuery(raw []byte) (ParsedQuery, error) {
 		var overflow bool
 		q.Key, q.Value, q.TTL, overflow = extractSetPayloadInline(trimmed)
 		if overflow {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "rejected INSERT operation due to TTL duration overflow")
+			}
 			return q, ErrTTLOverflow
 		}
 		if q.Key == nil || q.Value == nil {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "failed to parse core schema blocks from SQL INSERT statement")
+			}
 			return q, ErrParse
 		}
 	case hasPrefixCase(trimmed, kwDelete):
 		q.Type = CmdDelete
 		q.Key = extractSelectKeyInline(trimmed)
 		if q.Key == nil {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "failed to extract key from SQL DELETE statement",
+					log.Int("raw_len", len(raw)),
+				)
+			}
 			return q, ErrParse
 		}
 	default:
+		if logger.Enabled(log.LevelDebug) {
+			logger.Log(log.LevelDebug, "unknown transaction syntax or unsupported SQL command")
+		}
 		return q, ErrParse
 	}
-
+	if logger.Enabled(log.LevelDebug) {
+		logger.Log(log.LevelDebug, "query parsed successfully",
+			log.Int("cmd_type", int(q.Type)),
+			log.Int("key_len", len(q.Key)),
+			log.Int64("ttl_ms", q.TTL.Milliseconds()),
+		)
+	}
 	return q, nil
 }
 

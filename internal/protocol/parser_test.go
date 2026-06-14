@@ -14,7 +14,7 @@ func TestParseQuery_Valid(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		q, err := ParseQuery(tt.query)
+		q, err := ParseQuery(tt.query, nil)
 		if err != nil {
 			t.Fatalf("%s: unexpected error %v", tt.name, err)
 		}
@@ -26,16 +26,16 @@ func TestParseQuery_Valid(t *testing.T) {
 
 func TestParseQuery_Invalid(t *testing.T) {
 	invalid := [][]byte{
-		{},                                         // empty
-		[]byte("   "),                               // whitespace only
-		[]byte("DROP TABLE kv"),                   // unknown command
-		[]byte("SELECT * FROM kv"),               // missing WHERE
-		[]byte("INSERT INTO kv VALUES ('k')"),    // malformed values
-		[]byte("DELETE FROM kv"),                 // missing WHERE
+		{},                                    // empty
+		[]byte("   "),                         // whitespace only
+		[]byte("DROP TABLE kv"),               // unknown command
+		[]byte("SELECT * FROM kv"),            // missing WHERE
+		[]byte("INSERT INTO kv VALUES ('k')"), // malformed values
+		[]byte("DELETE FROM kv"),              // missing WHERE
 	}
 
 	for i, q := range invalid {
-		_, err := ParseQuery(q)
+		_, err := ParseQuery(q, nil)
 		if err == nil {
 			t.Fatalf("invalid case %d: expected error, got nil", i)
 		}
@@ -47,7 +47,7 @@ func TestParseQuery_Invalid(t *testing.T) {
 
 func TestParseQuery_TTLOverflow(t *testing.T) {
 	overflowQuery := []byte("INSERT INTO kv (key, value, ttl_ms) VALUES ('k','v', 9999999999999)")
-	_, err := ParseQuery(overflowQuery)
+	_, err := ParseQuery(overflowQuery, nil)
 	if err != ErrTTLOverflow {
 		t.Fatalf("expected ErrTTLOverflow, got %v", err)
 	}
