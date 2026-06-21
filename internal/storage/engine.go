@@ -75,7 +75,7 @@ func NewEngine(interval time.Duration, numSlots uint32, cryptoEngine *crypto.Eng
 	}
 	e.logger = logger
 	if e.logger.Enabled(log.LevelInfo) {
-		e.logger.Info("storage engine created")
+		e.logger.Log(log.LevelInfo, "storage engine created")
 	}
 	return e
 }
@@ -86,7 +86,7 @@ func (e *Engine) Close() {
 		e.chronometer.Stop()
 	}
 	if e.logger.Enabled(log.LevelInfo) {
-		e.logger.Info("storage engine and background chronometer stopped")
+		e.logger.Log(log.LevelInfo, "storage engine and background chronometer stopped")
 	}
 }
 

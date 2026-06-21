@@ -1,7 +1,5 @@
 package log
 
-import "context"
-
 type Level uint8
 
 const (
@@ -37,12 +35,5 @@ func Bool(key string, val bool) Field   { return Field{Key: key, BoolVal: val, T
 
 type Logger interface {
 	Enabled(level Level) bool
-	Debug(msg string)
-	Info(msg string)
-	Warn(msg string)
-	Error(msg string)
-	Fatal(msg string)
-	WithFields(fields ...Field) Logger
-	WithContext(ctx context.Context) Logger
 	Log(level Level, msg string, fields ...Field)
 }
