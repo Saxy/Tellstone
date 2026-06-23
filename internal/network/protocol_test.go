@@ -25,7 +25,7 @@ func TestMain(m *testing.M) {
 	// Server starten
 	srv := NewServer(benchAddr, func(msg *Message) ([]byte, MessageType, error) {
 		return msg.Payload, MsgResponse, nil
-	})
+	}, nil)
 
 	go func() {
 		_ = srv.ListenAndServe()
