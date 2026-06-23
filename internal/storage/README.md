@@ -70,11 +70,27 @@ func (c *Chronometer) Stop()
 
 ## 📈 🏎️ High-Core CPU Showcase & Multi-Thread Scaling
 
-The engine was stress-tested across the entire thread spectrum of an **AMD Ryzen 9 9950X (16 Physical Cores, 32 Execution Threads, Zen 5 Architecture)**.
+The engine was stress‑tested across the entire thread spectrum of an **AMD Ryzen 9 9950X (16 Physical Cores, 32 Execution Threads, Zen 5 Architecture)**.
 
-To force the Go runtime to maintain maximum stable boost clocks and push the hardware to its absolute limit, the continuous execution window was set to a brutal 5 seconds per tier.
+**Latest benchmark run (2026‑06‑23):**
 
-### 📊 Real-World Raw Telemetry
+```text
+goos: linux
+goarch: amd64
+pkg: github.com/Saxy/Tellstone/internal/storage
+cpu: AMD Ryzen 9 9950X 16-Core Processor
+
+BenchmarkEngineGetNoAlloc-32                      76,606,690          15.95 ns/op            0 B/op          0 allocs/op
+BenchmarkEngineGetWithEncryptionNoAlloc-32        7,008,223          175.3 ns/op            0 B/op          0 allocs/op
+BenchmarkChronometerEvictionPipeline-32           5,979,178          214.2 ns/op            1 B/op          0 allocs/op
+BenchmarkChronometerEvictionPipelineSequential-32 4,552,518          233.8 ns/op            2 B/op          0 allocs/op
+```
+
+*Note:* The benchmarks focus on the 32‑thread (full‑SMT) configuration, which reflects the worst‑case contention scenario. Earlier multi‑core results are preserved in the historical data section above.
+
+---
+
+### 📊 Historical Raw Telemetry (pre‑2026‑06‑23)
 
 Running: `go test -bench=^BenchmarkChronometerEvictionPipeline$ -benchmem -benchtime=5s -cpu=1,4,8,16,32 ./internal/storage/...`
 
@@ -88,7 +104,6 @@ BenchmarkChronometerEvictionPipeline-4     45018214         127.2 ns/op         
 BenchmarkChronometerEvictionPipeline-8     48242398         126.6 ns/op            0 B/op          0 allocs/op
 BenchmarkChronometerEvictionPipeline-16    42896708         144.8 ns/op            0 B/op          0 allocs/op
 BenchmarkChronometerEvictionPipeline-32    36406423         173.0 ns/op            0 B/op          0 allocs/op
-
 ```
 
 ### 🔬 Multi-Core Performance & Architecture Analysis
