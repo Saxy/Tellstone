@@ -22,9 +22,11 @@ package trace
 
 import (
 	"context"
+	"time"
 
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
@@ -79,10 +81,19 @@ func (o *OTelSpan) SetError(err error) { o.span.RecordError(err) }
 func (o *OTelSpan) IsRecording() bool  { return o.span.IsRecording() }
 
 func InitTracer(serviceName, url string, sampleRatio float64) (*sdktrace.TracerProvider, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	exporter, err := otlptracegrpc.New(ctx,
+		otlptracegrpc.WithInsecure(),
+		otlptracegrpc.WithEndpoint(url),
+	)
+	if err != nil {
+		return nil, err
+	}
 	res, err := resource.Merge(
 		resource.Default(),
 		resource.NewWithAttributes(
-			semconv.SchemaURL,
+			"",
 			semconv.ServiceNameKey.String(serviceName),
 		),
 	)
@@ -91,8 +102,8 @@ func InitTracer(serviceName, url string, sampleRatio float64) (*sdktrace.TracerP
 	}
 	tp := sdktrace.NewTracerProvider(
 		sdktrace.WithResource(res),
-		// critical for performance: hard sampling on the root case
-		// without sampling otel would allocate heap
+		sdktrace.WithBatcher(exporter),
+		// critical for performance: hard sampling
 		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.TraceIDRatioBased(sampleRatio))),
 	)
 	otel.SetTracerProvider(tp)

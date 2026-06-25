@@ -10,6 +10,23 @@ const (
 	LevelFatal
 )
 
+func ParseLogLevel(lvl string) Level {
+	switch lvl {
+	case "debug", "DEBUG":
+		return LevelDebug
+	case "info", "INFO":
+		return LevelInfo
+	case "warn", "WARN", "warning":
+		return LevelWarn
+	case "error", "ERROR":
+		return LevelError
+	case "fatal", "FATAL":
+		return LevelFatal
+	default:
+		return LevelInfo
+	}
+}
+
 type FieldType uint8
 
 const (
