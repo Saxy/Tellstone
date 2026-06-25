@@ -10,7 +10,7 @@ import (
 // and the Get operation only reads from the map under a read lock.
 func BenchmarkEngineGetNoAlloc(b *testing.B) {
 	// Create an engine with a tiny tick interval (not used in this benchmark) and a modest number of slots.
-	eng := NewEngine(1*time.Millisecond, 64, nil, nil)
+	eng := NewEngine(1*time.Millisecond, 64, nil, nil, 0)
 	defer eng.Close()
 
 	// Pre‑populate the engine with a key/value pair.

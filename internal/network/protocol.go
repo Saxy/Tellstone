@@ -50,6 +50,8 @@ var (
 // Marshal encodes a Message into its binary representation on the wire.
 // NOTE: This triggers heap allocations. Only use this for non-hot-paths
 // such as initial cluster handshakes, tear-downs, or out-of-band management tasks.
+// Marshal encodes the Message into its binary wire format.
+// It allocates a new slice – suitable for one‑off operations such as handshakes.
 func (m *Message) Marshal() []byte {
 	total := 1 + len(m.Payload)
 	buf := make([]byte, 4+total)
@@ -62,6 +64,8 @@ func (m *Message) Marshal() []byte {
 // Decode parses a full protocol frame directly from an existing byte slice.
 // This is the core data-path method used inside asynchronous event loops (e.g., gnet).
 // It guarantees 0 heap allocations by slicing directly into the underlying ring buffer window.
+// Decode parses a full protocol frame from an existing byte slice.
+// It returns the payload length and populates the supplied Message struct.
 func Decode(data []byte, out *Message) (int, error) {
 	if len(data) < 5 {
 		return 0, errShortRead

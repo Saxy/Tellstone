@@ -14,10 +14,28 @@ package storage
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
 )
+
+type TimelineWheel interface {
+	Start()
+	Stop()
+	Register(key string, ttl time.Duration)
+	ExpiredCount() uint64
+	Overflows() uint64
+}
+
+// NoOpChronometer belegt 0 Byte RAM und optimiert die CPU-Branches weg.
+type NoOpChronometer struct{}
+
+func (n *NoOpChronometer) Start()                                 {}
+func (n *NoOpChronometer) Stop()                                  {}
+func (n *NoOpChronometer) Register(key string, ttl time.Duration) {}
+func (n *NoOpChronometer) ExpiredCount() uint64                   { return 0 }
+func (n *NoOpChronometer) Overflows() uint64                      { return 0 }
 
 const (
 	MaxSlots     = 1000
@@ -47,6 +65,9 @@ type Chronometer struct {
 	deletion  func(key string)
 	wg        sync.WaitGroup // tracks the background ticker goroutine
 	logger    log.Logger
+
+	overflows    uint64
+	expiredCount uint64
 }
 
 // NewChronometer instantiates a precision time‑tracking wheel bound to a specific storage Engine.
@@ -80,6 +101,7 @@ func (c *Chronometer) advance() {
 		for i := 0; i < size; i++ {
 			c.deletion(c.slots[c.curSlot][i])
 		}
+		atomic.AddUint64(&c.expiredCount, uint64(size))
 		c.slotSizes[c.curSlot] = 0
 	}
 	c.curSlot = (c.curSlot + 1) % c.numSlots
@@ -147,6 +169,7 @@ func (c *Chronometer) Register(key string, ttl time.Duration) {
 			)
 		}
 	} else {
+		atomic.AddUint64(&c.overflows, 1)
 		if c.logger.Enabled(log.LevelWarn) {
 			c.logger.Log(log.LevelWarn, "chronometer slot capacity exceeded! eviction will be delayed for key",
 				log.String("key", key),
@@ -156,3 +179,6 @@ func (c *Chronometer) Register(key string, ttl time.Duration) {
 		}
 	}
 }
+
+func (c *Chronometer) ExpiredCount() uint64 { return atomic.LoadUint64(&c.expiredCount) }
+func (c *Chronometer) Overflows() uint64    { return atomic.LoadUint64(&c.overflows) }

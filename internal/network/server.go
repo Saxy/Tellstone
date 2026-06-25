@@ -14,26 +14,39 @@ package network
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/panjf2000/gnet/v2"
 )
+
+const defaultAddr = "127.0.0.1:9988"
 
 type Server struct {
 	gnet.BuiltinEventEngine
 	addr    string
 	handler func(msg *Message) ([]byte, MessageType, error)
 	logger  log.Logger
+
+	connectedClients uint64
+	totalConnections uint64
+	bytesRead        uint64
+	bytesWritten     uint64
+	protocolErrors   uint64
+	handlerErrors    uint64
 }
 
 // NewServer initializes an edge-triggered networking server engine instance.
 // It applies defensive configuration defaults before spawning infrastructure.
 func NewServer(addr string, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
-	if addr == "" {
-		addr = "127.0.0.1:9988"
-	}
 	if logger == nil {
 		logger = log.NewNoOpLogger()
+	}
+	if addr == "" {
+		if logger.Enabled(log.LevelDebug) {
+			logger.Log(log.LevelDebug, "addr is nil using defaultAddr instead", log.String("listen to addr", defaultAddr))
+		}
+		addr = defaultAddr
 	}
 	s := &Server{
 		addr:    addr,
@@ -54,25 +67,46 @@ func (s *Server) ListenAndServe() error {
 	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true))
 }
 
+func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
+	atomic.AddUint64(&s.connectedClients, 1)
+	atomic.AddUint64(&s.totalConnections, 1)
+	return []byte{}, gnet.None
+}
+
+func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
+	atomic.AddUint64(&s.connectedClients, ^uint64(0))
+	return gnet.None
+}
+
 // OnTraffic handles incoming bytes on the socket asynchronously and lock-free.
 func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 	for {
-		buf, _ := c.Peek(-1)
+		buf, err := c.Peek(-1)
+		if err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "peek failed to return n bytes",
+					log.String("error", err.Error()),
+				)
+			}
+			return gnet.Close
+		}
 		var msg Message
 		payloadLen, err := Decode(buf, &msg)
 		if err != nil {
 			if errors.Is(err, errShortRead) {
 				break
 			}
+			atomic.AddUint64(&s.protocolErrors, 1)
 			if s.logger.Enabled(log.LevelError) {
 				s.logger.Log(log.LevelError, "protocol decoding failed catastrophically",
-					log.String("error", err.Error()),
 					log.String("remote_addr", c.RemoteAddr().String()),
+					log.String("error", err.Error()),
 				)
 			}
 			return gnet.Close
 		}
 		totalPacketLen := 5 + payloadLen
+		atomic.AddUint64(&s.bytesRead, uint64(totalPacketLen))
 		if s.handler != nil {
 			var (
 				respType    MessageType
@@ -80,6 +114,7 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 			)
 			respPayload, respType, err = s.handler(&msg)
 			if err != nil {
+				atomic.AddUint64(&s.handlerErrors, 1)
 				if s.logger.Enabled(log.LevelWarn) {
 					s.logger.Log(log.LevelWarn, "application handler returned execution error",
 						log.String("error", err.Error()),
@@ -96,9 +131,26 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 					}
 					return gnet.Close
 				}
+				atomic.AddUint64(&s.bytesWritten, uint64(5+len(respPayload)))
 			}
 		}
-		_, _ = c.Discard(totalPacketLen)
+		_, err = c.Discard(totalPacketLen)
+		if err != nil {
+			atomic.AddUint64(&s.protocolErrors, 1)
+			if s.logger.Enabled(log.LevelWarn) {
+				s.logger.Log(log.LevelWarn, "discarding packages not possible",
+					log.Int("total packet length", totalPacketLen),
+					log.String("error", err.Error()),
+				)
+			}
+		}
 	}
 	return gnet.None
 }
+
+func (s *Server) ConnectedClients() uint64 { return atomic.LoadUint64(&s.connectedClients) }
+func (s *Server) TotalConnections() uint64 { return atomic.LoadUint64(&s.totalConnections) }
+func (s *Server) BytesRead() uint64        { return atomic.LoadUint64(&s.bytesRead) }
+func (s *Server) BytesWritten() uint64     { return atomic.LoadUint64(&s.bytesWritten) }
+func (s *Server) ProtocolErrors() uint64   { return atomic.LoadUint64(&s.protocolErrors) }
+func (s *Server) HandlerErrors() uint64    { return atomic.LoadUint64(&s.handlerErrors) }

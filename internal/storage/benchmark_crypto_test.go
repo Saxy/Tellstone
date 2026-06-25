@@ -24,7 +24,7 @@ func BenchmarkEngineGetWithEncryptionNoAlloc(b *testing.B) {
 	}
 
 	// Create the storage engine with the crypto engine enabled.
-	eng := NewEngine(1*time.Millisecond, 64, cryptoEng, nil)
+	eng := NewEngine(1*time.Millisecond, 64, cryptoEng, nil, 0)
 	defer eng.Close()
 
 	// Insert a small value (well under the 2KB stack buffer threshold).
