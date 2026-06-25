@@ -41,7 +41,10 @@ func NewEngine(key []byte, logger log.Logger) (*Engine, error) {
 		if logger.Enabled(log.LevelInfo) {
 			logger.Log(log.LevelInfo, "crypto engine initialized in pass-through mode (encryption disabled)")
 		}
-		return &Engine{enabled: false}, nil
+		return &Engine{
+			enabled: false,
+			logger:  logger,
+		}, nil
 	}
 	// ChaCha20-Poly1305 requires exactly a 32-byte key
 	if len(key) != 32 {
