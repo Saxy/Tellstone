@@ -26,7 +26,7 @@ func (N NOOPLogger) Fatalf(format string, args ...any) {}
 const benchAddr = "127.0.0.1:9988"
 
 func TestMain(m *testing.M) {
-	srv := NewServer(benchAddr, func(msg *Message) ([]byte, MessageType, error) {
+	srv := NewServer(benchAddr, 0, func(msg *Message) ([]byte, MessageType, error) {
 		return msg.Payload, MsgResponse, nil
 	}, nil)
 
@@ -52,7 +52,7 @@ func BenchmarkReadMessageZeroAlloc(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := Decode(data, &m)
+		_, err := Decode(data, uint32(len(data)), &m)
 		if err != nil {
 			b.Fatalf("read error: %v", err)
 		}
@@ -84,7 +84,7 @@ func (bc *benchClient) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 func (bc *benchClient) OnTraffic(c gnet.Conn) gnet.Action {
 	buf, _ := c.Peek(-1)
 	var msg Message
-	payloadLen, err := Decode(buf, &msg)
+	payloadLen, err := Decode(buf, uint32(len(buf)), &msg)
 	if err != nil {
 		return gnet.None
 	}
@@ -149,15 +149,15 @@ func BenchmarkGnetServerHandlerParallel(b *testing.B) {
 
 // Test Decode returns proper errors for malformed inputs.
 func TestDecodeErrors(t *testing.T) {
-	if _, err := Decode([]byte{0, 0, 0}, &Message{}); !errors.Is(err, errShortRead) {
+	if _, err := Decode([]byte{0, 0, 0}, uint32(len([]byte{0, 0, 0})), &Message{}); !errors.Is(err, errShortRead) {
 		t.Fatalf("expected errShortRead, got %v", err)
 	}
 	data := []byte{0, 0, 0, 0, byte(MsgPing)}
-	if _, err := Decode(data, &Message{}); !errors.Is(err, errZeroLength) {
+	if _, err := Decode(data, uint32(len(data)), &Message{}); !errors.Is(err, errZeroLength) {
 		t.Fatalf("expected errZeroLength, got %v", err)
 	}
 	data = []byte{0, 0, 0, 5, byte(MsgPing), 'a', 'b', 'c'}
-	if _, err := Decode(data, &Message{}); !errors.Is(err, errShortRead) {
+	if _, err := Decode(data, uint32(len(data)), &Message{}); !errors.Is(err, errShortRead) {
 		t.Fatalf("expected errShortRead for insufficient payload, got %v", err)
 	}
 }

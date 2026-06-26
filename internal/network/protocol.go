@@ -24,55 +24,79 @@ import (
 type MessageType uint8
 
 const (
-	// MsgPing is used for heartbeat or health-check routines.
 	MsgPing MessageType = iota
-	// MsgPong is the mandatory acknowledgement response to a MsgPing.
 	MsgPong
-	// MsgRequest represents an incoming client data payload.
 	MsgRequest
-	// MsgResponse represents an outgoing server response payload.
 	MsgResponse
+)
+
+// OpCode defines the backend database operation.
+type OpCode uint8
+
+const (
+	OpGet OpCode = iota + 1
+	OpSet
+	OpDelete
 )
 
 // Message is the atomic execution frame of the Tellstone TCP protocol.
 type Message struct {
 	Type    MessageType
-	Payload []byte
+	Op      OpCode
+	TTL     int64
+	Key     []byte
+	Value   []byte
+	Payload []byte // Beibehalten für rohe Abwärtskompatibilität / Pings
 }
 
 var (
 	errShortRead      = errors.New("network: short read while decoding message")
+	errTooLong        = errors.New("network: msg size exceeded limit")
 	errZeroLength     = errors.New("network: message length cannot be zero")
 	errMissingType    = errors.New("network: missing type byte")
 	errBufferTooSmall = errors.New("network: supplied buffer too small for payload")
+	errMalformedFrame = errors.New("network: malformed frame structure")
 )
 
-// Marshal encodes a Message into its binary representation on the wire.
-// NOTE: This triggers heap allocations. Only use this for non-hot-paths
-// such as initial cluster handshakes, tear-downs, or out-of-band management tasks.
 // Marshal encodes the Message into its binary wire format.
 // It allocates a new slice – suitable for one‑off operations such as handshakes.
 func (m *Message) Marshal() []byte {
-	total := 1 + len(m.Payload)
+	var payload []byte
+	if m.Type == MsgRequest || m.Type == MsgResponse {
+		keyLen := len(m.Key)
+		totalPayloadLen := 1 + 2 + 8 + keyLen + len(m.Value)
+		payload = make([]byte, totalPayloadLen)
+
+		payload[0] = byte(m.Op)
+		binary.BigEndian.PutUint16(payload[1:3], uint16(keyLen))
+		binary.BigEndian.PutUint64(payload[3:11], uint64(m.TTL))
+		copy(payload[11:11+keyLen], m.Key)
+		copy(payload[11+keyLen:], m.Value)
+	} else {
+		payload = m.Payload
+	}
+
+	total := 1 + len(payload)
 	buf := make([]byte, 4+total)
 	binary.BigEndian.PutUint32(buf[:4], uint32(total))
 	buf[4] = byte(m.Type)
-	copy(buf[5:], m.Payload)
+	copy(buf[5:], payload)
 	return buf
 }
 
-// Decode parses a full protocol frame directly from an existing byte slice.
-// This is the core data-path method used inside asynchronous event loops (e.g., gnet).
-// It guarantees 0 heap allocations by slicing directly into the underlying ring buffer window.
 // Decode parses a full protocol frame from an existing byte slice.
 // It returns the payload length and populates the supplied Message struct.
-func Decode(data []byte, out *Message) (int, error) {
+// Guarantees 0 heap allocations by slicing directly into the network ring buffer.
+func Decode(data []byte, maxMsgSize uint32, out *Message) (int, error) {
 	if len(data) < 5 {
 		return 0, errShortRead
 	}
-	length := uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
+	length := binary.BigEndian.Uint32(data[:4])
 	if length == 0 {
 		return 0, errZeroLength
+	}
+	if length > maxMsgSize {
+		return 0, errTooLong
 	}
 	if uint32(len(data)) < length+4 {
 		return 0, errShortRead
@@ -80,39 +104,49 @@ func Decode(data []byte, out *Message) (int, error) {
 	out.Type = MessageType(data[4])
 	payloadLen := int(length) - 1
 	if payloadLen > 0 {
-		out.Payload = data[5 : 5+payloadLen]
+		rawPayload := data[5 : 5+payloadLen]
+		out.Payload = rawPayload
+		if out.Type == MsgRequest || out.Type == MsgResponse {
+			if len(rawPayload) < 11 { // 1 + 2 + 8
+				return 0, errMalformedFrame
+			}
+			out.Op = OpCode(rawPayload[0])
+			keyLen := int(binary.BigEndian.Uint16(rawPayload[1:3]))
+			out.TTL = int64(binary.BigEndian.Uint64(rawPayload[3:11]))
+
+			if len(rawPayload) < 11+keyLen {
+				return 0, errMalformedFrame
+			}
+			out.Key = rawPayload[11 : 11+keyLen]
+			out.Value = rawPayload[11+keyLen:]
+		}
 	} else {
 		out.Payload = nil
+		out.Key = nil
+		out.Value = nil
 	}
 	return payloadLen, nil
 }
 
 // Write transmits a message completely allocation-free.
-// To circumvent TCP fragmentation (sending header and payload in distinct packets),
-// it passes an aggregated slice array to net.Buffers to leverage system-level scatter-gather I/O (writev).
 func Write(w io.Writer, msgType MessageType, payload []byte) error {
 	total := 1 + len(payload)
 	var hdr [5]byte
-	hdr[0] = byte(total >> 24)
-	hdr[1] = byte(total >> 16)
-	hdr[2] = byte(total >> 8)
-	hdr[3] = byte(total)
+	binary.BigEndian.PutUint32(hdr[:4], uint32(total))
 	hdr[4] = byte(msgType)
-	// net.Buffers wraps multi-slice arrays. Go's escape analysis allows this two-slice
-	// wrapper to reside safely on the stack since it never escapes this local scope execution.
+
 	bufs := net.Buffers{hdr[:], payload}
 	_, err := bufs.WriteTo(w)
 	return err
 }
 
 // Read extracts a message from an io.Reader stream directly into a pre-allocated scratchpad buffer.
-// Optimized for synchronous, blocking multi-threaded Go client implementations.
 func Read(r io.Reader, buf []byte, out *Message) error {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return err
 	}
-	length := uint32(lenBuf[0])<<24 | uint32(lenBuf[1])<<16 | uint32(lenBuf[2])<<8 | uint32(lenBuf[3])
+	length := binary.BigEndian.Uint32(lenBuf[:])
 	if length == 0 {
 		return errZeroLength
 	}
@@ -122,8 +156,25 @@ func Read(r io.Reader, buf []byte, out *Message) error {
 	if _, err := io.ReadFull(r, buf[:length]); err != nil {
 		return err
 	}
+
 	out.Type = MessageType(buf[0])
-	out.Payload = buf[1:length]
+	rawPayload := buf[1:length]
+	out.Payload = rawPayload
+
+	if out.Type == MsgRequest || out.Type == MsgResponse {
+		if len(rawPayload) < 11 {
+			return errMalformedFrame
+		}
+		out.Op = OpCode(rawPayload[0])
+		keyLen := int(binary.BigEndian.Uint16(rawPayload[1:3]))
+		out.TTL = int64(binary.BigEndian.Uint64(rawPayload[3:11]))
+
+		if len(rawPayload) < 11+keyLen {
+			return errMalformedFrame
+		}
+		out.Key = rawPayload[11 : 11+keyLen]
+		out.Value = rawPayload[11+keyLen:]
+	}
 	return nil
 }
 
@@ -133,7 +184,7 @@ func Unmarshal(r io.Reader) (*Message, error) {
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
 		return nil, err
 	}
-	length := uint32(lenBuf[0])<<24 | uint32(lenBuf[1])<<16 | uint32(lenBuf[2])<<8 | uint32(lenBuf[3])
+	length := binary.BigEndian.Uint32(lenBuf[:])
 	if length == 0 {
 		return nil, errZeroLength
 	}
@@ -143,19 +194,28 @@ func Unmarshal(r io.Reader) (*Message, error) {
 		return nil, err
 	}
 
-	return &Message{
-		Type:    MessageType(data[0]),
-		Payload: data[1:],
-	}, nil
+	msg := &Message{Type: MessageType(data[0])}
+	rawPayload := data[1:]
+	msg.Payload = rawPayload
+
+	if msg.Type == MsgRequest || msg.Type == MsgResponse {
+		if len(rawPayload) < 11 {
+			return nil, errMalformedFrame
+		}
+		msg.Op = OpCode(rawPayload[0])
+		keyLen := int(binary.BigEndian.Uint16(rawPayload[1:3]))
+		msg.TTL = int64(binary.BigEndian.Uint64(rawPayload[3:11]))
+		msg.Key = rawPayload[11 : 11+keyLen]
+		msg.Value = rawPayload[11+keyLen:]
+	}
+	return msg, nil
 }
 
-// WriteMessage executes a standard network write by marshalling data into a newly allocated buffer.
 func WriteMessage(w io.Writer, m *Message) error {
 	_, err := w.Write(m.Marshal())
 	return err
 }
 
-// ReadMessage reads an allocated frame structure from an arbitrary streaming source interface.
 func ReadMessage(r io.Reader) (*Message, error) {
 	return Unmarshal(r)
 }

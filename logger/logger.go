@@ -37,6 +37,8 @@ func (s *SlogAdapter) Log(level log.Level, msg string, fields ...log.Field) {
 			attrs[i] = slog.Bool(f.Key, f.BoolVal)
 		case log.TypeFloat:
 			attrs[i] = slog.Float64(f.Key, f.FloatVal)
+		case log.TypeUint32:
+			attrs[i] = slog.Uint64(f.Key, uint64(f.UintVal))
 		}
 	}
 	s.slogLogger.Log(context.Background(), translateLevelToSlog(level), msg, attrs...)

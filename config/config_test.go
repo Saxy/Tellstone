@@ -96,7 +96,7 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	os.Unsetenv("TSD_TRACE_RATIO")
 
 	resetFlagSet()
-	cfg := loadConfig()
+	cfg := LoadConfig()
 
 	if cfg.Addr != "127.0.0.1:9988" {
 		t.Fatalf("default Addr mismatch: %s", cfg.Addr)
@@ -126,7 +126,7 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	os.Setenv("TSD_TRACE_RATIO", "0.25")
 
 	resetFlagSet()
-	cfg = loadConfig()
+	cfg = LoadConfig()
 
 	if cfg.Addr != "0.0.0.0:7777" {
 		t.Fatalf("env Addr mismatch: %s", cfg.Addr)

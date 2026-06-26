@@ -21,12 +21,14 @@ import (
 )
 
 const defaultAddr = "127.0.0.1:9988"
+const defaultMaxMsgSize = 16 * 1024 * 1024
 
 type Server struct {
 	gnet.BuiltinEventEngine
-	addr    string
-	handler func(msg *Message) ([]byte, MessageType, error)
-	logger  log.Logger
+	addr       string
+	handler    func(msg *Message) ([]byte, MessageType, error)
+	logger     log.Logger
+	maxMsgSize uint32
 
 	connectedClients uint64
 	totalConnections uint64
@@ -38,7 +40,7 @@ type Server struct {
 
 // NewServer initializes an edge-triggered networking server engine instance.
 // It applies defensive configuration defaults before spawning infrastructure.
-func NewServer(addr string, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
+func NewServer(addr string, maxMsgSize uint32, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -48,13 +50,17 @@ func NewServer(addr string, handler func(msg *Message) ([]byte, MessageType, err
 		}
 		addr = defaultAddr
 	}
+	if maxMsgSize == 0 {
+		maxMsgSize = defaultMaxMsgSize
+	}
 	s := &Server{
-		addr:    addr,
-		handler: handler,
-		logger:  logger,
+		addr:       addr,
+		handler:    handler,
+		logger:     logger,
+		maxMsgSize: maxMsgSize,
 	}
 	if s.logger.Enabled(log.LevelInfo) {
-		s.logger.Log(log.LevelInfo, "tcp server created")
+		s.logger.Log(log.LevelInfo, "tcp server created", log.Int("max_msg_size", int(maxMsgSize)))
 	}
 	return s
 }
@@ -91,7 +97,7 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 			return gnet.Close
 		}
 		var msg Message
-		payloadLen, err := Decode(buf, &msg)
+		payloadLen, err := Decode(buf, s.maxMsgSize, &msg)
 		if err != nil {
 			if errors.Is(err, errShortRead) {
 				break
