@@ -46,7 +46,7 @@ type Message struct {
 	TTL     int64
 	Key     []byte
 	Value   []byte
-	Payload []byte // Beibehalten für rohe Abwärtskompatibilität / Pings
+	Payload []byte
 }
 
 var (
@@ -56,6 +56,14 @@ var (
 	errMissingType    = errors.New("network: missing type byte")
 	errBufferTooSmall = errors.New("network: supplied buffer too small for payload")
 	errMalformedFrame = errors.New("network: malformed frame structure")
+)
+
+var (
+	ResponseOK             = []byte("OK")
+	ResponseNotFound       = []byte("ERR NOT_FOUND")
+	ResponseEmptyKey       = []byte("ERR EMPTY_KEY")
+	ResponseStorageFailure = []byte("ERR STORAGE_FAILURE")
+	ResponseInvalidOpCode  = []byte("ERR INVALID_OPCODE")
 )
 
 // Marshal encodes the Message into its binary wire format.
@@ -87,7 +95,7 @@ func (m *Message) Marshal() []byte {
 // Decode parses a full protocol frame from an existing byte slice.
 // It returns the payload length and populates the supplied Message struct.
 // Guarantees 0 heap allocations by slicing directly into the network ring buffer.
-func Decode(data []byte, maxMsgSize uint32, out *Message) (int, error) {
+func Decode(data []byte, maxMsgSize uint64, out *Message) (int, error) {
 	if len(data) < 5 {
 		return 0, errShortRead
 	}
@@ -95,7 +103,7 @@ func Decode(data []byte, maxMsgSize uint32, out *Message) (int, error) {
 	if length == 0 {
 		return 0, errZeroLength
 	}
-	if length > maxMsgSize {
+	if uint64(length) > maxMsgSize {
 		return 0, errTooLong
 	}
 	if uint32(len(data)) < length+4 {

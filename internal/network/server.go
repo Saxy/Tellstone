@@ -28,7 +28,7 @@ type Server struct {
 	addr       string
 	handler    func(msg *Message) ([]byte, MessageType, error)
 	logger     log.Logger
-	maxMsgSize uint32
+	maxMsgSize uint64
 
 	connectedClients uint64
 	totalConnections uint64
@@ -40,7 +40,7 @@ type Server struct {
 
 // NewServer initializes an edge-triggered networking server engine instance.
 // It applies defensive configuration defaults before spawning infrastructure.
-func NewServer(addr string, maxMsgSize uint32, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
+func NewServer(addr string, maxMsgSize uint64, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}

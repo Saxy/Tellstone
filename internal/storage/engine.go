@@ -58,7 +58,7 @@ const (
 //     the OS from brutally killing the process with a SIGKILL.
 //
 // On 64-bit systems, this compiles to 0 (unlimited), letting the engine scale safely.
-var defaultMaxBytes uint64 = func() uint64 {
+var defaultMaxBytes = func() uint64 {
 	if bits.UintSize == 32 {
 		// 3 GB safety cap for 32-bit
 		return 3 * 1024 * 1024 * 1024
@@ -88,7 +88,7 @@ type Engine struct {
 // NewEngine creates a new storage engine with the given chronometer interval,
 // number of timing‑wheel slots, optional crypto engine and logger. It initialises all
 // shards, starts the background chronometer and returns a ready‑to‑use *Engine.
-func NewEngine(interval time.Duration, numSlots uint32, cryptoEngine *crypto.Engine, logger log.Logger, maxBytes uint64) *Engine {
+func NewEngine(interval time.Duration, numSlots uint32, maxBytes uint64, logger log.Logger, cryptoEngine *crypto.Engine) *Engine {
 	e := new(Engine)
 	if maxBytes == 0 {
 		maxBytes = defaultMaxBytes

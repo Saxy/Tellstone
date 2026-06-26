@@ -10,13 +10,13 @@ import (
 )
 
 type Config struct {
-	Addr          string
-	LogLevel      log.Level
-	EvictTicker   time.Duration
-	EvictSlots    uint32
-	EncryptionKey string
-	TraceRatio    float64
-	MaxMsgSize    uint32
+	addr          string
+	logLevel      log.Level
+	evictTicker   time.Duration
+	evictSlots    uint32
+	encryptionKey string
+	traceRatio    float64
+	maxMsgSize    uint64
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -81,7 +81,7 @@ func LoadConfig() *Config {
 
 	// Network listening address.
 	flag.StringVar(
-		&cfg.Addr,
+		&cfg.addr,
 		"addr",
 		getEnv("TSD_ADDR", "127.0.0.1:9988"),
 		"TCP listen address (default: 127.0.0.1:9988)",
@@ -94,10 +94,10 @@ func LoadConfig() *Config {
 		getEnv("TSD_LOG_LEVEL", "info"),
 		"Log verbosity (debug|info|warn|error|fatal) (default: info)",
 	)
-	cfg.LogLevel = log.ParseLogLevel(logLevel)
+	cfg.logLevel = log.ParseLogLevel(logLevel)
 	// Chronometer eviction ticker interval.
 	flag.DurationVar(
-		&cfg.EvictTicker,
+		&cfg.evictTicker,
 		"evict-interval",
 		getEnv("TSD_EVICT_INTERVAL", time.Second),
 		"Interval between eviction scans (default: 1s)",
@@ -110,17 +110,17 @@ func LoadConfig() *Config {
 		getEnv("TSD_EVICT_SLOTS", uint(256)),
 		"Number of slots in the chronometer wheel (default: 256)",
 	)
-	cfg.EvictSlots = uint32(evictSlots)
+	cfg.evictSlots = uint32(evictSlots)
 	// Optional encryption key for data at rest.
 	flag.StringVar(
-		&cfg.EncryptionKey,
+		&cfg.encryptionKey,
 		"encryption-key",
 		getEnv("TSD_ENCRYPTION_KEY", ""),
 		"Base‑64 encoded encryption key; empty disables encryption (default: none)",
 	)
 	// OpenTelemetry trace sampling ratio.
 	flag.Float64Var(
-		&cfg.TraceRatio,
+		&cfg.traceRatio,
 		"trace-ratio",
 		getEnv("TSD_TRACE_RATIO", 0.0),
 		"OTel sampling ratio in [0.0‑1.0] (default: 0.0 – disabled)",
@@ -138,7 +138,7 @@ func LoadConfig() *Config {
 		"max-msg-size",
 		"Maximum network message size (e.g. 16MiB, 1GiB, 0 = use default 16MiB)",
 	)
-	cfg.MaxMsgSize = uint32(maxMsgSize)
+	cfg.maxMsgSize = uint64(maxMsgSize)
 	// Custom usage output to guide operators.
 	flag.Usage = func() {
 		println("Tellstone server – high‑performance in‑memory database")
@@ -151,3 +151,11 @@ func LoadConfig() *Config {
 	_ = flag.CommandLine.Parse([]string{})
 	return cfg
 }
+
+func (cfg *Config) GetAddr() string               { return cfg.addr }
+func (cfg *Config) GetLogLevel() log.Level        { return cfg.logLevel }
+func (cfg *Config) GetEvictTicker() time.Duration { return cfg.evictTicker }
+func (cfg *Config) GetEvictSlots() uint32         { return cfg.evictSlots }
+func (cfg *Config) GetEncryptionKey() string      { return cfg.encryptionKey }
+func (cfg *Config) GetTraceRatio() float64        { return cfg.traceRatio }
+func (cfg *Config) GetMaxMsgSize() uint64         { return cfg.maxMsgSize }
