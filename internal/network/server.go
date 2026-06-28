@@ -74,7 +74,7 @@ func (s *Server) ListenAndServe() error {
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, 1)
 	atomic.AddUint64(&s.totalConnections, 1)
-	return []byte{}, gnet.None
+	return nil, gnet.None
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
@@ -84,6 +84,7 @@ func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 
 // OnTraffic handles incoming bytes on the socket asynchronously and lock-free.
 func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
+	var msg Message
 	for {
 		buf, err := c.Peek(-1)
 		if err != nil {
@@ -94,7 +95,7 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 			}
 			return gnet.Close
 		}
-		var msg Message
+		msg = Message{}
 		payloadLen, err := Decode(buf, s.maxMsgSize, &msg)
 		if err != nil {
 			if errors.Is(err, errShortRead) {

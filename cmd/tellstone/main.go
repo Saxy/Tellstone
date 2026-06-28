@@ -21,7 +21,7 @@ import (
 func main() {
 	cfg := config.LoadConfig()
 	app := new(tellstone.App)
-	app.Start(cfg, logger.NewSlogLogger(log.LevelDebug))
+	app.Start(cfg, logger.NewSlogLogger(log.LevelError))
 	svr := server.NewServer(app)
 	svr.Run()
 }

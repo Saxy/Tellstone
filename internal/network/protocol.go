@@ -14,7 +14,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
-	"net"
 )
 
 // MessageType defines the kind of message exchanged over the protocol.
@@ -185,10 +184,15 @@ func Write(w io.Writer, msgType MessageType, payload []byte) error {
 	var hdr [5]byte
 	binary.BigEndian.PutUint32(hdr[:4], uint32(total))
 	hdr[4] = byte(msgType)
-
-	bufs := net.Buffers{hdr[:], payload}
-	_, err := bufs.WriteTo(w)
-	return err
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	if len(payload) > 0 {
+		if _, err := w.Write(payload); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Read extracts a message from an io.Reader stream directly into a pre-allocated scratchpad buffer.

@@ -20,13 +20,16 @@ import (
 )
 
 type Config struct {
-	addr          string
-	logLevel      log.Level
-	evictTicker   time.Duration
-	evictSlots    uint32
-	encryptionKey string
-	traceRatio    float64
-	maxMsgSize    uint64
+	addr             string
+	enableMetrics    bool
+	metricsAddr      string
+	logLevel         log.Level
+	evictTicker      time.Duration
+	evictSlots       uint32
+	enableEncryption bool
+	encryptionKey    string
+	traceRatio       float64
+	maxMsgSize       uint64
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -76,13 +79,16 @@ func getEnv[T any](key string, fallback T) T {
 // The function also respects the following environment variables, allowing configuration
 // via container orchestration tools or CI pipelines:
 //
-//	TSD_ADDR            – server listen address (default "127.0.0.1:9988")
-//	TSD_LOG_LEVEL       – log verbosity (debug, info, warn, error, fatal)
-//	TSD_EVICT_INTERVAL  – eviction ticker interval (e.g. "500ms", "2s")
-//	TSD_EVICT_SLOTS     – number of slots in the timing‑wheel chronometer
-//	TSD_ENCRYPTION_KEY  – optional base‑64 symmetric key for data encryption
-//	TSD_TRACE_RATIO     – OpenTelemetry sampling ratio in the range [0.0‑1.0]
-//	TSD_MAX_MSG_SIZE	- optional parameter to define the maximum msg size
+//		TSD_ADDR            – server listen address (default "127.0.0.1:9988")
+//		TSD_LOG_LEVEL       – log verbosity (debug, info, warn, error, fatal)
+//		TSD_EVICT_INTERVAL  – eviction ticker interval (e.g. "500ms", "2s")
+//		TSD_EVICT_SLOTS     – number of slots in the timing‑wheel chronometer
+//		TSD_ENCRYPTION_KEY  – optional base‑64 symmetric key for data encryption
+//		TSD_TRACE_RATIO     – OpenTelemetry sampling ratio in the range [0.0‑1.0]
+//		TSD_MAX_MSG_SIZE	- optional parameter to define the maximum msg size
+//		TSD_METRICS_ADDR    – Prometheus HTTP exporter address (e.g. ":9100")
+//		SD_ENABLE_METRICS   – boolean to activate the Prometheus exporter (default: false)
+//	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
 //
 // The flag definitions below intentionally repeat the default values in the help text
 // to improve discoverability for end users.
@@ -95,6 +101,18 @@ func LoadConfig() *Config {
 		"addr",
 		getEnv("TSD_ADDR", "127.0.0.1:9988"),
 		"TCP listen address (default: 127.0.0.1:9988)",
+	)
+	flag.BoolVar(
+		&cfg.enableMetrics,
+		"enable-metrics",
+		getEnv("TSD_ENABLE_METRICS", true),
+		"Enable the Prometheus HTTP metrics exporter (default: false)",
+	)
+	flag.StringVar(
+		&cfg.metricsAddr,
+		"metrics-addr",
+		getEnv("TSD_METRICS_ADDR", ":9100"),
+		"Prometheus HTTP metrics exporter address (default: :9100)",
 	)
 	// Log level – accepts values: debug, info, warn, error, fatal.
 	var logLevel string
@@ -121,6 +139,12 @@ func LoadConfig() *Config {
 		"Number of slots in the chronometer wheel (default: 256)",
 	)
 	cfg.evictSlots = uint32(evictSlots)
+	flag.BoolVar(
+		&cfg.enableEncryption,
+		"enable-encryption",
+		getEnv("TSD_ENABLE_ENCRYPTION", false),
+		"Enforce symmetric encryption for data at rest (default: false)",
+	)
 	// Optional encryption key for data at rest.
 	flag.StringVar(
 		&cfg.encryptionKey,
@@ -163,9 +187,12 @@ func LoadConfig() *Config {
 }
 
 func (cfg *Config) GetAddr() string               { return cfg.addr }
+func (cfg *Config) MetricsEnabled() bool          { return cfg.enableMetrics }
+func (cfg *Config) GetMetricsAddr() string        { return cfg.metricsAddr }
 func (cfg *Config) GetLogLevel() log.Level        { return cfg.logLevel }
 func (cfg *Config) GetEvictTicker() time.Duration { return cfg.evictTicker }
 func (cfg *Config) GetEvictSlots() uint32         { return cfg.evictSlots }
+func (cfg *Config) EncryptionEnabled() bool       { return cfg.enableEncryption }
 func (cfg *Config) GetEncryptionKey() string      { return cfg.encryptionKey }
 func (cfg *Config) GetTraceRatio() float64        { return cfg.traceRatio }
 func (cfg *Config) GetMaxMsgSize() uint64         { return cfg.maxMsgSize }

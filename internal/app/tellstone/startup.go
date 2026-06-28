@@ -19,9 +19,8 @@ import (
 )
 
 type App struct {
-	logger      log.Logger
-	config      *config.Config
-	isEncrypted bool
+	logger log.Logger
+	config *config.Config
 }
 
 func (a *App) Start(cfg *config.Config, logger log.Logger) {
@@ -46,8 +45,10 @@ github: https://github.com/Saxy/Tellstone
 		log.Int("evict_slots", int(cfg.GetEvictSlots())),
 		log.String("log_level", cfg.GetLogLevel().String()),
 	)
-	if cfg.GetEncryptionKey() != "" {
-		a.isEncrypted = true
+	if cfg.EncryptionEnabled() {
+		if cfg.GetEncryptionKey() == "" {
+			logger.Log(log.LevelFatal, "Encryption key must be provided", log.String("error", "encryption key is missing but encryption is enabled"))
+		}
 		logger.Log(log.LevelInfo, "Engine crypto status", log.String("encryption", "ENABLED (ChaCha20-Poly1305)"))
 	} else {
 		logger.Log(log.LevelWarn, "Engine crypto status", log.String("encryption", "DISABLED (Plaintext Mode)"))
@@ -64,4 +65,3 @@ github: https://github.com/Saxy/Tellstone
 
 func (a *App) GetLogger() log.Logger     { return a.logger }
 func (a *App) GetConfig() *config.Config { return a.config }
-func (a *App) EncryptionEnabled() bool   { return a.isEncrypted }
