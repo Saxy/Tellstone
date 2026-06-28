@@ -42,3 +42,10 @@ type Shard struct {
 	sync.RWMutex
 	items map[string]Item
 }
+
+type shardMetrics struct {
+	missCount     uint64
+	hitCount      uint64
+	totalCommands uint64
+	_             [5]uint64 // Padding auf 64 Bytes gegen False Sharing
+}

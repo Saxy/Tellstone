@@ -69,19 +69,17 @@ var defaultMaxBytes = func() uint64 {
 // Engine represents a collection of shards
 type Engine struct {
 	shards       [shardCount]*Shard
+	shardStats   [shardCount]shardMetrics
 	chronometer  TimelineWheel
 	cryptoEngine *crypto.Engine
 	logger       log.Logger
 
 	maxBytes             uint64
 	allocatedBytes       uint64
-	missCount            uint64
-	hitCount             uint64
 	keyCount             uint64
 	expiredCount         uint64
 	cryptoEncryptedBytes uint64
 	cryptoDecryptedBytes uint64
-	totalCommands        uint64
 }
 
 // NewEngine creates a new engine with the default number of shards to prevent thread contention.
@@ -184,7 +182,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 		Expiration: exp,
 	}
 	shard.Unlock()
-	atomic.AddUint64(&e.totalCommands, 1)
+	atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 	if isUpdate {
 		oldSize := uint64(len(key) + len(oldItem.Value))
 		newSize := uint64(len(key) + len(value))
@@ -232,7 +230,7 @@ func (e *Engine) Delete(key string) {
 	// Adding this inverted value causes a controlled CPU register overflow,
 	// effectively performing a lightning-fast, lock-free subtraction.
 	atomic.AddUint64(&e.allocatedBytes, ^(releasedBytes - 1))
-	atomic.AddUint64(&e.totalCommands, 1)
+	atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 	atomic.AddUint64(&e.keyCount, ^uint64(0))
 	if e.logger.Enabled(log.LevelDebug) {
 		e.logger.Log(log.LevelDebug, "key deleted from engine state",
@@ -248,13 +246,14 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 		plainValue []byte
 		err        error
 	)
-	shard := e.shards[e.getShardIndex(key)]
+	idx := e.getShardIndex(key)
+	shard := e.shards[idx]
 	shard.RLock()
 	item, exist := shard.items[key]
 	shard.RUnlock()
 	if !exist {
-		atomic.AddUint64(&e.missCount, 1)
-		atomic.AddUint64(&e.totalCommands, 1)
+		atomic.AddUint64(&e.shardStats[idx].missCount, 1)
+		atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 		return nil, false
 	}
 	if !item.Expiration.IsZero() && time.Now().After(item.Expiration) {
@@ -282,13 +281,13 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 			}
 			return nil, false
 		}
-		atomic.AddUint64(&e.hitCount, 1)
-		atomic.AddUint64(&e.totalCommands, 1)
+		atomic.AddUint64(&e.shardStats[idx].hitCount, 1)
+		atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 		atomic.AddUint64(&e.cryptoDecryptedBytes, uint64(len(plainValue)))
 		return plainValue, true
 	}
-	atomic.AddUint64(&e.hitCount, 1)
-	atomic.AddUint64(&e.totalCommands, 1)
+	atomic.AddUint64(&e.shardStats[idx].hitCount, 1)
+	atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 	return item.Value, true
 }
 
@@ -296,13 +295,14 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 // It returns the number of bytes written and a bool indicating whether the key existed.
 // The caller must ensure the buffer has sufficient capacity for the plaintext.
 func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
-	shard := e.shards[e.getShardIndex(key)]
+	idx := e.getShardIndex(key)
+	shard := e.shards[idx]
 	shard.RLock()
 	item, exist := shard.items[key]
 	shard.RUnlock()
 	if !exist {
-		atomic.AddUint64(&e.missCount, 1)
-		atomic.AddUint64(&e.totalCommands, 1)
+		atomic.AddUint64(&e.shardStats[idx].missCount, 1)
+		atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 		return 0, false
 	}
 	if !item.Expiration.IsZero() && time.Now().After(item.Expiration) {
@@ -324,8 +324,8 @@ func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
 			}
 			return 0, false
 		}
-		atomic.AddUint64(&e.hitCount, 1)
-		atomic.AddUint64(&e.totalCommands, 1)
+		atomic.AddUint64(&e.shardStats[idx].hitCount, 1)
+		atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 		atomic.AddUint64(&e.cryptoDecryptedBytes, uint64(len(plain)))
 		return len(plain), true
 	}
@@ -341,18 +341,36 @@ func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
 		return 0, false // insufficient capacity (caller responsibility)
 	}
 	copy(buf, item.Value)
-	atomic.AddUint64(&e.hitCount, 1)
-	atomic.AddUint64(&e.totalCommands, 1)
+	atomic.AddUint64(&e.shardStats[idx].hitCount, 1)
+	atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
 	return len(item.Value), true
 }
 
-func (e *Engine) MaxBytes() uint64             { return atomic.LoadUint64(&e.maxBytes) }
-func (e *Engine) AllocatedBytes() uint64       { return atomic.LoadUint64(&e.allocatedBytes) }
-func (e *Engine) MissCount() uint64            { return atomic.LoadUint64(&e.missCount) }
-func (e *Engine) HitCount() uint64             { return atomic.LoadUint64(&e.hitCount) }
+func (e *Engine) MaxBytes() uint64       { return atomic.LoadUint64(&e.maxBytes) }
+func (e *Engine) AllocatedBytes() uint64 { return atomic.LoadUint64(&e.allocatedBytes) }
+func (e *Engine) MissCount() uint64 {
+	var total uint64
+	for i := 0; i < int(shardCount); i++ {
+		total += atomic.LoadUint64(&e.shardStats[i].missCount)
+	}
+	return total
+}
+func (e *Engine) HitCount() uint64 {
+	var total uint64
+	for i := 0; i < int(shardCount); i++ {
+		total += atomic.LoadUint64(&e.shardStats[i].hitCount)
+	}
+	return total
+}
 func (e *Engine) KeyCount() uint64             { return atomic.LoadUint64(&e.keyCount) }
 func (e *Engine) ExpiredCount() uint64         { return atomic.LoadUint64(&e.expiredCount) } // Passive Evictions
 func (e *Engine) CryptoEncryptedBytes() uint64 { return atomic.LoadUint64(&e.cryptoEncryptedBytes) }
 func (e *Engine) CryptoDecryptedBytes() uint64 { return atomic.LoadUint64(&e.cryptoDecryptedBytes) }
-func (e *Engine) TotalCommands() uint64        { return atomic.LoadUint64(&e.totalCommands) }
-func (e *Engine) Chronometer() TimelineWheel   { return e.chronometer }
+func (e *Engine) TotalCommands() uint64 {
+	var total uint64
+	for i := 0; i < int(shardCount); i++ {
+		total += atomic.LoadUint64(&e.shardStats[i].totalCommands)
+	}
+	return total
+}
+func (e *Engine) Chronometer() TimelineWheel { return e.chronometer }
