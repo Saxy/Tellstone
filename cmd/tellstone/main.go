@@ -1,3 +1,13 @@
+/*
+Package main
+Tellstone Cloud-Native In-Memory Database
+File: main.go
+Description: Server entry point. Loads configuration and starts the Tellstone application.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package main
 
 import (

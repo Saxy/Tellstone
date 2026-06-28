@@ -1,3 +1,13 @@
+/*
+Package main
+Tellstone Cloud-Native In-Memory Database
+File: main.go
+Description: Example client that connects to the Tellstone server, sends a request, and prints the response.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package main
 
 import (

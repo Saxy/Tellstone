@@ -1,8 +1,13 @@
 /*
 Package network
-Tellstone Secure TCP Networking Package
+Tellstone Cloud-Native In-Memory Database
 File: client.go
-Description: Implements a high-performance, synchronous, zero-allocation TCP client
+Description: Implements a high-performance, synchronous, zero-allocation TCP client using pre‑allocated buffers for request/response handling.
+
+Authors:
+
+	Maximilian Hagen
+*/
 
 	engineered for internal microservices and high-throughput connections.
 

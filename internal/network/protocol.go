@@ -2,10 +2,7 @@
 Package network
 Tellstone Secure TCP Networking Package
 File: protocol.go
-Description: Defines the binary protocol wire format used by the secure server.
-
-	All encoding and decoding routines operate without heap allocations
-	by engineering stack-allocated buffers and direct slice views.
+Description: Defines the binary protocol wire format used by the secure server. Provides Message struct, MessageType constants, and zero‑allocation encode/decode helpers.
 
 Authors:
 

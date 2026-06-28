@@ -1,4 +1,14 @@
 // Package config provides utilities for loading server configuration.
+/*
+Package config
+Tellstone Cloud-Native In-Memory Database
+File: bytesize.go
+Description: Utilities for parsing human‑readable byte size strings (e.g., "16MiB", "1GiB"). Implements flag.Value.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package config
 
 import (

@@ -1,3 +1,13 @@
+/*
+Package config
+Tellstone Cloud-Native In-Memory Database
+File: config.go
+Description: Loads server configuration from command‑line flags (with environment‑variable fallbacks) into a Config struct.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package config
 
 import (

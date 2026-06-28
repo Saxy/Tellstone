@@ -1,3 +1,13 @@
+/*
+Package tellstone
+Tellstone Cloud-Native In-Memory Database
+File: startup.go
+Description: Application bootstrap that stores logger, config and prints a startup banner.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package tellstone
 
 import (
@@ -31,7 +41,7 @@ github: https://github.com/Saxy/Tellstone
 	logger.Log(log.LevelInfo, "TSD Core Engine initializing",
 		log.String("bind_address", cfg.GetAddr()),
 		log.String("max_msg_size", (new(config.ByteSize(cfg.GetMaxMsgSize()))).String()),
-		log.Uint32("max_msg_size_bytes", cfg.GetMaxMsgSize()),
+		log.Uint64("max_msg_size_bytes", cfg.GetMaxMsgSize()),
 		log.String("evict_interval", cfg.GetEvictTicker().String()),
 		log.Int("evict_slots", int(cfg.GetEvictSlots())),
 	)

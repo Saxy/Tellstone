@@ -2,9 +2,7 @@
 Package network
 Tellstone Secure Event-Driven Networking Package
 File: server.go
-Description: Implements an ultra-high performance, zero-allocation TCP server
-
-	using an edge-triggered epoll event-loop (gnet).
+Description: Implements an ultra‑high‑performance, zero‑allocation TCP server using an edge‑triggered epoll event‑loop (gnet). Handles incoming messages, dispatches them to storage, and writes responses.
 
 Authors:
 

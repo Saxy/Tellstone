@@ -1,3 +1,23 @@
+/*
+Package log
+Tellstone Cloud-Native In-Memory Database
+File: log.go
+Description: Lightweight logging abstraction with log levels and a Logger interface.
+
+Authors:
+
+	Maximilian Hagen
+*/
+/*
+Package log
+Tellstone Cloud-Native In-Memory Database
+File: log.go
+Description: Lightweight logging abstraction defining log levels and a Logger interface.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package log
 
 type Level uint8
@@ -34,22 +54,25 @@ const (
 	TypeInt
 	TypeBool
 	TypeFloat
-	TypeUint32
+	TypeUint
 )
 
 type Field struct {
 	Key      string
 	StrVal   string
 	IntVal   int
-	UintVal  uint32
+	UintVal  uint64
 	BoolVal  bool
 	FloatVal float64
 	Type     FieldType
 }
 
-func String(key, val string) Field        { return Field{Key: key, StrVal: val, Type: TypeString} }
-func Int(key string, val int) Field       { return Field{Key: key, IntVal: int(int64(val)), Type: TypeInt} }
-func Uint32(key string, val uint32) Field { return Field{Key: key, UintVal: val, Type: TypeUint32} }
+func String(key, val string) Field  { return Field{Key: key, StrVal: val, Type: TypeString} }
+func Int(key string, val int) Field { return Field{Key: key, IntVal: int(int64(val)), Type: TypeInt} }
+func Uint(key string, val uint32) Field {
+	return Field{Key: key, UintVal: uint64(val), Type: TypeUint}
+}
+func Uint64(key string, val uint64) Field { return Field{Key: key, UintVal: val, Type: TypeUint} }
 func Int64(key string, val int64) Field   { return Field{Key: key, IntVal: int(val), Type: TypeInt} }
 func Float(key string, val float64) Field { return Field{Key: key, FloatVal: val, Type: TypeFloat} }
 func Bool(key string, val bool) Field     { return Field{Key: key, BoolVal: val, Type: TypeBool} }

@@ -1,3 +1,13 @@
+/*
+Package server
+Tellstone Cloud-Native In-Memory Database
+File: server.go
+Description: High‑level orchestration of all components (app, crypto, logger, network, storage). Exposes public error variables for client misuse and internal failures.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package server
 
 import (

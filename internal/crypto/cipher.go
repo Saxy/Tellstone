@@ -2,11 +2,7 @@
 Package crypto
 Tellstone Cloud-Native In-Memory Database
 File: cipher.go
-Description: CPU-agnostic, zero-allocation In-Memory Encryption engine
-
-	using ChaCha20-Poly1305 with In-Place buffer mutation.
-
-"Locked in silicon, opaque to the host."
+Description: CPU‑agnostic, zero‑allocation In‑Memory Encryption engine using ChaCha20‑Poly1305. Provides an Engine with Encrypt/Decrypt methods and optional enable/disable.
 
 Authors:
 

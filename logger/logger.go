@@ -1,3 +1,13 @@
+/*
+Package logger
+Tellstone Cloud-Native In-Memory Database
+File: logger.go
+Description: Adapter that bridges the internal log abstraction to Go's structured slog logger (JSON output).
+
+Authors:
+
+	Maximilian Hagen
+*/
 package logger
 
 import (
@@ -37,8 +47,8 @@ func (s *SlogAdapter) Log(level log.Level, msg string, fields ...log.Field) {
 			attrs[i] = slog.Bool(f.Key, f.BoolVal)
 		case log.TypeFloat:
 			attrs[i] = slog.Float64(f.Key, f.FloatVal)
-		case log.TypeUint32:
-			attrs[i] = slog.Uint64(f.Key, uint64(f.UintVal))
+		case log.TypeUint:
+			attrs[i] = slog.Uint64(f.Key, f.UintVal)
 		}
 	}
 	s.slogLogger.Log(context.Background(), translateLevelToSlog(level), msg, attrs...)
