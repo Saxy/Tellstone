@@ -98,12 +98,11 @@ func (r *fastRand) Zipf(maxKey uint64, skew float64) uint64 {
 	return uint64(math.Pow(r.Float64(), skew)*float64(maxKey)) % maxKey
 }
 
-// WorkerStats mit CPU Padding (64 Bytes), um False Sharing auf der Cache Line zu verhindern
 type workerStats struct {
 	successOps uint64
 	errorOps   uint64
 	hist       histogram
-	_          [8]uint64 // Padding gegen Cache-Line Ping-Pong zwischen CPU-Kernen
+	_          [8]uint64
 }
 
 func main() {
@@ -113,99 +112,74 @@ func main() {
 	readRatio := flag.Float64("read-ratio", 0.95, "Ratio of GET requests")
 	zipfSkew := flag.Float64("skew", 1.5, "Power-law skew")
 	flag.Parse()
-
 	reqsPerWorker := *totalRequests / *concurrency
 	fmt.Printf("Benchmarking %s with %d workers (%d reqs each)...\n", *addr, *concurrency, reqsPerWorker)
-
 	var wg sync.WaitGroup
 	stats := make([]workerStats, *concurrency)
-
 	dummyValue := make([]byte, 32)
 	_, _ = rand.Read(dummyValue)
-
 	start := time.Now()
-
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
 			wStats := &stats[workerID]
-
 			var seedBuf [8]byte
 			_, _ = rand.Read(seedBuf[:])
 			rng := newFastRand(int64(binary.BigEndian.Uint64(seedBuf[:])))
-
 			conn, err := net.Dial("tcp", *addr)
 			if err != nil {
 				wStats.errorOps += uint64(reqsPerWorker)
 				return
 			}
 			defer conn.Close()
-
 			var msg network.Message
 			var buf [1024]byte
-
-			// Statischer, lokaler Speicherbereich pro Worker für die Key-Slices
-			// Verhindert das Aliasing-Risiko komplett
 			var staticKey [32]byte
 			prefix := []byte("key-")
-
 			for r := 0; r < reqsPerWorker; r++ {
-				// Sicheres Schreiben in das statische Array
 				copy(staticKey[0:4], prefix)
 				keyEnd := strconv.AppendUint(staticKey[4:4], rng.Zipf(50000, *zipfSkew), 10)
 				totalKeyLen := 4 + len(keyEnd)
 				activeKeySlice := staticKey[:totalKeyLen]
-
 				isRead := rng.Float64() < *readRatio
-
 				if isRead {
 					msg = network.Message{Type: network.MsgRequest, Op: network.OpGet, Key: activeKeySlice}
 				} else {
 					msg = network.Message{Type: network.MsgRequest, Op: network.OpSet, Key: activeKeySlice, Value: dummyValue}
 				}
-
 				opStart := time.Now()
-
 				payload := msg.Marshal()
 				if _, err := conn.Write(payload); err != nil {
 					wStats.errorOps++
 					continue
 				}
-
 				var resp network.Message
 				if err := network.Read(conn, buf[:], &resp); err != nil {
 					wStats.errorOps++
 					continue
 				}
-
 				wStats.hist.Record(time.Since(opStart))
 				wStats.successOps++
 			}
 		}(i)
 	}
-
 	wg.Wait()
 	duration := time.Since(start)
-
 	globalHist := histogram{}
 	var totalSuccess uint64
 	var totalErrors uint64
-
 	for i := 0; i < *concurrency; i++ {
 		globalHist.Add(&stats[i].hist)
 		totalSuccess += stats[i].successOps
 		totalErrors += stats[i].errorOps
 	}
-
 	rps := float64(totalSuccess) / duration.Seconds()
-
 	fmt.Println("--- Results ---")
 	fmt.Printf("Total Requests (Success): %d\n", totalSuccess)
 	fmt.Printf("Total Requests (Failed):  %d\n", totalErrors)
 	fmt.Printf("Duration:                 %s\n", duration)
 	fmt.Printf("Throughput:               %.2f RPS\n\n", rps)
-
 	if totalSuccess > 0 {
 		fmt.Println("--- Latency Percentiles (Histogram) ---")
 		fmt.Printf("p50 (Median): %s\n", globalHist.Percentile(0.50, totalSuccess))
