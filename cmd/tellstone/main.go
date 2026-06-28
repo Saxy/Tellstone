@@ -15,10 +15,13 @@ import (
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/logger"
+	"github.com/Saxy/Tellstone/server"
 )
 
 func main() {
 	cfg := config.LoadConfig()
-	a := new(tellstone.App)
-	a.Start(cfg, logger.NewSlogLogger(log.LevelInfo))
+	app := new(tellstone.App)
+	app.Start(cfg, logger.NewSlogLogger(log.LevelDebug))
+	svr := server.NewServer(app)
+	svr.Run()
 }

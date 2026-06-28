@@ -30,6 +30,19 @@ const (
 // OpCode defines the backend database operation.
 type OpCode uint8
 
+func (o OpCode) String() string {
+	switch o {
+	case OpGet:
+		return "GET"
+	case OpSet:
+		return "SET"
+	case OpDelete:
+		return "DELETE"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 const (
 	OpGet OpCode = iota + 1
 	OpSet
@@ -67,7 +80,7 @@ var (
 // It allocates a new slice – suitable for one‑off operations such as handshakes.
 func (m *Message) Marshal() []byte {
 	var payload []byte
-	if m.Type == MsgRequest || m.Type == MsgResponse {
+	if m.Type == MsgRequest {
 		keyLen := len(m.Key)
 		totalPayloadLen := 1 + 2 + 8 + keyLen + len(m.Value)
 		payload = make([]byte, totalPayloadLen)
@@ -87,6 +100,41 @@ func (m *Message) Marshal() []byte {
 	buf[4] = byte(m.Type)
 	copy(buf[5:], payload)
 	return buf
+}
+
+// Unmarshal blocks on an io.Reader and instantiates a freshly allocated Message pointer on success.
+func Unmarshal(r io.Reader) (*Message, error) {
+	var lenBuf [4]byte
+	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
+		return nil, err
+	}
+	length := binary.BigEndian.Uint32(lenBuf[:])
+	if length == 0 {
+		return nil, errZeroLength
+	}
+
+	data := make([]byte, length)
+	if _, err := io.ReadFull(r, data); err != nil {
+		return nil, err
+	}
+
+	msg := &Message{Type: MessageType(data[0])}
+	rawPayload := data[1:]
+	msg.Payload = rawPayload
+
+	if msg.Type == MsgRequest {
+		if len(rawPayload) < 11 {
+			return nil, errMalformedFrame
+		}
+		msg.Op = OpCode(rawPayload[0])
+		keyLen := int(binary.BigEndian.Uint16(rawPayload[1:3]))
+		msg.TTL = int64(binary.BigEndian.Uint64(rawPayload[3:11]))
+		msg.Key = rawPayload[11 : 11+keyLen]
+		msg.Value = rawPayload[11+keyLen:]
+	} else {
+		msg.Value = rawPayload
+	}
+	return msg, nil
 }
 
 // Decode parses a full protocol frame from an existing byte slice.
@@ -111,8 +159,8 @@ func Decode(data []byte, maxMsgSize uint64, out *Message) (int, error) {
 	if payloadLen > 0 {
 		rawPayload := data[5 : 5+payloadLen]
 		out.Payload = rawPayload
-		if out.Type == MsgRequest || out.Type == MsgResponse {
-			if len(rawPayload) < 11 { // 1 + 2 + 8
+		if out.Type == MsgRequest {
+			if len(rawPayload) < 11 {
 				return 0, errMalformedFrame
 			}
 			out.Op = OpCode(rawPayload[0])
@@ -124,11 +172,9 @@ func Decode(data []byte, maxMsgSize uint64, out *Message) (int, error) {
 			}
 			out.Key = rawPayload[11 : 11+keyLen]
 			out.Value = rawPayload[11+keyLen:]
+		} else {
+			out.Value = rawPayload
 		}
-	} else {
-		out.Payload = nil
-		out.Key = nil
-		out.Value = nil
 	}
 	return payloadLen, nil
 }
@@ -166,7 +212,7 @@ func Read(r io.Reader, buf []byte, out *Message) error {
 	rawPayload := buf[1:length]
 	out.Payload = rawPayload
 
-	if out.Type == MsgRequest || out.Type == MsgResponse {
+	if out.Type == MsgRequest {
 		if len(rawPayload) < 11 {
 			return errMalformedFrame
 		}
@@ -179,46 +225,10 @@ func Read(r io.Reader, buf []byte, out *Message) error {
 		}
 		out.Key = rawPayload[11 : 11+keyLen]
 		out.Value = rawPayload[11+keyLen:]
+	} else {
+		out.Value = rawPayload
 	}
 	return nil
-}
-
-// Unmarshal blocks on an io.Reader and instantiates a freshly allocated Message pointer on success.
-func Unmarshal(r io.Reader) (*Message, error) {
-	var lenBuf [4]byte
-	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		return nil, err
-	}
-	length := binary.BigEndian.Uint32(lenBuf[:])
-	if length == 0 {
-		return nil, errZeroLength
-	}
-
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
-		return nil, err
-	}
-
-	msg := &Message{Type: MessageType(data[0])}
-	rawPayload := data[1:]
-	msg.Payload = rawPayload
-
-	if msg.Type == MsgRequest || msg.Type == MsgResponse {
-		if len(rawPayload) < 11 {
-			return nil, errMalformedFrame
-		}
-		msg.Op = OpCode(rawPayload[0])
-		keyLen := int(binary.BigEndian.Uint16(rawPayload[1:3]))
-		msg.TTL = int64(binary.BigEndian.Uint64(rawPayload[3:11]))
-		msg.Key = rawPayload[11 : 11+keyLen]
-		msg.Value = rawPayload[11+keyLen:]
-	}
-	return msg, nil
-}
-
-func WriteMessage(w io.Writer, m *Message) error {
-	_, err := w.Write(m.Marshal())
-	return err
 }
 
 func ReadMessage(r io.Reader) (*Message, error) {

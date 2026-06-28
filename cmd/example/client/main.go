@@ -2,7 +2,7 @@
 Package main
 Tellstone Cloud-Native In-Memory Database
 File: main.go
-Description: Example client that connects to the Tellstone server, sends a request, and prints the response.
+Description: Example client that uses the binary protocol (OpCodes and response codes) to interact with the Tellstone server.
 
 Authors:
 
@@ -24,16 +24,19 @@ func main() {
 		log.Fatalf("failed to dial server: %v", err)
 	}
 	defer client.Close()
+
+	// 4KB reusable scratch buffer for both building requests and receiving replies
 	buf := make([]byte, 4*1024)
-	call := func(payload string) {
-		var resp network.Message
-		if err := client.Call(network.MsgRequest, []byte(payload), buf, &resp); err != nil {
-			log.Fatalf("call %q failed: %v", payload, err)
-		}
-		fmt.Printf("%s => %s\n", payload, string(resp.Payload))
-	}
-	call("SET mykey myvalue")
-	call("GET mykey")
-	call("DEL mykey")
-	call("GET mykey")
+
+	// SET
+	res, _ := client.Set([]byte("mykey"), []byte("myvalue"), 0, buf)
+	fmt.Printf("SET => %s\n", string(res))
+
+	// GET
+	res, _ = client.Get([]byte("mykey"), buf)
+	fmt.Printf("GET => %s\n", string(res))
+
+	// DELETE
+	res, _ = client.Delete([]byte("mykey"), buf)
+	fmt.Printf("DEL => %s\n", string(res))
 }

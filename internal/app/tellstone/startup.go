@@ -44,6 +44,7 @@ github: https://github.com/Saxy/Tellstone
 		log.Uint64("max_msg_size_bytes", cfg.GetMaxMsgSize()),
 		log.String("evict_interval", cfg.GetEvictTicker().String()),
 		log.Int("evict_slots", int(cfg.GetEvictSlots())),
+		log.String("log_level", cfg.GetLogLevel().String()),
 	)
 	if cfg.GetEncryptionKey() != "" {
 		a.isEncrypted = true

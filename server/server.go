@@ -48,7 +48,6 @@ func (s *Server) Run() {
 	var cryptoEngine *crypto.Engine
 	logger := s.app.GetLogger()
 	cfg := s.app.GetConfig()
-
 	if s.app.EncryptionEnabled() {
 		var err error
 		cryptoEngine, err = crypto.NewEngine([]byte(cfg.GetEncryptionKey()), logger)

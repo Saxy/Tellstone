@@ -22,6 +22,23 @@ package log
 
 type Level uint8
 
+func (l Level) String() string {
+	switch l {
+	case LevelDebug:
+		return "DEBUG"
+	case LevelInfo:
+		return "INFO"
+	case LevelWarn:
+		return "WARN"
+	case LevelError:
+		return "ERROR"
+	case LevelFatal:
+		return "FATAL"
+	default:
+		return "UNKNOWN"
+	}
+}
+
 const (
 	LevelDebug Level = iota
 	LevelInfo
