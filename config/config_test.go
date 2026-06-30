@@ -3,16 +3,10 @@
 package config
 
 import (
-	"flag"
 	"os"
 	"testing"
 	"time"
 )
-
-// resetFlagSet restores the default flag.CommandLine between test runs.
-func resetFlagSet() {
-	flag.CommandLine = flag.NewFlagSet("test", flag.ContinueOnError)
-}
 
 func TestGetEnvPrimitives(t *testing.T) {
 	// string
@@ -95,26 +89,25 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	os.Unsetenv("TSD_ENCRYPTION_KEY")
 	os.Unsetenv("TSD_TRACE_RATIO")
 
-	resetFlagSet()
-	cfg := LoadConfig()
+	cfg := LoadConfig(nil)
 
-	if cfg.Addr != "127.0.0.1:9988" {
-		t.Fatalf("default Addr mismatch: %s", cfg.Addr)
+	if cfg.GetAddr() != "127.0.0.1:9988" {
+		t.Fatalf("default Addr mismatch: %s", cfg.GetAddr())
 	}
-	if cfg.LogLevel != 1 { // LevelInfo = 1
-		t.Fatalf("default LogLevel mismatch: %d", cfg.LogLevel)
+	if cfg.GetLogLevel() != 1 { // LevelInfo = 1
+		t.Fatalf("default LogLevel mismatch: %d", cfg.GetLogLevel())
 	}
-	if cfg.EvictTicker != time.Second {
-		t.Fatalf("default EvictTicker mismatch: %v", cfg.EvictTicker)
+	if cfg.GetEvictTicker() != time.Second {
+		t.Fatalf("default EvictTicker mismatch: %v", cfg.GetEvictTicker())
 	}
-	if cfg.EvictSlots != 256 {
-		t.Fatalf("default EvictSlots mismatch: %d", cfg.EvictSlots)
+	if cfg.GetEvictSlots() != 256 {
+		t.Fatalf("default EvictSlots mismatch: %d", cfg.GetEvictSlots())
 	}
-	if cfg.EncryptionKey != "" {
-		t.Fatalf("default EncryptionKey should be empty, got %s", cfg.EncryptionKey)
+	if cfg.GetEncryptionKey() != "" {
+		t.Fatalf("default EncryptionKey should be empty, got %s", cfg.GetEncryptionKey())
 	}
-	if cfg.TraceRatio != 0.0 {
-		t.Fatalf("default TraceRatio mismatch: %f", cfg.TraceRatio)
+	if cfg.GetTraceRatio() != 0.0 {
+		t.Fatalf("default TraceRatio mismatch: %f", cfg.GetTraceRatio())
 	}
 
 	// Now set environment variables to override defaults.
@@ -125,25 +118,32 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	os.Setenv("TSD_ENCRYPTION_KEY", "mykey")
 	os.Setenv("TSD_TRACE_RATIO", "0.25")
 
-	resetFlagSet()
-	cfg = LoadConfig()
+	cfg = LoadConfig(nil)
 
-	if cfg.Addr != "0.0.0.0:7777" {
-		t.Fatalf("env Addr mismatch: %s", cfg.Addr)
+	if cfg.GetAddr() != "0.0.0.0:7777" {
+		t.Fatalf("env Addr mismatch: %s", cfg.GetAddr())
 	}
-	if cfg.LogLevel != 0 { // LevelDebug = 0
-		t.Fatalf("env LogLevel mismatch: %d", cfg.LogLevel)
+	if cfg.GetLogLevel() != 0 { // LevelDebug = 0
+		t.Fatalf("env LogLevel mismatch: %d", cfg.GetLogLevel())
 	}
-	if cfg.EvictTicker != 500*time.Millisecond {
-		t.Fatalf("env EvictTicker mismatch: %v", cfg.EvictTicker)
+	if cfg.GetEvictTicker() != 500*time.Millisecond {
+		t.Fatalf("env EvictTicker mismatch: %v", cfg.GetEvictTicker())
 	}
-	if cfg.EvictSlots != 256 {
-		t.Fatalf("env EvictSlots mismatch: %d", cfg.EvictSlots)
+	if cfg.GetEvictSlots() != 512 {
+		t.Fatalf("env EvictSlots mismatch: %d", cfg.GetEvictSlots())
 	}
-	if cfg.EncryptionKey != "mykey" {
-		t.Fatalf("env EncryptionKey mismatch: %s", cfg.EncryptionKey)
+	if cfg.GetEncryptionKey() != "mykey" {
+		t.Fatalf("env EncryptionKey mismatch: %s", cfg.GetEncryptionKey())
 	}
-	if cfg.TraceRatio != 0.25 {
-		t.Fatalf("env TraceRatio mismatch: %f", cfg.TraceRatio)
+	if cfg.GetTraceRatio() != 0.25 {
+		t.Fatalf("env TraceRatio mismatch: %f", cfg.GetTraceRatio())
 	}
+
+	// Clean up env so subsequent tests/packages see a pristine environment.
+	os.Unsetenv("TSD_ADDR")
+	os.Unsetenv("TSD_LOG_LEVEL")
+	os.Unsetenv("TSD_EVICT_INTERVAL")
+	os.Unsetenv("TSD_EVICT_SLOTS")
+	os.Unsetenv("TSD_ENCRYPTION_KEY")
+	os.Unsetenv("TSD_TRACE_RATIO")
 }
