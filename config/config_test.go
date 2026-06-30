@@ -109,6 +109,12 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	if cfg.GetTraceRatio() != 0.0 {
 		t.Fatalf("default TraceRatio mismatch: %f", cfg.GetTraceRatio())
 	}
+	if cfg.RESPEnabled() {
+		t.Fatalf("RESP should be disabled by default")
+	}
+	if cfg.GetRESPAddr() != "127.0.0.1:6379" {
+		t.Fatalf("default RESP addr mismatch: %s", cfg.GetRESPAddr())
+	}
 
 	// Now set environment variables to override defaults.
 	os.Setenv("TSD_ADDR", "0.0.0.0:7777")

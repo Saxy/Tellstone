@@ -31,6 +31,8 @@ type Config struct {
 	traceRatio       float64
 	maxMsgSize       uint64
 	maxMemBytes      uint64
+	enableRESP       bool
+	respAddr         string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -95,6 +97,8 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_MAX_MSG_SIZE	- optional parameter to define the maximum msg size
 //		TSD_METRICS_ADDR    – Prometheus HTTP exporter address (e.g. ":9100")
 //		TSD_MAX_MEM_BYTES   – optional engine memory ceiling (e.g. "512MiB"; 0 = unlimited)
+//		TSD_ENABLE_RESP     – boolean to enable the Redis-compatible RESP listener (default: false)
+//		TSD_RESP_ADDR       – RESP listener address (default 127.0.0.1:6379)
 //		TSD_ENABLE_METRICS  – boolean to activate the Prometheus exporter (default: false)
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
 //
@@ -191,6 +195,19 @@ func LoadConfig(args []string) *Config {
 		"max-mem-bytes",
 		"Total engine memory ceiling (e.g. 512MiB, 4GiB, 0 = unlimited)",
 	)
+	// Optional RESP2 (Redis-compatible) listener, for benchmarking against Redis/Dragonfly/etc.
+	fs.BoolVar(
+		&cfg.enableRESP,
+		"enable-resp",
+		getEnv("TSD_ENABLE_RESP", false),
+		"Enable the Redis-compatible RESP listener (default: false)",
+	)
+	fs.StringVar(
+		&cfg.respAddr,
+		"resp-addr",
+		getEnv("TSD_RESP_ADDR", "127.0.0.1:6379"),
+		"RESP listener address (default: 127.0.0.1:6379)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -219,3 +236,5 @@ func (cfg *Config) GetEncryptionKey() string      { return cfg.encryptionKey }
 func (cfg *Config) GetTraceRatio() float64        { return cfg.traceRatio }
 func (cfg *Config) GetMaxMsgSize() uint64         { return cfg.maxMsgSize }
 func (cfg *Config) GetMaxMemBytes() uint64        { return cfg.maxMemBytes }
+func (cfg *Config) RESPEnabled() bool             { return cfg.enableRESP }
+func (cfg *Config) GetRESPAddr() string           { return cfg.respAddr }

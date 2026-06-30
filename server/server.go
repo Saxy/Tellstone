@@ -22,6 +22,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/metrics"
 	"github.com/Saxy/Tellstone/internal/network"
+	"github.com/Saxy/Tellstone/internal/resp"
 	"github.com/Saxy/Tellstone/internal/storage"
 )
 
@@ -61,6 +62,9 @@ func (s *Server) Run() {
 	)
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(srv)
+	}
+	if cfg.RESPEnabled() {
+		s.startRESPServer()
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
@@ -125,6 +129,22 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			if logger.Enabled(log.LevelError) {
 				logger.Log(log.LevelError, "metrics server encountered an error", log.String("error", err.Error()))
+			}
+		}
+	}()
+}
+
+// startRESPServer boots the optional Redis-compatible (RESP2) listener on its own port,
+// sharing the storage engine. It runs in a goroutine because gnet.Run blocks; the binary
+// protocol server keeps owning the main goroutine.
+func (s *Server) startRESPServer() {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	respSrv := resp.NewServer(cfg.GetRESPAddr(), s.engine, logger)
+	go func() {
+		if err := respSrv.ListenAndServe(); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "resp server encountered an error", log.String("error", err.Error()))
 			}
 		}
 	}()
