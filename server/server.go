@@ -50,26 +50,18 @@ func NewServer(app *tellstone.App) *Server {
 func (s *Server) Run() {
 	logger := s.app.GetLogger()
 	cfg := s.app.GetConfig()
-
-	// 1. Subsystems initialisieren
 	cryptoEngine := s.initCrypto()
 	s.engine = s.initStorage(cryptoEngine)
 	defer s.engine.Close()
-
-	// 2. Core TCP Server vorbereiten
 	srv := network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
 		s.networkHandler,
 		logger,
 	)
-
-	// 3. Optionalen Telemetrie-Endpunkt starten
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(srv)
 	}
-
-	// 4. Haupt-Event-Loop starten
 	if err := srv.ListenAndServe(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			return
@@ -84,11 +76,9 @@ func (s *Server) Run() {
 func (s *Server) initCrypto() *crypto.Engine {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
-
 	if !cfg.EncryptionEnabled() {
 		return nil
 	}
-
 	cryptoEngine, err := crypto.NewEngine([]byte(cfg.GetEncryptionKey()), logger)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
@@ -116,22 +106,18 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	metricsAddr := cfg.GetMetricsAddr()
-
 	collector := metrics.NewCollector(s.engine, srv, s.app.GetLogger())
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		collector.WritePrometheus(w)
 	})
-
 	httpSrv := &http.Server{
 		Addr:         metricsAddr,
 		Handler:      mux,
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 	}
-
 	go func() {
 		if logger.Enabled(log.LevelInfo) {
 			logger.Log(log.LevelInfo, "telemetry infrastructure online", log.String("addr", metricsAddr))
@@ -157,7 +143,6 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 			return network.ResponseNotFound, network.MsgResponse, nil
 		}
 		return val, network.MsgResponse, nil
-
 	case network.OpSet:
 		if len(msg.Key) == 0 {
 			return network.ResponseEmptyKey, network.MsgResponse, ErrEmptyKey
