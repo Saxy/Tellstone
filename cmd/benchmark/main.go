@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"math"
+	rnd "math/rand/v2"
 	"net"
 	"strconv"
 	"sync"
@@ -15,6 +16,24 @@ import (
 )
 
 const bucketCount = 371
+
+// encodeRequest writes a full MsgRequest frame into dst (which must be large enough) and
+// returns the number of bytes written. Encoding into a caller-owned buffer keeps the load
+// generator allocation-free; allocating a fresh frame per request (as Message.Marshal does)
+// makes the benchmark process GC, which shows up as client-side latency in the tail.
+//
+// Frame layout: [4B total][1B type][1B op][2B keyLen][8B ttl][key][value].
+func encodeRequest(dst []byte, op network.OpCode, key, value []byte, ttl int64) int {
+	total := 1 + 1 + 2 + 8 + len(key) + len(value) // type byte + payload
+	binary.BigEndian.PutUint32(dst[0:4], uint32(total))
+	dst[4] = byte(network.MsgRequest)
+	dst[5] = byte(op)
+	binary.BigEndian.PutUint16(dst[6:8], uint16(len(key)))
+	binary.BigEndian.PutUint64(dst[8:16], uint64(ttl))
+	copy(dst[16:16+len(key)], key)
+	copy(dst[16+len(key):], value)
+	return 4 + total
+}
 
 type histogram struct {
 	buckets [bucketCount]uint64
@@ -119,6 +138,14 @@ func main() {
 	dummyValue := make([]byte, 32)
 	_, _ = rand.Read(dummyValue)
 	start := time.Now()
+	ttls := make([]int64, *concurrency)
+
+	// The protocol/handler interprets TTL in milliseconds. Generate 1s–3600s TTLs
+	// expressed in ms so keys survive the run instead of expiring mid-benchmark and
+	// triggering an eviction storm that distorts the latency tail.
+	for i := 0; i < *concurrency; i++ {
+		ttls[i] = int64((rnd.IntN(3600) + 1) * 1000)
+	}
 	for i := 0; i < *concurrency; i++ {
 		wg.Add(1)
 		go func(workerID int) {
@@ -133,8 +160,8 @@ func main() {
 				return
 			}
 			defer conn.Close()
-			var msg network.Message
 			var buf [1024]byte
+			var wbuf [1100]byte // reused request frame buffer (keeps the load generator zero-alloc)
 			var staticKey [32]byte
 			prefix := []byte("key-")
 			for r := 0; r < reqsPerWorker; r++ {
@@ -143,14 +170,14 @@ func main() {
 				totalKeyLen := 4 + len(keyEnd)
 				activeKeySlice := staticKey[:totalKeyLen]
 				isRead := rng.Float64() < *readRatio
+				var n int
 				if isRead {
-					msg = network.Message{Type: network.MsgRequest, Op: network.OpGet, Key: activeKeySlice}
+					n = encodeRequest(wbuf[:], network.OpGet, activeKeySlice, nil, 0)
 				} else {
-					msg = network.Message{Type: network.MsgRequest, Op: network.OpSet, Key: activeKeySlice, Value: dummyValue}
+					n = encodeRequest(wbuf[:], network.OpSet, activeKeySlice, dummyValue, ttls[i])
 				}
 				opStart := time.Now()
-				payload := msg.Marshal()
-				if _, err := conn.Write(payload); err != nil {
+				if _, err := conn.Write(wbuf[:n]); err != nil {
 					wStats.errorOps++
 					continue
 				}
