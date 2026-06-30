@@ -48,9 +48,11 @@ const (
 // Chronometer is a high‑performance timing wheel that groups keys by their
 // expiration time. It provides O(1) registration and O(1) eviction per tick.
 //
-// The implementation tracks which slot each key belongs to so that re‑registering
-// a key (e.g., updating its TTL) moves it from the old slot to the new one,
-// preventing duplicate expirations.
+// Registration is append-only: re-registering a key (e.g. updating its TTL) leaves the
+// old slot entry in place rather than relocating it, so a key may appear in more than one
+// slot. This is safe because eviction is validated against the item's real Expiration via
+// the engine's deleteIfExpired callback — a stale slot entry for a refreshed key simply
+// no-ops when its slot fires.
 //
 // A sync.WaitGroup is used to ensure the background goroutine terminates cleanly when Stop() is called.
 type Chronometer struct {
@@ -87,25 +89,35 @@ func NewChronometer(deletion func(key string), interval time.Duration, numSlots 
 }
 
 // advance turns the internal wheel by exactly one tick, isolates the expired bucket,
-// and asynchronously flushes all dead keys out of the sharded storage engine.
+// and flushes the dead keys out of the sharded storage engine.
+//
+// The slot's keys are snapshotted and the slot is reset while holding c.mutex, but the
+// (potentially shard-locking) deletions run AFTER releasing it. Holding the wheel mutex
+// across the delete loop would block every concurrent Set's Register() call for the whole
+// eviction wave, which was a major source of tail latency.
 func (c *Chronometer) advance() {
 	c.mutex.Lock()
-	size := c.slotSizes[c.curSlot]
+	slot := c.curSlot
+	size := c.slotSizes[slot]
+	var batch []string
 	if size > 0 {
 		if c.logger.Enabled(log.LevelDebug) {
 			c.logger.Log(log.LevelDebug, "active eviction wave triggered by chronometer tick",
-				log.Int("slot_index", int(c.curSlot)),
+				log.Int("slot_index", int(slot)),
 				log.Int("evicted_keys_count", size),
 			)
 		}
-		for i := 0; i < size; i++ {
-			c.deletion(c.slots[c.curSlot][i])
-		}
+		batch = make([]string, size)
+		copy(batch, c.slots[slot][:size])
+		c.slotSizes[slot] = 0
 		atomic.AddUint64(&c.expiredCount, uint64(size))
-		c.slotSizes[c.curSlot] = 0
 	}
 	c.curSlot = (c.curSlot + 1) % c.numSlots
 	c.mutex.Unlock()
+
+	for _, key := range batch {
+		c.deletion(key)
+	}
 }
 
 // Start spawns the background orchestration loop, setting the Chronometer's internal gears into motion.

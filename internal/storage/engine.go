@@ -13,6 +13,7 @@ package storage
 import (
 	"errors"
 	"math/bits"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -88,32 +89,33 @@ type Engine struct {
 // shards, starts the background chronometer and returns a ready‑to‑use *Engine.
 func NewEngine(interval time.Duration, numSlots uint32, maxBytes uint64, logger log.Logger, cryptoEngine *crypto.Engine) *Engine {
 	e := new(Engine)
-	if maxBytes == 0 {
-		maxBytes = defaultMaxBytes
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
+	e.logger = logger
+	e.maxBytes = maxBytes
+	if e.maxBytes == 0 {
+		e.maxBytes = defaultMaxBytes
 	}
 	for i := ShardCount(0); i < shardCount; i++ {
 		e.shards[i] = &Shard{items: make(map[string]Item)}
 	}
+	// Active eviction deletes only keys whose real expiration has actually passed
+	// (deleteIfExpired), so a refreshed key sitting in a stale slot is not evicted early.
 	if interval <= 0 || numSlots == 0 {
 		e.chronometer = &NoOpChronometer{}
 		if e.logger.Enabled(log.LevelInfo) {
 			e.logger.Log(log.LevelInfo, "chronometer disabled; running without active eviction loop")
 		}
 	} else {
-		c := NewChronometer(e.Delete, interval, numSlots, logger)
+		c := NewChronometer(func(k string) { e.deleteIfExpired(k) }, interval, numSlots, logger)
 		c.Start()
 		e.chronometer = c
 	}
-	e.chronometer = NewChronometer(e.Delete, interval, numSlots, logger)
-	e.chronometer.Start()
 	if cryptoEngine == nil {
 		cryptoEngine, _ = crypto.NewEngine(nil, logger)
 	}
 	e.cryptoEngine = cryptoEngine
-	if logger == nil {
-		logger = log.NewNoOpLogger()
-	}
-	e.logger = logger
 	if e.logger.Enabled(log.LevelInfo) {
 		e.logger.Log(log.LevelInfo, "storage engine created")
 	}
@@ -174,10 +176,18 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 			}
 			return err
 		}
+	} else {
+		// The caller's value may alias a transient network read buffer that is reused
+		// after this call. The encrypted path already produces an owned buffer above,
+		// so only the plaintext path needs a defensive copy before we retain it.
+		value = append([]byte(nil), value...)
 	}
+	// The key likewise may alias the network read buffer; clone it once so the map and
+	// the chronometer both retain a stable, owned copy.
+	storedKey := strings.Clone(key)
 	shard.Lock()
-	oldItem, isUpdate := shard.items[key]
-	shard.items[key] = Item{
+	oldItem, isUpdate := shard.items[storedKey]
+	shard.items[storedKey] = Item{
 		Value:      value,
 		Expiration: exp,
 	}
@@ -206,7 +216,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 		)
 	}
 	if ttl > 0 {
-		e.chronometer.Register(key, ttl)
+		e.chronometer.Register(storedKey, ttl)
 	}
 	return nil
 }
@@ -240,6 +250,35 @@ func (e *Engine) Delete(key string) {
 	}
 }
 
+// deleteIfExpired removes a key only if it is still present AND its expiration has
+// actually passed, re-checked under the shard write lock. It returns true when it
+// performed the deletion.
+//
+// This serves two purposes:
+//   - Lazy eviction (Get/GetInto): when many readers race on the same just-expired hot
+//     key, only the first observer does the delete; the rest no-op instead of stampeding
+//     the shard write lock.
+//   - Active eviction (chronometer): a key that was re-Set with a fresh TTL but still sits
+//     in an older timing-wheel slot is not evicted early, because its real Expiration is
+//     re-validated here.
+func (e *Engine) deleteIfExpired(key string) bool {
+	idx := e.getShardIndex(key)
+	shard := e.shards[idx]
+	shard.Lock()
+	item, exists := shard.items[key]
+	if !exists || item.Expiration.IsZero() || !time.Now().After(item.Expiration) {
+		shard.Unlock()
+		return false
+	}
+	delete(shard.items, key)
+	shard.Unlock()
+	releasedBytes := uint64(len(key) + len(item.Value))
+	atomic.AddUint64(&e.allocatedBytes, ^(releasedBytes - 1))
+	atomic.AddUint64(&e.shardStats[idx].totalCommands, 1)
+	atomic.AddUint64(&e.keyCount, ^uint64(0))
+	return true
+}
+
 // Get shard from the storage engine by acquiring a read lock
 func (e *Engine) Get(key string) ([]byte, bool) {
 	var (
@@ -260,8 +299,9 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 		if e.logger.Enabled(log.LevelDebug) {
 			e.logger.Log(log.LevelDebug, "lazy eviction triggered during Get", log.String("key", key))
 		}
-		atomic.AddUint64(&e.expiredCount, 1)
-		e.Delete(key)
+		if e.deleteIfExpired(key) {
+			atomic.AddUint64(&e.expiredCount, 1)
+		}
 		return nil, false
 	}
 	if e.cryptoEngine.Enabled() {
@@ -309,8 +349,9 @@ func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
 		if e.logger.Enabled(log.LevelDebug) {
 			e.logger.Log(log.LevelDebug, "lazy eviction triggered during GetInto", log.String("key", key))
 		}
-		atomic.AddUint64(&e.expiredCount, 1)
-		e.Delete(key)
+		if e.deleteIfExpired(key) {
+			atomic.AddUint64(&e.expiredCount, 1)
+		}
 		return 0, false
 	}
 	if e.cryptoEngine.Enabled() {
