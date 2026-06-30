@@ -1,0 +1,169 @@
+# Taskfile for Tellstone — https://taskfile.dev
+# Run `task` (or `task --list`) to see available tasks.
+version: '3'
+
+vars:
+  BIN: bin/tellstone
+  BENCH_BIN: bin/benchmark
+  # Ports — the binary listener uses a non-default port so it won't clash with an
+  # IDE-launched instance on :9988. RESP uses the standard Redis port.
+  BIN_PORT: '{{.BIN_PORT | default "19988"}}'
+  RESP_PORT: '{{.RESP_PORT | default "6379"}}'
+  # Core isolation: server and load generator on disjoint CPU sets so they don't
+  # contend for cores (this is what keeps the latency tail honest).
+  SRV_CORES: '{{.SRV_CORES | default "0-15"}}'
+  SRV_PROCS: '{{.SRV_PROCS | default "16"}}'
+  BENCH_CORES: '{{.BENCH_CORES | default "16-31"}}'
+  # memtier workload knobs (override on the CLI, e.g. `task bench:resp PIPELINE=16`).
+  THREADS: '{{.THREADS | default "4"}}'
+  CONNS: '{{.CONNS | default "25"}}'
+  DURATION: '{{.DURATION | default "10"}}'
+  PIPELINE: '{{.PIPELINE | default "1"}}'
+  RATIO: '{{.RATIO | default "1:10"}}'
+  KEYSPACE: '{{.KEYSPACE | default "200000"}}'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  # ---------- build ----------
+  build:
+    desc: Build the server binary into ./bin/tellstone
+    cmds:
+      - go build -o {{.BIN}} ./cmd/tellstone
+    sources:
+      - "**/*.go"
+    generates:
+      - "{{.BIN}}"
+
+  build:bench:
+    desc: Build the native (binary-protocol) load generator into ./bin/benchmark
+    cmds:
+      - go build -o {{.BENCH_BIN}} ./cmd/benchmark
+
+  build:all:
+    desc: Build all binaries
+    deps: [build, build:bench]
+
+  # ---------- quality ----------
+  fmt:
+    desc: Format all Go code
+    cmds:
+      - go fmt ./...
+
+  vet:
+    desc: Run go vet
+    cmds:
+      - go vet ./...
+
+  test:
+    desc: Run the full test suite
+    cmds:
+      - go test ./...
+
+  test:race:
+    desc: Run the full test suite with the race detector
+    cmds:
+      - go test -race ./...
+
+  check:
+    desc: vet + race tests (run before committing)
+    deps: [vet, test:race]
+
+  clean:
+    desc: Remove build artifacts
+    cmds:
+      - rm -rf bin
+
+  # ---------- run ----------
+  run:
+    desc: Run the server in the foreground (binary protocol only)
+    deps: [build]
+    cmds:
+      - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} ./{{.BIN}}
+
+  run:resp:
+    desc: Run the server in the foreground with the RESP listener enabled
+    deps: [build]
+    cmds:
+      - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} ./{{.BIN}}
+
+  # ---------- benchmarks (self-contained: start pinned server, load, clean up) ----------
+  bench:native:
+    desc: Native binary-protocol benchmark, server & client pinned to disjoint cores
+    deps: [build, build:bench]
+    cmds:
+      - |
+        set -e
+        taskset -c {{.SRV_CORES}} env GOMAXPROCS={{.SRV_PROCS}} TSD_LOG_LEVEL=error \
+          TSD_ADDR=127.0.0.1:{{.BIN_PORT}} ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
+        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
+        sleep 1.5
+        kill -0 $SRV 2>/dev/null || { echo "server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
+        taskset -c {{.BENCH_CORES}} ./{{.BENCH_BIN}} -addr 127.0.0.1:{{.BIN_PORT}} \
+          -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
+
+  bench:resp:
+    desc: "RESP latency benchmark via memtier (pinned). Vars: THREADS CONNS DURATION PIPELINE RATIO KEYSPACE"
+    deps: [build]
+    cmds:
+      - |
+        set -e
+        command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
+        taskset -c {{.SRV_CORES}} env GOMAXPROCS={{.SRV_PROCS}} TSD_LOG_LEVEL=error \
+          TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
+          ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
+        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
+        sleep 1.5
+        kill -0 $SRV 2>/dev/null || { echo "server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
+        taskset -c {{.BENCH_CORES}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
+          -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
+          --ratio={{.RATIO}} --key-maximum={{.KEYSPACE}} --hide-histogram
+
+  bench:resp:pipeline:
+    desc: RESP throughput-ceiling benchmark (pipeline=16)
+    cmds:
+      - task: bench:resp
+        vars: {PIPELINE: '16'}
+
+  bench:resp:hits:
+    desc: Realistic cache benchmark — preload the keyspace, then read-heavy (~100% hits)
+    deps: [build]
+    cmds:
+      - |
+        set -e
+        command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
+        taskset -c {{.SRV_CORES}} env GOMAXPROCS={{.SRV_PROCS}} TSD_LOG_LEVEL=error \
+          TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
+          ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
+        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
+        sleep 1.5
+        kill -0 $SRV 2>/dev/null || { echo "server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
+        echo "== preload {{.KEYSPACE}} keys =="
+        taskset -c {{.BENCH_CORES}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
+          -t 1 -c 1 -n {{.KEYSPACE}} --ratio=1:0 --key-pattern=S:S \
+          --key-minimum=1 --key-maximum={{.KEYSPACE}} --hide-histogram | grep -E "Sets|Totals"
+        echo "== read-heavy (expect near-zero miss rate) =="
+        taskset -c {{.BENCH_CORES}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
+          -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
+          --ratio=0:1 --key-maximum={{.KEYSPACE}} --hide-histogram
+
+  bench:resp:correctness:
+    desc: Prove GET returns what SET stored (preload then read the same keyspace)
+    deps: [build]
+    cmds:
+      - |
+        set -e
+        command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
+        TSD_LOG_LEVEL=error TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true \
+          TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
+        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
+        sleep 1.5
+        kill -0 $SRV 2>/dev/null || { echo "server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
+        memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis -t 1 -c 1 -n 50000 \
+          --ratio=1:0 --key-pattern=S:S --key-minimum=1 --key-maximum=50000 --hide-histogram | grep -E "Sets|Totals"
+        memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis -t 1 -c 1 -n 50000 \
+          --ratio=0:1 --key-pattern=S:S --key-minimum=1 --key-maximum=50000 --hide-histogram | grep -E "Gets|Totals|miss"
