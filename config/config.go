@@ -30,6 +30,7 @@ type Config struct {
 	encryptionKey    string
 	traceRatio       float64
 	maxMsgSize       uint64
+	maxMemBytes      uint64
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -44,6 +45,12 @@ func getEnv[T any](key string, fallback T) T {
 	case *int:
 		if i, err := strconv.Atoi(val); err == nil {
 			*p = i
+		} else {
+			return fallback
+		}
+	case *uint:
+		if u, err := strconv.ParseUint(val, 10, 64); err == nil {
+			*p = uint(u)
 		} else {
 			return fallback
 		}
@@ -87,28 +94,31 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_TRACE_RATIO     – OpenTelemetry sampling ratio in the range [0.0‑1.0]
 //		TSD_MAX_MSG_SIZE	- optional parameter to define the maximum msg size
 //		TSD_METRICS_ADDR    – Prometheus HTTP exporter address (e.g. ":9100")
-//		SD_ENABLE_METRICS   – boolean to activate the Prometheus exporter (default: false)
+//		TSD_MAX_MEM_BYTES   – optional engine memory ceiling (e.g. "512MiB"; 0 = unlimited)
+//		TSD_ENABLE_METRICS  – boolean to activate the Prometheus exporter (default: false)
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
 //
-// The flag definitions below intentionally repeat the default values in the help text
-// to improve discoverability for end users.
-func LoadConfig() *Config {
+// args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
+// environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
+// free of global state and safe to call repeatedly (e.g. from tests).
+func LoadConfig(args []string) *Config {
 	cfg := new(Config)
+	fs := flag.NewFlagSet("tellstone", flag.ContinueOnError)
 
 	// Network listening address.
-	flag.StringVar(
+	fs.StringVar(
 		&cfg.addr,
 		"addr",
 		getEnv("TSD_ADDR", "127.0.0.1:9988"),
 		"TCP listen address (default: 127.0.0.1:9988)",
 	)
-	flag.BoolVar(
+	fs.BoolVar(
 		&cfg.enableMetrics,
 		"enable-metrics",
-		getEnv("TSD_ENABLE_METRICS", true),
+		getEnv("TSD_ENABLE_METRICS", false),
 		"Enable the Prometheus HTTP metrics exporter (default: false)",
 	)
-	flag.StringVar(
+	fs.StringVar(
 		&cfg.metricsAddr,
 		"metrics-addr",
 		getEnv("TSD_METRICS_ADDR", ":9100"),
@@ -116,15 +126,14 @@ func LoadConfig() *Config {
 	)
 	// Log level – accepts values: debug, info, warn, error, fatal.
 	var logLevel string
-	flag.StringVar(
+	fs.StringVar(
 		&logLevel,
 		"log-level",
 		getEnv("TSD_LOG_LEVEL", "info"),
 		"Log verbosity (debug|info|warn|error|fatal) (default: info)",
 	)
-	cfg.logLevel = log.ParseLogLevel(logLevel)
 	// Chronometer eviction ticker interval.
-	flag.DurationVar(
+	fs.DurationVar(
 		&cfg.evictTicker,
 		"evict-interval",
 		getEnv("TSD_EVICT_INTERVAL", time.Second),
@@ -132,28 +141,27 @@ func LoadConfig() *Config {
 	)
 	// Number of slots in the timing‑wheel chronometer (default derived from config).
 	var evictSlots uint
-	flag.UintVar(
+	fs.UintVar(
 		&evictSlots,
 		"evict-slots",
 		getEnv("TSD_EVICT_SLOTS", uint(256)),
 		"Number of slots in the chronometer wheel (default: 256)",
 	)
-	cfg.evictSlots = uint32(evictSlots)
-	flag.BoolVar(
+	fs.BoolVar(
 		&cfg.enableEncryption,
 		"enable-encryption",
 		getEnv("TSD_ENABLE_ENCRYPTION", false),
 		"Enforce symmetric encryption for data at rest (default: false)",
 	)
 	// Optional encryption key for data at rest.
-	flag.StringVar(
+	fs.StringVar(
 		&cfg.encryptionKey,
 		"encryption-key",
 		getEnv("TSD_ENCRYPTION_KEY", ""),
 		"Base‑64 encoded encryption key; empty disables encryption (default: none)",
 	)
 	// OpenTelemetry trace sampling ratio.
-	flag.Float64Var(
+	fs.Float64Var(
 		&cfg.traceRatio,
 		"trace-ratio",
 		getEnv("TSD_TRACE_RATIO", 0.0),
@@ -167,22 +175,36 @@ func LoadConfig() *Config {
 	if env := os.Getenv("TSD_MAX_MSG_SIZE"); env != "" {
 		_ = maxMsgSize.Set(env) // ignore errors – malformed env yields zero (default)
 	}
-	flag.Var(
+	fs.Var(
 		&maxMsgSize,
 		"max-msg-size",
 		"Maximum network message size (e.g. 16MiB, 1GiB, 0 = use default 16MiB)",
 	)
-	cfg.maxMsgSize = uint64(maxMsgSize)
+	// Total engine memory ceiling, distinct from the per-message size limit.
+	// 0 means unlimited on 64-bit (the engine applies a safety cap on 32-bit).
+	var maxMemBytes ByteSize
+	if env := os.Getenv("TSD_MAX_MEM_BYTES"); env != "" {
+		_ = maxMemBytes.Set(env)
+	}
+	fs.Var(
+		&maxMemBytes,
+		"max-mem-bytes",
+		"Total engine memory ceiling (e.g. 512MiB, 4GiB, 0 = unlimited)",
+	)
 	// Custom usage output to guide operators.
-	flag.Usage = func() {
-		println("Tellstone server – high‑performance in‑memory database")
+	fs.Usage = func() {
+		println("Tellstone server – high-performance in-memory database")
 		println("Usage: tellstone [options]")
 		println("Options:")
-		flag.PrintDefaults()
+		fs.PrintDefaults()
 	}
-	// Parse flags without inheriting any arguments from the testing framework.
-	// Using an empty slice ensures that only the flags defined above are considered.
-	_ = flag.CommandLine.Parse([]string{})
+	_ = fs.Parse(args)
+
+	// Resolve derived values after parsing so command-line flags can override defaults.
+	cfg.logLevel = log.ParseLogLevel(logLevel)
+	cfg.evictSlots = uint32(evictSlots)
+	cfg.maxMsgSize = uint64(maxMsgSize)
+	cfg.maxMemBytes = uint64(maxMemBytes)
 	return cfg
 }
 
@@ -196,3 +218,4 @@ func (cfg *Config) EncryptionEnabled() bool       { return cfg.enableEncryption 
 func (cfg *Config) GetEncryptionKey() string      { return cfg.encryptionKey }
 func (cfg *Config) GetTraceRatio() float64        { return cfg.traceRatio }
 func (cfg *Config) GetMaxMsgSize() uint64         { return cfg.maxMsgSize }
+func (cfg *Config) GetMaxMemBytes() uint64        { return cfg.maxMemBytes }
