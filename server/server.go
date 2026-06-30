@@ -105,7 +105,7 @@ func (s *Server) initStorage(cryptoEngine *crypto.Engine) *storage.Engine {
 	return storage.NewEngine(
 		cfg.GetEvictTicker(),
 		cfg.GetEvictSlots(),
-		cfg.GetMaxMsgSize(),
+		cfg.GetMaxMemBytes(),
 		s.app.GetLogger(),
 		cryptoEngine,
 	)

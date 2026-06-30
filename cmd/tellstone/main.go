@@ -73,7 +73,7 @@ func initRuntimeSettings() {
 func main() {
 	initRuntimeSettings()
 	initProfiling()
-	cfg := config.LoadConfig()
+	cfg := config.LoadConfig(os.Args[1:])
 	app := new(tellstone.App)
 	app.Start(cfg, logger.NewSlogLogger(log.LevelError))
 	svr := server.NewServer(app)
