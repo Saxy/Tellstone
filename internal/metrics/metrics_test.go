@@ -13,7 +13,7 @@ import (
 // the values reported by the storage engine after a few operations.
 func TestCollectorEngineSnapshot(t *testing.T) {
 	// Create a simple storage engine with a minimal chronometer (interval 1ms, 1 slot).
-	eng := storage.NewEngine(time.Millisecond, 1, nil, log.NewNoOpLogger(), 0)
+	eng := storage.NewEngine(time.Millisecond, 1, 0, log.NewNoOpLogger(), nil)
 	// Perform a basic Set operation to affect counters.
 	if err := eng.Set("key1", []byte("value"), 0); err != nil {
 		t.Fatalf("Set returned error: %v", err)
@@ -25,7 +25,7 @@ func TestCollectorEngineSnapshot(t *testing.T) {
 	// Create a dummy network server (no handler, no activity).
 	srv := network.NewServer("", 0, nil, log.NewNoOpLogger())
 
-	col := NewCollector(eng, srv)
+	col := NewCollector(eng, srv, log.NewNoOpLogger())
 	snap := col.GetEngineSnapshot()
 	if snap.KeyCount != 1 {
 		t.Fatalf("expected KeyCount 1, got %d", snap.KeyCount)

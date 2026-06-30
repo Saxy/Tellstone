@@ -4,10 +4,43 @@ import (
 	"bytes"
 	"testing"
 	"time"
+	"unsafe"
 )
 
+// TestEngine_SetCopiesAliasedKeyAndValue reproduces the data-corruption bug where the
+// engine retained a key/value that aliased a transient network read buffer (the server's
+// networkHandler derives a zero-copy unsafe string key straight from gnet's buffer). After
+// the buffer is reused, the stored key and value must remain intact, which requires Set to
+// clone the key and copy the plaintext value before retaining them.
+func TestEngine_SetCopiesAliasedKeyAndValue(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	// One backing buffer holding both key ("key1") and value ("VALUE!"), mimicking a frame
+	// sliced directly out of the network ring buffer.
+	buf := []byte("key1VALUE!")
+	keyBytes := buf[:4]
+	valBytes := buf[4:]
+	aliasKey := *(*string)(unsafe.Pointer(&keyBytes)) // exactly what server.networkHandler does
+
+	if err := engine.Set(aliasKey, valBytes, 0); err != nil {
+		t.Fatalf("Set failed: %v", err)
+	}
+
+	// Reuse/overwrite the buffer the way gnet does after c.Discard.
+	copy(buf, []byte("XXXXyyyyyy"))
+
+	got, found := engine.Get("key1")
+	if !found {
+		t.Fatal("stored key was corrupted by buffer reuse: key1 not found")
+	}
+	if string(got) != "VALUE!" {
+		t.Fatalf("stored value was corrupted by buffer reuse: got %q want %q", got, "VALUE!")
+	}
+}
+
 func TestEngine_TableDriven(t *testing.T) {
-	engine := NewEngine(10*time.Millisecond, 100, nil, nil, 0)
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
 	defer engine.Close()
 
 	type testCase struct {
@@ -129,23 +162,28 @@ func TestEngine_TableDriven(t *testing.T) {
 	}
 }
 
-func TestEngine_NewPanic(t *testing.T) {
-	t.Run("Panic on invalid interval", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic for interval <= 0")
-			}
-		}()
-		NewEngine(0, 100, nil, nil, 0)
+// TestEngine_NewDisabledEviction verifies that an invalid interval or zero slot count
+// disables active eviction (NoOpChronometer) instead of panicking. The engine must still
+// be fully usable; expired keys are then reclaimed lazily on access.
+func TestEngine_NewDisabledEviction(t *testing.T) {
+	t.Run("interval <= 0 disables active eviction", func(t *testing.T) {
+		engine := NewEngine(0, 100, 0, nil, nil)
+		defer engine.Close()
+		if _, ok := engine.Chronometer().(*NoOpChronometer); !ok {
+			t.Errorf("expected NoOpChronometer when interval <= 0, got %T", engine.Chronometer())
+		}
+		engine.Set("k", []byte("v"), 0)
+		if v, found := engine.Get("k"); !found || string(v) != "v" {
+			t.Errorf("engine should remain usable with eviction disabled; got %q found=%t", v, found)
+		}
 	})
 
-	t.Run("Panic on invalid numSlots", func(t *testing.T) {
-		defer func() {
-			if r := recover(); r == nil {
-				t.Errorf("expected panic for numSlots == 0")
-			}
-		}()
-		NewEngine(1*time.Second, 0, nil, nil, 0)
+	t.Run("numSlots == 0 disables active eviction", func(t *testing.T) {
+		engine := NewEngine(1*time.Second, 0, 0, nil, nil)
+		defer engine.Close()
+		if _, ok := engine.Chronometer().(*NoOpChronometer); !ok {
+			t.Errorf("expected NoOpChronometer when numSlots == 0, got %T", engine.Chronometer())
+		}
 	})
 }
 
@@ -154,7 +192,7 @@ func FuzzEngine_Operations(f *testing.F) {
 	f.Add("normal_key", []byte("normal_value"))
 	f.Add("", []byte("")) // Edge-Cases
 	f.Add("special_#!@*&_chars", []byte{0x00, 0xFF, 0xDE, 0xAD})
-	engine := NewEngine(50*time.Millisecond, 100, nil, nil, 0)
+	engine := NewEngine(50*time.Millisecond, 100, 0, nil, nil)
 	defer engine.Close()
 	f.Fuzz(func(t *testing.T, key string, value []byte) {
 		engine.Set(key, value, 0)
