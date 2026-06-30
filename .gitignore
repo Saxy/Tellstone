@@ -1,0 +1,9 @@
+# Build output
+/bin/
+
+# go-task cache
+/.task/
+
+# Profiling / benchmark artifacts
+*.prof
+*.pprof
