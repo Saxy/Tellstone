@@ -178,19 +178,31 @@ func Decode(data []byte, maxMsgSize uint64, out *Message) (int, error) {
 	return payloadLen, nil
 }
 
+// writeFastPathMax is the payload size below which Write coalesces the 5-byte header and
+// the payload into a single buffer and one Write call. Small responses (OK, NOT_FOUND, and
+// typical cache values) dominate, so this avoids a second syscall on a raw net.Conn and a
+// second outbound-buffer operation under gnet.
+const writeFastPathMax = 512
+
 // Write transmits a message completely allocation-free.
 func Write(w io.Writer, msgType MessageType, payload []byte) error {
 	total := 1 + len(payload)
+	if len(payload) <= writeFastPathMax {
+		var frame [5 + writeFastPathMax]byte
+		binary.BigEndian.PutUint32(frame[:4], uint32(total))
+		frame[4] = byte(msgType)
+		n := copy(frame[5:], payload)
+		_, err := w.Write(frame[:5+n])
+		return err
+	}
 	var hdr [5]byte
 	binary.BigEndian.PutUint32(hdr[:4], uint32(total))
 	hdr[4] = byte(msgType)
 	if _, err := w.Write(hdr[:]); err != nil {
 		return err
 	}
-	if len(payload) > 0 {
-		if _, err := w.Write(payload); err != nil {
-			return err
-		}
+	if _, err := w.Write(payload); err != nil {
+		return err
 	}
 	return nil
 }
