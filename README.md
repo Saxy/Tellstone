@@ -1,4 +1,5 @@
-# Tellstone
+# Tellstone <img src="tsd_logo.svg" width="100" height="100" alt="Description" style="vertical-align: middle;">
+
 
 `Tellstone` is an ultra‑high‑performance, cloud‑native **in‑memory key/value store** written
 entirely in **Go**. It speaks two protocols over TCP — a compact custom **binary protocol** and

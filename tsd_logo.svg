@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" width="100%" height="100%">
+  <path d="M 50 10 L 85 30 L 85 70 L 50 90 L 15 70 L 15 30 Z" fill="#1e293b"/>
+  
+  <path d="M 50 50 L 15 30 L 50 10 Z" fill="#475569" />
+  <path d="M 50 50 L 50 10 L 85 30 Z" fill="#334155" />
+  <path d="M 50 50 L 85 30 L 85 70 Z" fill="#1e293b" />
+  <path d="M 50 50 L 85 70 L 50 90 Z" fill="#0f172a" />
+  <path d="M 50 50 L 50 90 L 15 70 Z" fill="#1e293b" />
+  <path d="M 50 50 L 15 70 L 15 30 Z" fill="#334155" />
+
+  <path d="M 50 20 L 75 35 L 75 65 L 50 80 L 25 65 L 25 35 Z" fill="none" stroke="#475569" stroke-width="2" opacity="0.4"/>
+
+  <g stroke="#00e5ff" stroke-width="2" stroke-linecap="round">
+    <line x1="50" y1="50" x2="50" y2="22" />
+    <line x1="50" y1="50" x2="50" y2="78" />
+    <line x1="50" y1="50" x2="22" y2="50" />
+    <line x1="50" y1="50" x2="78" y2="50" />
+    
+    <line x1="50" y1="50" x2="30" y2="30" />
+    <line x1="50" y1="50" x2="70" y2="30" />
+    <line x1="50" y1="50" x2="70" y2="70" />
+    <line x1="50" y1="50" x2="30" y2="70" />
+    
+    <line x1="50" y1="35" x2="65" y2="35" />
+    <line x1="50" y1="65" x2="35" y2="65" />
+    <line x1="35" y1="50" x2="35" y2="35" />
+    <line x1="65" y1="50" x2="65" y2="65" />
+  </g>
+
+  <g fill="#00e5ff">
+    <circle cx="50" cy="22" r="2" />
+    <circle cx="50" cy="78" r="2" />
+    <circle cx="30" cy="30" r="2" />
+    <circle cx="70" cy="30" r="2" />
+    <circle cx="70" cy="70" r="2" />
+    <circle cx="30" cy="70" r="2" />
+    <circle cx="65" cy="35" r="1.5" />
+    <circle cx="35" cy="65" r="1.5" />
+  </g>
+
+  <circle cx="50" cy="50" r="9" fill="#0f172a" stroke="#00e5ff" stroke-width="2.5" />
+  <circle cx="50" cy="50" r="4" fill="#00e5ff" />
+</svg>
