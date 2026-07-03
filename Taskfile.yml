@@ -159,3 +159,39 @@ tasks:
           {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
             -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
             --ratio=0:1 --key-maximum={{.KEYSPACE}} --hide-histogram
+  bench:compare:
+    desc: "Vergleiche DBs. Usage: task bench:compare TARGET=redis|valkey|tellstone [THREADS=...]"
+    vars:
+      TARGET: '{{.TARGET | default "tellstone"}}'
+    cmds:
+      - |
+        set -e
+        # Server Start Logik
+        case "{{.TARGET}}" in
+          tellstone)
+            echo "--- Starte Tellstone ---"
+           sh -c 'export TSD_ADDR=127.0.0.1:{{.BIN_PORT}}; \
+                   export TSD_ENABLE_RESP=true; \
+                   export TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}}; \
+                   ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1' &
+            SRV=$! ;;
+          redis)
+            echo "--- Starte Redis ---"
+            redis-server --port {{.RESP_PORT}} --save "" --appendonly no >/tmp/redis-bench.log 2>&1 &
+            SRV=$! ;;
+          valkey)
+            echo "--- Starte Valkey ---"
+            valkey-server --port {{.RESP_PORT}} --save "" --appendonly no >/tmp/valkey-bench.log 2>&1 &
+            SRV=$! ;;
+          *) echo "Unbekanntes Target: {{.TARGET}}"; exit 1 ;;
+        esac
+        
+        trap "kill $SRV 2>/dev/null || true" EXIT
+      
+        # Warten bis Port offen ist
+        for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.5; done
+        
+        echo "Running memtier against {{.TARGET}}..."
+        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
+          -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
+          --ratio={{.RATIO}} --key-maximum={{.KEYSPACE}} --hide-histogram
