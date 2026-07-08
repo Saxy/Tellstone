@@ -195,3 +195,73 @@ tasks:
         {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
           -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
           --ratio={{.RATIO}} --key-maximum={{.KEYSPACE}} --hide-histogram
+
+  # ---------- profiling ----------
+  # Two independent workflows, both driven by the stock Go toolchain (pprof / trace). Nothing
+  # here assumes a specific core count, OS, or machine — every var is overridable on the CLI, so
+  # this works the same on a laptop, CI runner, or a bigger benchmarking host.
+  #
+  #   1) profile:pkg + profile:view   — profile a package's Go benchmarks directly, no server.
+  #   2) run:profiling + profile:live — profile the actual running server under real load
+  #      generated from a second terminal (task bench:*, bin/benchmark, memtier_benchmark, ...).
+  profile:pkg:
+    desc: "Benchmark a package with CPU+mem profiling. Vars: PKG (default ./internal/storage/...), BENCH, COUNT, OUT"
+    vars:
+      PKG: '{{.PKG | default "./internal/storage/..."}}'
+      BENCH: '{{.BENCH | default "."}}'
+      COUNT: '{{.COUNT | default "1"}}'
+      OUT: '{{.OUT | default "tmp/profile"}}'
+    cmds:
+      - mkdir -p {{.OUT}}
+      - go test -bench={{.BENCH}} -benchmem -count={{.COUNT}} -run='^$' -cpuprofile={{.OUT}}/cpu.out -memprofile={{.OUT}}/mem.out {{.PKG}}
+      - 'echo "CPU profile:  task profile:view FILE={{.OUT}}/cpu.out"'
+      - 'echo "Mem profile:  task profile:view FILE={{.OUT}}/mem.out ARGS=-alloc_space"'
+
+  profile:view:
+    desc: "Open a saved pprof profile file in the browser. Vars: FILE (required), PORT (default 8081), ARGS (extra pprof flags, e.g. -alloc_space/-alloc_objects)"
+    vars:
+      FILE: '{{.FILE | default ""}}'
+      PORT: '{{.PORT | default "8081"}}'
+      ARGS: '{{.ARGS | default ""}}'
+    cmds:
+      - |
+        set -e
+        [ -n "{{.FILE}}" ] || { echo "FILE is required, e.g. task profile:view FILE=tmp/profile/cpu.out"; exit 1; }
+        go tool pprof -http=:{{.PORT}} {{.ARGS}} {{.FILE}}
+
+  run:profiling:
+    desc: "Run the server in the foreground with live pprof enabled (mutex+block sampling, /debug/pprof on :6060). Generate load against it from a second terminal, then use profile:live."
+    deps: [ build ]
+    cmds:
+      - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} TSD_ENABLE_PROFILING=1 ./{{.BIN}}
+
+  profile:live:
+    desc: "Pull a profile from a server started via run:profiling and open it in the browser. Vars: KIND (cpu|heap|mutex|block|goroutine|allocs, default cpu), SECONDS (cpu only, default 30), PPROF_ADDR (default 127.0.0.1:6060), PORT (default 8081)"
+    vars:
+      KIND: '{{.KIND | default "cpu"}}'
+      SECONDS: '{{.SECONDS | default "30"}}'
+      PPROF_ADDR: '{{.PPROF_ADDR | default "127.0.0.1:6060"}}'
+      PORT: '{{.PORT | default "8081"}}'
+    cmds:
+      - |
+        set -e
+        if [ "{{.KIND}}" = "cpu" ]; then
+          URL="http://{{.PPROF_ADDR}}/debug/pprof/profile?seconds={{.SECONDS}}"
+        else
+          URL="http://{{.PPROF_ADDR}}/debug/pprof/{{.KIND}}"
+        fi
+        echo "Make sure load is running against the server (see README: Profiling) — an idle"
+        echo "server produces an empty/uninteresting profile."
+        echo "Fetching $URL ..."
+        go tool pprof -http=:{{.PORT}} "$URL"
+
+  profile:live:trace:
+    desc: "Capture an execution trace from a server started via run:profiling and open it with go tool trace. Vars: SECONDS (default 5), PPROF_ADDR (default 127.0.0.1:6060), OUT (default tmp/trace.out)"
+    vars:
+      SECONDS: '{{.SECONDS | default "5"}}'
+      PPROF_ADDR: '{{.PPROF_ADDR | default "127.0.0.1:6060"}}'
+      OUT: '{{.OUT | default "tmp/trace.out"}}'
+    cmds:
+      - mkdir -p $(dirname {{.OUT}})
+      - curl -s "http://{{.PPROF_ADDR}}/debug/pprof/trace?seconds={{.SECONDS}}" -o {{.OUT}}
+      - go tool trace {{.OUT}}
