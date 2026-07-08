@@ -38,14 +38,27 @@ func TestMain(m *testing.M) {
 }
 
 func BenchmarkReadMessageZeroAlloc(b *testing.B) {
-	var payloadArr = [16]byte{'b', 'e', 'n', 'c', 'h', 'm', 'a', 'r', 'k', ' ', 'p', 'a', 'y', 'l', 'o', 'a'}
-	payload := payloadArr[:]
-	total := 1 + len(payload)
+	// Build a well-formed MsgRequest frame (Op + keyLen + TTL + key + value) so Decode
+	// actually exercises the request-parsing branch instead of failing on the length guard.
+	key := []byte("benchmark_key")
+	value := []byte("benchmark_value_payload")
+	reqPayload := make([]byte, 0, 11+len(key)+len(value))
+	reqPayload = append(reqPayload, byte(OpGet))
+	var keyLenBuf [2]byte
+	binary.BigEndian.PutUint16(keyLenBuf[:], uint16(len(key)))
+	reqPayload = append(reqPayload, keyLenBuf[:]...)
+	var ttlBuf [8]byte
+	binary.BigEndian.PutUint64(ttlBuf[:], 0)
+	reqPayload = append(reqPayload, ttlBuf[:]...)
+	reqPayload = append(reqPayload, key...)
+	reqPayload = append(reqPayload, value...)
+
+	total := 1 + len(reqPayload)
 	var msgBuf [256]byte
 
 	binary.BigEndian.PutUint32(msgBuf[:4], uint32(total))
 	msgBuf[4] = byte(MsgRequest)
-	copy(msgBuf[5:], payload)
+	copy(msgBuf[5:], reqPayload)
 	data := msgBuf[:4+total]
 
 	var m Message
