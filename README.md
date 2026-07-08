@@ -73,6 +73,16 @@ Or run the binary directly with flags / environment variables:
 TSD_ADDR=127.0.0.1:9988 TSD_ENABLE_RESP=true ./bin/tellstone
 ```
 
+If a previous run got killed uncleanly and left a server stuck on a port (`address already in
+use`), find and stop it with:
+
+```bash
+task kill                          # checks :19988, :6379, :6060 and any bin/tellstone process
+task kill PORTS="9988" NAME=myapp  # override the ports/name to search for
+```
+
+Works on Linux and macOS (`lsof`/`pgrep`/`pkill`, no OS-specific tooling).
+
 ### Configuration
 
 Every option is available as a flag and an environment variable.
