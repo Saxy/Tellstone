@@ -96,6 +96,38 @@ tasks:
     cmds:
       - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} ./{{.BIN}}
 
+  # ---------- process management ----------
+  kill:
+    desc: "Find and kill stray Tellstone server processes, by port and by name. Linux + macOS (lsof/pgrep/pkill, no OS-specific tools). Vars: PORTS (default: 19988 6379 6060 — binary/RESP/pprof), NAME (default: bin/tellstone — deliberately specific, a bare 'tellstone' pattern would also match unrelated commands mentioning the project path)"
+    vars:
+      PORTS: '{{.PORTS | default "19988 6379 6060"}}'
+      NAME: '{{.NAME | default "bin/tellstone"}}'
+    cmds:
+      - |
+        set +e
+        found=0
+        if command -v lsof >/dev/null 2>&1; then
+          for p in {{.PORTS}}; do
+            pids=$(lsof -ti tcp:"$p" 2>/dev/null)
+            if [ -n "$pids" ]; then
+              echo "Port $p held by PID(s) $pids — killing"
+              kill $pids 2>/dev/null
+              found=1
+            fi
+          done
+        else
+          echo "lsof not found on this machine — skipping port lookup, falling back to name match only"
+        fi
+        matches=$(pgrep -f "{{.NAME}}" 2>/dev/null)
+        if [ -n "$matches" ]; then
+          echo "Process(es) matching '{{.NAME}}': $matches — killing"
+          pkill -f "{{.NAME}}" 2>/dev/null
+          found=1
+        fi
+        if [ "$found" = "0" ]; then
+          echo "Nothing found — no process on ports [{{.PORTS}}] or matching '{{.NAME}}'."
+        fi
+
   # ---------- benchmarks (self-contained: start pinned server, load, clean up) ----------
   bench:native:
     desc: Native binary-protocol benchmark, server & client pinned to disjoint cores (Linux only)
