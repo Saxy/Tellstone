@@ -7,3 +7,6 @@
 # Profiling / benchmark artifacts
 *.prof
 *.pprof
+
+# IDE
+/.idea/

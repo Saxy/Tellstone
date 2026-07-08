@@ -77,20 +77,21 @@ TSD_ADDR=127.0.0.1:9988 TSD_ENABLE_RESP=true ./bin/tellstone
 
 Every option is available as a flag and an environment variable.
 
-| Flag | Env | Default | Description |
-|---|---|---|---|
-| `--addr` | `TSD_ADDR` | `127.0.0.1:9988` | Binary‑protocol listen address |
-| `--enable-resp` | `TSD_ENABLE_RESP` | `false` | Enable the Redis‑compatible RESP listener |
-| `--resp-addr` | `TSD_RESP_ADDR` | `127.0.0.1:6379` | RESP listen address |
-| `--max-msg-size` | `TSD_MAX_MSG_SIZE` | `16MiB` | Per‑message size limit |
-| `--max-mem-bytes` | `TSD_MAX_MEM_BYTES` | `0` (unlimited) | Total engine memory ceiling |
-| `--evict-interval` | `TSD_EVICT_INTERVAL` | `1s` | Chronometer tick interval (`0` disables active eviction) |
-| `--evict-slots` | `TSD_EVICT_SLOTS` | `256` | Timing‑wheel slot count |
-| `--enable-encryption` | `TSD_ENABLE_ENCRYPTION` | `false` | Enable ChaCha20‑Poly1305 at‑rest encryption |
-| `--encryption-key` | `TSD_ENCRYPTION_KEY` | _(none)_ | 32‑byte key (required when encryption is on) |
-| `--enable-metrics` | `TSD_ENABLE_METRICS` | `false` | Enable the Prometheus exporter |
-| `--metrics-addr` | `TSD_METRICS_ADDR` | `:9100` | Prometheus exporter address (`/metrics`) |
-| `--trace-ratio` | `TSD_TRACE_RATIO` | `0.0` | OpenTelemetry sample ratio (`0` disables) |
+| Flag                  | Env                     | Default          | Description                                              |
+|-----------------------|-------------------------|------------------|----------------------------------------------------------|
+| `--addr`              | `TSD_ADDR`              | `127.0.0.1:9988` | Binary‑protocol listen address                           |
+| `--enable-resp`       | `TSD_ENABLE_RESP`       | `false`          | Enable the Redis‑compatible RESP listener                |
+| `--resp-addr`         | `TSD_RESP_ADDR`         | `127.0.0.1:6379` | RESP listen address                                      |
+| `--max-msg-size`      | `TSD_MAX_MSG_SIZE`      | `16MiB`          | Per‑message size limit                                   |
+| `--max-mem-bytes`     | `TSD_MAX_MEM_BYTES`     | `0` (unlimited)  | Total engine memory ceiling                              |
+| `--evict-interval`    | `TSD_EVICT_INTERVAL`    | `1s`             | Chronometer tick interval (`0` disables active eviction) |
+| `--evict-slots`       | `TSD_EVICT_SLOTS`       | `256`            | Timing‑wheel slot count                                  |
+| `--enable-encryption` | `TSD_ENABLE_ENCRYPTION` | `false`          | Enable ChaCha20‑Poly1305 at‑rest encryption              |
+| `--encryption-key`    | `TSD_ENCRYPTION_KEY`    | _(none)_         | 32‑byte key (required when encryption is on)             |
+| `--enable-metrics`    | `TSD_ENABLE_METRICS`    | `false`          | Enable the Prometheus exporter                           |
+| `--metrics-addr`      | `TSD_METRICS_ADDR`      | `:9100`          | Prometheus exporter address (`/metrics`)                 |
+| `--trace-ratio`       | `TSD_TRACE_RATIO`       | `0.0`            | OpenTelemetry sample ratio (`0` disables)                |
+| `--shutdown-timeout`  | `TSD_SHUTDOWN_TIMEOUT`  | `10s`            | Max wait for graceful shutdown on SIGINT/SIGTERM         |
 
 Runtime tuning (environment only): `TSD_GC_PERCENT` (default `-1`, GC off for a zero‑GC hot
 path), `TSD_MEM_LIMIT_BYTES` (soft heap ceiling), `TSD_ENABLE_PROFILING` (serves `pprof` on
