@@ -197,8 +197,47 @@ task fmt            # format
 ### Observability
 * **Metrics:** `task run:resp` with `--enable-metrics` exposes Prometheus text at
   `http://<metrics-addr>/metrics` (default `:9100`).
-* **Profiling:** set `TSD_ENABLE_PROFILING=1` to serve `pprof` on `127.0.0.1:6060`
-  (e.g. `go tool pprof http://127.0.0.1:6060/debug/pprof/profile`).
+
+### Profiling
+
+Two independent workflows, both built on the stock Go toolchain (`pprof` / `trace`). Neither
+assumes a specific core count, OS, or machine — every variable below is overridable on the CLI,
+so the same commands work on a laptop, a CI runner, or a dedicated benchmarking host.
+
+**1) Profile a package's benchmarks directly** — no server involved, good for isolating one
+function (e.g. the storage engine or the RESP parser):
+
+```bash
+task profile:pkg                                          # ./internal/storage/..., all benchmarks
+task profile:pkg PKG=./internal/resp/... BENCH=BenchmarkParseGet
+task profile:view FILE=tmp/profile/cpu.out                # opens the CPU profile in the browser
+task profile:view FILE=tmp/profile/mem.out ARGS=-alloc_space
+```
+
+**2) Profile the running server under real load**, generated from a second terminal:
+
+```bash
+task run:profiling                    # foreground server, RESP + live pprof on :6060
+```
+
+```bash
+# in a second terminal, generate load, e.g.:
+task bench:resp:pipeline
+# or: ./bin/benchmark -addr 127.0.0.1:19988 -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
+```
+
+```bash
+# while load is running, pull a profile and open it in the browser:
+task profile:live                     # CPU, 30s sample (default)
+task profile:live KIND=heap
+task profile:live KIND=mutex
+task profile:live KIND=block
+task profile:live:trace               # execution trace, opened via `go tool trace`
+```
+
+`go tool pprof -http` starts a local web server and opens your default browser automatically.
+On a headless/remote host, set `PORT=<port>` and open `http://<host>:<port>` yourself (e.g. via
+an SSH tunnel), or browse the raw index at `http://127.0.0.1:6060/debug/pprof/` directly.
 
 ---
 

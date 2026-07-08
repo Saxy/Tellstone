@@ -8,5 +8,8 @@
 *.prof
 *.pprof
 
+# Scratch directory for local analysis docs and profile:* task output (see Taskfile.yml)
+/tmp/
+
 # IDE
 /.idea/
