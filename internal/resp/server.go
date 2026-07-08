@@ -14,6 +14,7 @@ Authors:
 package resp
 
 import (
+	"context"
 	"errors"
 	"strconv"
 	"sync/atomic"
@@ -46,6 +47,12 @@ type Server struct {
 	store  Store
 	logger log.Logger
 
+	// eng and ready let Shutdown reach the running gnet engine: OnBoot fires once the event
+	// loop is accepting connections and hands us the Engine handle we need to stop it; ready
+	// is closed at that point so a concurrent Shutdown call can block until it's safe to stop.
+	eng   gnet.Engine
+	ready chan struct{}
+
 	connectedClients uint64
 	totalConnections uint64
 	bytesRead        uint64
@@ -58,7 +65,7 @@ func NewServer(addr string, store Store, logger log.Logger) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
-	return &Server{addr: addr, store: store, logger: logger}
+	return &Server{addr: addr, store: store, logger: logger, ready: make(chan struct{})}
 }
 
 // ListenAndServe starts the multi-reactor epoll event loop (blocking).
@@ -67,6 +74,24 @@ func (s *Server) ListenAndServe() error {
 		s.logger.Log(log.LevelInfo, "resp: event-driven engine initializing", log.String("address", s.addr))
 	}
 	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true))
+}
+
+// Shutdown gracefully stops the event loop, waiting for in-flight connections to drain or
+// ctx to expire. It blocks until ListenAndServe has reached OnBoot, so it is safe to call
+// concurrently with ListenAndServe from another goroutine (e.g. a signal handler).
+func (s *Server) Shutdown(ctx context.Context) error {
+	select {
+	case <-s.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.eng.Stop(ctx)
+}
+
+func (s *Server) OnBoot(eng gnet.Engine) gnet.Action {
+	s.eng = eng
+	close(s.ready)
+	return gnet.None
 }
 
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {

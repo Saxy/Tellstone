@@ -11,6 +11,7 @@ Authors:
 package network
 
 import (
+	"context"
 	"errors"
 	"sync/atomic"
 
@@ -27,6 +28,12 @@ type Server struct {
 	handler    func(msg *Message) ([]byte, MessageType, error)
 	logger     log.Logger
 	maxMsgSize uint64
+
+	// eng and ready let Shutdown reach the running gnet engine: OnBoot fires once the event
+	// loop is accepting connections and hands us the Engine handle we need to stop it; ready
+	// is closed at that point so a concurrent Shutdown call can block until it's safe to stop.
+	eng   gnet.Engine
+	ready chan struct{}
 
 	connectedClients uint64
 	totalConnections uint64
@@ -56,6 +63,7 @@ func NewServer(addr string, maxMsgSize uint64, handler func(msg *Message) ([]byt
 		handler:    handler,
 		logger:     logger,
 		maxMsgSize: maxMsgSize,
+		ready:      make(chan struct{}),
 	}
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "tcp server created", log.Int("max_msg_size", int(maxMsgSize)))
@@ -69,6 +77,24 @@ func (s *Server) ListenAndServe() error {
 		s.logger.Log(log.LevelInfo, "network: event-driven engine initializing", log.String("address", s.addr))
 	}
 	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true))
+}
+
+// Shutdown gracefully stops the event loop, waiting for in-flight connections to drain or
+// ctx to expire. It blocks until ListenAndServe has reached OnBoot, so it is safe to call
+// concurrently with ListenAndServe from another goroutine (e.g. a signal handler).
+func (s *Server) Shutdown(ctx context.Context) error {
+	select {
+	case <-s.ready:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.eng.Stop(ctx)
+}
+
+func (s *Server) OnBoot(eng gnet.Engine) gnet.Action {
+	s.eng = eng
+	close(s.ready)
+	return gnet.None
 }
 
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {

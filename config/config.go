@@ -33,6 +33,7 @@ type Config struct {
 	maxMemBytes      uint64
 	enableRESP       bool
 	respAddr         string
+	shutdownTimeout  time.Duration
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -101,6 +102,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_RESP_ADDR       – RESP listener address (default 127.0.0.1:6379)
 //		TSD_ENABLE_METRICS  – boolean to activate the Prometheus exporter (default: false)
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
+//		TSD_SHUTDOWN_TIMEOUT – max wait for graceful shutdown on SIGINT/SIGTERM (default: 10s)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -208,6 +210,14 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_RESP_ADDR", "127.0.0.1:6379"),
 		"RESP listener address (default: 127.0.0.1:6379)",
 	)
+	// Maximum time graceful shutdown waits for in-flight connections to drain after
+	// SIGINT/SIGTERM before forcing termination.
+	fs.DurationVar(
+		&cfg.shutdownTimeout,
+		"shutdown-timeout",
+		getEnv("TSD_SHUTDOWN_TIMEOUT", 10*time.Second),
+		"Max time to wait for graceful shutdown on SIGINT/SIGTERM (default: 10s)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -225,16 +235,17 @@ func LoadConfig(args []string) *Config {
 	return cfg
 }
 
-func (cfg *Config) GetAddr() string               { return cfg.addr }
-func (cfg *Config) MetricsEnabled() bool          { return cfg.enableMetrics }
-func (cfg *Config) GetMetricsAddr() string        { return cfg.metricsAddr }
-func (cfg *Config) GetLogLevel() log.Level        { return cfg.logLevel }
-func (cfg *Config) GetEvictTicker() time.Duration { return cfg.evictTicker }
-func (cfg *Config) GetEvictSlots() uint32         { return cfg.evictSlots }
-func (cfg *Config) EncryptionEnabled() bool       { return cfg.enableEncryption }
-func (cfg *Config) GetEncryptionKey() string      { return cfg.encryptionKey }
-func (cfg *Config) GetTraceRatio() float64        { return cfg.traceRatio }
-func (cfg *Config) GetMaxMsgSize() uint64         { return cfg.maxMsgSize }
-func (cfg *Config) GetMaxMemBytes() uint64        { return cfg.maxMemBytes }
-func (cfg *Config) RESPEnabled() bool             { return cfg.enableRESP }
-func (cfg *Config) GetRESPAddr() string           { return cfg.respAddr }
+func (cfg *Config) GetAddr() string                   { return cfg.addr }
+func (cfg *Config) MetricsEnabled() bool              { return cfg.enableMetrics }
+func (cfg *Config) GetMetricsAddr() string            { return cfg.metricsAddr }
+func (cfg *Config) GetLogLevel() log.Level            { return cfg.logLevel }
+func (cfg *Config) GetEvictTicker() time.Duration     { return cfg.evictTicker }
+func (cfg *Config) GetEvictSlots() uint32             { return cfg.evictSlots }
+func (cfg *Config) EncryptionEnabled() bool           { return cfg.enableEncryption }
+func (cfg *Config) GetEncryptionKey() string          { return cfg.encryptionKey }
+func (cfg *Config) GetTraceRatio() float64            { return cfg.traceRatio }
+func (cfg *Config) GetMaxMsgSize() uint64             { return cfg.maxMsgSize }
+func (cfg *Config) GetMaxMemBytes() uint64            { return cfg.maxMemBytes }
+func (cfg *Config) RESPEnabled() bool                 { return cfg.enableRESP }
+func (cfg *Config) GetRESPAddr() string               { return cfg.respAddr }
+func (cfg *Config) GetShutdownTimeout() time.Duration { return cfg.shutdownTimeout }

@@ -11,9 +11,13 @@ Authors:
 package server
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -38,6 +42,10 @@ var (
 type Server struct {
 	app    *tellstone.App
 	engine *storage.Engine
+
+	netSrv     *network.Server
+	respSrv    *resp.Server
+	metricsSrv *http.Server
 }
 
 // NewServer initializes a bare server abstraction waiting for network stack execution.
@@ -47,31 +55,76 @@ func NewServer(app *tellstone.App) *Server {
 	}
 }
 
-// Run configures cryptography, allocates the storage ring engine, and boots up the gnet event loop.
+// Run configures cryptography, allocates the storage ring engine, and boots up the gnet event
+// loop. It blocks until the binary-protocol listener stops, either because of a fatal error or
+// because SIGINT/SIGTERM triggered a graceful shutdown of all subsystems.
 func (s *Server) Run() {
 	logger := s.app.GetLogger()
 	cfg := s.app.GetConfig()
 	cryptoEngine := s.initCrypto()
 	s.engine = s.initStorage(cryptoEngine)
 	defer s.engine.Close()
-	srv := network.NewServer(
+	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
 		s.networkHandler,
 		logger,
 	)
 	if cfg.MetricsEnabled() {
-		s.startMetricsServer(srv)
+		s.startMetricsServer(s.netSrv)
 	}
 	if cfg.RESPEnabled() {
 		s.startRESPServer()
 	}
-	if err := srv.ListenAndServe(); err != nil {
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		// Restore default signal behavior so a second SIGINT/SIGTERM force-kills the
+		// process if graceful shutdown hangs (e.g. a slow client refusing to drain).
+		stop()
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "shutdown signal received, draining connections")
+		}
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.GetShutdownTimeout())
+		defer cancel()
+		s.shutdown(shutdownCtx)
+	}()
+
+	if err := s.netSrv.ListenAndServe(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			return
 		}
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "tcp error", log.String("error", err.Error()))
+		}
+	}
+}
+
+// shutdown gracefully stops every running subsystem (RESP listener, metrics HTTP server, then
+// the binary-protocol listener). Errors are logged, not returned, since shutdown runs on a
+// best-effort basis against ctx's deadline — s.Run() proceeds to close the storage engine
+// regardless of individual subsystem outcomes.
+func (s *Server) shutdown(ctx context.Context) {
+	logger := s.app.GetLogger()
+	if s.respSrv != nil {
+		if err := s.respSrv.Shutdown(ctx); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "resp server shutdown error", log.String("error", err.Error()))
+			}
+		}
+	}
+	if s.metricsSrv != nil {
+		if err := s.metricsSrv.Shutdown(ctx); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "metrics server shutdown error", log.String("error", err.Error()))
+			}
+		}
+	}
+	if err := s.netSrv.Shutdown(ctx); err != nil {
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "tcp server shutdown error", log.String("error", err.Error()))
 		}
 	}
 }
@@ -122,6 +175,7 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 		ReadTimeout:  3 * time.Second,
 		WriteTimeout: 3 * time.Second,
 	}
+	s.metricsSrv = httpSrv
 	go func() {
 		if logger.Enabled(log.LevelInfo) {
 			logger.Log(log.LevelInfo, "telemetry infrastructure online", log.String("addr", metricsAddr))
@@ -141,6 +195,7 @@ func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	respSrv := resp.NewServer(cfg.GetRESPAddr(), s.engine, logger)
+	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {
 			if logger.Enabled(log.LevelError) {
