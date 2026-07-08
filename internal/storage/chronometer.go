@@ -42,6 +42,15 @@ const (
 	SlotCapacity = 512
 )
 
+// slotLock pads a sync.Mutex out to a full cache line. Without the padding, 8 of the 1000
+// per-slot mutexes below would share one cache line, and concurrent Register calls hitting
+// neighboring slots would bounce that line between cores — quietly reintroducing the exact
+// contention the per-slot striping is meant to remove.
+type slotLock struct {
+	sync.Mutex
+	_ [56]byte
+}
+
 // Chronometer is a highly optimized, O(1) circular timeline for deterministic active TTL cache eviction.
 // It organizes expiring keys into circular time slots (buckets) to avoid the high overhead
 // of maintaining individual runtime timers per database key.
@@ -54,16 +63,25 @@ const (
 // the engine's deleteIfExpired callback — a stale slot entry for a refreshed key simply
 // no-ops when its slot fires.
 //
+// Locking is striped per slot (slotMu) rather than a single global mutex: Set() calls a
+// chronometer of this size 1:1 for every TTL write, so a single mutex here would serialize all
+// concurrent TTL writes across all 256 storage shards regardless of which slot they target.
+// Per-slot locks mean two Register calls only contend if they land in the same future tick.
+// curSlot is accessed via atomics for the same reason — advance() (the ticker goroutine) and
+// Register (called from any number of caller goroutines) both need to read/advance it without
+// a global lock.
+//
 // A sync.WaitGroup is used to ensure the background goroutine terminates cleanly when Stop() is called.
 type Chronometer struct {
-	mutex     sync.Mutex // protects slots and keySlotMap
 	interval  time.Duration
+	slotMu    [MaxSlots]slotLock
 	slots     [MaxSlots][SlotCapacity]string // each bucket holds keys scheduled to expire on that tick
 	slotSizes [MaxSlots]int
 	numSlots  uint32
-	curSlot   uint32
+	curSlot   atomic.Uint32
 	ticker    *time.Ticker
 	stop      chan struct{}
+	stopOnce  sync.Once
 	deletion  func(key string)
 	wg        sync.WaitGroup // tracks the background ticker goroutine
 	logger    log.Logger
@@ -91,13 +109,14 @@ func NewChronometer(deletion func(key string), interval time.Duration, numSlots 
 // advance turns the internal wheel by exactly one tick, isolates the expired bucket,
 // and flushes the dead keys out of the sharded storage engine.
 //
-// The slot's keys are snapshotted and the slot is reset while holding c.mutex, but the
-// (potentially shard-locking) deletions run AFTER releasing it. Holding the wheel mutex
-// across the delete loop would block every concurrent Set's Register() call for the whole
-// eviction wave, which was a major source of tail latency.
+// The slot's keys are snapshotted and the slot is reset while holding only that slot's lock,
+// but the (potentially shard-locking) deletions run AFTER releasing it. Holding a lock across
+// the delete loop would block any concurrent Register() call targeting the same slot for the
+// whole eviction wave, which was a major source of tail latency.
 func (c *Chronometer) advance() {
-	c.mutex.Lock()
-	slot := c.curSlot
+	slot := c.curSlot.Load()
+
+	c.slotMu[slot].Lock()
 	size := c.slotSizes[slot]
 	var batch []string
 	if size > 0 {
@@ -112,8 +131,9 @@ func (c *Chronometer) advance() {
 		c.slotSizes[slot] = 0
 		atomic.AddUint64(&c.expiredCount, uint64(size))
 	}
-	c.curSlot = (c.curSlot + 1) % c.numSlots
-	c.mutex.Unlock()
+	c.slotMu[slot].Unlock()
+
+	c.curSlot.Store((slot + 1) % c.numSlots)
 
 	for _, key := range batch {
 		c.deletion(key)
@@ -143,32 +163,29 @@ func (c *Chronometer) Start() {
 
 // Stop safely freezes the Chronometer timeline, releases underlying system tickers, and waits for the background goroutine to exit.
 func (c *Chronometer) Stop() {
-	c.mutex.Lock()
-	select {
-	case <-c.stop:
-		// already closed
-	default:
-
+	c.stopOnce.Do(func() {
 		close(c.stop)
 		if c.logger.Enabled(log.LevelInfo) {
 			c.logger.Log(log.LevelInfo, "stopping chronometer background routine")
 		}
-	}
-	c.mutex.Unlock()
+	})
 	c.wg.Wait()
 }
 
 // Register maps a key to a specific target slot in the future based on its given Time-To-Live (TTL).
-// This mapping runs with O(1) efficiency without altering execution pipelines.
+// This mapping runs with O(1) efficiency without altering execution pipelines. Only the target
+// slot's own lock is taken, so concurrent registrations for different future ticks never
+// contend with each other.
 func (c *Chronometer) Register(key string, ttl time.Duration) {
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
 	maxSteps := uint64(c.numSlots) - 1
 	steps := uint64(ttl / c.interval)
 	if steps > maxSteps {
 		steps = maxSteps
 	}
-	targetSlot := (c.curSlot + uint32(steps)) % c.numSlots
+	targetSlot := (c.curSlot.Load() + uint32(steps)) % c.numSlots
+
+	c.slotMu[targetSlot].Lock()
+	defer c.slotMu[targetSlot].Unlock()
 	size := c.slotSizes[targetSlot]
 	if size < SlotCapacity {
 		c.slots[targetSlot][size] = key
