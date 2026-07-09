@@ -243,7 +243,6 @@ Pull requests and pushes to `main` trigger the [CI workflow](.github/workflows/c
 - **Vet** — `go vet ./...`
 - **Test** — `go test ./...`
 - **Race tests** — `go test -race ./...`
-- **Lint** — `golangci-lint` (latest)
 
 Benchmarks are not run automatically on every push due to resource constraints.
 Run them locally with `task bench:native` or `task bench:resp:precise`.
