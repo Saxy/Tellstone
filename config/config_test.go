@@ -115,6 +115,9 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	if cfg.GetRESPAddr() != "127.0.0.1:6379" {
 		t.Fatalf("default RESP addr mismatch: %s", cfg.GetRESPAddr())
 	}
+	if cfg.GetNumShards() != 32 {
+		t.Fatalf("default NumShards mismatch: %d (expected 32 on this machine)", cfg.GetNumShards())
+	}
 
 	// Now set environment variables to override defaults.
 	os.Setenv("TSD_ADDR", "0.0.0.0:7777")
@@ -123,6 +126,7 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	os.Setenv("TSD_EVICT_SLOTS", "512")
 	os.Setenv("TSD_ENCRYPTION_KEY", "mykey")
 	os.Setenv("TSD_TRACE_RATIO", "0.25")
+	os.Setenv("TSD_NUM_SHARDS", "16")
 
 	cfg = LoadConfig(nil)
 
@@ -144,6 +148,9 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	if cfg.GetTraceRatio() != 0.25 {
 		t.Fatalf("env TraceRatio mismatch: %f", cfg.GetTraceRatio())
 	}
+	if cfg.GetNumShards() != 16 {
+		t.Fatalf("env NumShards mismatch: %d (expected 16)", cfg.GetNumShards())
+	}
 
 	// Clean up env so subsequent tests/packages see a pristine environment.
 	os.Unsetenv("TSD_ADDR")
@@ -152,4 +159,5 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	os.Unsetenv("TSD_EVICT_SLOTS")
 	os.Unsetenv("TSD_ENCRYPTION_KEY")
 	os.Unsetenv("TSD_TRACE_RATIO")
+	os.Unsetenv("TSD_NUM_SHARDS")
 }

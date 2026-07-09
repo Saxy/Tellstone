@@ -13,6 +13,7 @@ package config
 import (
 	"flag"
 	"os"
+	"runtime"
 	"strconv"
 	"time"
 
@@ -34,6 +35,7 @@ type Config struct {
 	enableRESP       bool
 	respAddr         string
 	shutdownTimeout  time.Duration
+	numShards        int
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -103,6 +105,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_ENABLE_METRICS  – boolean to activate the Prometheus exporter (default: false)
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
 //		TSD_SHUTDOWN_TIMEOUT – max wait for graceful shutdown on SIGINT/SIGTERM (default: 10s)
+//		TSD_NUM_SHARDS      – number of shared-nothing shards (default: GOMAXPROCS)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -218,6 +221,13 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_SHUTDOWN_TIMEOUT", 10*time.Second),
 		"Max time to wait for graceful shutdown on SIGINT/SIGTERM (default: 10s)",
 	)
+	// Number of shared-nothing shards (one goroutine + one lock-free map per shard).
+	fs.IntVar(
+		&cfg.numShards,
+		"shards",
+		getEnv("TSD_NUM_SHARDS", runtime.NumCPU()),
+		"Number of shared-nothing shards (default: GOMAXPROCS). Each shard = 1 goroutine + 1 lock-free map",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -249,3 +259,4 @@ func (cfg *Config) GetMaxMemBytes() uint64            { return cfg.maxMemBytes }
 func (cfg *Config) RESPEnabled() bool                 { return cfg.enableRESP }
 func (cfg *Config) GetRESPAddr() string               { return cfg.respAddr }
 func (cfg *Config) GetShutdownTimeout() time.Duration { return cfg.shutdownTimeout }
+func (cfg *Config) GetNumShards() int                 { return cfg.numShards }
