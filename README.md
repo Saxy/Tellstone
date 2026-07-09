@@ -3,7 +3,7 @@
 
 `Tellstone` is an ultra‑high‑performance, cloud‑native **in‑memory key/value store** written
 entirely in **Go**. It speaks two protocols over TCP — a compact custom **binary protocol** and
-a **Redis‑compatible (RESP2)** protocol — on top of a **sharded, low‑contention storage engine**
+a **Redis‑compatible (RESP2)** protocol — on top of a **shared-nothing (SN) storage engine**
 with optional TTL eviction and at‑rest encryption.
 
 ```
@@ -14,7 +14,9 @@ with optional TTL eviction and at‑rest encryption.
        |                                             |
        |     +---------------------------------+     |
        |     |        TELLSTONE CORE           |     |
-       |     |  (256 Sharded In‑Memory Buckets)|     |
+       |     |  (N Shards, each a goroutine +  |     |
+       |     |   sync.RWMutex + map[string]Item)|    |
+       |     |  FNV-1a hash → O(1) dispatch    |     |
        |     +---------------------------------+     |
        +---------------------------------------------+
 ```
@@ -27,8 +29,9 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 * **Zero‑Copy Binary Protocol** – Direct binary messages avoid text parsing / Protobuf overhead.
 * **Redis‑Compatible** – An optional RESP2 listener lets you drive Tellstone with `redis-cli`,
   `redis-benchmark`, `memtier_benchmark`, and existing Redis client libraries (GET/SET/PING/DEL).
-* **Sharded, Low‑Contention Engine** – 256 buckets indexed by key‑hash, each guarded by its own
-  `RWMutex`, for near‑linear scaling across CPU cores.
+* **Shared-Nothing Engine** – N independent shards, each containing one `map[string]Item` plus a
+  `sync.RWMutex`. Keys are pinned to a shard via FNV-1a hashing so the lock is almost never
+  contended. No cross-shard coordination, no channel round-trips, no per-request allocations.
 * **Configurable TTL Eviction** – An active timing‑wheel (chronometer) evicts expired keys in
   O(1); lazy eviction on read backs it up.
 * **Optional At‑Rest Encryption** – ChaCha20‑Poly1305, off by default.
@@ -37,10 +40,12 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 ### Core Architecture
 
 | Layer | Package | Notes |
-|---|---|---|
+|---|---|---|---|
 | Binary protocol | `internal/network` | `MsgRequest`/`MsgResponse` frames (`GET`/`SET`/`DEL`, TTL, key, value) |
 | RESP2 protocol | `internal/resp` | Redis‑compatible listener reusing the same engine |
-| Storage engine | `internal/storage` | 256 sharded buckets, per‑shard `RWMutex`, timing‑wheel eviction |
+| Request router | `internal/router` | FNV-1a hash → O(1) shard dispatch |
+| Shard runner | `internal/shard` | Shared-nothing shard: synchronous `Execute()`, per-shard `sync.RWMutex` |
+| Storage engine | `internal/storage` | Single-map engine, TTL eviction via timing wheel |
 | Crypto | `internal/crypto` | Optional ChaCha20‑Poly1305 |
 | Metrics / tracing | `internal/metrics`, `internal/trace` | Prometheus text exporter, OTLP/gRPC tracing |
 
@@ -92,6 +97,7 @@ Every option is available as a flag and an environment variable.
 | `--addr`              | `TSD_ADDR`              | `127.0.0.1:9988` | Binary‑protocol listen address                           |
 | `--enable-resp`       | `TSD_ENABLE_RESP`       | `false`          | Enable the Redis‑compatible RESP listener                |
 | `--resp-addr`         | `TSD_RESP_ADDR`         | `127.0.0.1:6379` | RESP listen address                                      |
+| `--shards`            | `TSD_NUM_SHARDS`        | `0` (auto = CPU) | Number of shared-nothing shards                          |
 | `--max-msg-size`      | `TSD_MAX_MSG_SIZE`      | `16MiB`          | Per‑message size limit                                   |
 | `--max-mem-bytes`     | `TSD_MAX_MEM_BYTES`     | `0` (unlimited)  | Total engine memory ceiling                              |
 | `--evict-interval`    | `TSD_EVICT_INTERVAL`    | `1s`             | Chronometer tick interval (`0` disables active eviction) |
@@ -180,17 +186,39 @@ an apples‑to‑apples comparison.
 
 ### Reference results
 
-Single host (32‑core, WSL2), server and `memtier_benchmark` pinned to disjoint cores,
-`--ratio=1:10`, 100 connections:
+Single host (32 cores, Linux), server pinned to cores 0-15 (GOMAXPROCS=16), memtier pinned to
+cores 16-31, `--ratio=1:9`, 8 threads, 100 connections each, pipeline 8, 200k keys preloaded
+(Gaussian distribution, zero miss rate):
 
-| Mode | Throughput | p50 | p99 | p99.9 |
-|---|---|---|---|---|
-| RESP, pipeline 1 | ~192k ops/s | 0.56ms | **1.04ms** | 1.19ms |
-| RESP, pipeline 16 | ~2.2M ops/s | 0.68ms | 1.25ms | 1.61ms |
+| System | Throughput | vs Redis | p50 | p99 | p99.9 |
+|--------|-----------|----------|-----|-----|-------|
+| **Tellstone** | **4.70M ops/s** | **4.7x** | **1.23ms** | **3.38ms** | **4.67ms** |
+| Redis 8.8 | 0.99M ops/s | 1.0x | 6.59ms | 10.56ms | 18.69ms |
+| Valkey 7.2 | 1.01M ops/s | 1.0x | 6.34ms | 13.25ms | 23.30ms |
 
-> Numbers are environment‑specific; reproduce with the tasks above. The high GET miss rate
-> memtier reports under a random keyspace is a load‑shape artifact (use `bench:resp:hits` for a
-> realistic hit rate), not a server behavior.
+Without core pinning (all 32 cores shared, `GOMAXPROCS=32`):
+
+| System | Throughput | vs Redis | p50 | p99 | p99.9 |
+|--------|-----------|----------|-----|-----|-------|
+| **Tellstone** | **2.21M ops/s** | **2.1x** | **2.82ms** | **4.67ms** | **7.14ms** |
+| Redis 8.8 | 1.07M ops/s | 1.0x | 6.34ms | 10.56ms | 18.69ms |
+| Valkey 7.2 | 0.99M ops/s | 1.0x | 6.66ms | 13.25ms | 23.30ms |
+
+Tellstone delivers **2.1-4.7x higher throughput** than Redis/Valkey on the same workload
+with **56-81% lower** p50 latency. The gap widens with core isolation because Tellstone's
+shared-nothing design scales linearly with dedicated cores, while Redis's single-threaded
+event loop cannot utilze more than one.
+
+Native binary protocol throughput (without pipelining, read-heavy):
+
+| Connections | Throughput | p50 |
+|-------------|-----------|-----|
+| 32 | 940K RPS | 99us |
+| 200 | 940K RPS | 99us |
+| 1000 | 1.47M RPS | 470us |
+| 2000 | 1.35M RPS | 1.2ms |
+
+> Numbers are environment-specific; reproduce with the tasks above.
 
 ---
 

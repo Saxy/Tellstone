@@ -1,4 +1,3 @@
-// Package config provides utilities for loading server configuration.
 /*
 Package config
 Tellstone Cloud-Native In-Memory Database
