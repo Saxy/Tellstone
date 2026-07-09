@@ -1,7 +1,10 @@
-# Tellstone <img src="tsd_logo.svg" width="100" height="100" alt="Description" style="vertical-align: middle;">
+# Tellstone <img src="tsd_logo.svg" width="100" height="100" alt="Tellstone logo" style="vertical-align: middle;">
 
+[![CI](https://github.com/Saxy/Tellstone/actions/workflows/ci.yml/badge.svg)](https://github.com/Saxy/Tellstone/actions/workflows/ci.yml)
+[![Go Version](https://img.shields.io/badge/Go-1.26-blue)](https://go.dev)
+[![License](https://img.shields.io/badge/License-Apache--2.0-green)](LICENSE)
 
-`Tellstone` is an ultra‑high‑performance, cloud‑native **in‑memory key/value store** written
+**Tellstone** is an ultra‑high‑performance, cloud‑native **in‑memory key/value store** written
 entirely in **Go**. It speaks two protocols over TCP — a compact custom **binary protocol** and
 a **Redis‑compatible (RESP2)** protocol — on top of a **shared-nothing (SN) storage engine**
 with optional TTL eviction and at‑rest encryption.
@@ -21,7 +24,7 @@ with optional TTL eviction and at‑rest encryption.
        +---------------------------------------------+
 ```
 
-## ⚡ Why Tellstone?
+## Why Tellstone?
 
 Many managed databases (PostgreSQL, MySQL, …) become bottlenecks under high‑frequency
 workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
@@ -51,7 +54,7 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 * **Go 1.26+**
@@ -115,7 +118,7 @@ path), `TSD_MEM_LIMIT_BYTES` (soft heap ceiling), `TSD_ENABLE_PROFILING` (serves
 
 ---
 
-## 🔌 Using Tellstone
+## Using Tellstone
 
 ### Redis‑compatible (RESP) — easiest
 
@@ -151,7 +154,7 @@ A runnable example lives in `cmd/example/client`.
 
 ---
 
-## 📊 Benchmarks
+## Benchmarks
 
 > **Methodology matters.** A naive local benchmark runs the load generator on the same cores as
 > the server's event loops, so the two contend for CPU and the latency tail balloons. All tasks
@@ -222,7 +225,7 @@ Native binary protocol throughput (without pipelining, read-heavy):
 
 ---
 
-## 🧪 Development
+## Development
 
 ```bash
 task test           # go test ./...
@@ -231,6 +234,19 @@ task vet            # go vet ./...
 task check          # vet + race tests (run before committing)
 task fmt            # format
 ```
+
+### Continuous Integration
+
+Pull requests and pushes to `main` trigger the [CI workflow](.github/workflows/ci.yml):
+
+- **Build** — `go build ./...`
+- **Vet** — `go vet ./...`
+- **Test** — `go test ./...`
+- **Race tests** — `go test -race ./...`
+- **Lint** — `golangci-lint` (latest)
+
+Benchmarks are not run automatically on every push due to resource constraints.
+Run them locally with `task bench:native` or `task bench:resp:precise`.
 
 ### Observability
 * **Metrics:** `task run:resp` with `--enable-metrics` exposes Prometheus text at
@@ -279,7 +295,7 @@ an SSH tunnel), or browse the raw index at `http://127.0.0.1:6060/debug/pprof/` 
 
 ---
 
-## 🛠️ Milestones
+## Milestones
 
 **Phase 1 — Core Engine (done):** sharded in‑memory engine with TTL eviction, binary TCP
 protocol, Redis‑compatible RESP listener (GET/SET/PING/DEL), at‑rest encryption, Prometheus
@@ -289,12 +305,12 @@ metrics and OpenTelemetry tracing.
 write‑through / write‑behind persistence, official client SDKs, and a broader RESP command set
 (RESP3, INCR, EXPIRE, MULTI/EXEC).
 
-## 🚀 Vision
+## Vision
 
 Tellstone aims to be the go‑to **in‑cluster accelerator** for cloud‑native applications —
 reducing latency and off‑loading traffic from downstream databases.
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome — especially around networking, replication, persistence, and RESP
 command coverage. Open an issue or start a discussion to share ideas.
