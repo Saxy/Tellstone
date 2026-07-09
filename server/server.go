@@ -2,7 +2,7 @@
 Package server
 Tellstone Cloud-Native In-Memory Database
 File: server.go
-Description: High‑level orchestration of all components (app, crypto, logger, network, storage). Exposes public error variables for client misuse and internal failures.
+Description: Top-level server orchestration: initializes the shared-nothing shards, router, binary-protocol listener, optional RESP listener, and metrics server. Handles graceful shutdown on SIGINT/SIGTERM.
 
 Authors:
 
@@ -27,43 +27,54 @@ import (
 	"github.com/Saxy/Tellstone/internal/metrics"
 	"github.com/Saxy/Tellstone/internal/network"
 	"github.com/Saxy/Tellstone/internal/resp"
-	"github.com/Saxy/Tellstone/internal/storage"
+	"github.com/Saxy/Tellstone/internal/router"
+	"github.com/Saxy/Tellstone/internal/shard"
 )
 
 var (
-	// ErrEmptyKey is returned when a client attempts a SET execution with a zero-length identifier.
-	ErrEmptyKey = errors.New("set requires a key")
-	// ErrStorageFailure is returned when the storage engine rejects data synchronization.
+	ErrEmptyKey       = errors.New("set requires a key")
 	ErrStorageFailure = errors.New("failed to store inside storage engine")
-	// ErrInvalidOpCode is returned when the unpacked message frame contains an unknown engine operation.
-	ErrInvalidOpCode = errors.New("unsupported protocol operation")
+	ErrInvalidOpCode  = errors.New("unsupported protocol operation")
 )
 
-type Server struct {
-	app    *tellstone.App
-	engine *storage.Engine
+type RouterStore struct {
+	router *router.Router
+}
 
+func (rs *RouterStore) Get(key string) ([]byte, bool) {
+	resp := rs.router.Dispatch("GET", key, nil, 0)
+	return resp.Value, resp.OK
+}
+
+func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
+	resp := rs.router.Dispatch("SET", key, value, ttl)
+	return resp.Err
+}
+
+func (rs *RouterStore) Delete(key string) {
+	rs.router.Dispatch("DEL", key, nil, 0)
+}
+
+type Server struct {
+	app        *tellstone.App
+	router     *router.Router
+	shards     []*shard.Shard
 	netSrv     *network.Server
 	respSrv    *resp.Server
 	metricsSrv *http.Server
 }
 
-// NewServer initializes a bare server abstraction waiting for network stack execution.
 func NewServer(app *tellstone.App) *Server {
 	return &Server{
 		app: app,
 	}
 }
 
-// Run configures cryptography, allocates the storage ring engine, and boots up the gnet event
-// loop. It blocks until the binary-protocol listener stops, either because of a fatal error or
-// because SIGINT/SIGTERM triggered a graceful shutdown of all subsystems.
 func (s *Server) Run() {
 	logger := s.app.GetLogger()
 	cfg := s.app.GetConfig()
 	cryptoEngine := s.initCrypto()
-	s.engine = s.initStorage(cryptoEngine)
-	defer s.engine.Close()
+	s.initShards(cryptoEngine)
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
@@ -81,8 +92,6 @@ func (s *Server) Run() {
 	defer stop()
 	go func() {
 		<-ctx.Done()
-		// Restore default signal behavior so a second SIGINT/SIGTERM force-kills the
-		// process if graceful shutdown hangs (e.g. a slow client refusing to drain).
 		stop()
 		if logger.Enabled(log.LevelInfo) {
 			logger.Log(log.LevelInfo, "shutdown signal received, draining connections")
@@ -102,10 +111,6 @@ func (s *Server) Run() {
 	}
 }
 
-// shutdown gracefully stops every running subsystem (RESP listener, metrics HTTP server, then
-// the binary-protocol listener). Errors are logged, not returned, since shutdown runs on a
-// best-effort basis against ctx's deadline — s.Run() proceeds to close the storage engine
-// regardless of individual subsystem outcomes.
 func (s *Server) shutdown(ctx context.Context) {
 	logger := s.app.GetLogger()
 	if s.respSrv != nil {
@@ -127,9 +132,18 @@ func (s *Server) shutdown(ctx context.Context) {
 			logger.Log(log.LevelError, "tcp server shutdown error", log.String("error", err.Error()))
 		}
 	}
+	for _, sh := range s.shards {
+		if err := sh.Stop(ctx); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "shard shutdown error",
+					log.Uint64("shard_id", uint64(sh.ID)),
+					log.String("error", err.Error()),
+				)
+			}
+		}
+	}
 }
 
-// initCrypto configures and validates the cryptographic subsystem if enabled.
 func (s *Server) initCrypto() *crypto.Engine {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
@@ -146,28 +160,35 @@ func (s *Server) initCrypto() *crypto.Engine {
 	return cryptoEngine
 }
 
-// initStorage instantiates the underlying memory engine with the required timing wheels.
-func (s *Server) initStorage(cryptoEngine *crypto.Engine) *storage.Engine {
+func (s *Server) initShards(cryptoEngine *crypto.Engine) {
 	cfg := s.app.GetConfig()
-	return storage.NewEngine(
-		cfg.GetEvictTicker(),
-		cfg.GetEvictSlots(),
-		cfg.GetMaxMemBytes(),
-		s.app.GetLogger(),
-		cryptoEngine,
-	)
+	numShards := cfg.GetNumShards()
+	logger := s.app.GetLogger()
+
+	s.shards = make([]*shard.Shard, numShards)
+	for i := 0; i < numShards; i++ {
+		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger)
+		if err != nil {
+			panic("shard init: " + err.Error())
+		}
+		s.shards[i] = sh
+	}
+	s.router = router.New(s.shards)
 }
 
-// startMetricsServer boots the asynchronous Prometheus text exporter on a separate HTTP port.
 func (s *Server) startMetricsServer(srv *network.Server) {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	metricsAddr := cfg.GetMetricsAddr()
-	collector := metrics.NewCollector(s.engine, srv, s.app.GetLogger())
+	shardCollectors := make([]*metrics.Collector, len(s.shards))
+	for i, sh := range s.shards {
+		shardCollectors[i] = metrics.NewShardCollector(uint32(sh.ID), sh.Engine, srv, logger)
+	}
+	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		collector.WritePrometheus(w)
+		aggregateCollector.WritePrometheus(w)
 	})
 	httpSrv := &http.Server{
 		Addr:         metricsAddr,
@@ -188,13 +209,11 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	}()
 }
 
-// startRESPServer boots the optional Redis-compatible (RESP2) listener on its own port,
-// sharing the storage engine. It runs in a goroutine because gnet.Run blocks; the binary
-// protocol server keeps owning the main goroutine.
 func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
-	respSrv := resp.NewServer(cfg.GetRESPAddr(), s.engine, logger)
+	store := &RouterStore{router: s.router}
+	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, logger)
 	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {
@@ -205,7 +224,6 @@ func (s *Server) startRESPServer() {
 	}()
 }
 
-// networkHandler unmarshals input frames, proxies operations to storage, and generates network responses.
 func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageType, error) {
 	if msg.Type == network.MsgPing {
 		return nil, network.MsgPong, nil
@@ -213,27 +231,28 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 	keyStr := *(*string)(unsafe.Pointer(&msg.Key))
 	switch msg.Op {
 	case network.OpGet:
-		val, ok := s.engine.Get(keyStr)
-		if !ok {
+		resp := s.router.Dispatch("GET", keyStr, nil, 0)
+		if !resp.OK {
 			return network.ResponseNotFound, network.MsgResponse, nil
 		}
-		return val, network.MsgResponse, nil
+		return resp.Value, network.MsgResponse, nil
 	case network.OpSet:
 		if len(msg.Key) == 0 {
 			return network.ResponseEmptyKey, network.MsgResponse, ErrEmptyKey
 		}
 		ttlDuration := time.Duration(msg.TTL) * time.Millisecond
-		if err := s.engine.Set(keyStr, msg.Value, ttlDuration); err != nil {
+		resp := s.router.Dispatch("SET", keyStr, msg.Value, ttlDuration)
+		if resp.Err != nil {
 			if s.app.GetLogger().Enabled(log.LevelError) {
-				s.app.GetLogger().Log(log.LevelError, "failed to store inside storage engine", log.String("error", err.Error()))
+				s.app.GetLogger().Log(log.LevelError, "failed to store inside storage engine", log.String("error", resp.Err.Error()))
 			}
 			return network.ResponseStorageFailure, network.MsgResponse, ErrStorageFailure
 		}
 		return network.ResponseOK, network.MsgResponse, nil
 	case network.OpDelete:
-		s.engine.Delete(keyStr)
+		s.router.Dispatch("DEL", keyStr, nil, 0)
 		return network.ResponseOK, network.MsgResponse, nil
 	default:
-		return network.ResponseInvalidOpCode, network.MsgResponse, ErrInvalidOpCode
+		return network.ResponseNotFound, network.MsgResponse, ErrInvalidOpCode
 	}
 }
