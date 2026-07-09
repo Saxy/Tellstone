@@ -4,6 +4,7 @@ package config
 
 import (
 	"os"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -115,8 +116,9 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	if cfg.GetRESPAddr() != "127.0.0.1:6379" {
 		t.Fatalf("default RESP addr mismatch: %s", cfg.GetRESPAddr())
 	}
-	if cfg.GetNumShards() != 32 {
-		t.Fatalf("default NumShards mismatch: %d (expected 32 on this machine)", cfg.GetNumShards())
+	wantShards := runtime.NumCPU()
+	if cfg.GetNumShards() != wantShards {
+		t.Fatalf("default NumShards mismatch: %d (expected %d)", cfg.GetNumShards(), wantShards)
 	}
 
 	// Now set environment variables to override defaults.
