@@ -71,5 +71,4 @@ If there is no measurable change, state "no measurable change".
 - [ ] New and existing tests pass locally (`go test ./...` and `go test -race ./...`)
 - [ ] I have updated the documentation (README, comments, or any relevant docs)
 - [ ] My changes generate no new `go vet` warnings
-- [ ] My changes generate no new lint warnings
 - [ ] Any breaking changes are documented and communicated
