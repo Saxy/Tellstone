@@ -48,14 +48,3 @@ func BenchmarkEngineSetGetParallelNoTTL(b *testing.B) {
 	})
 }
 
-// BenchmarkGetShardIndex isolates the FNV-1a shard-hash cost from the rest of Set/Get.
-func BenchmarkGetShardIndex(b *testing.B) {
-	eng := NewEngine(0, 0, 0, nil, nil)
-	defer eng.Close()
-	key := "tellstone:session:cluster-node-a:active:user:12345"
-	b.ResetTimer()
-	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
-		_ = eng.getShardIndex(key)
-	}
-}
