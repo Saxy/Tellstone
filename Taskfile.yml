@@ -191,6 +191,32 @@ tasks:
           {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
             -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
             --ratio=0:1 --key-maximum={{.KEYSPACE}} --hide-histogram
+  bench:resp:precise:
+    desc: "Reproducible baseline benchmark: 8 threads, 100 conns, pipeline 8, 90/10 read/write, with preload. Mirrors the pre-SN comparison table."
+    deps: [ build ]
+    cmds:
+      - |
+        set -e
+        command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
+        {{.TASKSET_SRV}} env GOMAXPROCS=16 TSD_LOG_LEVEL=error \
+          TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
+          ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
+        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
+        echo "Warte auf Tellstone RESP (Port {{.RESP_PORT}})..."
+        for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
+        nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server konnte nicht starten:"; cat /tmp/tellstone-bench.log; exit 1; }
+
+        echo "== preload 200000 keys =="
+        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
+          -t 1 -c 1 -n 200000 --ratio=1:0 --key-pattern=S:S \
+          --key-minimum=1 --key-maximum=200000 --hide-histogram | grep -E "Sets|Totals"
+
+        echo "== read-heavy (expect near-zero miss rate) =="
+        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
+          -t 8 -c 100 --test-time=10 --pipeline=8 \
+          --ratio=1:9 --key-maximum=200000 --key-pattern=G:G \
+          --key-stddev=50000 --hide-histogram
+
   bench:compare:
     desc: "Vergleiche DBs. Usage: task bench:compare TARGET=redis|valkey|tellstone [THREADS=...]"
     vars:

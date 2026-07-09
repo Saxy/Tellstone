@@ -1,3 +1,13 @@
+/*
+Package main
+Tellstone Cloud-Native In-Memory Database
+File: main.go
+Description: Native binary-protocol load generator. Opens multiple TCP connections and drives GET/SET requests against a Tellstone server, reporting throughput and latency percentiles.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package main
 
 import (
