@@ -17,6 +17,7 @@ import (
 
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/network"
+	"github.com/Saxy/Tellstone/internal/shard"
 	"github.com/Saxy/Tellstone/internal/storage"
 )
 
@@ -44,6 +45,7 @@ type Collector struct {
 	writer        io.Writer
 	engine        *storage.Engine
 	networkServer *network.Server
+	shard         *shard.Shard
 	logger        log.Logger
 	shardLabel    string
 }
@@ -52,11 +54,12 @@ func NewCollector(e *storage.Engine, n *network.Server, logger log.Logger) *Coll
 	return &Collector{engine: e, networkServer: n, logger: logger}
 }
 
-func NewShardCollector(id uint32, e *storage.Engine, n *network.Server, logger log.Logger) *Collector {
+func NewShardCollector(id uint32, sh *shard.Shard, e *storage.Engine, n *network.Server, logger log.Logger) *Collector {
 	label := "shard_" + strconv.FormatUint(uint64(id), 10)
 	return &Collector{
 		engine:        e,
 		networkServer: n,
+		shard:         sh,
 		logger:        logger,
 		shardLabel:    label,
 	}
@@ -78,6 +81,14 @@ func (c *Collector) GetEngineSnapshot() EngineSnapshot {
 }
 
 func (c *Collector) GetNetworkSnapshot() NetworkSnapshot {
+	if c.shard != nil {
+		return NetworkSnapshot{
+			ConnectedClients: c.shard.ConnectedClients(),
+			TotalConnections: c.shard.TotalConnections(),
+			BytesRead:        c.shard.BytesRead(),
+			BytesWritten:     c.shard.BytesWritten(),
+		}
+	}
 	n := c.networkServer
 	return NetworkSnapshot{
 		ConnectedClients: n.ConnectedClients(),
@@ -104,10 +115,10 @@ func (c *Collector) WritePrometheus(w io.Writer) {
 	c.writeMetric(prefix+"tellstone_engine_misses_total", "counter", "Failed lookups.", eng.MissCount)
 	c.writeMetric(prefix+"tellstone_engine_evictions_passive_total", "counter", "Passive evictions.", eng.PassiveEvictions)
 	c.writeMetric(prefix+"tellstone_engine_evictions_active_total", "counter", "Active evictions.", eng.ActiveEvictions)
-	c.writeMetric("tellstone_network_connected_clients", "gauge", "Active connections.", netSnap.ConnectedClients)
-	c.writeMetric("tellstone_network_connections_total", "counter", "Total connections.", netSnap.TotalConnections)
-	c.writeMetric("tellstone_network_bytes_read_total", "counter", "Bytes read.", netSnap.BytesRead)
-	c.writeMetric("tellstone_network_bytes_written_total", "counter", "Bytes written.", netSnap.BytesWritten)
+	c.writeMetric(prefix+"tellstone_network_connected_clients", "gauge", "Active connections.", netSnap.ConnectedClients)
+	c.writeMetric(prefix+"tellstone_network_connections_total", "counter", "Total connections.", netSnap.TotalConnections)
+	c.writeMetric(prefix+"tellstone_network_bytes_read_total", "counter", "Bytes read.", netSnap.BytesRead)
+	c.writeMetric(prefix+"tellstone_network_bytes_written_total", "counter", "Bytes written.", netSnap.BytesWritten)
 }
 
 func (c *Collector) writeMetric(name, mType, help string, value uint64) {

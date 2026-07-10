@@ -73,19 +73,18 @@ type slotLock struct {
 //
 // A sync.WaitGroup is used to ensure the background goroutine terminates cleanly when Stop() is called.
 type Chronometer struct {
-	interval  time.Duration
-	slotMu    [MaxSlots]slotLock
-	slots     [MaxSlots][SlotCapacity]string // each bucket holds keys scheduled to expire on that tick
-	slotSizes [MaxSlots]int
-	numSlots  uint32
-	curSlot   atomic.Uint32
-	ticker    *time.Ticker
-	stop      chan struct{}
-	stopOnce  sync.Once
-	deletion  func(key string)
-	wg        sync.WaitGroup // tracks the background ticker goroutine
-	logger    log.Logger
-
+	interval     time.Duration
+	slotMu       [MaxSlots]slotLock
+	slots        [MaxSlots][SlotCapacity]string // each bucket holds keys scheduled to expire on that tick
+	slotSizes    [MaxSlots]int
+	numSlots     uint32
+	curSlot      atomic.Uint32
+	ticker       *time.Ticker
+	stop         chan struct{}
+	stopOnce     sync.Once
+	deletion     func(key string)
+	wg           sync.WaitGroup // tracks the background ticker goroutine
+	logger       log.Logger
 	overflows    uint64
 	expiredCount uint64
 }

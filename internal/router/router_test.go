@@ -2,6 +2,7 @@ package router
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/Saxy/Tellstone/config"
@@ -9,9 +10,9 @@ import (
 	"github.com/Saxy/Tellstone/internal/shard"
 )
 
-func TestRouterDistribution(t *testing.T) {
-	numShards := 16
-	cfg := config.LoadConfig([]string{"-shards=16"})
+func testDistribution(t *testing.T, numShards int) {
+	t.Helper()
+	cfg := config.LoadConfig([]string{"-shards", fmt.Sprint(numShards)})
 	shards := make([]*shard.Shard, numShards)
 	for i := 0; i < numShards; i++ {
 		s, err := shard.Run(shard.ID(i), cfg, nil, log.NewNoOpLogger())
@@ -28,15 +29,25 @@ func TestRouterDistribution(t *testing.T) {
 	numKeys := 100000
 	for i := 0; i < numKeys; i++ {
 		key := "key:" + string(rune(i))
-		sid := hashKey(key) & (r.numShards - 1)
+		sid := hashKey(key) % r.numShards
 		counts[sid]++
 	}
 
 	for i, c := range counts {
 		if c == 0 {
-			t.Errorf("shard %d received 0 keys out of %d", i, numKeys)
+			t.Errorf("shard %d received 0 keys out of %d with %d shards", i, numKeys, numShards)
 		}
 	}
+}
+
+func TestRouterDistributionPowerOfTwo(t *testing.T) {
+	testDistribution(t, 16)
+}
+
+func TestRouterDistributionNonPowerOfTwo(t *testing.T) {
+	testDistribution(t, 10)
+	testDistribution(t, 7)
+	testDistribution(t, 3)
 }
 
 func TestRouterSetGet(t *testing.T) {

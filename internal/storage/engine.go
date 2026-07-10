@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
@@ -116,6 +117,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)
 	}
+	var storedKey string
 	if cryptoEnabled {
 		encryptedBuf := make([]byte, 0, neededSize)
 		value, err = e.cryptoEngine.EncryptInPlace(encryptedBuf, value)
@@ -127,10 +129,15 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 			}
 			return err
 		}
+		storedKey = strings.Clone(key)
 	} else {
-		value = append([]byte(nil), value...)
+		total := len(key) + len(value)
+		buf := make([]byte, total)
+		copy(buf, key)
+		copy(buf[len(key):], value)
+		storedKey = unsafe.String(unsafe.SliceData(buf), len(key))
+		value = buf[len(key):]
 	}
-	storedKey := strings.Clone(key)
 	e.mu.Lock()
 	oldItem, isUpdate := e.items[storedKey]
 	e.items[storedKey] = Item{

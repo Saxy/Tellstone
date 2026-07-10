@@ -23,7 +23,7 @@ func TestServerEcho(t *testing.T) {
 		}
 		return nil, 0, nil
 	}
-	srv := NewServer(addr, 0, handler, log.NewNoOpLogger())
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger())
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.ListenAndServe() }()
 	time.Sleep(100 * time.Millisecond)

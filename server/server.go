@@ -78,6 +78,7 @@ func (s *Server) Run() {
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
+		s.shards,
 		s.networkHandler,
 		logger,
 	)
@@ -182,7 +183,7 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	metricsAddr := cfg.GetMetricsAddr()
 	shardCollectors := make([]*metrics.Collector, len(s.shards))
 	for i, sh := range s.shards {
-		shardCollectors[i] = metrics.NewShardCollector(uint32(sh.ID), sh.Engine, srv, logger)
+		shardCollectors[i] = metrics.NewShardCollector(uint32(sh.ID), sh, sh.Engine, srv, logger)
 	}
 	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv)
 	mux := http.NewServeMux()
@@ -213,7 +214,7 @@ func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	store := &RouterStore{router: s.router}
-	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, logger)
+	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger)
 	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {
