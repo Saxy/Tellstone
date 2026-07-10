@@ -26,7 +26,7 @@ func (N NOOPLogger) Fatalf(format string, args ...any) {}
 const benchAddr = "127.0.0.1:9988"
 
 func TestMain(m *testing.M) {
-	srv := NewServer(benchAddr, 0, func(msg *Message) ([]byte, MessageType, error) {
+	srv := NewServer(benchAddr, 0, nil, func(msg *Message) ([]byte, MessageType, error) {
 		return msg.Payload, MsgResponse, nil
 	}, nil)
 

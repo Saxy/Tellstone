@@ -2,7 +2,7 @@
 Package router
 Tellstone Request Router
 File: router.go
-Description: Routes incoming requests to the correct shard using FNV-1a hashing. The key is hashed and masked against (numShards-1) for O(1) dispatch with zero shared state between shards.
+Description: Routes incoming requests to the correct shard using FNV-1a hashing. Uses modulo against the shard count so any positive shard count works, not only powers of two.
 
 Authors:
 
@@ -38,7 +38,7 @@ func hashKey(key string) uint32 {
 }
 
 func (r *Router) Dispatch(op string, key string, value []byte, ttl time.Duration) shard.Response {
-	sid := hashKey(key) & (r.numShards - 1)
+	sid := hashKey(key) % r.numShards
 	return r.shards[sid].Execute(op, key, value, ttl)
 }
 

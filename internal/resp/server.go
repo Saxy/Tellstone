@@ -22,6 +22,7 @@ import (
 	"unsafe"
 
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/shard"
 	"github.com/panjf2000/gnet/v2"
 )
 
@@ -34,10 +35,11 @@ type Store interface {
 }
 
 // connState holds per-connection scratch buffers reused across OnTraffic calls so the hot
-// path stays allocation-free.
+// path stays allocation-free, plus the assigned shard index for per-shard metrics.
 type connState struct {
-	out  []byte
-	args [][]byte
+	out     []byte
+	args    [][]byte
+	shardID int
 }
 
 // Server is an edge-triggered RESP2 listener backed by gnet.
@@ -58,14 +60,23 @@ type Server struct {
 	bytesRead        uint64
 	bytesWritten     uint64
 	protocolErrors   uint64
+	shards           []*shard.Shard
+	nextConn         uint64
 }
 
 // NewServer creates a RESP server bound to addr that dispatches commands to store.
-func NewServer(addr string, store Store, logger log.Logger) *Server {
+// shards is optional — if nil, per-shard metrics are not tracked.
+func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
-	return &Server{addr: addr, store: store, logger: logger, ready: make(chan struct{})}
+	return &Server{
+		addr:   addr,
+		store:  store,
+		shards: shards,
+		logger: logger,
+		ready:  make(chan struct{}),
+	}
 }
 
 // ListenAndServe starts the multi-reactor epoll event loop (blocking).
@@ -97,15 +108,27 @@ func (s *Server) OnBoot(eng gnet.Engine) gnet.Action {
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, 1)
 	atomic.AddUint64(&s.totalConnections, 1)
+	shardID := -1
+	if len(s.shards) > 0 {
+		sid := atomic.AddUint64(&s.nextConn, 1) - 1
+		sid = sid % uint64(len(s.shards))
+		shardID = int(sid)
+		s.shards[sid].IncConnectedClients()
+		s.shards[sid].IncTotalConnections()
+	}
 	c.SetContext(&connState{
-		out:  make([]byte, 0, 4096),
-		args: make([][]byte, 0, 8),
+		out:     make([]byte, 0, 4096),
+		args:    make([][]byte, 0, 8),
+		shardID: shardID,
 	})
 	return nil, gnet.None
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, ^uint64(0))
+	if st, ok := c.Context().(*connState); ok && st.shardID >= 0 && st.shardID < len(s.shards) {
+		s.shards[st.shardID].DecConnectedClients()
+	}
 	return gnet.None
 }
 
@@ -149,12 +172,20 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 		if _, err := c.Write(st.out); err != nil {
 			return gnet.Close
 		}
-		atomic.AddUint64(&s.bytesWritten, uint64(len(st.out)))
+		n := uint64(len(st.out))
+		atomic.AddUint64(&s.bytesWritten, n)
+		if st.shardID >= 0 && st.shardID < len(s.shards) {
+			s.shards[st.shardID].AddBytesWritten(n)
+		}
 	}
 	if _, err := c.Discard(consumed); err != nil {
 		return gnet.Close
 	}
-	atomic.AddUint64(&s.bytesRead, uint64(consumed))
+	n := uint64(consumed)
+	atomic.AddUint64(&s.bytesRead, n)
+	if st.shardID >= 0 && st.shardID < len(s.shards) {
+		s.shards[st.shardID].AddBytesRead(n)
+	}
 	return gnet.None
 }
 
@@ -231,7 +262,7 @@ func parseSetTTL(args [][]byte) (time.Duration, bool) {
 	if len(args) == 3 {
 		return 0, true
 	}
-	v, err := strconv.Atoi(string(args[4]))
+	v, err := strconv.Atoi(unsafe.String(unsafe.SliceData(args[4]), len(args[4])))
 	if err != nil || v < 0 {
 		return 0, false
 	}

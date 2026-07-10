@@ -11,11 +11,14 @@ func BenchmarkEngineSetNoTTL(b *testing.B) {
 	eng := NewEngine(1*time.Millisecond, 64, 0, nil, nil)
 	defer eng.Close()
 	val := []byte("benchmark_value")
+	keys := make([]string, 1000)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("benchmark_key_%d", i)
+	}
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("benchmark_key_%d", i%1000)
-		if err := eng.Set(key, val, 0); err != nil {
+		if err := eng.Set(keys[i%1000], val, 0); err != nil {
 			b.Fatalf("unexpected error: %v", err)
 		}
 	}

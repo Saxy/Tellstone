@@ -225,8 +225,8 @@ func LoadConfig(args []string) *Config {
 	fs.IntVar(
 		&cfg.numShards,
 		"shards",
-		getEnv("TSD_NUM_SHARDS", runtime.NumCPU()),
-		"Number of shared-nothing shards (default: GOMAXPROCS). Each shard = 1 goroutine + 1 lock-free map",
+		getEnv("TSD_NUM_SHARDS", 0),
+		"Number of shared-nothing shards (0 = GOMAXPROCS). Each shard = 1 goroutine + 1 lock-free map",
 	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
@@ -242,6 +242,9 @@ func LoadConfig(args []string) *Config {
 	cfg.evictSlots = uint32(evictSlots)
 	cfg.maxMsgSize = uint64(maxMsgSize)
 	cfg.maxMemBytes = uint64(maxMemBytes)
+	if cfg.numShards < 1 {
+		cfg.numShards = runtime.NumCPU()
+	}
 	return cfg
 }
 

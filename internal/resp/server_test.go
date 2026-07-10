@@ -54,7 +54,7 @@ func freeAddr(t *testing.T) string {
 
 func TestRESPServer_GetSetPingPipeline(t *testing.T) {
 	addr := freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), log.NewNoOpLogger())
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger())
 	go func() { _ = srv.ListenAndServe() }()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

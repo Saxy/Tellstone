@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/shard"
 	"github.com/panjf2000/gnet/v2"
 )
 
@@ -41,11 +42,15 @@ type Server struct {
 	bytesWritten     uint64
 	protocolErrors   uint64
 	handlerErrors    uint64
+
+	shards   []*shard.Shard
+	nextConn uint64
 }
 
 // NewServer initializes an edge-triggered networking server engine instance.
 // It applies defensive configuration defaults before spawning infrastructure.
-func NewServer(addr string, maxMsgSize uint64, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
+// shards is optional — if nil, per-shard metrics are not tracked.
+func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -64,6 +69,7 @@ func NewServer(addr string, maxMsgSize uint64, handler func(msg *Message) ([]byt
 		logger:     logger,
 		maxMsgSize: maxMsgSize,
 		ready:      make(chan struct{}),
+		shards:     shards,
 	}
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "tcp server created", log.Int("max_msg_size", int(maxMsgSize)))
@@ -100,11 +106,23 @@ func (s *Server) OnBoot(eng gnet.Engine) gnet.Action {
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, 1)
 	atomic.AddUint64(&s.totalConnections, 1)
+	if len(s.shards) > 0 {
+		sid := atomic.AddUint64(&s.nextConn, 1) - 1
+		sid = sid % uint64(len(s.shards))
+		c.SetContext(sid)
+		s.shards[sid].IncConnectedClients()
+		s.shards[sid].IncTotalConnections()
+	}
 	return nil, gnet.None
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, ^uint64(0))
+	if len(s.shards) > 0 {
+		if sid, ok := c.Context().(uint64); ok && int(sid) < len(s.shards) {
+			s.shards[sid].DecConnectedClients()
+		}
+	}
 	return gnet.None
 }
 
@@ -138,6 +156,11 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 		}
 		totalPacketLen := 5 + payloadLen
 		atomic.AddUint64(&s.bytesRead, uint64(totalPacketLen))
+		if len(s.shards) > 0 {
+			if sid, ok := c.Context().(uint64); ok && int(sid) < len(s.shards) {
+				s.shards[sid].AddBytesRead(uint64(totalPacketLen))
+			}
+		}
 		if s.handler != nil {
 			var (
 				respType    MessageType
@@ -162,7 +185,13 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 					}
 					return gnet.Close
 				}
-				atomic.AddUint64(&s.bytesWritten, uint64(5+len(respPayload)))
+				n := uint64(5 + len(respPayload))
+				atomic.AddUint64(&s.bytesWritten, n)
+				if len(s.shards) > 0 {
+					if sid, ok := c.Context().(uint64); ok && int(sid) < len(s.shards) {
+						s.shards[sid].AddBytesWritten(n)
+					}
+				}
 			}
 		}
 		_, err = c.Discard(totalPacketLen)
