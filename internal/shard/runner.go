@@ -22,9 +22,11 @@ import (
 )
 
 const (
-	cmdGet string = "GET"
-	cmdSet string = "SET"
-	cmdDel string = "DEL"
+	CmdGet    string = "GET"
+	CmdSet    string = "SET"
+	CmdDel    string = "DEL"
+	CmdPing   string = "PING"
+	CmdCommand string = "COMMAND"
 )
 
 type Shard struct {
@@ -75,16 +77,16 @@ func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logg
 
 func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) Response {
 	switch op {
-	case cmdGet:
+	case CmdGet:
 		val, ok := s.Engine.Get(key)
 		return Response{Value: val, OK: ok}
-	case cmdSet:
+	case CmdSet:
 		err := s.Engine.Set(key, value, ttl)
 		if err != nil {
 			return Response{Err: err}
 		}
 		return Response{OK: true}
-	case cmdDel:
+	case CmdDel:
 		s.Engine.Delete(key)
 		return Response{OK: true}
 	default:

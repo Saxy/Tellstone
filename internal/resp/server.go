@@ -48,13 +48,11 @@ type Server struct {
 	addr   string
 	store  Store
 	logger log.Logger
-
 	// eng and ready let Shutdown reach the running gnet engine: OnBoot fires once the event
 	// loop is accepting connections and hands us the Engine handle we need to stop it; ready
 	// is closed at that point so a concurrent Shutdown call can block until it's safe to stop.
-	eng   gnet.Engine
-	ready chan struct{}
-
+	eng              gnet.Engine
+	ready            chan struct{}
 	connectedClients uint64
 	totalConnections uint64
 	bytesRead        uint64
@@ -200,7 +198,7 @@ func (s *Server) dispatch(args [][]byte, out []byte) []byte {
 	}
 	cmd := args[0]
 	switch {
-	case EqualFold(cmd, "GET"):
+	case EqualFold(cmd, shard.CmdGet):
 		if len(args) != 2 {
 			return AppendError(out, "ERR wrong number of arguments for 'get' command")
 		}
@@ -211,7 +209,7 @@ func (s *Server) dispatch(args [][]byte, out []byte) []byte {
 		}
 		return AppendBulk(out, val)
 
-	case EqualFold(cmd, "SET"):
+	case EqualFold(cmd, shard.CmdSet):
 		if len(args) != 3 && len(args) != 5 {
 			return AppendError(out, "ERR wrong number of arguments for 'set' command")
 		}
@@ -225,7 +223,7 @@ func (s *Server) dispatch(args [][]byte, out []byte) []byte {
 		}
 		return append(out, respOK...)
 
-	case EqualFold(cmd, "DEL"):
+	case EqualFold(cmd, shard.CmdDel):
 		if len(args) < 2 {
 			return AppendError(out, "ERR wrong number of arguments for 'del' command")
 		}
@@ -239,13 +237,13 @@ func (s *Server) dispatch(args [][]byte, out []byte) []byte {
 		}
 		return AppendInt(out, n)
 
-	case EqualFold(cmd, "PING"):
+	case EqualFold(cmd, shard.CmdPing):
 		if len(args) >= 2 {
 			return AppendBulk(out, args[1])
 		}
 		return append(out, respPong...)
 
-	case EqualFold(cmd, "COMMAND"):
+	case EqualFold(cmd, shard.CmdCommand):
 		// redis-cli / some tools probe COMMAND DOCS|COUNT at startup; an empty array keeps
 		// the session alive without implementing the introspection surface.
 		return append(out, "*0\r\n"...)

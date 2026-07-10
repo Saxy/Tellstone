@@ -42,17 +42,17 @@ type RouterStore struct {
 }
 
 func (rs *RouterStore) Get(key string) ([]byte, bool) {
-	resp := rs.router.Dispatch("GET", key, nil, 0)
+	resp := rs.router.Dispatch(shard.CmdGet, key, nil, 0)
 	return resp.Value, resp.OK
 }
 
 func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
-	resp := rs.router.Dispatch("SET", key, value, ttl)
+	resp := rs.router.Dispatch(shard.CmdSet, key, value, ttl)
 	return resp.Err
 }
 
 func (rs *RouterStore) Delete(key string) {
-	rs.router.Dispatch("DEL", key, nil, 0)
+	rs.router.Dispatch(shard.CmdDel, key, nil, 0)
 }
 
 type Server struct {
@@ -232,7 +232,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 	keyStr := *(*string)(unsafe.Pointer(&msg.Key))
 	switch msg.Op {
 	case network.OpGet:
-		resp := s.router.Dispatch("GET", keyStr, nil, 0)
+		resp := s.router.Dispatch(shard.CmdGet, keyStr, nil, 0)
 		if !resp.OK {
 			return network.ResponseNotFound, network.MsgResponse, nil
 		}
@@ -242,7 +242,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 			return network.ResponseEmptyKey, network.MsgResponse, ErrEmptyKey
 		}
 		ttlDuration := time.Duration(msg.TTL) * time.Millisecond
-		resp := s.router.Dispatch("SET", keyStr, msg.Value, ttlDuration)
+		resp := s.router.Dispatch(shard.CmdSet, keyStr, msg.Value, ttlDuration)
 		if resp.Err != nil {
 			if s.app.GetLogger().Enabled(log.LevelError) {
 				s.app.GetLogger().Log(log.LevelError, "failed to store inside storage engine", log.String("error", resp.Err.Error()))
@@ -251,7 +251,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 		}
 		return network.ResponseOK, network.MsgResponse, nil
 	case network.OpDelete:
-		s.router.Dispatch("DEL", keyStr, nil, 0)
+		s.router.Dispatch(shard.CmdDel, keyStr, nil, 0)
 		return network.ResponseOK, network.MsgResponse, nil
 	default:
 		return network.ResponseNotFound, network.MsgResponse, ErrInvalidOpCode
