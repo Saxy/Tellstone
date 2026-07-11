@@ -18,23 +18,23 @@ import (
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/persistence"
 	"github.com/Saxy/Tellstone/internal/storage"
 )
 
 const (
-	CmdGet    string = "GET"
-	CmdSet    string = "SET"
-	CmdDel    string = "DEL"
-	CmdPing   string = "PING"
+	CmdGet     string = "GET"
+	CmdSet     string = "SET"
+	CmdDel     string = "DEL"
+	CmdPing    string = "PING"
 	CmdCommand string = "COMMAND"
 )
 
 type Shard struct {
-	ID     ID
-	Engine *storage.Engine
-	Logger log.Logger
-
-	// Per-shard network metrics updated atomically from gnet event-loop goroutines.
+	ID               ID
+	Engine           *storage.Engine
+	Logger           log.Logger
+	Persistence      *persistence.Storage
 	connectedClients int64
 	totalConnections uint64
 	bytesRead        uint64
@@ -52,7 +52,7 @@ func (s *Shard) TotalConnections() uint64 { return atomic.LoadUint64(&s.totalCon
 func (s *Shard) BytesRead() uint64        { return atomic.LoadUint64(&s.bytesRead) }
 func (s *Shard) BytesWritten() uint64     { return atomic.LoadUint64(&s.bytesWritten) }
 
-func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logger) (*Shard, error) {
+func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logger, store *persistence.Storage) (*Shard, error) {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -68,11 +68,30 @@ func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logg
 		shardLogger,
 		cryptoEngine,
 	)
-	return &Shard{
-		ID:     id,
-		Engine: engine,
-		Logger: logger,
-	}, nil
+	if store == nil {
+		store = persistence.NewStorage(false, logger, "")
+	}
+	shard := &Shard{
+		ID:          id,
+		Engine:      engine,
+		Logger:      logger,
+		Persistence: store,
+	}
+	if store.Enabled() {
+		if err := store.OpenShard(uint32(id)); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "persitence can not open shard")
+			}
+			return nil, err
+		}
+		if err := store.LoadShard(uint32(id), engine); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "persitence can not load file")
+			}
+			return nil, err
+		}
+	}
+	return shard, nil
 }
 
 func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) Response {
@@ -81,9 +100,18 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		val, ok := s.Engine.Get(key)
 		return Response{Value: val, OK: ok}
 	case CmdSet:
+		var expiration time.Time
+		if ttl > 0 {
+			expiration = time.Now().Add(ttl)
+		}
 		err := s.Engine.Set(key, value, ttl)
 		if err != nil {
 			return Response{Err: err}
+		}
+		if s.Persistence.Enabled() {
+			if err = s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
+				s.Logger.Log(log.LevelError, "failed to persist key", log.String("key", key))
+			}
 		}
 		return Response{OK: true}
 	case CmdDel:

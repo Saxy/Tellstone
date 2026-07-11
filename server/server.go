@@ -26,6 +26,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/metrics"
 	"github.com/Saxy/Tellstone/internal/network"
+	"github.com/Saxy/Tellstone/internal/persistence"
 	"github.com/Saxy/Tellstone/internal/resp"
 	"github.com/Saxy/Tellstone/internal/router"
 	"github.com/Saxy/Tellstone/internal/shard"
@@ -166,9 +167,14 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) {
 	numShards := cfg.GetNumShards()
 	logger := s.app.GetLogger()
 
+	var store *persistence.Storage
+	if cfg.PersistenceEnabled() {
+		store = persistence.NewStorage(true, logger, cfg.GetPersistenceDir())
+	}
+
 	s.shards = make([]*shard.Shard, numShards)
 	for i := 0; i < numShards; i++ {
-		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger)
+		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger, store)
 		if err != nil {
 			panic("shard init: " + err.Error())
 		}

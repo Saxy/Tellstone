@@ -36,6 +36,8 @@ type Config struct {
 	respAddr         string
 	shutdownTimeout  time.Duration
 	numShards        int
+	enablePersistence bool
+	persistenceDir    string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -106,6 +108,8 @@ func getEnv[T any](key string, fallback T) T {
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
 //		TSD_SHUTDOWN_TIMEOUT – max wait for graceful shutdown on SIGINT/SIGTERM (default: 10s)
 //		TSD_NUM_SHARDS      – number of shared-nothing shards (default: GOMAXPROCS)
+//		TSD_ENABLE_PERSISTENCE – boolean to enable WAL persistence (default: false)
+//		TSD_PERSISTENCE_DIR  – directory for persistence data files (default: ~/.local/share/tellstone/data)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -228,6 +232,19 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_NUM_SHARDS", 0),
 		"Number of shared-nothing shards (0 = GOMAXPROCS). Each shard = 1 goroutine + 1 lock-free map",
 	)
+	// Optional write-ahead log persistence per shard.
+	fs.BoolVar(
+		&cfg.enablePersistence,
+		"enable-persistence",
+		getEnv("TSD_ENABLE_PERSISTENCE", false),
+		"Enable write-ahead log persistence for crash recovery (default: false)",
+	)
+	fs.StringVar(
+		&cfg.persistenceDir,
+		"persistence-dir",
+		getEnv("TSD_PERSISTENCE_DIR", ""),
+		"Directory for persistence data files (default: ~/.local/share/tellstone/data on Linux)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -263,3 +280,5 @@ func (cfg *Config) RESPEnabled() bool                 { return cfg.enableRESP }
 func (cfg *Config) GetRESPAddr() string               { return cfg.respAddr }
 func (cfg *Config) GetShutdownTimeout() time.Duration { return cfg.shutdownTimeout }
 func (cfg *Config) GetNumShards() int                 { return cfg.numShards }
+func (cfg *Config) PersistenceEnabled() bool           { return cfg.enablePersistence }
+func (cfg *Config) GetPersistenceDir() string          { return cfg.persistenceDir }

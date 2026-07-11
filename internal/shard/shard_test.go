@@ -12,7 +12,7 @@ func TestShardIsolation(t *testing.T) {
 	cfg := config.LoadConfig([]string{"-shards=4"})
 	shards := make([]*Shard, 4)
 	for i := 0; i < 4; i++ {
-		s, err := Run(ID(i), cfg, nil, log.NewNoOpLogger())
+		s, err := Run(ID(i), cfg, nil, log.NewNoOpLogger(), nil)
 		if err != nil {
 			t.Fatalf("shard %d: %v", i, err)
 		}
@@ -40,7 +40,7 @@ func TestShardIsolation(t *testing.T) {
 
 func TestShardSetGetDelete(t *testing.T) {
 	cfg := config.LoadConfig([]string{"-shards=1"})
-	s, err := Run(0, cfg, nil, log.NewNoOpLogger())
+	s, err := Run(0, cfg, nil, log.NewNoOpLogger(), nil)
 	if err != nil {
 		t.Fatalf("shard init: %v", err)
 	}
@@ -73,7 +73,7 @@ func TestShardSetGetDelete(t *testing.T) {
 
 func TestShardStoppedError(t *testing.T) {
 	cfg := config.LoadConfig([]string{"-shards=1"})
-	s, err := Run(0, cfg, nil, log.NewNoOpLogger())
+	s, err := Run(0, cfg, nil, log.NewNoOpLogger(), nil)
 	if err != nil {
 		t.Fatalf("shard init: %v", err)
 	}
