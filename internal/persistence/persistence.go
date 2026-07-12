@@ -110,6 +110,46 @@ func (s *Storage) getShard(shardID uint32) *shardHandle {
 	return h
 }
 
+// appendRecord is the shared write path for both SET and tombstone records.
+// It acquires the shard mutex, writes the header, key, value, and syncs.
+func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, value []byte, op string) error {
+	h := s.getShard(shardID)
+	if h == nil {
+		return fmt.Errorf("persistence: shard %d not opened", shardID)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, err := h.file.Write(header[:]); err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write "+op+" header failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	if _, err := h.file.WriteString(key); err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write "+op+" key failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	if _, err := h.file.Write(value); err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write "+op+" value failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	if err := h.file.Sync(); err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: sync "+op+" failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	return nil
+}
+
 // Write appends a SET record to the shard's WAL file. The record includes a
 // 16-byte header (key length, value length, TTL), followed by key and value bytes.
 // The write and trailing Sync are serialized under the shard's own mutex.
@@ -132,12 +172,6 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 		}
 		return fmt.Errorf("persistence: value too large (%d bytes, max %d)", len(value), ^uint32(0))
 	}
-	h := s.getShard(shardID)
-	if h == nil {
-		return fmt.Errorf("persistence: shard %d not opened", shardID)
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	var header [16]byte
 	var ttlNano int64
 	if !ttl.IsZero() {
@@ -151,35 +185,7 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 			log.Uint("shard", shardID), log.String("key", key),
 			log.Int("key_len", len(key)), log.Int("val_len", len(value)))
 	}
-	if _, err := h.file.Write(header[:]); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write header failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	if _, err := h.file.WriteString(key); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write key failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	if _, err := h.file.Write(value); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write value failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	if err := h.file.Sync(); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: sync failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	return nil
+	return s.appendRecord(shardID, header, key, value, "set")
 }
 
 // Delete appends a tombstone record to the shard's WAL file. The tombstone
@@ -198,12 +204,6 @@ func (s *Storage) Delete(shardID uint32, key string) error {
 		}
 		return fmt.Errorf("persistence: key too large (%d bytes, max %d)", len(key), ^uint32(0))
 	}
-	h := s.getShard(shardID)
-	if h == nil {
-		return fmt.Errorf("persistence: shard %d not opened", shardID)
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	var header [16]byte
 	binary.LittleEndian.PutUint32(header[0:4], uint32(len(key)))
 	binary.LittleEndian.PutUint32(header[4:8], 0)
@@ -212,28 +212,7 @@ func (s *Storage) Delete(shardID uint32, key string) error {
 		s.logger.Log(log.LevelDebug, "persistence: delete",
 			log.Uint("shard", shardID), log.String("key", key))
 	}
-	if _, err := h.file.Write(header[:]); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write delete header failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	if _, err := h.file.WriteString(key); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write delete key failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	if err := h.file.Sync(); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: sync delete failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	return nil
+	return s.appendRecord(shardID, header, key, nil, "delete")
 }
 
 // OpenShard opens (or creates) the WAL file for the given shard.
@@ -266,7 +245,8 @@ func (s *Storage) OpenShard(shardID uint32) error {
 
 // LoadShard replays all records from the shard's WAL file into the given engine,
 // skipping expired keys and applying tombstones as deletions. Truncated records
-// from a crash mid-write are silently skipped.
+// from a crash mid-write are detected and the WAL is truncated to the last valid
+// offset so future loads resume from a clean end.
 func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 	h := s.getShard(shardID)
 	if h == nil {
@@ -283,12 +263,14 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		h.mu.Unlock()
 		return err
 	}
-	remaining := fi.Size()
+	fileSize := fi.Size()
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "persistence: loading shard",
-			log.Uint("shard", shardID), log.Int64("file_size", remaining))
+			log.Uint("shard", shardID), log.Int64("file_size", fileSize))
 	}
 	h.mu.Unlock()
+	remaining := fileSize
+	var validOffset int64
 	header := make([]byte, 16)
 	var recordsRead int
 	var recordsSkipped int
@@ -308,7 +290,6 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		if int64(keyLen)+int64(valLen) > remaining {
 			break
 		}
-		remaining -= int64(keyLen) + int64(valLen)
 		keyBuf := make([]byte, keyLen)
 		if _, err = io.ReadFull(f, keyBuf); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -323,6 +304,8 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 			}
 			return fmt.Errorf("persistence: read value: %w", err)
 		}
+		remaining -= int64(keyLen) + int64(valLen)
+		validOffset = fileSize - remaining
 		recordsRead++
 		ttlVal := int64(ttlNano)
 		if ttlVal == tombstoneTTL {
@@ -350,6 +333,22 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		if err = engine.Set(string(keyBuf), valBuf, duration); err != nil {
 			return err
 		}
+	}
+	if validOffset < fileSize {
+		h.mu.Lock()
+		if err := f.Truncate(validOffset); err != nil {
+			h.mu.Unlock()
+			if s.logger.Enabled(log.LevelWarn) {
+				s.logger.Log(log.LevelWarn, "persistence: failed to truncate corrupted tail",
+					log.Uint("shard", shardID), log.String("error", err.Error()))
+			}
+		} else {
+			if s.logger.Enabled(log.LevelInfo) {
+				s.logger.Log(log.LevelInfo, "persistence: truncated corrupted WAL tail",
+					log.Uint("shard", shardID), log.Int64("from", fileSize), log.Int64("to", validOffset))
+			}
+		}
+		h.mu.Unlock()
 	}
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "persistence: shard loaded",

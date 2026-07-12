@@ -72,11 +72,16 @@ func NewServer(app *tellstone.App) *Server {
 	}
 }
 
-func (s *Server) Run() {
+func (s *Server) Run() error {
 	logger := s.app.GetLogger()
 	cfg := s.app.GetConfig()
-	cryptoEngine := s.initCrypto()
-	s.initShards(cryptoEngine)
+	cryptoEngine, err := s.initCrypto()
+	if err != nil {
+		return fmt.Errorf("crypto init: %w", err)
+	}
+	if err := s.initShards(cryptoEngine); err != nil {
+		return fmt.Errorf("shard init: %w", err)
+	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
@@ -106,12 +111,14 @@ func (s *Server) Run() {
 
 	if err := s.netSrv.ListenAndServe(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
-			return
+			return nil
 		}
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "tcp error", log.String("error", err.Error()))
 		}
+		return err
 	}
+	return nil
 }
 
 func (s *Server) shutdown(ctx context.Context) {
@@ -147,23 +154,23 @@ func (s *Server) shutdown(ctx context.Context) {
 	}
 }
 
-func (s *Server) initCrypto() *crypto.Engine {
+func (s *Server) initCrypto() (*crypto.Engine, error) {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	if !cfg.EncryptionEnabled() {
-		return nil
+		return nil, nil
 	}
 	cryptoEngine, err := crypto.NewEngine([]byte(cfg.GetEncryptionKey()), logger)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "crypto engine setup failed", log.String("error", err.Error()))
 		}
-		panic("crypto engine initialization failed: " + err.Error())
+		return nil, fmt.Errorf("crypto engine initialization: %w", err)
 	}
-	return cryptoEngine
+	return cryptoEngine, nil
 }
 
-func (s *Server) initShards(cryptoEngine *crypto.Engine) {
+func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 	cfg := s.app.GetConfig()
 	numShards := cfg.GetNumShards()
 	logger := s.app.GetLogger()
@@ -176,7 +183,7 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) {
 			if logger.Enabled(log.LevelError) {
 				logger.Log(log.LevelError, "persistence initialization failed", log.String("error", err.Error()))
 			}
-			panic("persistence initialization failed: " + err.Error())
+			return fmt.Errorf("persistence initialization: %w", err)
 		}
 	}
 
@@ -188,11 +195,12 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) {
 				logger.Log(log.LevelError, "shard initialization failed",
 					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", i)))
 			}
-			panic("shard init: " + err.Error())
+			return fmt.Errorf("shard %d init: %w", i, err)
 		}
 		s.shards[i] = sh
 	}
 	s.router = router.New(s.shards)
+	return nil
 }
 
 func (s *Server) startMetricsServer(srv *network.Server) {

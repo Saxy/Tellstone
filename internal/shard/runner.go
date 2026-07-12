@@ -107,13 +107,14 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		if ttl > 0 {
 			expiration = time.Now().Add(ttl)
 		}
+		_, keyExisted := s.Engine.Get(key)
 		if s.Persistence.Enabled() {
 			if err := s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
 				return Response{Err: err}
 			}
 		}
 		if err := s.Engine.Set(key, value, ttl); err != nil {
-			if s.Persistence.Enabled() {
+			if s.Persistence.Enabled() && !keyExisted {
 				if delErr := s.Persistence.Delete(uint32(s.ID), key); delErr != nil {
 					s.Logger.Log(log.LevelError, "persistence: compensation delete failed after engine rejection",
 						log.String("key", key), log.String("error", delErr.Error()))
