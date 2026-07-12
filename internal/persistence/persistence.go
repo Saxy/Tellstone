@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -18,6 +19,8 @@ const (
 	osWindows = "windows"
 	osDarwin  = "darwin"
 )
+
+var tombstoneTTL int64 = math.MinInt64
 
 func getDefaultDir() string {
 	var baseDir string
@@ -104,7 +107,11 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 		return fmt.Errorf("persistence: value too large (%d bytes, max %d)", len(value), ^uint32(0))
 	}
 	s.mu.Lock()
-	writer := s.file[shardID]
+	writer, exist := s.file[shardID]
+	if !exist {
+		s.mu.Unlock()
+		return fmt.Errorf("persistence: shard %d not opened", shardID)
+	}
 	var header [16]byte
 	var ttlNano int64
 	if !ttl.IsZero() {
@@ -146,6 +153,48 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 		s.mu.Unlock()
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: sync failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Storage) Delete(shardID uint32, key string) error {
+	if !s.enabled {
+		return nil
+	}
+	s.mu.Lock()
+	writer := s.file[shardID]
+	var header [16]byte
+	binary.LittleEndian.PutUint32(header[0:4], uint32(len(key)))
+	binary.LittleEndian.PutUint32(header[4:8], 0)
+	binary.LittleEndian.PutUint64(header[8:16], uint64(tombstoneTTL))
+	if s.logger.Enabled(log.LevelDebug) {
+		s.logger.Log(log.LevelDebug, "persistence: delete",
+			log.Uint("shard", shardID), log.String("key", key))
+	}
+	if _, err := writer.Write(header[:]); err != nil {
+		s.mu.Unlock()
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write delete header failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	if _, err := writer.WriteString(key); err != nil {
+		s.mu.Unlock()
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write delete key failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	if err := writer.Sync(); err != nil {
+		s.mu.Unlock()
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: sync delete failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
@@ -229,6 +278,16 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 			return fmt.Errorf("persistence: read value: %w", err)
 		}
 		recordsRead++
+		ttlVal := int64(ttlNano)
+		if ttlVal == tombstoneTTL {
+			if s.logger.Enabled(log.LevelDebug) {
+				s.logger.Log(log.LevelDebug, "persistence: replaying delete",
+					log.Uint("shard", shardID), log.String("key", string(keyBuf)))
+			}
+			engine.Delete(string(keyBuf))
+			recordsSkipped++
+			continue
+		}
 		var duration time.Duration
 		if ttlNano != 0 {
 			ttl := time.Unix(0, ttlNano)

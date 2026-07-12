@@ -174,28 +174,24 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) {
 		store, err = persistence.NewStorage(true, logger, cfg.GetPersistenceDir())
 		if err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "persistence initialization failed, continuing without persistence",
-					log.String("error", err.Error()))
+				logger.Log(log.LevelError, "persistence initialization failed", log.String("error", err.Error()))
 			}
-			store = nil
+			panic("persistence initialization failed: " + err.Error())
 		}
 	}
 
 	s.shards = make([]*shard.Shard, numShards)
-	var activeShards int
 	for i := 0; i < numShards; i++ {
 		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger, store)
 		if err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "shard initialization failed, skipping",
+				logger.Log(log.LevelError, "shard initialization failed",
 					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", i)))
 			}
-			continue
+			panic("shard init: " + err.Error())
 		}
-		s.shards[activeShards] = sh
-		activeShards++
+		s.shards[i] = sh
 	}
-	s.shards = s.shards[:activeShards]
 	s.router = router.New(s.shards)
 }
 

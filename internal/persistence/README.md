@@ -26,12 +26,12 @@ Offset  Size  Field       Encoding
 ------  ----  ----------  --------
 0       4     keyLen      uint32 little-endian
 4       4     valLen      uint32 little-endian
-8       8     ttlNano     int64  little-endian (0 = no expiry)
+8       8     ttlNano     int64  little-endian (0 = no expiry, MinInt64 = tombstone)
 16      var   key         raw bytes (keyLen)
 16+var  var   value       raw bytes (valLen)
 ```
 
-A TTL value of `0` in the on-disk format means "no expiry". The `LoadShard` function treats `ttlNano == 0` as a live key with no time-to-live.
+A TTL value of `0` in the on-disk format means "no expiry". The `LoadShard` function treats `ttlNano == 0` as a live key with no time-to-live. A TTL value of `math.MinInt64` is a **tombstone marker** indicating the key was deleted; `LoadShard` applies the deletion during replay so deleted keys do not reappear after restart.
 
 ---
 
@@ -50,9 +50,14 @@ func (s *Storage) Enabled() bool
 // Must be called before Write or LoadShard for that shard.
 func (s *Storage) OpenShard(shardID uint32) error
 
-// Write appends a single record to the shard's WAL file.
+// Write appends a single SET record to the shard's WAL file.
 // Returns nil immediately when persistence is disabled.
 func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time) error
+
+// Delete appends a tombstone record to the shard's WAL file.
+// During replay, the tombstone causes the key to be deleted from the engine.
+// Returns nil immediately when persistence is disabled.
+func (s *Storage) Delete(shardID uint32, key string) error
 
 // LoadShard replays all records from the shard's WAL file into the given engine,
 // skipping expired keys.
@@ -131,8 +136,8 @@ Key observations:
 
 Persistence is wired into Tellstone's shard layer (`internal/shard/runner.go`):
 
-1. **Startup:** When the server starts with persistence enabled, each shard calls `OpenShard` and `LoadShard` to replay its WAL file into the in-memory engine.
-2. **Write path:** Before every `Engine.Set()`, the shard calls `Persistence.Write()` to append the record to disk. If the write fails, the SET returns an error to the client and the in-memory state is not modified. `Persistence.Write` is best-effort storage: write failures are logged, but data may not survive a power failure since the OS page cache may not have flushed to disk.
+1. **Startup:** When the server starts with persistence enabled, each shard calls `OpenShard` and `LoadShard` to replay its WAL file into the in-memory engine. Tombstone records cause keys to be deleted during replay.
+2. **Write path:** Before every `Engine.Set()`, the shard calls `Persistence.Write()` to append the SET record to disk. Before every `Engine.Delete()`, the shard calls `Persistence.Delete()` to append a tombstone record. If either write fails, the operation returns an error to the client. `Persistence.Write` and `Persistence.Delete` are best-effort storage: write failures are logged, but data may not survive a power failure since the OS page cache may not have flushed to disk.
 3. **Shutdown:** On graceful shutdown, in-memory state is preserved. Uncommitted WAL entries (if any) are irrelevant because the engine is consistent at shutdown.
 
 ### Platform-Specific Default Directories
@@ -165,6 +170,6 @@ go test -race ./internal/persistence/
 ## Architectural Notes & Constraints
 
 * **No compaction (yet):** The WAL is append-only. Over time, duplicate keys accumulate in the file. `LoadShard` replays all records in order, so the final in-memory state is correct (last-write-wins). A future compaction pass can reclaim space.
-* **Deletes are not persisted:** `DEL` operations only remove the key from the in-memory engine. The WAL does not currently write tombstone records, so deleted keys will not reappear after restart because they were never written to the WAL in the first place. If delete persistence across restarts is needed in the future, a tombstone record type can be added to the binary format.
+* **Deletes are persisted as tombstones:** `DEL` operations write a tombstone record (header with `ttlNano = math.MinInt64`) to the WAL. During `LoadShard` replay, tombstones are applied after earlier SET records, so deleted keys remain absent after restart. Tombstone records accumulate in the append-only WAL and are reclaimed by future compaction.
 * **File handles:** One open file per shard. The file is opened `O_RDWR` to support both `Write` (append) and `LoadShard` (read from start). A per-shard mutex serializes concurrent writes, and `Sync` is called after each record to ensure durability to disk. The OS page cache handles buffering, so no userspace `bufio.Writer` is used.
 * **Crash safety:** Because the WAL is append-only and each record is written atomically (header + key + value under a per-shard mutex with a trailing `Sync`), a partial write at crash time results in a truncated record that `LoadShard` will detect as a read error. Future work can add a checksum footer to make this explicit.

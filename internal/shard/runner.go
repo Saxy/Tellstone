@@ -113,10 +113,21 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 			}
 		}
 		if err := s.Engine.Set(key, value, ttl); err != nil {
+			if s.Persistence.Enabled() {
+				if delErr := s.Persistence.Delete(uint32(s.ID), key); delErr != nil {
+					s.Logger.Log(log.LevelError, "persistence: compensation delete failed after engine rejection",
+						log.String("key", key), log.String("error", delErr.Error()))
+				}
+			}
 			return Response{Err: err}
 		}
 		return Response{OK: true}
 	case CmdDel:
+		if s.Persistence.Enabled() {
+			if err := s.Persistence.Delete(uint32(s.ID), key); err != nil {
+				return Response{Err: err}
+			}
+		}
 		s.Engine.Delete(key)
 		return Response{OK: true}
 	default:
