@@ -200,29 +200,32 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 	for {
 		var n int
 		n, err = io.ReadFull(f, header)
-		if n == 0 && err == io.EOF {
-			break
-		}
 		if err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break // clean EOF or a truncated trailing header from a crash mid-write
+			}
 			return fmt.Errorf("persistence: incomplete header read (%d bytes): %w", n, err)
-		}
-		if remaining < 16 {
-			return fmt.Errorf("persistence: truncated header")
 		}
 		remaining -= 16
 		keyLen := binary.LittleEndian.Uint32(header[0:4])
 		valLen := binary.LittleEndian.Uint32(header[4:8])
 		ttlNano := int64(binary.LittleEndian.Uint64(header[8:16]))
 		if int64(keyLen)+int64(valLen) > remaining {
-			return fmt.Errorf("persistence: record payload exceeds remaining file (%d+%d > %d)", keyLen, valLen, remaining)
+			break // truncated trailing record
 		}
 		remaining -= int64(keyLen) + int64(valLen)
 		keyBuf := make([]byte, keyLen)
 		if _, err = io.ReadFull(f, keyBuf); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
 			return fmt.Errorf("persistence: read key: %w", err)
 		}
 		valBuf := make([]byte, valLen)
 		if _, err = io.ReadFull(f, valBuf); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break
+			}
 			return fmt.Errorf("persistence: read value: %w", err)
 		}
 		recordsRead++
