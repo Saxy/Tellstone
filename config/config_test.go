@@ -172,8 +172,8 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	}
 
 	// Set persistence env vars.
-	os.Setenv("TSD_ENABLE_PERSISTENCE", "true")
-	os.Setenv("TSD_PERSISTENCE_DIR", "/tmp/test-persist")
+	t.Setenv("TSD_ENABLE_PERSISTENCE", "true")
+	t.Setenv("TSD_PERSISTENCE_DIR", "/tmp/test-persist")
 
 	cfg = LoadConfig(nil)
 
@@ -183,7 +183,4 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	if cfg.GetPersistenceDir() != "/tmp/test-persist" {
 		t.Fatalf("persistence dir mismatch: %s", cfg.GetPersistenceDir())
 	}
-
-	os.Unsetenv("TSD_ENABLE_PERSISTENCE")
-	os.Unsetenv("TSD_PERSISTENCE_DIR")
 }

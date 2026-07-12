@@ -4,16 +4,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/storage"
 )
 
-// BenchmarkWriteSequential measures the cost of a single Write (append to WAL).
 func BenchmarkWriteSequential(b *testing.B) {
 	dir := b.TempDir()
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		b.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		b.Fatal(err)
 	}
@@ -31,14 +34,17 @@ func BenchmarkWriteSequential(b *testing.B) {
 	}
 }
 
-// BenchmarkWriteParallel measures concurrent Write throughput across goroutines.
 func BenchmarkWriteParallel(b *testing.B) {
 	dir := b.TempDir()
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		b.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		b.Fatal(err)
 	}
 	val := []byte("bench_val")
+	var firstErr atomic.Value
 	b.ResetTimer()
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
@@ -46,17 +52,24 @@ func BenchmarkWriteParallel(b *testing.B) {
 		for pb.Next() {
 			key := fmt.Sprintf("k%d", i)
 			if err := s.Write(0, key, val, time.Time{}); err != nil {
-				b.Fatal(err)
+				firstErr.Store(err)
+				return
 			}
 			i++
 		}
 	})
+	b.StopTimer()
+	if v := firstErr.Load(); v != nil {
+		b.Fatal(v.(error))
+	}
 }
 
-// BenchmarkWriteWithTTL measures Write cost when TTL is set.
 func BenchmarkWriteWithTTL(b *testing.B) {
 	dir := b.TempDir()
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		b.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		b.Fatal(err)
 	}
@@ -75,10 +88,12 @@ func BenchmarkWriteWithTTL(b *testing.B) {
 	}
 }
 
-// BenchmarkLoadShardSequential measures the cost of replaying a WAL file.
 func BenchmarkLoadShardSequential(b *testing.B) {
 	dir := b.TempDir()
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		b.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		b.Fatal(err)
 	}
@@ -102,10 +117,12 @@ func BenchmarkLoadShardSequential(b *testing.B) {
 	}
 }
 
-// BenchmarkLoadShardSmall measures load performance for small datasets (typical restart).
 func BenchmarkLoadShardSmall(b *testing.B) {
 	dir := b.TempDir()
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		b.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		b.Fatal(err)
 	}
@@ -129,10 +146,12 @@ func BenchmarkLoadShardSmall(b *testing.B) {
 	}
 }
 
-// BenchmarkWriteThenLoad measures the full lifecycle: write N records then load them all.
 func BenchmarkWriteThenLoad(b *testing.B) {
 	dir := b.TempDir()
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		b.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		b.Fatal(err)
 	}
@@ -148,6 +167,7 @@ func BenchmarkWriteThenLoad(b *testing.B) {
 		if err := s.OpenShard(0); err != nil {
 			b.Fatal(err)
 		}
+		b.StartTimer()
 		for j := 0; j < numRecords; j++ {
 			key := fmt.Sprintf("lk%d", j)
 			if err := s.Write(0, key, val, time.Time{}); err != nil {
@@ -155,7 +175,6 @@ func BenchmarkWriteThenLoad(b *testing.B) {
 			}
 		}
 		engine := storage.NewEngine(0, 0, 0, nil, nil)
-		b.StartTimer()
 		if err := s.LoadShard(0, engine); err != nil {
 			b.Fatal(err)
 		}

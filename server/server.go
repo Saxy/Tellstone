@@ -13,6 +13,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -169,17 +170,32 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) {
 
 	var store *persistence.Storage
 	if cfg.PersistenceEnabled() {
-		store = persistence.NewStorage(true, logger, cfg.GetPersistenceDir())
+		var err error
+		store, err = persistence.NewStorage(true, logger, cfg.GetPersistenceDir())
+		if err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "persistence initialization failed, continuing without persistence",
+					log.String("error", err.Error()))
+			}
+			store = nil
+		}
 	}
 
 	s.shards = make([]*shard.Shard, numShards)
+	var activeShards int
 	for i := 0; i < numShards; i++ {
 		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger, store)
 		if err != nil {
-			panic("shard init: " + err.Error())
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "shard initialization failed, skipping",
+					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", i)))
+			}
+			continue
 		}
-		s.shards[i] = sh
+		s.shards[activeShards] = sh
+		activeShards++
 	}
+	s.shards = s.shards[:activeShards]
 	s.router = router.New(s.shards)
 }
 

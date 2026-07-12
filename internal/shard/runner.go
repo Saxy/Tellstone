@@ -12,6 +12,7 @@ package shard
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
@@ -69,7 +70,7 @@ func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logg
 		cryptoEngine,
 	)
 	if store == nil {
-		store = persistence.NewStorage(false, logger, "")
+		store, _ = persistence.NewStorage(false, logger, "")
 	}
 	shard := &Shard{
 		ID:          id,
@@ -80,15 +81,17 @@ func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logg
 	if store.Enabled() {
 		if err := store.OpenShard(uint32(id)); err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "persitence can not open shard")
+				logger.Log(log.LevelError, "persistence: cannot open shard",
+					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", id)))
 			}
-			return nil, err
+			return nil, fmt.Errorf("shard %d: open persistence: %w", id, err)
 		}
 		if err := store.LoadShard(uint32(id), engine); err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "persitence can not load file")
+				logger.Log(log.LevelError, "persistence: cannot load shard",
+					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", id)))
 			}
-			return nil, err
+			return nil, fmt.Errorf("shard %d: load persistence: %w", id, err)
 		}
 	}
 	return shard, nil
@@ -104,14 +107,13 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		if ttl > 0 {
 			expiration = time.Now().Add(ttl)
 		}
-		err := s.Engine.Set(key, value, ttl)
-		if err != nil {
-			return Response{Err: err}
-		}
 		if s.Persistence.Enabled() {
-			if err = s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
-				s.Logger.Log(log.LevelError, "failed to persist key", log.String("key", key))
+			if err := s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
+				return Response{Err: err}
 			}
+		}
+		if err := s.Engine.Set(key, value, ttl); err != nil {
+			return Response{Err: err}
 		}
 		return Response{OK: true}
 	case CmdDel:

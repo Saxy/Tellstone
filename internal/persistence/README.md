@@ -40,7 +40,8 @@ A TTL value of `0` in the on-disk format means "no expiry". The `LoadShard` func
 ```go
 // NewStorage creates a new persistence Storage. If enabled is false, a pass-through
 // (no-op) instance is returned. If dir is empty, the platform-specific default is used.
-func NewStorage(enabled bool, logger log.Logger, dir string) *Storage
+// Returns an error if enabled is true and the data directory cannot be created.
+func NewStorage(enabled bool, logger log.Logger, dir string) (*Storage, error)
 
 // Enabled reports whether this storage instance will actually write to disk.
 func (s *Storage) Enabled() bool
@@ -75,7 +76,10 @@ import (
 
 func main() {
     // Create a persistence store in a temporary directory.
-    store := persistence.NewStorage(true, nil, "/tmp/tellstone-data")
+    store, err := persistence.NewStorage(true, nil, "/tmp/tellstone-data")
+    if err != nil {
+        panic(err)
+    }
 
     // Open the WAL file for shard 0.
     if err := store.OpenShard(0); err != nil {
@@ -128,7 +132,7 @@ Key observations:
 Persistence is wired into Tellstone's shard layer (`internal/shard/runner.go`):
 
 1. **Startup:** When the server starts with persistence enabled, each shard calls `OpenShard` and `LoadShard` to replay its WAL file into the in-memory engine.
-2. **Write path:** After every successful `Engine.Set()`, the shard calls `Persistence.Write()` to append the record to disk. Errors are logged but do not fail the SET (the data is already in memory).
+2. **Write path:** Before every `Engine.Set()`, the shard calls `Persistence.Write()` to append the record to disk. If the write fails, the SET returns an error to the client and the in-memory state is not modified. `Persistence.Write` is best-effort storage: write failures are logged, but data may not survive a power failure since the OS page cache may not have flushed to disk.
 3. **Shutdown:** On graceful shutdown, in-memory state is preserved. Uncommitted WAL entries (if any) are irrelevant because the engine is consistent at shutdown.
 
 ### Platform-Specific Default Directories
@@ -161,6 +165,6 @@ go test -race ./internal/persistence/
 ## Architectural Notes & Constraints
 
 * **No compaction (yet):** The WAL is append-only. Over time, duplicate keys accumulate in the file. `LoadShard` replays all records in order, so the final in-memory state is correct (last-write-wins). A future compaction pass can reclaim space.
-* **Deletes are not persisted:** `DEL` operations only remove the key from the in-memory engine. On restart, deleted keys will not reappear (they were never written to the WAL). If delete persistence is needed in the future, a tombstone record type can be added to the binary format.
-* **File handles:** One open file per shard. The file is opened `O_RDWR` to support both `Write` (append) and `LoadShard` (read from start). The OS page cache handles buffering, so no userspace `bufio.Writer` is used.
-* **Crash safety:** Because the WAL is append-only and each record is written atomically (header + key + value in a single `Write` call sequence), a partial write at crash time results in a truncated record that `LoadShard` will detect as a read error. Future work can add a checksum footer to make this explicit.
+* **Deletes are not persisted:** `DEL` operations only remove the key from the in-memory engine. The WAL does not currently write tombstone records, so deleted keys will not reappear after restart because they were never written to the WAL in the first place. If delete persistence across restarts is needed in the future, a tombstone record type can be added to the binary format.
+* **File handles:** One open file per shard. The file is opened `O_RDWR` to support both `Write` (append) and `LoadShard` (read from start). A per-shard mutex serializes concurrent writes, and `Sync` is called after each record to ensure durability to disk. The OS page cache handles buffering, so no userspace `bufio.Writer` is used.
+* **Crash safety:** Because the WAL is append-only and each record is written atomically (header + key + value under a per-shard mutex with a trailing `Sync`), a partial write at crash time results in a truncated record that `LoadShard` will detect as a read error. Future work can add a checksum footer to make this explicit.

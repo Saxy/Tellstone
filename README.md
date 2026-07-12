@@ -38,7 +38,7 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 * **Configurable TTL Eviction** – An active timing‑wheel (chronometer) evicts expired keys in
   O(1); lazy eviction on read backs it up.
 * **Optional At‑Rest Encryption** – ChaCha20‑Poly1305, off by default.
-* **Write-Ahead Log Persistence** – Per-shard append-only WAL for crash recovery. Zero-allocation on the hot path (`Write` = 0 allocs/op). Disabled by default.
+* **Write-Ahead Log Persistence** – Per-shard append-only WAL for crash recovery. SET operations are persisted before in-memory update; DEL operations are not persisted (deleted keys do not reappear after restart because they were never written). Zero-allocation on the hot path (`Write` = 0 allocs/op). Disabled by default.
 * **Metrics & Tracing** – Built‑in Prometheus exporter and optional OpenTelemetry tracing.
 
 ### Core Architecture

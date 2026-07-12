@@ -27,7 +27,10 @@ func newTestDir(t *testing.T) string {
 // --- NewStorage ---
 
 func TestNewStorageDisabled(t *testing.T) {
-	s := NewStorage(false, nil, "")
+	s, err := NewStorage(false, nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if s.Enabled() {
 		t.Fatal("expected disabled storage")
 	}
@@ -38,7 +41,10 @@ func TestNewStorageDisabled(t *testing.T) {
 
 func TestNewStorageEnabledCreatesDir(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !s.Enabled() {
 		t.Fatal("expected enabled storage")
 	}
@@ -52,7 +58,10 @@ func TestNewStorageEnabledCreatesDir(t *testing.T) {
 }
 
 func TestNewStorageEnabledDefaultDir(t *testing.T) {
-	s := NewStorage(true, nil, "")
+	s, err := NewStorage(true, nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !s.Enabled() {
 		t.Fatal("expected enabled storage")
 	}
@@ -62,25 +71,37 @@ func TestNewStorageEnabledDefaultDir(t *testing.T) {
 }
 
 func TestNewStorageNilLogger(t *testing.T) {
-	s := NewStorage(false, nil, "")
+	s, err := NewStorage(false, nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if s.logger == nil {
 		t.Fatal("expected nil logger to be replaced with NoOpLogger")
 	}
 }
 
 func TestNewStorageMkdirFail(t *testing.T) {
-	s := NewStorage(true, nil, "/nonexistent/deeply/nested/path/that/should/not/exist")
-	if s.Enabled() {
-		t.Fatal("expected disabled storage when MkdirAll fails")
+	s, err := NewStorage(true, nil, "/nonexistent/deeply/nested/path/that/should/not/exist")
+	if err == nil {
+		t.Fatal("expected error when MkdirAll fails with explicit enable")
+	}
+	if s != nil {
+		t.Fatal("expected nil storage on MkdirAll failure")
 	}
 }
 
 func TestStorageEnabled(t *testing.T) {
-	s := NewStorage(false, nil, "")
+	s, err := NewStorage(false, nil, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if s.Enabled() {
 		t.Fatal("expected Enabled() == false")
 	}
-	s2 := NewStorage(true, nil, newTestDir(t))
+	s2, err := NewStorage(true, nil, newTestDir(t))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !s2.Enabled() {
 		t.Fatal("expected Enabled() == true")
 	}
@@ -90,7 +111,10 @@ func TestStorageEnabled(t *testing.T) {
 
 func TestOpenShardCreatesFile(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatalf("OpenShard(0): %v", err)
 	}
@@ -102,7 +126,10 @@ func TestOpenShardCreatesFile(t *testing.T) {
 
 func TestOpenShardMultipleFiles(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := uint32(0); i < 4; i++ {
 		if err := s.OpenShard(i); err != nil {
 			t.Fatalf("OpenShard(%d): %v", i, err)
@@ -117,7 +144,10 @@ func TestOpenShardMultipleFiles(t *testing.T) {
 }
 
 func TestOpenShardInvalidPath(t *testing.T) {
-	s := NewStorage(true, nil, newTestDir(t))
+	s, err := NewStorage(true, nil, newTestDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.dir = "/nonexistent/path"
 	if err := s.OpenShard(0); err == nil {
 		t.Fatal("expected error when opening shard with invalid dir")
@@ -127,7 +157,10 @@ func TestOpenShardInvalidPath(t *testing.T) {
 // --- Write ---
 
 func TestWriteDisabledNoError(t *testing.T) {
-	s := NewStorage(false, nil, "")
+	s, err := NewStorage(false, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.Write(0, "key", []byte("value"), time.Time{}); err != nil {
 		t.Fatalf("Write on disabled storage should not error: %v", err)
 	}
@@ -135,8 +168,11 @@ func TestWriteDisabledNoError(t *testing.T) {
 
 func TestWriteToUnopenedShard(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
-	err := s.Write(99, "key", []byte("value"), time.Time{})
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = s.Write(99, "key", []byte("value"), time.Time{})
 	if err == nil {
 		t.Fatal("expected error writing to unopened shard")
 	}
@@ -144,7 +180,10 @@ func TestWriteToUnopenedShard(t *testing.T) {
 
 func TestWriteRecordBinaryFormat(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +229,10 @@ func TestWriteRecordBinaryFormat(t *testing.T) {
 
 func TestWriteZeroTTL(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -201,7 +243,10 @@ func TestWriteZeroTTL(t *testing.T) {
 
 func TestWriteMultipleRecords(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +281,10 @@ func TestWriteMultipleRecords(t *testing.T) {
 
 func TestLoadShardEmptyFile(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +299,10 @@ func TestLoadShardEmptyFile(t *testing.T) {
 
 func TestLoadShardRoundTrip(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -295,7 +346,10 @@ func TestLoadShardRoundTrip(t *testing.T) {
 
 func TestLoadShardSkipsExpiredKeys(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -329,9 +383,12 @@ func TestLoadShardSkipsExpiredKeys(t *testing.T) {
 
 func TestLoadShardUnopenedShard(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	engine := newTestEngine(t)
-	err := s.LoadShard(99, engine)
+	err = s.LoadShard(99, engine)
 	if err == nil {
 		t.Fatal("expected error loading unopened shard")
 	}
@@ -339,7 +396,10 @@ func TestLoadShardUnopenedShard(t *testing.T) {
 
 func TestLoadShardTwiceAppended(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -373,7 +433,10 @@ func TestLoadShardTwiceAppended(t *testing.T) {
 
 func TestLoadShardTTLRefresh(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +463,10 @@ func TestLoadShardTTLRefresh(t *testing.T) {
 // --- Pass-through behavior ---
 
 func TestDisabledWriteAndLoadAreNoOps(t *testing.T) {
-	s := NewStorage(false, nil, "")
+	s, err := NewStorage(false, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	// Write should not panic or error
 	if err := s.Write(0, "key", []byte("val"), time.Time{}); err != nil {
 		t.Fatalf("Write on disabled: %v", err)
@@ -415,7 +481,10 @@ func TestDisabledWriteAndLoadAreNoOps(t *testing.T) {
 
 func TestWriteEmptyKeyAndValue(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -435,7 +504,10 @@ func TestWriteEmptyKeyAndValue(t *testing.T) {
 
 func TestWriteLargeValue(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -462,7 +534,10 @@ func TestWriteLargeValue(t *testing.T) {
 
 func TestOpenShardReopen(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +564,10 @@ func TestOpenShardReopen(t *testing.T) {
 
 func TestWriteConcurrent(t *testing.T) {
 	dir := newTestDir(t)
-	s := NewStorage(true, nil, dir)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := s.OpenShard(0); err != nil {
 		t.Fatal(err)
 	}
@@ -508,6 +586,35 @@ func TestWriteConcurrent(t *testing.T) {
 	}
 	for i := 0; i < 10; i++ {
 		<-done
+	}
+
+	if err := s.file[0].Close(); err != nil {
+		t.Fatalf("close shard: %v", err)
+	}
+	delete(s.file, 0)
+	if err := s.OpenShard(0); err != nil {
+		t.Fatalf("reopen shard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard after concurrent writes: %v", err)
+	}
+	expected := 10 * 100
+	if engine.KeyCount() != uint64(expected) {
+		t.Fatalf("expected %d keys after concurrent writes, got %d", expected, engine.KeyCount())
+	}
+	for i := 0; i < 10; i++ {
+		for j := 0; j < 100; j++ {
+			key := "key_" + string(rune('0'+i)) + "_" + string(rune('0'+j/10)) + string(rune('0'+j%10))
+			val, ok := engine.Get(key)
+			if !ok {
+				t.Errorf("key %q not found after reload", key)
+				continue
+			}
+			if string(val) != "val" {
+				t.Errorf("key %q value = %q, want %q", key, val, "val")
+			}
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
@@ -36,14 +37,18 @@ type Storage struct {
 	enabled bool
 	logger  log.Logger
 	file    map[uint32]*os.File
+	mu      sync.Mutex
 }
 
-func NewStorage(enabled bool, logger log.Logger, dir string) *Storage {
+func NewStorage(enabled bool, logger log.Logger, dir string) (*Storage, error) {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
 	if dir == "" {
 		dir = getDefaultDir()
+		if logger.Enabled(log.LevelDebug) {
+			logger.Log(log.LevelDebug, "no persistence dir configured, using default", log.String("dir", dir))
+		}
 	}
 	if !enabled {
 		if logger.Enabled(log.LevelInfo) {
@@ -52,10 +57,10 @@ func NewStorage(enabled bool, logger log.Logger, dir string) *Storage {
 		return &Storage{
 			enabled: false,
 			logger:  logger,
-		}
+		}, nil
 	}
 	if logger.Enabled(log.LevelInfo) {
-		logger.Log(log.LevelInfo, "data storage initialized", log.String("data stored in path", dir))
+		logger.Log(log.LevelInfo, "data storage initialized", log.String("dir", dir))
 	}
 	stg := &Storage{
 		dir:     dir,
@@ -63,16 +68,17 @@ func NewStorage(enabled bool, logger log.Logger, dir string) *Storage {
 		logger:  logger,
 		file:    make(map[uint32]*os.File),
 	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		if logger.Enabled(log.LevelWarn) {
-			logger.Log(log.LevelWarn, "data storage initialization failed (proceed with data storage disabled)")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "persistence: failed to create data directory",
+				log.String("dir", dir), log.String("error", err.Error()))
 		}
-		return &Storage{
-			enabled: false,
-			logger:  logger,
-		}
+		return nil, fmt.Errorf("persistence: mkdir %s: %w", dir, err)
 	}
-	return stg
+	if logger.Enabled(log.LevelDebug) {
+		logger.Log(log.LevelDebug, "persistence: data directory ready", log.String("dir", dir))
+	}
+	return stg, nil
 }
 
 func (s *Storage) Enabled() bool {
@@ -83,6 +89,21 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 	if !s.enabled {
 		return nil
 	}
+	if uint64(len(key)) > uint64(^uint32(0)) {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: key too large",
+				log.String("key", key), log.Int("bytes", len(key)), log.Uint("max", ^uint32(0)))
+		}
+		return fmt.Errorf("persistence: key too large (%d bytes, max %d)", len(key), ^uint32(0))
+	}
+	if uint64(len(value)) > uint64(^uint32(0)) {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: value too large",
+				log.String("key", key), log.Int("bytes", len(value)), log.Uint("max", ^uint32(0)))
+		}
+		return fmt.Errorf("persistence: value too large (%d bytes, max %d)", len(value), ^uint32(0))
+	}
+	s.mu.Lock()
 	writer := s.file[shardID]
 	var header [16]byte
 	var ttlNano int64
@@ -92,26 +113,67 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 	binary.LittleEndian.PutUint32(header[0:4], uint32(len(key)))
 	binary.LittleEndian.PutUint32(header[4:8], uint32(len(value)))
 	binary.LittleEndian.PutUint64(header[8:16], uint64(ttlNano))
+	if s.logger.Enabled(log.LevelDebug) {
+		s.logger.Log(log.LevelDebug, "persistence: write",
+			log.Uint("shard", shardID), log.String("key", key),
+			log.Int("key_len", len(key)), log.Int("val_len", len(value)))
+	}
 	if _, err := writer.Write(header[:]); err != nil {
+		s.mu.Unlock()
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write header failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
 		return err
 	}
 	if _, err := writer.WriteString(key); err != nil {
+		s.mu.Unlock()
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write key failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
 		return err
 	}
 	if _, err := writer.Write(value); err != nil {
+		s.mu.Unlock()
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: write value failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
 		return err
 	}
-
+	if err := writer.Sync(); err != nil {
+		s.mu.Unlock()
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: sync failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return err
+	}
+	s.mu.Unlock()
 	return nil
 }
 
 func (s *Storage) OpenShard(shardID uint32) error {
+	if !s.enabled {
+		return nil
+	}
 	path := filepath.Join(s.dir, fmt.Sprintf("shard_%03d.db", shardID))
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0644)
+	if s.logger.Enabled(log.LevelDebug) {
+		s.logger.Log(log.LevelDebug, "persistence: opening shard", log.Uint("shard", shardID), log.String("path", path))
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: failed to open shard",
+				log.Uint("shard", shardID), log.String("path", path), log.String("error", err.Error()))
+		}
 		return err
 	}
 	s.file[shardID] = f
+	if s.logger.Enabled(log.LevelDebug) {
+		s.logger.Log(log.LevelDebug, "persistence: shard opened", log.Uint("shard", shardID))
+	}
 	return nil
 }
 
@@ -123,37 +185,68 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 	if _, err := f.Seek(0, 0); err != nil {
 		return err
 	}
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	remaining := fi.Size()
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "persistence: loading shard",
+			log.Uint("shard", shardID), log.Int64("file_size", remaining))
+	}
 	header := make([]byte, 16)
+	var recordsRead int
+	var recordsSkipped int
 	for {
-		_, err := f.Read(header)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
+		var n int
+		n, err = io.ReadFull(f, header)
+		if n == 0 && err == io.EOF {
+			break
 		}
+		if err != nil {
+			return fmt.Errorf("persistence: incomplete header read (%d bytes): %w", n, err)
+		}
+		if remaining < 16 {
+			return fmt.Errorf("persistence: truncated header")
+		}
+		remaining -= 16
 		keyLen := binary.LittleEndian.Uint32(header[0:4])
 		valLen := binary.LittleEndian.Uint32(header[4:8])
 		ttlNano := int64(binary.LittleEndian.Uint64(header[8:16]))
+		if int64(keyLen)+int64(valLen) > remaining {
+			return fmt.Errorf("persistence: record payload exceeds remaining file (%d+%d > %d)", keyLen, valLen, remaining)
+		}
+		remaining -= int64(keyLen) + int64(valLen)
 		keyBuf := make([]byte, keyLen)
 		if _, err = io.ReadFull(f, keyBuf); err != nil {
-			return err
+			return fmt.Errorf("persistence: read key: %w", err)
 		}
 		valBuf := make([]byte, valLen)
 		if _, err = io.ReadFull(f, valBuf); err != nil {
-			return err
+			return fmt.Errorf("persistence: read value: %w", err)
 		}
+		recordsRead++
 		var duration time.Duration
 		if ttlNano != 0 {
 			ttl := time.Unix(0, ttlNano)
 			duration = time.Until(ttl)
 			if duration <= 0 {
+				if s.logger.Enabled(log.LevelDebug) {
+					s.logger.Log(log.LevelDebug, "persistence: skipping expired key",
+						log.Uint("shard", shardID), log.String("key", string(keyBuf)))
+				}
+				recordsSkipped++
 				continue
 			}
 		}
 		if err = engine.Set(string(keyBuf), valBuf, duration); err != nil {
 			return err
 		}
+	}
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "persistence: shard loaded",
+			log.Uint("shard", shardID), log.Int("records_read", recordsRead),
+			log.Int("records_skipped", recordsSkipped), log.Int("records_loaded", recordsRead-recordsSkipped))
 	}
 	return nil
 }
