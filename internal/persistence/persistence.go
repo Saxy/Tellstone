@@ -191,6 +191,13 @@ func (s *Storage) Delete(shardID uint32, key string) error {
 	if !s.enabled {
 		return nil
 	}
+	if uint64(len(key)) > uint64(^uint32(0)) {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: delete key too large",
+				log.String("key", key), log.Int("bytes", len(key)), log.Uint("max", ^uint32(0)))
+		}
+		return fmt.Errorf("persistence: key too large (%d bytes, max %d)", len(key), ^uint32(0))
+	}
 	h := s.getShard(shardID)
 	if h == nil {
 		return fmt.Errorf("persistence: shard %d not opened", shardID)
