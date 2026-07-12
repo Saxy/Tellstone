@@ -164,10 +164,10 @@ func BenchmarkWriteThenLoad(b *testing.B) {
 		b.StopTimer()
 		s.file[0].Close()
 		os.Remove(filepath.Join(dir, fmt.Sprintf("shard_%03d.db", 0)))
+		b.StartTimer()
 		if err := s.OpenShard(0); err != nil {
 			b.Fatal(err)
 		}
-		b.StartTimer()
 		for j := 0; j < numRecords; j++ {
 			key := fmt.Sprintf("lk%d", j)
 			if err := s.Write(0, key, val, time.Time{}); err != nil {
