@@ -76,29 +76,41 @@ func (a *App) Start(cfg *config.Config, logger log.Logger) {
 `
 	fmt.Println("\033[36m" + banner + "\033[0m")
 	fmt.Println("\033[90m" + strings.Repeat("-", 70) + "\033[0m")
-	logger.Log(log.LevelInfo, "TSD Core Engine initializing",
-		log.String("bind_address", cfg.GetAddr()),
-		log.String("max_msg_size", (new(config.ByteSize(cfg.GetMaxMsgSize()))).String()),
-		log.Uint64("max_msg_size_bytes", cfg.GetMaxMsgSize()),
-		log.String("evict_interval", cfg.GetEvictTicker().String()),
-		log.Int("evict_slots", int(cfg.GetEvictSlots())),
-		log.String("log_level", cfg.GetLogLevel().String()),
-	)
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "TSD Core Engine initializing",
+			log.String("bind_address", cfg.GetAddr()),
+			log.String("max_msg_size", (new(config.ByteSize(cfg.GetMaxMsgSize()))).String()),
+			log.Uint64("max_msg_size_bytes", cfg.GetMaxMsgSize()),
+			log.String("evict_interval", cfg.GetEvictTicker().String()),
+			log.Int("evict_slots", int(cfg.GetEvictSlots())),
+			log.String("log_level", cfg.GetLogLevel().String()),
+		)
+	}
 	if cfg.EncryptionEnabled() {
 		if cfg.GetEncryptionKey() == "" {
-			logger.Log(log.LevelFatal, "Encryption key must be provided", log.String("error", "encryption key is missing but encryption is enabled"))
+			if logger.Enabled(log.LevelFatal) {
+				logger.Log(log.LevelFatal, "Encryption key must be provided", log.String("error", "encryption key is missing but encryption is enabled"))
+			}
 		}
-		logger.Log(log.LevelInfo, "Engine crypto status", log.String("encryption", "ENABLED (ChaCha20-Poly1305)"))
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "Engine crypto status", log.String("encryption", "ENABLED (ChaCha20-Poly1305)"))
+		}
 	} else {
-		logger.Log(log.LevelWarn, "Engine crypto status", log.String("encryption", "DISABLED (Plaintext Mode)"))
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "Engine crypto status", log.String("encryption", "DISABLED (Plaintext Mode)"))
+		}
 	}
 	if cfg.GetTraceRatio() > 0 {
-		logger.Log(log.LevelInfo, "Telemetry stack configuration",
-			log.String("telemetry", "OTLP/gRPC Active"),
-			log.Float("sample_ratio", cfg.GetTraceRatio()),
-		)
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "Telemetry stack configuration",
+				log.String("telemetry", "OTLP/gRPC Active"),
+				log.Float("sample_ratio", cfg.GetTraceRatio()),
+			)
+		}
 	} else {
-		logger.Log(log.LevelInfo, "Telemetry stack configuration", log.String("telemetry", "NoOp Tracer"))
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "Telemetry stack configuration", log.String("telemetry", "NoOp Tracer"))
+		}
 	}
 }
 
