@@ -588,10 +588,9 @@ func TestWriteConcurrent(t *testing.T) {
 		<-done
 	}
 
-	if err := s.file[0].Close(); err != nil {
+	if err := s.CloseShard(0); err != nil {
 		t.Fatalf("close shard: %v", err)
 	}
-	delete(s.file, 0)
 	if err := s.OpenShard(0); err != nil {
 		t.Fatalf("reopen shard: %v", err)
 	}

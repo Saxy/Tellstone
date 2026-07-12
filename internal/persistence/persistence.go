@@ -35,14 +35,26 @@ func getDefaultDir() string {
 	return filepath.Join(baseDir, "tellstone", "data")
 }
 
+// shardHandle holds the WAL file and its per-shard mutex for a single shard.
+type shardHandle struct {
+	file *os.File
+	mu   sync.Mutex
+}
+
+// Storage provides a per-shard, append-only write-ahead log (WAL) for crash recovery.
+// Each shard owns an independent file, eliminating cross-shard coordination during writes.
+// When disabled, Write and Delete are no-ops and no files are opened.
 type Storage struct {
 	dir     string
 	enabled bool
 	logger  log.Logger
-	file    map[uint32]*os.File
-	mu      sync.Mutex
+	shards  map[uint32]*shardHandle
+	mapMu   sync.RWMutex
 }
 
+// NewStorage creates a new persistence Storage. If enabled is false, a pass-through
+// (no-op) instance is returned. If dir is empty, the platform-specific default is used.
+// Returns an error if enabled is true and the data directory cannot be created.
 func NewStorage(enabled bool, logger log.Logger, dir string) (*Storage, error) {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
@@ -69,7 +81,7 @@ func NewStorage(enabled bool, logger log.Logger, dir string) (*Storage, error) {
 		dir:     dir,
 		enabled: true,
 		logger:  logger,
-		file:    make(map[uint32]*os.File),
+		shards:  make(map[uint32]*shardHandle),
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		if logger.Enabled(log.LevelError) {
@@ -84,10 +96,24 @@ func NewStorage(enabled bool, logger log.Logger, dir string) (*Storage, error) {
 	return stg, nil
 }
 
+// Enabled reports whether this storage instance will actually write to disk.
 func (s *Storage) Enabled() bool {
 	return s.enabled
 }
 
+// getShard retrieves the shard handle under mapMu. Returns nil if the shard
+// has not been opened.
+func (s *Storage) getShard(shardID uint32) *shardHandle {
+	s.mapMu.RLock()
+	h := s.shards[shardID]
+	s.mapMu.RUnlock()
+	return h
+}
+
+// Write appends a SET record to the shard's WAL file. The record includes a
+// 16-byte header (key length, value length, TTL), followed by key and value bytes.
+// The write and trailing Sync are serialized under the shard's own mutex.
+// Returns nil immediately when persistence is disabled.
 func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time) error {
 	if !s.enabled {
 		return nil
@@ -106,12 +132,12 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 		}
 		return fmt.Errorf("persistence: value too large (%d bytes, max %d)", len(value), ^uint32(0))
 	}
-	s.mu.Lock()
-	writer, exist := s.file[shardID]
-	if !exist {
-		s.mu.Unlock()
+	h := s.getShard(shardID)
+	if h == nil {
 		return fmt.Errorf("persistence: shard %d not opened", shardID)
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	var header [16]byte
 	var ttlNano int64
 	if !ttl.IsZero() {
@@ -125,48 +151,52 @@ func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time)
 			log.Uint("shard", shardID), log.String("key", key),
 			log.Int("key_len", len(key)), log.Int("val_len", len(value)))
 	}
-	if _, err := writer.Write(header[:]); err != nil {
-		s.mu.Unlock()
+	if _, err := h.file.Write(header[:]); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: write header failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
 	}
-	if _, err := writer.WriteString(key); err != nil {
-		s.mu.Unlock()
+	if _, err := h.file.WriteString(key); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: write key failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
 	}
-	if _, err := writer.Write(value); err != nil {
-		s.mu.Unlock()
+	if _, err := h.file.Write(value); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: write value failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
 	}
-	if err := writer.Sync(); err != nil {
-		s.mu.Unlock()
+	if err := h.file.Sync(); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: sync failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
 	}
-	s.mu.Unlock()
 	return nil
 }
 
+// Delete appends a tombstone record to the shard's WAL file. The tombstone
+// uses the same 16-byte header format with a sentinel TTL (math.MinInt64) and
+// zero-length value. During LoadShard replay, tombstones cause the key to be
+// deleted from the in-memory engine.
+// Returns nil immediately when persistence is disabled.
 func (s *Storage) Delete(shardID uint32, key string) error {
 	if !s.enabled {
 		return nil
 	}
-	s.mu.Lock()
-	writer := s.file[shardID]
+	h := s.getShard(shardID)
+	if h == nil {
+		return fmt.Errorf("persistence: shard %d not opened", shardID)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	var header [16]byte
 	binary.LittleEndian.PutUint32(header[0:4], uint32(len(key)))
 	binary.LittleEndian.PutUint32(header[4:8], 0)
@@ -175,34 +205,33 @@ func (s *Storage) Delete(shardID uint32, key string) error {
 		s.logger.Log(log.LevelDebug, "persistence: delete",
 			log.Uint("shard", shardID), log.String("key", key))
 	}
-	if _, err := writer.Write(header[:]); err != nil {
-		s.mu.Unlock()
+	if _, err := h.file.Write(header[:]); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: write delete header failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
 	}
-	if _, err := writer.WriteString(key); err != nil {
-		s.mu.Unlock()
+	if _, err := h.file.WriteString(key); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: write delete key failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
 	}
-	if err := writer.Sync(); err != nil {
-		s.mu.Unlock()
+	if err := h.file.Sync(); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: sync delete failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
 	}
-	s.mu.Unlock()
 	return nil
 }
 
+// OpenShard opens (or creates) the WAL file for the given shard.
+// Must be called before Write or LoadShard for that shard.
+// Returns nil immediately when persistence is disabled.
 func (s *Storage) OpenShard(shardID uint32) error {
 	if !s.enabled {
 		return nil
@@ -219,23 +248,32 @@ func (s *Storage) OpenShard(shardID uint32) error {
 		}
 		return err
 	}
-	s.file[shardID] = f
+	s.mapMu.Lock()
+	s.shards[shardID] = &shardHandle{file: f}
+	s.mapMu.Unlock()
 	if s.logger.Enabled(log.LevelDebug) {
 		s.logger.Log(log.LevelDebug, "persistence: shard opened", log.Uint("shard", shardID))
 	}
 	return nil
 }
 
+// LoadShard replays all records from the shard's WAL file into the given engine,
+// skipping expired keys and applying tombstones as deletions. Truncated records
+// from a crash mid-write are silently skipped.
 func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
-	f := s.file[shardID]
-	if f == nil {
+	h := s.getShard(shardID)
+	if h == nil {
 		return fmt.Errorf("shard %d not opened", shardID)
 	}
+	h.mu.Lock()
+	f := h.file
 	if _, err := f.Seek(0, 0); err != nil {
+		h.mu.Unlock()
 		return err
 	}
 	fi, err := f.Stat()
 	if err != nil {
+		h.mu.Unlock()
 		return err
 	}
 	remaining := fi.Size()
@@ -243,6 +281,7 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		s.logger.Log(log.LevelInfo, "persistence: loading shard",
 			log.Uint("shard", shardID), log.Int64("file_size", remaining))
 	}
+	h.mu.Unlock()
 	header := make([]byte, 16)
 	var recordsRead int
 	var recordsSkipped int
@@ -251,7 +290,7 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		n, err = io.ReadFull(f, header)
 		if err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				break // clean EOF or a truncated trailing header from a crash mid-write
+				break
 			}
 			return fmt.Errorf("persistence: incomplete header read (%d bytes): %w", n, err)
 		}
@@ -260,7 +299,7 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		valLen := binary.LittleEndian.Uint32(header[4:8])
 		ttlNano := int64(binary.LittleEndian.Uint64(header[8:16]))
 		if int64(keyLen)+int64(valLen) > remaining {
-			break // truncated trailing record
+			break
 		}
 		remaining -= int64(keyLen) + int64(valLen)
 		keyBuf := make([]byte, keyLen)
@@ -311,4 +350,15 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 			log.Int("records_skipped", recordsSkipped), log.Int("records_loaded", recordsRead-recordsSkipped))
 	}
 	return nil
+}
+
+// CloseShard closes the WAL file for the given shard.
+func (s *Storage) CloseShard(shardID uint32) error {
+	h := s.getShard(shardID)
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.file.Close()
 }

@@ -162,7 +162,7 @@ func BenchmarkWriteThenLoad(b *testing.B) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		s.file[0].Close()
+		s.CloseShard(0)
 		os.Remove(filepath.Join(dir, fmt.Sprintf("shard_%03d.db", 0)))
 		b.StartTimer()
 		if err := s.OpenShard(0); err != nil {
