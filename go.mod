@@ -3,6 +3,7 @@ module github.com/Saxy/Tellstone
 go 1.26.2
 
 require (
+	github.com/go-echarts/go-echarts/v2 v2.7.2
 	github.com/panjf2000/gnet/v2 v2.10.0
 	go.opentelemetry.io/otel v1.44.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.44.0

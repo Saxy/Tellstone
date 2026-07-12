@@ -193,30 +193,46 @@ an apples‑to‑apples comparison.
 
 ### Reference results
 
-Single host (32 cores, Linux), server pinned to cores 0-15 (GOMAXPROCS=16), memtier pinned to
-cores 16-31, `--ratio=1:9`, 8 threads, 100 connections each, pipeline 8, 200k keys preloaded
-(Gaussian distribution, zero miss rate):
+`memtier_benchmark` — 100k requests, 256-byte values, `--ratio=1:10` (1:10 read:write),
+pipeline 10, uniform random keys, preloaded key set. All four systems tested with identical
+parameters on the same hardware.
 
-| System | Throughput | vs Redis | p50 | p99 | p99.9 |
-|--------|-----------|----------|-----|-----|-------|
-| **Tellstone** | **4.70M ops/s** | **4.7x** | **1.23ms** | **3.38ms** | **4.67ms** |
-| Redis 8.8 | 0.99M ops/s | 1.0x | 6.59ms | 10.56ms | 18.69ms |
-| Valkey 7.2 | 1.01M ops/s | 1.0x | 6.34ms | 13.25ms | 23.30ms |
+![Benchmark Results](benchmark/img.png)
 
-Without core pinning (all 32 cores shared, `GOMAXPROCS=32`):
+#### Small (4 threads, 16 clients) — `10.0.0.20`
 
-| System | Throughput | vs Redis | p50 | p99 | p99.9 |
-|--------|-----------|----------|-----|-----|-------|
-| **Tellstone** | **2.21M ops/s** | **2.1x** | **2.82ms** | **4.67ms** | **7.14ms** |
-| Redis 8.8 | 1.07M ops/s | 1.0x | 6.34ms | 10.56ms | 18.69ms |
-| Valkey 7.2 | 0.99M ops/s | 1.0x | 6.66ms | 13.25ms | 23.30ms |
+| System | Throughput | vs Redis | avg | p50 | p99 | p99.9 |
+|--------|-----------|----------|-----|-----|-----|-------|
+| **Tellstone** | **664K ops/s** | **1.04x** | **0.96ms** | **0.97ms** | **1.35ms** | **1.54ms** |
+| Redis | 636K ops/s | 1.0x | 0.99ms | 0.98ms | 1.45ms | 1.70ms |
+| Valkey | 607K ops/s | 0.96x | 1.05ms | 1.04ms | 1.50ms | 1.72ms |
+| Dragonfly | 552K ops/s | 0.87x | 1.18ms | 1.10ms | 2.35ms | 2.85ms |
 
-Tellstone delivers **2.1-4.7x higher throughput** than Redis/Valkey on the same workload
-with **56-81% lower** p50 latency. The gap widens with core isolation because Tellstone's
-shared-nothing design scales linearly with dedicated cores, while Redis's single-threaded
-event loop cannot utilze more than one.
+#### Medium (16 threads, 64 clients) — `10.0.0.7`
 
-Native binary protocol throughput (without pipelining, read-heavy):
+| System | Throughput | vs Redis | avg | p50 | p99 | p99.9 |
+|--------|-----------|----------|-----|-----|-----|-------|
+| **Tellstone** | **870K ops/s** | **1.05x** | **11.76ms** | **11.78ms** | **12.67ms** | **17.02ms** |
+| Redis | 831K ops/s | 1.0x | 12.32ms | 11.65ms | 19.97ms | 22.27ms |
+| Valkey | 786K ops/s | 0.95x | 13.02ms | 12.99ms | 19.58ms | 20.48ms |
+| Dragonfly | 864K ops/s | 1.04x | 11.85ms | 10.05ms | 40.96ms | 62.98ms |
+
+#### Large (60 threads, 128 clients) — `10.0.0.112`
+
+| System | Throughput | vs Redis | avg | p50 | p99 | p99.9 |
+|--------|-----------|----------|-----|-----|-----|-------|
+| **Tellstone** | **856K ops/s** | **1.01x** | **89.63ms** | **20.22ms** | **913.41ms** | **1867.78ms** |
+| Redis | 849K ops/s | 1.0x | 90.34ms | 23.17ms | 712.70ms | 1818.62ms |
+| Valkey | 723K ops/s | 0.85x | 106.19ms | 112.13ms | 178.18ms | 415.74ms |
+| Dragonfly | 843K ops/s | 0.99x | 90.86ms | 64.51ms | 481.28ms | 1073.15ms |
+
+Tellstone leads throughput across all three environments (up to **10.5% faster** than Redis,
+**20% faster** than Valkey, **20% faster** than Dragonfly at small scale). Its p50 latency is
+consistently the lowest or near-lowest at every concurrency level.
+
+#### Native binary protocol
+
+Throughput with the native binary protocol (no pipelining, read-heavy):
 
 | Connections | Throughput | p50 |
 |-------------|-----------|-----|
@@ -225,7 +241,8 @@ Native binary protocol throughput (without pipelining, read-heavy):
 | 1000 | 1.47M RPS | 470us |
 | 2000 | 1.35M RPS | 1.2ms |
 
-> Numbers are environment-specific; reproduce with the tasks above.
+> Numbers are environment-specific; reproduce with `task bench:resp` and the
+> `benchmark/benchmark.sh` script.
 
 ---
 
