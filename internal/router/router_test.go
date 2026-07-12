@@ -15,7 +15,7 @@ func testDistribution(t *testing.T, numShards int) {
 	cfg := config.LoadConfig([]string{"-shards", fmt.Sprint(numShards)})
 	shards := make([]*shard.Shard, numShards)
 	for i := 0; i < numShards; i++ {
-		s, err := shard.Run(shard.ID(i), cfg, nil, log.NewNoOpLogger())
+		s, err := shard.Run(shard.ID(i), cfg, nil, log.NewNoOpLogger(), nil)
 		if err != nil {
 			t.Fatalf("shard %d: %v", i, err)
 		}
@@ -54,7 +54,7 @@ func TestRouterSetGet(t *testing.T) {
 	cfg := config.LoadConfig([]string{"-shards=4"})
 	shards := make([]*shard.Shard, 4)
 	for i := 0; i < 4; i++ {
-		s, err := shard.Run(shard.ID(i), cfg, nil, log.NewNoOpLogger())
+		s, err := shard.Run(shard.ID(i), cfg, nil, log.NewNoOpLogger(), nil)
 		if err != nil {
 			t.Fatalf("shard %d: %v", i, err)
 		}

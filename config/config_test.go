@@ -162,4 +162,25 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	os.Unsetenv("TSD_ENCRYPTION_KEY")
 	os.Unsetenv("TSD_TRACE_RATIO")
 	os.Unsetenv("TSD_NUM_SHARDS")
+
+	// Persistence defaults should be disabled.
+	if cfg.PersistenceEnabled() {
+		t.Fatalf("persistence should be disabled by default")
+	}
+	if cfg.GetPersistenceDir() != "" {
+		t.Fatalf("default PersistenceDir should be empty, got %s", cfg.GetPersistenceDir())
+	}
+
+	// Set persistence env vars.
+	t.Setenv("TSD_ENABLE_PERSISTENCE", "true")
+	t.Setenv("TSD_PERSISTENCE_DIR", "/tmp/test-persist")
+
+	cfg = LoadConfig(nil)
+
+	if !cfg.PersistenceEnabled() {
+		t.Fatalf("persistence should be enabled via env")
+	}
+	if cfg.GetPersistenceDir() != "/tmp/test-persist" {
+		t.Fatalf("persistence dir mismatch: %s", cfg.GetPersistenceDir())
+	}
 }

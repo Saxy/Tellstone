@@ -7,7 +7,7 @@
 **Tellstone** is an ultra‑high‑performance, cloud‑native **in‑memory key/value store** written
 entirely in **Go**. It speaks two protocols over TCP — a compact custom **binary protocol** and
 a **Redis‑compatible (RESP2)** protocol — on top of a **shared-nothing (SN) storage engine**
-with optional TTL eviction and at‑rest encryption.
+with optional TTL eviction, at‑rest encryption, and write-ahead log persistence.
 
 ```
        +---------------------------------------------+
@@ -38,17 +38,19 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 * **Configurable TTL Eviction** – An active timing‑wheel (chronometer) evicts expired keys in
   O(1); lazy eviction on read backs it up.
 * **Optional At‑Rest Encryption** – ChaCha20‑Poly1305, off by default.
+* **Write-Ahead Log Persistence** – Per-shard append-only WAL for crash recovery. SET and DEL operations are persisted (deletes as tombstones) and replayed on restart. Zero-allocation on the hot path (`Write` = 0 allocs/op). Disabled by default.
 * **Metrics & Tracing** – Built‑in Prometheus exporter and optional OpenTelemetry tracing.
 
 ### Core Architecture
 
 | Layer | Package | Notes |
-|---|---|---|---|
+|---|---|---|
 | Binary protocol | `internal/network` | `MsgRequest`/`MsgResponse` frames (`GET`/`SET`/`DEL`, TTL, key, value) |
 | RESP2 protocol | `internal/resp` | Redis‑compatible listener reusing the same engine |
 | Request router | `internal/router` | FNV-1a hash → O(1) shard dispatch |
 | Shard runner | `internal/shard` | Shared-nothing shard: synchronous `Execute()`, per-shard `sync.RWMutex` |
 | Storage engine | `internal/storage` | Single-map engine, TTL eviction via timing wheel |
+| Persistence | `internal/persistence` | Per-shard append-only WAL, zero-alloc write path |
 | Crypto | `internal/crypto` | Optional ChaCha20‑Poly1305 |
 | Metrics / tracing | `internal/metrics`, `internal/trace` | Prometheus text exporter, OTLP/gRPC tracing |
 
@@ -110,6 +112,8 @@ Every option is available as a flag and an environment variable.
 | `--enable-metrics`    | `TSD_ENABLE_METRICS`    | `false`          | Enable the Prometheus exporter                           |
 | `--metrics-addr`      | `TSD_METRICS_ADDR`      | `:9100`          | Prometheus exporter address (`/metrics`)                 |
 | `--trace-ratio`       | `TSD_TRACE_RATIO`       | `0.0`            | OpenTelemetry sample ratio (`0` disables)                |
+| `--enable-persistence`| `TSD_ENABLE_PERSISTENCE`| `false`          | Enable write-ahead log persistence for crash recovery    |
+| `--persistence-dir`   | `TSD_PERSISTENCE_DIR`   | _(platform)_     | Directory for WAL data files                             |
 | `--shutdown-timeout`  | `TSD_SHUTDOWN_TIMEOUT`  | `10s`            | Max wait for graceful shutdown on SIGINT/SIGTERM         |
 
 Runtime tuning (environment only): `TSD_GC_PERCENT` (default `-1`, GC off for a zero‑GC hot
@@ -300,9 +304,13 @@ an SSH tunnel), or browse the raw index at `http://127.0.0.1:6060/debug/pprof/` 
 protocol, Redis‑compatible RESP listener (GET/SET/PING/DEL), at‑rest encryption, Prometheus
 metrics and OpenTelemetry tracing.
 
-**Phase 2 — Distributed (future):** event‑driven replication (e.g. NATS JetStream),
-write‑through / write‑behind persistence, official client SDKs, and a broader RESP command set
-(RESP3, INCR, EXPIRE, MULTI/EXEC).
+**Phase 1.5 — Persistence (done):** per-shard write-ahead log with zero-allocation hot path,
+TTL-aware replay, and platform-specific default directories.
+
+**Phase 2 — Protocol & Integration (future):** RESP3 compatibility, Memcached protocol
+support, official client SDKs (Go, Python, Node.js), and write-through / write-behind
+persistence to external databases (PostgreSQL, MariaDB, MSSQL, etc.) — using Tellstone as
+a high-speed in-memory buffer store in front of durable backends.
 
 ## Vision
 

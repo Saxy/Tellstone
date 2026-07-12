@@ -12,29 +12,30 @@ package shard
 
 import (
 	"context"
+	"fmt"
 	"sync/atomic"
 	"time"
 
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/persistence"
 	"github.com/Saxy/Tellstone/internal/storage"
 )
 
 const (
-	CmdGet    string = "GET"
-	CmdSet    string = "SET"
-	CmdDel    string = "DEL"
-	CmdPing   string = "PING"
+	CmdGet     string = "GET"
+	CmdSet     string = "SET"
+	CmdDel     string = "DEL"
+	CmdPing    string = "PING"
 	CmdCommand string = "COMMAND"
 )
 
 type Shard struct {
-	ID     ID
-	Engine *storage.Engine
-	Logger log.Logger
-
-	// Per-shard network metrics updated atomically from gnet event-loop goroutines.
+	ID               ID
+	Engine           *storage.Engine
+	Logger           log.Logger
+	Persistence      *persistence.Storage
 	connectedClients int64
 	totalConnections uint64
 	bytesRead        uint64
@@ -52,7 +53,7 @@ func (s *Shard) TotalConnections() uint64 { return atomic.LoadUint64(&s.totalCon
 func (s *Shard) BytesRead() uint64        { return atomic.LoadUint64(&s.bytesRead) }
 func (s *Shard) BytesWritten() uint64     { return atomic.LoadUint64(&s.bytesWritten) }
 
-func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logger) (*Shard, error) {
+func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logger, store *persistence.Storage) (*Shard, error) {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -68,11 +69,32 @@ func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logg
 		shardLogger,
 		cryptoEngine,
 	)
-	return &Shard{
-		ID:     id,
-		Engine: engine,
-		Logger: logger,
-	}, nil
+	if store == nil {
+		store, _ = persistence.NewStorage(false, logger, "")
+	}
+	shard := &Shard{
+		ID:          id,
+		Engine:      engine,
+		Logger:      logger,
+		Persistence: store,
+	}
+	if store.Enabled() {
+		if err := store.OpenShard(uint32(id)); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "persistence: cannot open shard",
+					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", id)))
+			}
+			return nil, fmt.Errorf("shard %d: open persistence: %w", id, err)
+		}
+		if err := store.LoadShard(uint32(id), engine); err != nil {
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "persistence: cannot load shard",
+					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", id)))
+			}
+			return nil, fmt.Errorf("shard %d: load persistence: %w", id, err)
+		}
+	}
+	return shard, nil
 }
 
 func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) Response {
@@ -81,12 +103,32 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		val, ok := s.Engine.Get(key)
 		return Response{Value: val, OK: ok}
 	case CmdSet:
-		err := s.Engine.Set(key, value, ttl)
-		if err != nil {
+		var expiration time.Time
+		if ttl > 0 {
+			expiration = time.Now().Add(ttl)
+		}
+		_, keyExisted := s.Engine.Get(key)
+		if s.Persistence.Enabled() {
+			if err := s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
+				return Response{Err: err}
+			}
+		}
+		if err := s.Engine.Set(key, value, ttl); err != nil {
+			if s.Persistence.Enabled() && !keyExisted {
+				if delErr := s.Persistence.Delete(uint32(s.ID), key); delErr != nil {
+					s.Logger.Log(log.LevelError, "persistence: compensation delete failed after engine rejection",
+						log.String("key", key), log.String("error", delErr.Error()))
+				}
+			}
 			return Response{Err: err}
 		}
 		return Response{OK: true}
 	case CmdDel:
+		if s.Persistence.Enabled() {
+			if err := s.Persistence.Delete(uint32(s.ID), key); err != nil {
+				return Response{Err: err}
+			}
+		}
 		s.Engine.Delete(key)
 		return Response{OK: true}
 	default:

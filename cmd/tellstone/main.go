@@ -75,7 +75,13 @@ func main() {
 	initProfiling()
 	cfg := config.LoadConfig(os.Args[1:])
 	app := new(tellstone.App)
-	app.Start(cfg, logger.NewSlogLogger(log.LevelError))
+	logpkg := logger.NewSlogLogger(cfg.GetLogLevel())
+	app.Start(cfg, logpkg)
 	svr := server.NewServer(app)
-	svr.Run()
+	if err := svr.Run(); err != nil {
+		if logpkg.Enabled(log.LevelError) {
+			logpkg.Log(log.LevelError, "server terminated with error", log.String("error", err.Error()))
+		}
+		os.Exit(1)
+	}
 }
