@@ -197,6 +197,21 @@ an apples‑to‑apples comparison.
 pipeline 10, uniform random keys, preloaded key set. All four systems tested with identical
 parameters on the same hardware.
 
+In-memory database benchmarks are highly sensitive to the underlying network infrastructure. 
+To provide an honest and comprehensive view of Tellstone's performance, 
+we categorize our results into two distinct scenarios: 
+Cloud SDN Constraints (simulating a standard production microservice mesh)
+and Raw Engine Capabilities (eliminating the network stack to test core architectural limits).
+
+> Methodology: memtier_benchmark executed from a separate client VM against a remote target VM via a virtual 
+> Software-Defined Network. 100k requests, 256-byte values, --ratio=1:10, pipeline=10.
+> At higher concurrency levels (16_64 and 60_128), all engines run directly into the physical 
+> Packets Per Second (PPS) ceiling imposed by the cloud provider's virtual switches, 
+> capping out at roughly 850K ops/s. 
+> Tellstone successfully saturates the cloud network infrastructure, 
+> operating at the absolute limit of the hardware while maintaining lower or equivalent tail 
+> latencies compared to Redis, Valkey, and Dragonfly.
+
 ![Benchmark Results](benchmark/img.png)
 
 #### Small (4 threads, 16 clients) — `10.0.0.20`
