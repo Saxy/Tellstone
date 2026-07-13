@@ -1,0 +1,103 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Tellstone Benchmark Suite – Redis vs Valkey vs Dragonfly vs Tellstone</title>
+    <script src="https://go-echarts.github.io/go-echarts-assets/assets/echarts.min.js"></script>
+    <script src="https://go-echarts.github.io/go-echarts-assets/assets/themes/walden.js"></script>
+</head>
+
+<body>
+
+
+
+    <style> .container {display: flex;justify-content: center;align-items: center;} .item {margin: auto;} </style> <div class="container">
+    <div class="item" id="HZSDhuvHoSNU" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_HZSDhuvHoSNU = echarts.init(document.getElementById('HZSDhuvHoSNU'), "walden", { renderer: "canvas" });
+    let option_HZSDhuvHoSNU = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":1403724.26},{"value":4122284.48},{"value":7286280.58}]},{"name":"redis","type":"bar","data":[{"value":1186454.96},{"value":1138613.65},{"value":1104924.45}]},{"name":"tellstone","type":"bar","data":[{"value":2448050.08},{"value":6806061.9},{"value":12738014.27}]},{"name":"valkey","type":"bar","data":[{"value":1036125.96},{"value":1015939.65},{"value":996006.31}]}],"title":{"text":"Total Ops/sec"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Ops/sec","splitLine":{"show":true}}]}
+
+    goecharts_HZSDhuvHoSNU.setOption(option_HZSDhuvHoSNU);
+</script> <div class="container">
+    <div class="item" id="GeUWyBkWTFZl" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_GeUWyBkWTFZl = echarts.init(document.getElementById('GeUWyBkWTFZl'), "walden", { renderer: "canvas" });
+    let option_GeUWyBkWTFZl = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":127612.57},{"value":374756.88},{"value":662395.77}]},{"name":"redis","type":"bar","data":[{"value":107860.62},{"value":103511.37},{"value":100448.68}]},{"name":"tellstone","type":"bar","data":[{"value":222552.23},{"value":618739.09},{"value":1158012.88}]},{"name":"valkey","type":"bar","data":[{"value":94194.21},{"value":92359.07},{"value":90546.93}]}],"title":{"text":"SET Ops/sec"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Ops/sec","splitLine":{"show":true}}]}
+
+    goecharts_GeUWyBkWTFZl.setOption(option_GeUWyBkWTFZl);
+</script> <div class="container">
+    <div class="item" id="clEPqRtCYsFA" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_clEPqRtCYsFA = echarts.init(document.getElementById('clEPqRtCYsFA'), "walden", { renderer: "canvas" });
+    let option_clEPqRtCYsFA = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":1276111.68},{"value":3747527.6},{"value":6623884.81}]},{"name":"redis","type":"bar","data":[{"value":1078594.34},{"value":1035102.28},{"value":1004475.77}]},{"name":"tellstone","type":"bar","data":[{"value":2225497.85},{"value":6187322.82},{"value":11580001.4}]},{"name":"valkey","type":"bar","data":[{"value":941931.75},{"value":923580.58},{"value":905459.38}]}],"title":{"text":"GET Ops/sec"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Ops/sec","splitLine":{"show":true}}]}
+
+    goecharts_clEPqRtCYsFA.setOption(option_clEPqRtCYsFA);
+</script> <div class="container">
+    <div class="item" id="fLULZTmLDmjz" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_fLULZTmLDmjz = echarts.init(document.getElementById('fLULZTmLDmjz'), "walden", { renderer: "canvas" });
+    let option_fLULZTmLDmjz = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":"0.112"},{"value":"0.154"},{"value":"0.183"}]},{"name":"redis","type":"bar","data":[{"value":"0.132"},{"value":"0.559"},{"value":"1.161"}]},{"name":"tellstone","type":"bar","data":[{"value":"0.063"},{"value":"0.092"},{"value":"0.097"}]},{"name":"valkey","type":"bar","data":[{"value":"0.152"},{"value":"0.627"},{"value":"1.289"}]}],"title":{"text":"SET Avg Latency (ms)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Milliseconds","splitLine":{"show":true}}]}
+
+    goecharts_fLULZTmLDmjz.setOption(option_fLULZTmLDmjz);
+</script> <div class="container">
+    <div class="item" id="MxDcjcvQBwOS" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_MxDcjcvQBwOS = echarts.init(document.getElementById('MxDcjcvQBwOS'), "walden", { renderer: "canvas" });
+    let option_MxDcjcvQBwOS = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":"0.112"},{"value":"0.154"},{"value":"0.183"}]},{"name":"redis","type":"bar","data":[{"value":"0.132"},{"value":"0.559"},{"value":"1.161"}]},{"name":"tellstone","type":"bar","data":[{"value":"0.063"},{"value":"0.091"},{"value":"0.096"}]},{"name":"valkey","type":"bar","data":[{"value":"0.152"},{"value":"0.627"},{"value":"1.289"}]}],"title":{"text":"GET Avg Latency (ms)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Milliseconds","splitLine":{"show":true}}]}
+
+    goecharts_MxDcjcvQBwOS.setOption(option_MxDcjcvQBwOS);
+</script> <div class="container">
+    <div class="item" id="RTeLIKRAYKaR" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_RTeLIKRAYKaR = echarts.init(document.getElementById('RTeLIKRAYKaR'), "walden", { renderer: "canvas" });
+    let option_RTeLIKRAYKaR = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":"0.175"},{"value":"0.255"},{"value":"0.615"}]},{"name":"redis","type":"bar","data":[{"value":"0.207"},{"value":"1.063"},{"value":"2.335"}]},{"name":"tellstone","type":"bar","data":[{"value":"0.231"},{"value":"0.415"},{"value":"0.439"}]},{"name":"valkey","type":"bar","data":[{"value":"0.231"},{"value":"1.191"},{"value":"2.559"}]}],"title":{"text":"SET p99 Latency (ms)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Milliseconds","splitLine":{"show":true}}]}
+
+    goecharts_RTeLIKRAYKaR.setOption(option_RTeLIKRAYKaR);
+</script> <div class="container">
+    <div class="item" id="DzjsXjliwEIo" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_DzjsXjliwEIo = echarts.init(document.getElementById('DzjsXjliwEIo'), "walden", { renderer: "canvas" });
+    let option_DzjsXjliwEIo = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":"0.175"},{"value":"0.247"},{"value":"0.615"}]},{"name":"redis","type":"bar","data":[{"value":"0.207"},{"value":"1.063"},{"value":"2.335"}]},{"name":"tellstone","type":"bar","data":[{"value":"0.231"},{"value":"0.415"},{"value":"0.431"}]},{"name":"valkey","type":"bar","data":[{"value":"0.231"},{"value":"1.191"},{"value":"2.559"}]}],"title":{"text":"GET p99 Latency (ms)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Milliseconds","splitLine":{"show":true}}]}
+
+    goecharts_DzjsXjliwEIo.setOption(option_DzjsXjliwEIo);
+</script> <div class="container">
+    <div class="item" id="QwORCRjBTzFF" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_QwORCRjBTzFF = echarts.init(document.getElementById('QwORCRjBTzFF'), "walden", { renderer: "canvas" });
+    let option_QwORCRjBTzFF = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":"0.223"},{"value":"0.319"},{"value":"1.295"}]},{"name":"redis","type":"bar","data":[{"value":"0.247"},{"value":"1.095"},{"value":"2.383"}]},{"name":"tellstone","type":"bar","data":[{"value":"0.415"},{"value":"0.703"},{"value":"0.783"}]},{"name":"valkey","type":"bar","data":[{"value":"0.255"},{"value":"1.223"},{"value":"2.607"}]}],"title":{"text":"SET p99.9 Latency (ms)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Milliseconds","splitLine":{"show":true}}]}
+
+    goecharts_QwORCRjBTzFF.setOption(option_QwORCRjBTzFF);
+</script> <div class="container">
+    <div class="item" id="RFOLtMsvBMXH" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_RFOLtMsvBMXH = echarts.init(document.getElementById('RFOLtMsvBMXH'), "walden", { renderer: "canvas" });
+    let option_RFOLtMsvBMXH = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":"0.223"},{"value":"0.319"},{"value":"1.287"}]},{"name":"redis","type":"bar","data":[{"value":"0.247"},{"value":"1.095"},{"value":"2.383"}]},{"name":"tellstone","type":"bar","data":[{"value":"0.407"},{"value":"0.703"},{"value":"0.783"}]},{"name":"valkey","type":"bar","data":[{"value":"0.255"},{"value":"1.223"},{"value":"2.607"}]}],"title":{"text":"GET p99.9 Latency (ms)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"Milliseconds","splitLine":{"show":true}}]}
+
+    goecharts_RFOLtMsvBMXH.setOption(option_RFOLtMsvBMXH);
+</script> <div class="container">
+    <div class="item" id="BGbmrqzMYoOV" style="width:1200px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_BGbmrqzMYoOV = echarts.init(document.getElementById('BGbmrqzMYoOV'), "walden", { renderer: "canvas" });
+    let option_BGbmrqzMYoOV = {"legend":{"show":true,"right":"5%"},"series":[{"name":"dragonfly","type":"bar","data":[{"value":88349.51},{"value":261585.66},{"value":462361.72}]},{"name":"redis","type":"bar","data":[{"value":74660.73},{"value":71650.17},{"value":69545.93}]},{"name":"tellstone","type":"bar","data":[{"value":154060.92},{"value":428366.26},{"value":801738.45}]},{"name":"valkey","type":"bar","data":[{"value":65200.3},{"value":63930.44},{"value":62691.05}]}],"title":{"text":"Throughput (KB/sec)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4 CPUs","16 CPUs","32 CPUs"]}],"yAxis":[{"name":"KB/sec","splitLine":{"show":true}}]}
+
+    goecharts_BGbmrqzMYoOV.setOption(option_BGbmrqzMYoOV);
+</script>
+
+
+
+
+
+
+</body>
+</html>

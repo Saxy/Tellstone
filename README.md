@@ -214,7 +214,7 @@ and Raw Engine Capabilities (eliminating the network stack to test core architec
 
 ![Benchmark Results](benchmark/vm-vm-sdn/img.png)
 
-#### Small (4 threads, 16 clients) — `10.0.0.20`
+#### Small (4 threads, 16 clients) 
 
 | System | Throughput | vs Redis | avg | p50 | p99 | p99.9 |
 |--------|-----------|----------|-----|-----|-----|-------|
@@ -223,7 +223,7 @@ and Raw Engine Capabilities (eliminating the network stack to test core architec
 | Valkey | 607K ops/s | 0.96x | 1.05ms | 1.04ms | 1.50ms | 1.72ms |
 | Dragonfly | 552K ops/s | 0.87x | 1.18ms | 1.10ms | 2.35ms | 2.85ms |
 
-#### Medium (16 threads, 64 clients) — `10.0.0.7`
+#### Medium (16 threads, 64 clients)
 
 | System | Throughput | vs Redis | avg | p50 | p99 | p99.9 |
 |--------|-----------|----------|-----|-----|-----|-------|
@@ -232,7 +232,7 @@ and Raw Engine Capabilities (eliminating the network stack to test core architec
 | Valkey | 786K ops/s | 0.95x | 13.02ms | 12.99ms | 19.58ms | 20.48ms |
 | Dragonfly | 864K ops/s | 1.04x | 11.85ms | 10.05ms | 40.96ms | 62.98ms |
 
-#### Large (60 threads, 128 clients) — `10.0.0.112`
+#### Large (60 threads, 128 clients) 
 
 | System | Throughput | vs Redis | avg | p50 | p99 | p99.9 |
 |--------|-----------|----------|-----|-----|-----|-------|
@@ -258,6 +258,51 @@ Throughput with the native binary protocol (no pipelining, read-heavy):
 
 > Numbers are environment-specific; reproduce with `task bench:resp` and the
 > `benchmark/benchmark.sh` script.
+
+### Bare‑metal benchmarks (localhost, no network overhead)
+
+Same `memtier_benchmark` parameters (256 B values, `--ratio=1:10`, pipeline 10, uniform random
+keys) but executed on a **dedicated bare‑metal server** (Intel Xeon Platinum 8580, 56 cores,
+118 GB RAM, Debian). The load generator and server share the same machine, with `taskset`
+pining the server process to the requested core set. This isolates raw engine throughput and
+latency from any cloud‑SDN constraints.
+
+> 500K requests per client, 4 clients per memtier thread. Server `taskset -c 0-N`,
+> memtier runs unpinned.
+
+![Bare-metal Benchmark Results](benchmark/local/img.png)
+
+#### Small (4 CPUs)
+
+| System | Total Ops/s | vs Redis | avg | p50 | p99 | p99.9 |
+|--------|------------|----------|-----|-----|-----|-------|
+| **Tellstone** | **2,448K** | **2.06x** | **0.06ms** | **0.06ms** | **0.23ms** | **0.41ms** |
+| Dragonfly | 1,404K | 1.18x | 0.11ms | 0.11ms | 0.17ms | 0.22ms |
+| Redis | 1,186K | 1.0x | 0.13ms | 0.12ms | 0.21ms | 0.25ms |
+| Valkey | 1,036K | 0.87x | 0.15ms | 0.14ms | 0.23ms | 0.26ms |
+
+#### Medium (16 CPUs)
+
+| System | Total Ops/s | vs Redis | avg | p50 | p99 | p99.9 |
+|--------|------------|----------|-----|-----|-----|-------|
+| **Tellstone** | **6,806K** | **5.98x** | **0.09ms** | **0.07ms** | **0.41ms** | **0.70ms** |
+| Dragonfly | 4,122K | 3.62x | 0.15ms | 0.15ms | 0.26ms | 0.32ms |
+| Redis | 1,139K | 1.0x | 0.56ms | 0.54ms | 1.06ms | 1.09ms |
+| Valkey | 1,016K | 0.89x | 0.63ms | 0.60ms | 1.19ms | 1.22ms |
+
+#### Large (32 CPUs)
+
+| System | Total Ops/s | vs Redis | avg | p50 | p99 | p99.9 |
+|--------|------------|----------|-----|-----|-----|-------|
+| **Tellstone** | **12,738K** | **11.53x** | **0.10ms** | **0.08ms** | **0.44ms** | **0.78ms** |
+| Dragonfly | 7,286K | 6.59x | 0.18ms | 0.17ms | 0.61ms | 1.29ms |
+| Redis | 1,105K | 1.0x | 1.16ms | 1.15ms | 2.33ms | 2.38ms |
+| Valkey | 996K | 0.90x | 1.29ms | 1.27ms | 2.56ms | 2.61ms |
+
+On bare metal Tellstone scales nearly linearly with available cores — **11.5x Redis** at 32
+CPUs — while Redis and Valkey flatline around 1 M ops/s regardless of core count. Dragonfly
+scales well (6.6x) but Tellstone maintains a ~1.75x lead at every level, with the lowest p50
+latency across the board (0.06 – 0.08 ms).
 
 ---
 
