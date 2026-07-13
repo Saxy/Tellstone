@@ -212,7 +212,7 @@ and Raw Engine Capabilities (eliminating the network stack to test core architec
 > operating at the absolute limit of the hardware while maintaining lower or equivalent tail 
 > latencies compared to Redis, Valkey, and Dragonfly.
 
-![Benchmark Results](benchmark/img.png)
+![Benchmark Results](benchmark/vm-vm-sdn/img.png)
 
 #### Small (4 threads, 16 clients) — `10.0.0.20`
 
