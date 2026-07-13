@@ -1,0 +1,24 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Awesome go-echarts</title>
+    <script src="https://go-echarts.github.io/go-echarts-assets/assets/echarts.min.js"></script>
+</head>
+
+<body><div class="container">
+    <div class="item" id="FMQOKwVFryEg" style="width:900px;height:500px;"></div>
+</div><script type="text/javascript">
+    "use strict";
+    let goecharts_FMQOKwVFryEg = echarts.init(document.getElementById('FMQOKwVFryEg'), "white", { renderer: "canvas" });
+    let option_FMQOKwVFryEg = {"color":["#5470c6","#91cc75","#fac858","#ee6666","#73c0de","#3ba272","#fc8452","#9a60b4","#ea7ccc"],"legend":{"show":true,"right":"10%"},"series":[{"name":"redis","type":"bar","data":[{"value":635831.24},{"value":830906.39},{"value":848682.66}]},{"name":"valkey","type":"bar","data":[{"value":607491.61},{"value":786264.11},{"value":723110.61}]},{"name":"dragonfly","type":"bar","data":[{"value":552457},{"value":864022.09},{"value":842920.56}]},{"name":"tellstone","type":"bar","data":[{"value":664383.06},{"value":869611.27},{"value":855714.52}]}],"title":{"text":"Database Benchmark Comparison","subtext":"Throughput (Operations per Second - Higher is Better)"},"toolbox":{},"tooltip":{"show":true},"xAxis":[{"data":["4_16","16_64","60_128"]}],"yAxis":[{}]}
+
+    goecharts_FMQOKwVFryEg.setOption(option_FMQOKwVFryEg);
+</script>
+<style>
+    .container {margin-top:30px; display: flex;justify-content: center;align-items: center;}
+    .item {margin: auto;}
+</style>
+</body>
+</html>
