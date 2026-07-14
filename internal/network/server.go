@@ -82,7 +82,7 @@ func (s *Server) ListenAndServe() error {
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "network: event-driven engine initializing", log.String("address", s.addr))
 	}
-	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true))
+	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true), gnet.WithLogger(log.NewGnetAdapter(s.logger)))
 }
 
 // Shutdown gracefully stops the event loop, waiting for in-flight connections to drain or

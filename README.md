@@ -58,12 +58,37 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 
 ## Getting Started
 
-### Prerequisites
-* **Go 1.26+**
-* Optional: [`task`](https://taskfile.dev) (go‑task) for the shortcuts below
-* Optional (for RESP benchmarking): `redis-cli`, `memtier_benchmark`, or `redis-tools`
+### Install
 
-### Build
+#### Debian / Ubuntu (APT)
+
+```bash
+curl -fsSL https://saxy.github.io/tellstone-apt/saxy-keyring.gpg \
+  | sudo gpg --dearmor -o /usr/share/keyrings/saxy-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/saxy-keyring.gpg] \
+  https://saxy.github.io/tellstone-apt stable main" \
+  | sudo tee /etc/apt/sources.list.d/saxy-tellstone.list > /dev/null
+
+sudo apt update && sudo apt install tellstone
+```
+
+#### macOS (Homebrew)
+
+```bash
+brew tap Saxy/tellstone-tap
+brew install --cask Saxy/tellstone-tap/tellstone
+```
+
+#### Binary Downloads
+
+Pre-built binaries are available on the
+[Releases](https://github.com/Saxy/Tellstone/releases) page for Linux, macOS, and Windows
+(amd64 and arm64).
+
+#### Build from Source
+
+Requires **Go 1.26+** and optionally [`task`](https://taskfile.dev) (go‑task):
 
 ```bash
 task build          # → ./bin/tellstone   (or: go build -o bin/tellstone ./cmd/tellstone)
