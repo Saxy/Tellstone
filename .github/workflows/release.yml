@@ -77,6 +77,19 @@ jobs:
             -o APT::FTPArchive::Release::Components="main" \
             release dists/ > dists/stable/Release
 
+      - name: Sign Release file
+        run: |
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 -d | gpg --batch --import
+          gpg --batch --yes --pinentry-mode loopback \
+            -abs -o dists/stable/Release.gpg dists/stable/Release
+          gpg --batch --yes --pinentry-mode loopback \
+            --clearsign -o dists/stable/InRelease dists/stable/Release
+
+      - name: Export public key
+        run: |
+          gpg --batch --pinentry-mode loopback \
+            --armor --export > key.gpg
+
       - name: Push to APT repo
         run: |
           git config user.name "github-actions[bot]"
