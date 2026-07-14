@@ -21,6 +21,7 @@ import (
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/version"
 	"github.com/Saxy/Tellstone/logger"
 	"github.com/Saxy/Tellstone/server"
 )
@@ -71,6 +72,12 @@ func initRuntimeSettings() {
 }
 
 func main() {
+	for _, arg := range os.Args[1:] {
+		if arg == "-version" || arg == "--version" {
+			version.Print()
+			return
+		}
+	}
 	initRuntimeSettings()
 	initProfiling()
 	cfg := config.LoadConfig(os.Args[1:])

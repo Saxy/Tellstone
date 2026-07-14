@@ -1,0 +1,59 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Run tests
+        run: go test ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-deb:
+    name: Publish APT package
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: maxhagen/home-infra
+          token: ${{ secrets.INFRAREPO_TOKEN }}
+
+      - name: Download .deb from release
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          mkdir -p aptpool
+          gh release download "$TAG" -p "*.deb" -D aptpool/
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: Saxy/Tellstone
+
+      - name: Publish to APT repo
+        run: |
+          chmod +x scripts/publish-apt.sh
+          scripts/publish-apt.sh aptpool/

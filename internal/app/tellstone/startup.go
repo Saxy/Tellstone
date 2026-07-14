@@ -16,6 +16,7 @@ import (
 
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/version"
 )
 
 type App struct {
@@ -78,6 +79,8 @@ func (a *App) Start(cfg *config.Config, logger log.Logger) {
 	fmt.Println("\033[90m" + strings.Repeat("-", 70) + "\033[0m")
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "TSD Core Engine initializing",
+			log.String("version", version.Version),
+			log.String("commit", version.Commit),
 			log.String("bind_address", cfg.GetAddr()),
 			log.String("max_msg_size", (new(config.ByteSize(cfg.GetMaxMsgSize()))).String()),
 			log.Uint64("max_msg_size_bytes", cfg.GetMaxMsgSize()),

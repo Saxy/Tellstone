@@ -5,6 +5,18 @@ version: '3'
 vars:
   BIN: bin/tellstone
   BENCH_BIN: bin/benchmark
+
+  # Build version info (overridden by CI / goreleaser via ldflags).
+  VERSION: '{{.VERSION | default "0.0.0-dev"}}'
+  COMMIT:
+    sh: git rev-parse --short HEAD 2>/dev/null || echo "unknown"
+  DATE:
+    sh: date -u +%Y-%m-%dT%H:%M:%SZ
+  LDFLAGS: >-
+    -X github.com/Saxy/Tellstone/internal/version.Version={{.VERSION}}
+    -X github.com/Saxy/Tellstone/internal/version.Commit={{.COMMIT}}
+    -X github.com/Saxy/Tellstone/internal/version.Date={{.DATE}}
+
   # Ports — the binary listener uses a non-default port so it won't clash with an
   # IDE-launched instance on :9988. RESP uses the standard Redis port.
   BIN_PORT: '{{.BIN_PORT | default "19988"}}'
@@ -38,7 +50,7 @@ tasks:
   build:
     desc: Build the server binary into ./bin/tellstone
     cmds:
-      - go build -o {{.BIN}} ./cmd/tellstone
+      - go build -ldflags "{{.LDFLAGS}}" -o {{.BIN}} ./cmd/tellstone
     sources:
       - "**/*.go"
     generates:
@@ -139,31 +151,31 @@ tasks:
           TSD_ADDR=127.0.0.1:{{.BIN_PORT}} ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
         SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
         
-        echo "Warte auf Tellstone (Port {{.BIN_PORT}})..."
+        echo "Waiting for Tellstone (Port {{.BIN_PORT}})..."
         for i in {1..30}; do nc -z 127.0.0.1 {{.BIN_PORT}} && break; sleep 0.1; done
-        nc -z 127.0.0.1 {{.BIN_PORT}} || { echo "Server konnte nicht starten:"; cat /tmp/tellstone-bench.log; exit 1; }
+        nc -z 127.0.0.1 {{.BIN_PORT}} || { echo "Server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
         
         {{.TASKSET_BENCH}} ./{{.BENCH_BIN}} -addr 127.0.0.1:{{.BIN_PORT}} \
           -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
   bench:resp:
-      desc: "RESP latency benchmark via memtier. Vars: THREADS CONNS DURATION PIPELINE RATIO KEYSPACE"
-      deps: [ build ]
-      cmds:
-        - |
-          set -e
-          command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
-          {{.TASKSET_SRV}} env GOMAXPROCS={{.SRV_PROCS}} TSD_LOG_LEVEL=error \
-            TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
-            ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
-          SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
+    desc: "RESP latency benchmark via memtier. Vars: THREADS CONNS DURATION PIPELINE RATIO KEYSPACE"
+    deps: [ build ]
+    cmds:
+      - |
+        set -e
+        command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
+        {{.TASKSET_SRV}} env GOMAXPROCS={{.SRV_PROCS}} TSD_LOG_LEVEL=error \
+          TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
+          ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
+        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
 
-          echo "Warte auf Tellstone RESP (Port {{.RESP_PORT}})..."
-          for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
-          nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server konnte nicht starten:"; cat /tmp/tellstone-bench.log; exit 1; }
+        echo "Waiting for Tellstone RESP (Port {{.RESP_PORT}})..."
+        for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
+        nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
 
-          {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
-            -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
-            --ratio={{.RATIO}} --key-maximum={{.KEYSPACE}} --hide-histogram
+        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
+          -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
+          --ratio={{.RATIO}} --key-maximum={{.KEYSPACE}} --hide-histogram
   bench:resp:pipeline:
       desc: RESP throughput-ceiling benchmark (pipeline=16)
       cmds:
@@ -180,9 +192,9 @@ tasks:
             TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
             ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
           SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
-          echo "Warte auf Tellstone RESP (Port {{.RESP_PORT}})..."
+          echo "Waiting for Tellstone RESP (Port {{.RESP_PORT}})..."
           for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
-          nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server konnte nicht starten:"; cat /tmp/tellstone-bench.log; exit 1; }
+          nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
           echo "== preload {{.KEYSPACE}} keys =="
           {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
             -t 1 -c 1 -n {{.KEYSPACE}} --ratio=1:0 --key-pattern=S:S \
@@ -202,9 +214,9 @@ tasks:
           TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
           ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
         SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
-        echo "Warte auf Tellstone RESP (Port {{.RESP_PORT}})..."
+        echo "Waiting for Tellstone RESP (Port {{.RESP_PORT}})..."
         for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
-        nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server konnte nicht starten:"; cat /tmp/tellstone-bench.log; exit 1; }
+        nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
 
         echo "== preload 200000 keys =="
         {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
@@ -218,35 +230,35 @@ tasks:
           --key-stddev=50000 --hide-histogram
 
   bench:compare:
-    desc: "Vergleiche DBs. Usage: task bench:compare TARGET=redis|valkey|tellstone [THREADS=...]"
+    desc: "Compare databases. Usage: task bench:compare TARGET=redis|valkey|tellstone [THREADS=...]"
     vars:
       TARGET: '{{.TARGET | default "tellstone"}}'
     cmds:
       - |
         set -e
-        # Server Start Logik
+        # Server startup logic
         case "{{.TARGET}}" in
           tellstone)
-            echo "--- Starte Tellstone ---"
+            echo "--- Starting Tellstone ---"
            sh -c 'export TSD_ADDR=127.0.0.1:{{.BIN_PORT}}; \
                    export TSD_ENABLE_RESP=true; \
                    export TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}}; \
                    ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1' &
             SRV=$! ;;
           redis)
-            echo "--- Starte Redis ---"
+            echo "--- Starting Redis ---"
             redis-server --port {{.RESP_PORT}} --save "" --appendonly no >/tmp/redis-bench.log 2>&1 &
             SRV=$! ;;
           valkey)
-            echo "--- Starte Valkey ---"
+            echo "--- Starting Valkey ---"
             valkey-server --port {{.RESP_PORT}} --save "" --appendonly no >/tmp/valkey-bench.log 2>&1 &
             SRV=$! ;;
-          *) echo "Unbekanntes Target: {{.TARGET}}"; exit 1 ;;
+          *) echo "Unknown target: {{.TARGET}}"; exit 1 ;;
         esac
         
         trap "kill $SRV 2>/dev/null || true" EXIT
       
-        # Warten bis Port offen ist
+        # Wait for port to be ready
         for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.5; done
         
         echo "Running memtier against {{.TARGET}}..."

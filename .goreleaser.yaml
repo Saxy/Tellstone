@@ -1,0 +1,66 @@
+version: 2
+
+project_name: tellstone
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - main: ./cmd/tellstone
+    binary: tellstone
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/Saxy/Tellstone/internal/version.Version={{.Version}}
+      - -X github.com/Saxy/Tellstone/internal/version.Commit={{.Commit}}
+      - -X github.com/Saxy/Tellstone/internal/version.Date={{.Date}}
+
+archives:
+  - format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+nfpms:
+  - id: tellstone-nfpm
+    package_name: tellstone
+    vendor: Tellstone
+    homepage: https://tellstone.io
+    description: "High-performance, cloud-native in-memory key/value store"
+    license: Apache-2.0
+    maintainer: "Maximilian Hagen <max@tellstone.io>"
+    formats:
+      - deb
+    bindir: /usr/bin
+    section: database
+    priority: optional
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+
+release:
+  github:
+    owner: Saxy
+    name: Tellstone
+  draft: false
+  prerelease: auto
