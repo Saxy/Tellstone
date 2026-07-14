@@ -33,6 +33,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.TAP_TOKEN }}
 
   publish-deb:
     name: Publish APT package
@@ -41,19 +42,46 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: maxhagen/home-infra
-          token: ${{ secrets.INFRAREPO_TOKEN }}
+          repository: Saxy/tellstone-apt
+          token: ${{ secrets.APT_REPO_TOKEN }}
 
       - name: Download .deb from release
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
-          mkdir -p aptpool
-          gh release download "$TAG" -p "*.deb" -D aptpool/
+          mkdir -p pool/tellstone
+          gh release download "$TAG" -p "*.deb" -D pool/tellstone/
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: Saxy/Tellstone
 
-      - name: Publish to APT repo
+      - name: Install apt tooling
+        run: sudo apt-get update && sudo apt-get install -y dpkg-scanpackages apt-utils
+
+      - name: Generate Packages metadata
         run: |
-          chmod +x scripts/publish-apt.sh
-          scripts/publish-apt.sh aptpool/
+          for ARCH in amd64 arm64; do
+            mkdir -p "dists/stable/main/binary-${ARCH}"
+            dpkg-scanpackages --arch "${ARCH}" --multiversion pool/ /dev/null \
+              > "dists/stable/main/binary-${ARCH}/Packages"
+            gzip -9 -k -f "dists/stable/main/binary-${ARCH}/Packages"
+          done
+
+      - name: Generate Release file
+        run: |
+          apt-ftparchive \
+            -o APT::FTPArchive::Release::Origin="Tellstone" \
+            -o APT::FTPArchive::Release::Label="Tellstone" \
+            -o APT::FTPArchive::Release::Suite="stable" \
+            -o APT::FTPArchive::Release::Codename="stable" \
+            -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
+            -o APT::FTPArchive::Release::Components="main" \
+            release dists/ > dists/stable/Release
+
+      - name: Push to APT repo
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && exit 0
+          git commit -m "Release ${GITHUB_REF#refs/tags/}"
+          git push

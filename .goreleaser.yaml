@@ -64,3 +64,18 @@ release:
     name: Tellstone
   draft: false
   prerelease: auto
+
+brews:
+  - name: tellstone
+    repository:
+      owner: Saxy
+      name: tellstone-tap
+      token: "{{ .Env.HOMEBREW_TAP_TOKEN }}"
+    homepage: https://tellstone.io
+    description: "High-performance, cloud-native in-memory key/value store"
+    license: "Apache-2.0"
+    skip_upload: auto
+    install: |
+      bin.install "tellstone"
+    test: |
+      system "#{bin}/tellstone", "--version"
