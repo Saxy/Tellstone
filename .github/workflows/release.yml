@@ -49,7 +49,7 @@ jobs:
         run: |
           TAG="${GITHUB_REF#refs/tags/}"
           mkdir -p pool/tellstone
-          gh release download "$TAG" -p "*.deb" -D pool/tellstone/
+          gh release download "$TAG" -p "*.deb" -D pool/tellstone/ --clobber
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: Saxy/Tellstone
