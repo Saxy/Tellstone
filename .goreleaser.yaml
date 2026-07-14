@@ -75,7 +75,14 @@ homebrew_casks:
     description: "High-performance, cloud-native in-memory key/value store"
     license: "Apache-2.0"
     skip_upload: auto
-    install: |
-      bin.install "tellstone"
-    test: |
-      system "#{bin}/tellstone", "--version"
+    binaries:
+      - tellstone
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/tellstone"]
+          end
+    caveats: |
+      Tellstone is now installed. Run 'tellstone -h' for usage.
+      To start the server: tellstone -addr 127.0.0.1:9988
