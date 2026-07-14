@@ -68,6 +68,7 @@ jobs:
 
       - name: Generate Release file
         run: |
+          cd dists/stable
           apt-ftparchive \
             -o APT::FTPArchive::Release::Origin="Tellstone" \
             -o APT::FTPArchive::Release::Label="Tellstone" \
@@ -75,7 +76,7 @@ jobs:
             -o APT::FTPArchive::Release::Codename="stable" \
             -o APT::FTPArchive::Release::Architectures="amd64 arm64" \
             -o APT::FTPArchive::Release::Components="main" \
-            release dists/ > dists/stable/Release
+            release . > Release
 
       - name: Sign Release file
         run: |
