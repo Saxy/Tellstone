@@ -67,6 +67,7 @@ release:
 
 homebrew_casks:
   - name: tellstone
+    directory: Casks
     repository:
       owner: Saxy
       name: tellstone-tap
