@@ -1,4 +1,4 @@
-# Tellstone <img src="tsd_logo.svg" width="100" height="100" alt="Tellstone logo" style="vertical-align: middle;">
+# <img src="tsd_banner.svg" width="100%" alt="Tellstone logo" style="vertical-align: middle;">
 
 [![CI](https://github.com/Saxy/Tellstone/actions/workflows/ci.yml/badge.svg)](https://github.com/Saxy/Tellstone/actions/workflows/ci.yml)
 [![Go Version](https://img.shields.io/badge/Go-1.26-blue)](https://go.dev)
