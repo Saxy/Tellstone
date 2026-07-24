@@ -399,26 +399,6 @@ On a headless/remote host, set `PORT=<port>` and open `http://<host>:<port>` you
 an SSH tunnel), or browse the raw index at `http://127.0.0.1:6060/debug/pprof/` directly.
 
 ---
-
-## Milestones
-
-**Phase 1 — Core Engine (done):** sharded in‑memory engine with TTL eviction, binary TCP
-protocol, Redis‑compatible RESP listener (GET/SET/PING/DEL), at‑rest encryption, Prometheus
-metrics and OpenTelemetry tracing.
-
-**Phase 1.5 — Persistence (done):** per-shard write-ahead log with zero-allocation hot path,
-TTL-aware replay, and platform-specific default directories.
-
-**Phase 2 — Protocol & Integration (future):** RESP3 compatibility, Memcached protocol
-support, official client SDKs (Go, Python, Node.js), and write-through / write-behind
-persistence to external databases (PostgreSQL, MariaDB, MSSQL, etc.) — using Tellstone as
-a high-speed in-memory buffer store in front of durable backends.
-
-## Vision
-
-Tellstone aims to be the go‑to **in‑cluster accelerator** for cloud‑native applications —
-reducing latency and off‑loading traffic from downstream databases.
-
 ## Contributing
 
 Contributions are welcome — especially around networking, replication, persistence, and RESP
