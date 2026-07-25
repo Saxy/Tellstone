@@ -140,7 +140,7 @@ func BenchmarkGnetPlaintext(b *testing.B) {
 	if _, err := conn.Write(frame); err != nil {
 		b.Fatalf("warmup write failed: %v", err)
 	}
-	buf := make([]byte, 4096)
+	buf := make([]byte, 5+len(payload))
 	if _, err := io.ReadFull(conn, buf); err != nil {
 		b.Fatalf("warmup read failed: %v", err)
 	}
@@ -178,7 +178,7 @@ func BenchmarkGnetTLS(b *testing.B) {
 	defer conn.Close()
 
 	// Warm up: handshake + one ping/pong.
-	buf := make([]byte, 4096)
+	buf := make([]byte, 5+len(payload))
 	if _, err := conn.Write(frame); err != nil {
 		b.Fatalf("warmup write failed: %v", err)
 	}
@@ -219,7 +219,7 @@ func BenchmarkGnetPlaintextParallel(b *testing.B) {
 			}
 			defer conn.Close()
 
-			buf := make([]byte, 4096)
+			buf := make([]byte, 5+len(payload))
 			iters := b.N / numCores
 			if core < b.N%numCores {
 				iters++
@@ -266,7 +266,7 @@ func BenchmarkGnetTLSParallel(b *testing.B) {
 			}
 			defer conn.Close()
 
-			buf := make([]byte, 4096)
+			buf := make([]byte, 5+len(payload))
 			iters := b.N / numCores
 			if core < b.N%numCores {
 				iters++

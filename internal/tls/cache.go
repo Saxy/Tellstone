@@ -9,11 +9,13 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 )
 
 type cacheEntry struct {
 	refs atomic.Int64
 	cert *x509.Certificate
+	key  string // cached string(cert.Raw) — avoids re-allocation on eviction.
 }
 
 // certCache implements an intern table for reference counted x509.Certificates,
@@ -45,7 +47,17 @@ var globalCertCache = new(certCache)
 // no alive activeCerts for a given certificate, the certificate is removed
 // from the cache by a finalizer.
 type activeCert struct {
-	cert *x509.Certificate
+	cert  *x509.Certificate
+	entry *cacheEntry
+	cc    *certCache
+}
+
+// activeCertFinalizer is the package-level finalizer for activeCert.
+// Using a package-level function avoids allocating a closure per call.
+func activeCertFinalizer(a *activeCert) {
+	if a.entry.refs.Add(-1) == 0 {
+		a.cc.evict(a.entry)
+	}
 }
 
 // active increments the number of references to the entry, wraps the
@@ -59,18 +71,21 @@ type activeCert struct {
 // there being more than one distinct reference to a certificate alive at once.
 func (cc *certCache) active(e *cacheEntry) *activeCert {
 	e.refs.Add(1)
-	a := &activeCert{e.cert}
-	runtime.SetFinalizer(a, func(_ *activeCert) {
-		if e.refs.Add(-1) == 0 {
-			cc.evict(e)
-		}
-	})
+	a := &activeCert{cert: e.cert, entry: e, cc: cc}
+	runtime.SetFinalizer(a, activeCertFinalizer)
 	return a
 }
 
 // evict removes a cacheEntry from the cache.
 func (cc *certCache) evict(e *cacheEntry) {
-	cc.Delete(string(e.cert.Raw))
+	cc.Delete(e.key)
+}
+
+// unsafeBytesToString converts a byte slice to a string without copying.
+// Safe for read-only lookups where the source bytes are stable (e.g., DER
+// certificate data that is never modified after parsing).
+func unsafeBytesToString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
 }
 
 // newCert returns a x509.Certificate parsed from der. If there is already a copy
@@ -78,7 +93,7 @@ func (cc *certCache) evict(e *cacheEntry) {
 // be returned. Otherwise, a fresh certificate will be added to the cache, and
 // the reference returned. The returned reference should not be mutated.
 func (cc *certCache) newCert(der []byte) (*activeCert, error) {
-	if entry, ok := cc.Load(string(der)); ok {
+	if entry, ok := cc.Load(unsafeBytesToString(der)); ok {
 		return cc.active(entry.(*cacheEntry)), nil
 	}
 
@@ -87,8 +102,9 @@ func (cc *certCache) newCert(der []byte) (*activeCert, error) {
 		return nil, err
 	}
 
-	entry := &cacheEntry{cert: cert}
-	if entry, loaded := cc.LoadOrStore(string(der), entry); loaded {
+	key := string(der)
+	entry := &cacheEntry{cert: cert, key: key}
+	if entry, loaded := cc.LoadOrStore(key, entry); loaded {
 		return cc.active(entry.(*cacheEntry)), nil
 	}
 	return cc.active(entry), nil
