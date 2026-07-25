@@ -8,7 +8,6 @@ before:
 
 builds:
   - main: ./cmd/tellstone
-    binary: tellstone
     env:
       - CGO_ENABLED=0
     goos:
