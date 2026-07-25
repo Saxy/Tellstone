@@ -2,6 +2,7 @@ package network
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -11,30 +12,24 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/panjf2000/gnet/v2"
 )
-
-type NOOPLogger struct{}
-
-func (N NOOPLogger) Debugf(format string, args ...any) {}
-func (N NOOPLogger) Infof(format string, args ...any)  {}
-func (N NOOPLogger) Warnf(format string, args ...any)  {}
-func (N NOOPLogger) Errorf(format string, args ...any) {}
-func (N NOOPLogger) Fatalf(format string, args ...any) {}
 
 const benchAddr = "127.0.0.1:9988"
 
 func TestMain(m *testing.M) {
 	srv := NewServer(benchAddr, 0, nil, func(msg *Message) ([]byte, MessageType, error) {
 		return msg.Payload, MsgResponse, nil
-	}, nil)
+	}, nil, nil)
 
 	go func() {
 		_ = srv.ListenAndServe()
 	}()
 	time.Sleep(100 * time.Millisecond)
-	os.Exit(m.Run())
+	code := m.Run()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+	os.Exit(code)
 }
 
 func BenchmarkReadMessageZeroAlloc(b *testing.B) {
@@ -72,92 +67,48 @@ func BenchmarkReadMessageZeroAlloc(b *testing.B) {
 	}
 }
 
-type benchClient struct {
-	gnet.BuiltinEventEngine
-	payload   []byte
-	remaining int
-	done      chan struct{}
-}
-
-func (bc *benchClient) OnBoot(eng gnet.Engine) gnet.Action {
-	return gnet.None
-}
-
-func (bc *benchClient) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
-	var hdr [5]byte
-	totalLen := 1 + len(bc.payload)
-	binary.BigEndian.PutUint32(hdr[:4], uint32(totalLen))
-	hdr[4] = byte(MsgPing)
-
-	_, _ = c.Write(hdr[:])
-	_, _ = c.Write(bc.payload)
-	return nil, gnet.None
-}
-
-func (bc *benchClient) OnTraffic(c gnet.Conn) gnet.Action {
-	buf, _ := c.Peek(-1)
-	var msg Message
-	payloadLen, err := Decode(buf, uint64(len(buf)), &msg)
-	if err != nil {
-		return gnet.None
-	}
-	_, _ = c.Discard(5 + payloadLen)
-	bc.remaining--
-	if bc.remaining <= 0 {
-		close(bc.done)
-		return gnet.Close
-	}
-	var hdr [5]byte
-	totalLen := 1 + len(bc.payload)
-	binary.BigEndian.PutUint32(hdr[:4], uint32(totalLen))
-	hdr[4] = byte(MsgPing)
-	_, _ = c.Write(hdr[:])
-	_, _ = c.Write(bc.payload)
-	return gnet.None
-}
-
 func BenchmarkGnetServerHandlerParallel(b *testing.B) {
 	payload := []byte("benchdata")
+	frame := func() []byte {
+		totalLen := 1 + len(payload)
+		var hdr [5]byte
+		binary.BigEndian.PutUint32(hdr[:4], uint32(totalLen))
+		hdr[4] = byte(MsgPing)
+		out := make([]byte, 5+len(payload))
+		copy(out, hdr[:])
+		copy(out[5:], payload)
+		return out
+	}()
 	numCores := runtime.GOMAXPROCS(0)
-	itersPerClient := b.N / numCores
-	if itersPerClient == 0 {
-		itersPerClient = 1
-	}
-	clients := make([]*benchClient, numCores)
-	engines := make([]gnet.Client, numCores)
-	channels := make([]chan struct{}, numCores)
-	for i := 0; i < numCores; i++ {
-		channels[i] = make(chan struct{})
-		clients[i] = &benchClient{
-			payload:   payload,
-			remaining: itersPerClient,
-			done:      channels[i],
-		}
-		eng, err := gnet.NewClient(clients[i], gnet.WithMulticore(true), gnet.WithLogger(NOOPLogger{}))
-		if err != nil {
-			b.Fatalf("failed to create client: %v", err)
-		}
-		if err := eng.Start(); err != nil {
-			b.Fatalf("failed to start client engine: %v", err)
-		}
-		engines[i] = *eng
-	}
-	time.Sleep(50 * time.Millisecond)
 	b.ResetTimer()
 	var wg sync.WaitGroup
 	for i := 0; i < numCores; i++ {
 		wg.Add(1)
-		go func(idx int) {
+		go func() {
 			defer wg.Done()
-			_, _ = engines[idx].Dial("tcp", benchAddr)
-			<-channels[idx]
-		}(i)
+			conn, err := net.Dial("tcp", benchAddr)
+			if err != nil {
+				b.Errorf("dial failed: %v", err)
+				return
+			}
+			defer conn.Close()
+			buf := make([]byte, 4096)
+			iters := b.N / numCores
+			if iters == 0 {
+				iters = 1
+			}
+			for j := 0; j < iters; j++ {
+				if _, err := conn.Write(frame); err != nil {
+					return
+				}
+				if _, err := conn.Read(buf); err != nil {
+					return
+				}
+			}
+		}()
 	}
 	wg.Wait()
 	b.StopTimer()
-	for i := 0; i < numCores; i++ {
-		_ = engines[i].Stop()
-	}
 }
 
 // Test Decode returns proper errors for malformed inputs.

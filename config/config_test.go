@@ -184,3 +184,136 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 		t.Fatalf("persistence dir mismatch: %s", cfg.GetPersistenceDir())
 	}
 }
+
+func TestTLSDefaultsDisabled(t *testing.T) {
+	os.Unsetenv("TSD_TLS_CERT")
+	os.Unsetenv("TSD_TLS_KEY")
+	os.Unsetenv("TSD_TLS_CA")
+
+	cfg := LoadConfig(nil)
+
+	if cfg.TLSEnabled() {
+		t.Fatalf("TLS should be disabled by default")
+	}
+	if cfg.MTLSEnabled() {
+		t.Fatalf("mTLS should be disabled by default")
+	}
+	if cfg.GetTLSCert() != "" {
+		t.Fatalf("default TLSCert should be empty, got %s", cfg.GetTLSCert())
+	}
+	if cfg.GetTLSKey() != "" {
+		t.Fatalf("default TLSKey should be empty, got %s", cfg.GetTLSKey())
+	}
+	if cfg.GetTLSCA() != "" {
+		t.Fatalf("default TLSCA should be empty, got %s", cfg.GetTLSCA())
+	}
+}
+
+func TestTLSEnabledCertAndKey(t *testing.T) {
+	cfg := LoadConfig([]string{
+		"--tls-cert", "/path/to/cert.pem",
+		"--tls-key", "/path/to/key.pem",
+	})
+
+	if !cfg.TLSEnabled() {
+		t.Fatalf("TLS should be enabled when cert and key are set")
+	}
+	if cfg.MTLSEnabled() {
+		t.Fatalf("mTLS should not be enabled without CA")
+	}
+	if cfg.GetTLSCert() != "/path/to/cert.pem" {
+		t.Fatalf("TLSCert mismatch: %s", cfg.GetTLSCert())
+	}
+	if cfg.GetTLSKey() != "/path/to/key.pem" {
+		t.Fatalf("TLSKey mismatch: %s", cfg.GetTLSKey())
+	}
+	if cfg.GetTLSCA() != "" {
+		t.Fatalf("TLSCA should be empty without CA flag")
+	}
+}
+
+func TestMTLSEnabledCertKeyCA(t *testing.T) {
+	cfg := LoadConfig([]string{
+		"--tls-cert", "/path/to/cert.pem",
+		"--tls-key", "/path/to/key.pem",
+		"--tls-ca", "/path/to/ca.pem",
+	})
+
+	if !cfg.TLSEnabled() {
+		t.Fatalf("TLS should be enabled when mTLS is enabled")
+	}
+	if !cfg.MTLSEnabled() {
+		t.Fatalf("mTLS should be enabled when cert, key, and CA are set")
+	}
+	if cfg.GetTLSCA() != "/path/to/ca.pem" {
+		t.Fatalf("TLSCA mismatch: %s", cfg.GetTLSCA())
+	}
+}
+
+func TestTLSPanicCertOnly(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic when only tls-cert is set")
+		}
+	}()
+	LoadConfig([]string{"--tls-cert", "/path/to/cert.pem"})
+}
+
+func TestTLSPanicKeyOnly(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic when only tls-key is set")
+		}
+	}()
+	LoadConfig([]string{"--tls-key", "/path/to/key.pem"})
+}
+
+func TestTLSPanicCAOnly(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected panic when only tls-ca is set")
+		}
+	}()
+	LoadConfig([]string{"--tls-ca", "/path/to/ca.pem"})
+}
+
+func TestTLSEnvVars(t *testing.T) {
+	t.Setenv("TSD_TLS_CERT", "/env/cert.pem")
+	t.Setenv("TSD_TLS_KEY", "/env/key.pem")
+	t.Setenv("TSD_TLS_CA", "/env/ca.pem")
+
+	cfg := LoadConfig(nil)
+
+	if !cfg.TLSEnabled() {
+		t.Fatalf("TLS should be enabled via env vars")
+	}
+	if !cfg.MTLSEnabled() {
+		t.Fatalf("mTLS should be enabled via env vars")
+	}
+	if cfg.GetTLSCert() != "/env/cert.pem" {
+		t.Fatalf("TLSCert env mismatch: %s", cfg.GetTLSCert())
+	}
+	if cfg.GetTLSKey() != "/env/key.pem" {
+		t.Fatalf("TLSKey env mismatch: %s", cfg.GetTLSKey())
+	}
+	if cfg.GetTLSCA() != "/env/ca.pem" {
+		t.Fatalf("TLSCA env mismatch: %s", cfg.GetTLSCA())
+	}
+}
+
+func TestTLSFlagsOverrideEnvVars(t *testing.T) {
+	t.Setenv("TSD_TLS_CERT", "/env/cert.pem")
+	t.Setenv("TSD_TLS_KEY", "/env/key.pem")
+
+	cfg := LoadConfig([]string{
+		"--tls-cert", "/flag/cert.pem",
+		"--tls-key", "/flag/key.pem",
+	})
+
+	if cfg.GetTLSCert() != "/flag/cert.pem" {
+		t.Fatalf("flag should override env for cert: %s", cfg.GetTLSCert())
+	}
+	if cfg.GetTLSKey() != "/flag/key.pem" {
+		t.Fatalf("flag should override env for key: %s", cfg.GetTLSKey())
+	}
+}

@@ -11,9 +11,13 @@ Authors:
 package network
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
+	"os"
 	"time"
 )
 
@@ -38,6 +42,45 @@ func Dial(addr string, timeout time.Duration) (*Client, error) {
 	}
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
+	}
+	return &Client{conn: conn}, nil
+}
+
+// DialTLS connects to a Tellstone server with TLS 1.3 encryption.
+// certPath/keyPath are the client certificate and key for mTLS (pass empty for one-way TLS).
+// caPath is the CA certificate to verify the server (pass empty to skip verification).
+func DialTLS(addr string, certPath, keyPath, caPath string, timeout time.Duration) (*Client, error) {
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
+	}
+
+	if caPath != "" {
+		caPEM, err := os.ReadFile(caPath)
+		if err != nil {
+			return nil, fmt.Errorf("tls: read CA file: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caPEM) {
+			return nil, fmt.Errorf("tls: parse CA certificate")
+		}
+		tlsCfg.RootCAs = pool
+	} else {
+		tlsCfg.InsecureSkipVerify = true
+	}
+
+	if certPath != "" && keyPath != "" {
+		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("tls: load client certificate: %w", err)
+		}
+		tlsCfg.Certificates = []tls.Certificate{cert}
+	}
+
+	dialer := &net.Dialer{Timeout: timeout}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, tlsCfg)
+	if err != nil {
+		return nil, err
 	}
 	return &Client{conn: conn}, nil
 }

@@ -21,23 +21,26 @@ import (
 )
 
 type Config struct {
-	addr             string
-	enableMetrics    bool
-	metricsAddr      string
-	logLevel         log.Level
-	evictTicker      time.Duration
-	evictSlots       uint32
-	enableEncryption bool
-	encryptionKey    string
-	traceRatio       float64
-	maxMsgSize       uint64
-	maxMemBytes      uint64
-	enableRESP       bool
-	respAddr         string
-	shutdownTimeout  time.Duration
-	numShards        int
+	addr              string
+	enableMetrics     bool
+	metricsAddr       string
+	logLevel          log.Level
+	evictTicker       time.Duration
+	evictSlots        uint32
+	enableEncryption  bool
+	encryptionKey     string
+	traceRatio        float64
+	maxMsgSize        uint64
+	maxMemBytes       uint64
+	enableRESP        bool
+	respAddr          string
+	shutdownTimeout   time.Duration
+	numShards         int
 	enablePersistence bool
 	persistenceDir    string
+	tlsCert           string
+	tlsKey            string
+	tlsCA             string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -110,6 +113,9 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_NUM_SHARDS      – number of shared-nothing shards (default: GOMAXPROCS)
 //		TSD_ENABLE_PERSISTENCE – boolean to enable WAL persistence (default: false)
 //		TSD_PERSISTENCE_DIR  – directory for persistence data files (default: ~/.local/share/tellstone/data)
+//		TSD_TLS_CERT         – path to TLS certificate file (PEM; empty = TLS disabled)
+//		TSD_TLS_KEY          – path to TLS private key file (PEM)
+//		TSD_TLS_CA           – path to CA certificate for client verification (enables mTLS)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -245,6 +251,25 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_PERSISTENCE_DIR", ""),
 		"Directory for persistence data files (default: ~/.local/share/tellstone/data on Linux)",
 	)
+	// TLS configuration for transport encryption.
+	fs.StringVar(
+		&cfg.tlsCert,
+		"tls-cert",
+		getEnv("TSD_TLS_CERT", ""),
+		"Path to TLS certificate file (PEM); empty disables TLS (default: none)",
+	)
+	fs.StringVar(
+		&cfg.tlsKey,
+		"tls-key",
+		getEnv("TSD_TLS_KEY", ""),
+		"Path to TLS private key file (PEM); required when tls-cert is set",
+	)
+	fs.StringVar(
+		&cfg.tlsCA,
+		"tls-ca",
+		getEnv("TSD_TLS_CA", ""),
+		"Path to CA certificate for client verification (PEM); enables mTLS when set",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -261,6 +286,14 @@ func LoadConfig(args []string) *Config {
 	cfg.maxMemBytes = uint64(maxMemBytes)
 	if cfg.numShards < 1 {
 		cfg.numShards = runtime.NumCPU()
+	}
+	// Validate TLS configuration: cert and key must be provided together.
+	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
+		panic("tellstone: --tls-cert and --tls-key must both be provided")
+	}
+	// mTLS requires a valid TLS base (cert + key).
+	if cfg.tlsCA != "" && cfg.tlsCert == "" {
+		panic("tellstone: --tls-ca requires --tls-cert and --tls-key")
 	}
 	return cfg
 }
@@ -280,5 +313,12 @@ func (cfg *Config) RESPEnabled() bool                 { return cfg.enableRESP }
 func (cfg *Config) GetRESPAddr() string               { return cfg.respAddr }
 func (cfg *Config) GetShutdownTimeout() time.Duration { return cfg.shutdownTimeout }
 func (cfg *Config) GetNumShards() int                 { return cfg.numShards }
-func (cfg *Config) PersistenceEnabled() bool           { return cfg.enablePersistence }
-func (cfg *Config) GetPersistenceDir() string          { return cfg.persistenceDir }
+func (cfg *Config) PersistenceEnabled() bool          { return cfg.enablePersistence }
+func (cfg *Config) GetPersistenceDir() string         { return cfg.persistenceDir }
+func (cfg *Config) TLSEnabled() bool                  { return cfg.tlsCert != "" && cfg.tlsKey != "" }
+func (cfg *Config) GetTLSCert() string                { return cfg.tlsCert }
+func (cfg *Config) GetTLSKey() string                 { return cfg.tlsKey }
+func (cfg *Config) GetTLSCA() string                  { return cfg.tlsCA }
+func (cfg *Config) MTLSEnabled() bool {
+	return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != ""
+}

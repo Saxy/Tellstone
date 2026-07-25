@@ -85,6 +85,28 @@ func (a *App) Start(cfg *config.Config, logger log.Logger) {
 			logger.Log(log.LevelInfo, "Telemetry stack configuration", log.String("telemetry", "NoOp Tracer"))
 		}
 	}
+	if cfg.MTLSEnabled() {
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "Transport security",
+				log.String("tls", "ENABLED"),
+				log.String("mode", "mTLS"),
+				log.String("cert", cfg.GetTLSCert()),
+				log.String("ca", cfg.GetTLSCA()),
+			)
+		}
+	} else if cfg.TLSEnabled() {
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "Transport security",
+				log.String("tls", "ENABLED"),
+				log.String("mode", "TLS"),
+				log.String("cert", cfg.GetTLSCert()),
+			)
+		}
+	} else {
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "Transport security", log.String("tls", "DISABLED"))
+		}
+	}
 }
 
 func (a *App) GetLogger() log.Logger     { return a.logger }

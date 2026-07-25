@@ -1,11 +1,13 @@
 package network
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/panjf2000/gnet/v2"
 )
 
 // TestServerEcho verifies that the Server processes a Ping message and responds with a Pong
@@ -23,9 +25,13 @@ func TestServerEcho(t *testing.T) {
 		}
 		return nil, 0, nil
 	}
-	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger())
-	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ListenAndServe() }()
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil)
+	go func() { _ = srv.ListenAndServe() }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = gnet.Stop(ctx, "tcp://"+addr)
+	}()
 	time.Sleep(100 * time.Millisecond)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -44,13 +50,5 @@ func TestServerEcho(t *testing.T) {
 	}
 	if string(resp.Payload) != "pingdata" {
 		t.Fatalf("payload mismatch: got %s want %s", resp.Payload, "pingdata")
-	}
-	select {
-	case err = <-errCh:
-		if err != nil {
-			t.Fatalf("server returned error: %v", err)
-		}
-	default:
-		// server still running; test ends.
 	}
 }

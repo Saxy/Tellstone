@@ -31,6 +31,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/resp"
 	"github.com/Saxy/Tellstone/internal/router"
 	"github.com/Saxy/Tellstone/internal/shard"
+	tlslib "github.com/Saxy/Tellstone/internal/tls"
 )
 
 var (
@@ -64,6 +65,7 @@ type Server struct {
 	netSrv     *network.Server
 	respSrv    *resp.Server
 	metricsSrv *http.Server
+	tlsConfig  *tlslib.Config
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -79,15 +81,24 @@ func (s *Server) Run() error {
 	if err != nil {
 		return fmt.Errorf("crypto init: %w", err)
 	}
-	if err := s.initShards(cryptoEngine); err != nil {
+	if err = s.initShards(cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
+	var tlsCfg *tlslib.Config
+	if cfg.TLSEnabled() {
+		tlsCfg, err = tlslib.BuildConfig(cfg.GetTLSCert(), cfg.GetTLSKey(), cfg.GetTLSCA())
+		if err != nil {
+			return fmt.Errorf("tls config: %w", err)
+		}
+	}
+	s.tlsConfig = tlsCfg
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
 		s.shards,
 		s.networkHandler,
 		logger,
+		tlsCfg,
 	)
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(s.netSrv)
@@ -109,7 +120,7 @@ func (s *Server) Run() error {
 		s.shutdown(shutdownCtx)
 	}()
 
-	if err := s.netSrv.ListenAndServe(); err != nil {
+	if err = s.netSrv.ListenAndServe(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
 			return nil
 		}
@@ -240,7 +251,7 @@ func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	store := &RouterStore{router: s.router}
-	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger)
+	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfig)
 	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {

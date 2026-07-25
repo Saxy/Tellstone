@@ -2,7 +2,7 @@
 Package network
 Tellstone Secure Event-Driven Networking Package
 File: server.go
-Description: Implements an ultra‑high‑performance, zero‑allocation TCP server using an edge‑triggered epoll event‑loop (gnet). Handles incoming messages, dispatches them to storage, and writes responses.
+Description: Implements an ultra‑high‑performance, zero‑allocation TCP server using an edge‑triggered epoll event‑loop (gnet). Handles incoming messages, dispatches them to storage, and writes responses. Supports optional TLS 1.3 transport encryption via the internal TLS library.
 
 Authors:
 
@@ -17,11 +17,21 @@ import (
 
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/shard"
+	tlslib "github.com/Saxy/Tellstone/internal/tls"
 	"github.com/panjf2000/gnet/v2"
 )
 
 const defaultAddr = "127.0.0.1:9988"
 const defaultMaxMsgSize = 16 * 1024 * 1024
+
+// connState holds per-connection state. When TLS is enabled, tlsConn wraps the
+// raw gnet connection with TLS 1.3 encryption via the internal TLS library. readBuf is a
+// reusable scratch buffer for TLS Read calls to avoid per-traffic allocations.
+type connState struct {
+	shardID uint64
+	tlsConn *tlslib.Conn
+	readBuf []byte
+}
 
 type Server struct {
 	gnet.BuiltinEventEngine
@@ -29,6 +39,7 @@ type Server struct {
 	handler    func(msg *Message) ([]byte, MessageType, error)
 	logger     log.Logger
 	maxMsgSize uint64
+	tlsConfig  *tlslib.Config
 
 	// eng and ready let Shutdown reach the running gnet engine: OnBoot fires once the event
 	// loop is accepting connections and hands us the Engine handle we need to stop it; ready
@@ -50,7 +61,8 @@ type Server struct {
 // NewServer initializes an edge-triggered networking server engine instance.
 // It applies defensive configuration defaults before spawning infrastructure.
 // shards is optional — if nil, per-shard metrics are not tracked.
-func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger) *Server {
+// tlsCfg is optional — if nil, plaintext TCP is used.
+func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsCfg *tlslib.Config) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -68,6 +80,7 @@ func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler fu
 		handler:    handler,
 		logger:     logger,
 		maxMsgSize: maxMsgSize,
+		tlsConfig:  tlsCfg,
 		ready:      make(chan struct{}),
 		shards:     shards,
 	}
@@ -106,28 +119,132 @@ func (s *Server) OnBoot(eng gnet.Engine) gnet.Action {
 func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, 1)
 	atomic.AddUint64(&s.totalConnections, 1)
+	var sid uint64
 	if len(s.shards) > 0 {
-		sid := atomic.AddUint64(&s.nextConn, 1) - 1
+		sid = atomic.AddUint64(&s.nextConn, 1) - 1
 		sid = sid % uint64(len(s.shards))
-		c.SetContext(sid)
 		s.shards[sid].IncConnectedClients()
 		s.shards[sid].IncTotalConnections()
 	}
+	st := &connState{shardID: sid}
+	if s.tlsConfig != nil {
+		adapter := tlslib.NewGnetConnAdapter(c)
+		st.tlsConn = tlslib.Server(adapter, s.tlsConfig)
+		st.readBuf = make([]byte, 0, 4096)
+	}
+	c.SetContext(st)
 	return nil, gnet.None
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, ^uint64(0))
-	if len(s.shards) > 0 {
-		if sid, ok := c.Context().(uint64); ok && int(sid) < len(s.shards) {
-			s.shards[sid].DecConnectedClients()
-		}
+	if st, ok := c.Context().(*connState); ok && int(st.shardID) < len(s.shards) {
+		s.shards[st.shardID].DecConnectedClients()
 	}
 	return gnet.None
 }
 
 // OnTraffic handles incoming bytes on the socket asynchronously and lock-free.
+// When TLS is enabled, encrypted bytes are decrypted via the internal TLS library before
+// protocol parsing. The handshake is driven automatically by the first Read/Write
+// calls on the TLS connection.
 func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
+	st, _ := c.Context().(*connState)
+	if st != nil && st.tlsConn != nil {
+		return s.onTrafficTLS(c, st)
+	}
+	return s.onTrafficPlaintext(c, st)
+}
+
+// onTrafficTLS reads decrypted application data from the TLS connection, parses
+// our binary protocol frames, dispatches them to the handler, and writes
+// encrypted responses.
+func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
+	st.readBuf = st.readBuf[:cap(st.readBuf)]
+	for {
+		n, err := st.tlsConn.Read(st.readBuf)
+		if n > 0 {
+			s.handleDecryptedFrames(st, st.readBuf[:n])
+		}
+		if err != nil {
+			if errors.Is(err, tlslib.ErrNotEnough) {
+				return gnet.None
+			}
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "tls read failed",
+					log.String("error", err.Error()),
+				)
+			}
+			return gnet.Close
+		}
+	}
+}
+
+// handleDecryptedFrames parses zero or more Tellstone binary protocol frames
+// from plaintext data and dispatches each to the handler. Responses are written
+// through the TLS connection for automatic encryption.
+func (s *Server) handleDecryptedFrames(st *connState, plaintext []byte) {
+	var msg Message
+	offset := 0
+	for offset < len(plaintext) {
+		msg = Message{}
+		payloadLen, err := Decode(plaintext[offset:], s.maxMsgSize, &msg)
+		if err != nil {
+			if errors.Is(err, errShortRead) {
+				break
+			}
+			atomic.AddUint64(&s.protocolErrors, 1)
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "protocol decoding failed catastrophically",
+					log.String("error", err.Error()),
+				)
+			}
+			return
+		}
+		totalPacketLen := 5 + payloadLen
+		atomic.AddUint64(&s.bytesRead, uint64(totalPacketLen))
+		if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
+			s.shards[st.shardID].AddBytesRead(uint64(totalPacketLen))
+		}
+		if s.handler != nil {
+			var (
+				respType    MessageType
+				respPayload []byte
+			)
+			respPayload, respType, err = s.handler(&msg)
+			if err != nil {
+				atomic.AddUint64(&s.handlerErrors, 1)
+				if s.logger.Enabled(log.LevelWarn) {
+					s.logger.Log(log.LevelWarn, "application handler returned execution error",
+						log.String("error", err.Error()),
+					)
+				}
+				return
+			}
+			if respPayload != nil {
+				if err = Write(st.tlsConn, respType, respPayload); err != nil {
+					if s.logger.Enabled(log.LevelError) {
+						s.logger.Log(log.LevelError, "failed to write tls response frame",
+							log.String("error", err.Error()),
+						)
+					}
+					return
+				}
+				n := uint64(5 + len(respPayload))
+				atomic.AddUint64(&s.bytesWritten, n)
+				if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
+					s.shards[st.shardID].AddBytesWritten(n)
+				}
+			}
+		}
+		offset += totalPacketLen
+	}
+}
+
+// onTrafficPlaintext handles the original zero-copy plaintext path. Raw bytes
+// are peeked directly from the gnet ring buffer, parsed, and responses are
+// written back through gnet without any intermediate copies.
+func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 	var msg Message
 	for {
 		buf, err := c.Peek(-1)
@@ -157,8 +274,8 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 		totalPacketLen := 5 + payloadLen
 		atomic.AddUint64(&s.bytesRead, uint64(totalPacketLen))
 		if len(s.shards) > 0 {
-			if sid, ok := c.Context().(uint64); ok && int(sid) < len(s.shards) {
-				s.shards[sid].AddBytesRead(uint64(totalPacketLen))
+			if int(st.shardID) < len(s.shards) {
+				s.shards[st.shardID].AddBytesRead(uint64(totalPacketLen))
 			}
 		}
 		if s.handler != nil {
@@ -188,8 +305,8 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 				n := uint64(5 + len(respPayload))
 				atomic.AddUint64(&s.bytesWritten, n)
 				if len(s.shards) > 0 {
-					if sid, ok := c.Context().(uint64); ok && int(sid) < len(s.shards) {
-						s.shards[sid].AddBytesWritten(n)
+					if int(st.shardID) < len(s.shards) {
+						s.shards[st.shardID].AddBytesWritten(n)
 					}
 				}
 			}
