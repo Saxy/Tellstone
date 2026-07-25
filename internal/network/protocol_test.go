@@ -92,7 +92,7 @@ func BenchmarkGnetServerHandlerParallel(b *testing.B) {
 				return
 			}
 			defer conn.Close()
-			buf := make([]byte, 4096)
+			respBuf := make([]byte, 5+len(payload))
 			iters := b.N / numCores
 			if iters == 0 {
 				iters = 1
@@ -101,7 +101,7 @@ func BenchmarkGnetServerHandlerParallel(b *testing.B) {
 				if _, err := conn.Write(frame); err != nil {
 					return
 				}
-				if _, err := io.ReadFull(conn, buf); err != nil {
+				if _, err := io.ReadFull(conn, respBuf); err != nil {
 					return
 				}
 			}

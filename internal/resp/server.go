@@ -166,8 +166,22 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 
 // onTrafficTLS reads decrypted application data from the TLS connection,
 // parses RESP frames, and writes encrypted responses.
+const maxTLSReadBuf = 64 << 20 // 64 MB — hard ceiling for a single RESP request over TLS.
+
 func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 	for {
+		if len(st.readBuf) == cap(st.readBuf) {
+			if cap(st.readBuf) >= maxTLSReadBuf {
+				return gnet.Close
+			}
+			newCap := cap(st.readBuf) * 2
+			if newCap > maxTLSReadBuf {
+				newCap = maxTLSReadBuf
+			}
+			grown := make([]byte, len(st.readBuf), newCap)
+			copy(grown, st.readBuf)
+			st.readBuf = grown
+		}
 		n, err := st.tlsConn.Read(st.readBuf[len(st.readBuf):cap(st.readBuf)])
 		if n > 0 {
 			st.readBuf = st.readBuf[:len(st.readBuf)+n]
