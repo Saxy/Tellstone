@@ -70,69 +70,6 @@ func CipherSuiteName(id uint16) string {
 	return fmt.Sprintf("0x%04X", id)
 }
 
-type cipherSuite struct {
-	id uint16
-	// the lengths, in bytes, of the key material needed for each component.
-	keyLen int
-	macLen int
-	ivLen  int
-	// flags is a bitmask of the suite* values, above.
-	flags int
-	hash   crypto.Hash
-	mac    func(macKey []byte) hash.Hash
-	cipher func(key, iv []byte, readOnly bool) any
-	aead   func(key, iv []byte) aead
-}
-
-const (
-	// suiteECDHE indicates that the cipher suite involves elliptic curve
-	// Diffie-Hellman.
-	suiteECDHE = 1 << iota
-	// suiteECSign indicates that the cipher suite involves an ECDSA or
-	// EdDSA signature.
-	suiteECSign
-	// suiteTLS12 indicates that the cipher suite should only be advertised
-	// and accepted when using TLS 1.2.
-	suiteTLS12
-)
-
-// selectCipherSuite returns the first cipher suite from ids which
-// is also in supportedIDs and passes the ok filter.
-func selectCipherSuite(ids, supportedIDs []uint16, ok func(*cipherSuite) bool) *cipherSuite {
-	for _, id := range ids {
-		candidate := cipherSuiteByID(id)
-		if candidate == nil || !ok(candidate) {
-			continue
-		}
-
-		for _, suppID := range supportedIDs {
-			if id == suppID {
-				return candidate
-			}
-		}
-	}
-	return nil
-}
-
-// mutualCipherSuite returns a cipherSuite given a list of supported
-// ciphersuites and the id requested by the peer.
-func mutualCipherSuite(have []uint16, want uint16) *cipherSuite {
-	for _, id := range have {
-		if id == want {
-			return cipherSuiteByID(id)
-		}
-	}
-	return nil
-}
-
-func cipherSuiteByID(id uint16) *cipherSuite {
-	return nil
-}
-
-// defaultCipherSuites is the list of default cipher suites (TLS 1.2).
-// No TLS 1.2 cipher suites are supported.
-var defaultCipherSuites []uint16
-
 // A cipherSuiteTLS13 defines only the pair of the AEAD algorithm and hash
 // algorithm to be used with HKDF. See RFC 8446, Appendix B.4.
 type cipherSuiteTLS13 struct {
@@ -272,6 +209,7 @@ func aeadChaCha20Poly1305(key, nonceMask []byte) aead {
 }
 
 // tls10MAC implements the TLS 1.0 MAC function. RFC 2246, Section 6.2.3.
+// Retained for conn.go CBC-mode record layer; unreachable in TLS 1.3 only builds.
 func tls10MAC(h hash.Hash, out, seq, header, data, extra []byte) []byte {
 	h.Reset()
 	h.Write(seq)

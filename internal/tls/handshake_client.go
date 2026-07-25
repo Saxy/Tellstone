@@ -146,16 +146,6 @@ func (c *Conn) clientHandshake(ctx context.Context) error {
 		return err
 	}
 
-	if hello.earlyData {
-		suite := cipherSuiteTLS13ByID(session.cipherSuite)
-		transcript := suite.hash.New()
-		if err := transcriptMsg(hello, transcript); err != nil {
-			return err
-		}
-		earlyTrafficSecret := suite.deriveSecret(earlySecret, clientEarlyTrafficLabel, transcript)
-		_ = earlyTrafficSecret
-	}
-
 	msg, err := c.readHandshake(nil)
 	if err != nil {
 		return err
@@ -323,12 +313,8 @@ func (c *Conn) pickTLSVersion(serverHello *serverHelloMsg) error {
 
 // checkALPN ensure that the server's choice of ALPN protocol is compatible with
 // the protocols that we advertised in the Client Hello.
-func checkALPN(clientProtos []string, serverProto string, quic bool) error {
+func checkALPN(clientProtos []string, serverProto string) error {
 	if serverProto == "" {
-		if quic && len(clientProtos) > 0 {
-			// RFC 9001, Section 8.1
-			return errors.New("tls: server did not select an ALPN protocol")
-		}
 		return nil
 	}
 	if len(clientProtos) == 0 {

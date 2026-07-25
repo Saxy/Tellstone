@@ -6,7 +6,6 @@ package tls
 
 import (
 	"bytes"
-	"crypto"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -162,30 +161,9 @@ func newLocalListener(t testing.TB) net.Listener {
 	return ln
 }
 
-
-
-type readerFunc func([]byte) (int, error)
-
-func (f readerFunc) Read(b []byte) (int, error) { return f(b) }
-
-// TestDialer tests that tls.Dialer.DialContext can abort in the middle of a handshake.
-// (The other cases are all handled by the existing dial tests in this package, which
-// all also flow through the same code shared code paths)
-
-func isTimeoutError(err error) bool {
-	if ne, ok := err.(net.Error); ok {
-		return ne.Timeout()
-	}
-	return false
-}
-
 // tests that Conn.Read returns (non-zero, io.EOF) instead of
 // (non-zero, nil) when a Close (alertCloseNotify) is sitting right
 // behind the application data in the buffer.
-
-
-
-
 func TestConnCloseBreakingWrite(t *testing.T) {
 	ln := newLocalListener(t)
 	defer ln.Close()
@@ -264,8 +242,6 @@ func TestConnCloseBreakingWrite(t *testing.T) {
 		t.Errorf("Close error = %v; want net.ErrClosed", err)
 	}
 }
-
-
 
 func TestCloneFuncFields(t *testing.T) {
 	const expectedCount = 8
@@ -413,12 +389,6 @@ func (w *changeImplConn) Close() error {
 	}
 	return w.Conn.Close()
 }
-
-
-
-
-
-
 
 func TestConnectionStateMarshal(t *testing.T) {
 	cs := &ConnectionState{}
@@ -702,39 +672,6 @@ func TestVersionName(t *testing.T) {
 	if got, exp := VersionName(0x12a), "0x012A"; got != exp {
 		t.Errorf("unexpected fallback VersionName: got %q, expected %q", got, exp)
 	}
-}
-
-// http2isBadCipher is copied from net/http.
-// TODO: if it ends up exposed somewhere, use that instead.
-func http2isBadCipher(cipher uint16) bool {
-	switch cipher {
-	case TLS_RSA_WITH_RC4_128_SHA,
-		TLS_RSA_WITH_3DES_EDE_CBC_SHA,
-		TLS_RSA_WITH_AES_128_CBC_SHA,
-		TLS_RSA_WITH_AES_256_CBC_SHA,
-		TLS_RSA_WITH_AES_128_CBC_SHA256,
-		TLS_RSA_WITH_AES_128_GCM_SHA256,
-		TLS_RSA_WITH_AES_256_GCM_SHA384,
-		TLS_ECDHE_ECDSA_WITH_RC4_128_SHA,
-		TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA,
-		TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA,
-		TLS_ECDHE_RSA_WITH_RC4_128_SHA,
-		TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA,
-		TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
-		TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
-		TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA256,
-		TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256:
-		return true
-	default:
-		return false
-	}
-}
-
-type brokenSigner struct{ crypto.Signer }
-
-func (s brokenSigner) Sign(rand io.Reader, digest []byte, opts crypto.SignerOpts) (signature []byte, err error) {
-	// Replace opts with opts.HashFunc(), so rsa.PSSOptions are discarded.
-	return s.Signer.Sign(rand, digest, opts.HashFunc())
 }
 
 // TestPKCS1OnlyCert uses a client certificate with a broken crypto.Signer that

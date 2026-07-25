@@ -279,11 +279,6 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 		}
 	}
 
-	if hs.hello.earlyData {
-		hs.hello.earlyData = false
-		c.quicRejectedEarlyData()
-	}
-
 	if _, err := hs.c.writeHandshakeRecord(hs.hello, hs.transcript); err != nil {
 		return err
 	}
@@ -426,7 +421,7 @@ func (hs *clientHandshakeStateTLS13) readServerParameters() error {
 		return unexpectedMessageError(encryptedExtensions, msg)
 	}
 
-	if err := checkALPN(hs.hello.alpnProtocols, encryptedExtensions.alpnProtocol, false); err != nil {
+	if err := checkALPN(hs.hello.alpnProtocols, encryptedExtensions.alpnProtocol); err != nil {
 		c.sendAlert(alertNoApplicationProtocol)
 		return err
 	}
@@ -435,9 +430,6 @@ func (hs *clientHandshakeStateTLS13) readServerParameters() error {
 	if !hs.hello.earlyData && encryptedExtensions.earlyData {
 		c.sendAlert(alertUnsupportedExtension)
 		return errors.New("tls: server sent an unexpected early_data extension")
-	}
-	if hs.hello.earlyData && !encryptedExtensions.earlyData {
-		c.quicRejectedEarlyData()
 	}
 	if encryptedExtensions.earlyData {
 		if hs.session.cipherSuite != c.cipherSuite {

@@ -81,9 +81,6 @@ func (s *Server) Run() error {
 	if err != nil {
 		return fmt.Errorf("crypto init: %w", err)
 	}
-	if err = s.initShards(cryptoEngine); err != nil {
-		return fmt.Errorf("shard init: %w", err)
-	}
 	var tlsCfg *tlslib.Config
 	if cfg.TLSEnabled() {
 		tlsCfg, err = tlslib.BuildConfig(cfg.GetTLSCert(), cfg.GetTLSKey(), cfg.GetTLSCA())
@@ -92,6 +89,9 @@ func (s *Server) Run() error {
 		}
 	}
 	s.tlsConfig = tlsCfg
+	if err = s.initShards(cryptoEngine); err != nil {
+		return fmt.Errorf("shard init: %w", err)
+	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),

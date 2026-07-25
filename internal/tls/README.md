@@ -19,7 +19,7 @@ TLS is not optional in production. This package provides:
 
 ## Architecture
 
-```
+```text
 Tellstone binary
   └─ server.Server
        ├─ internal/network.Server   (binary protocol — gnet event-loop)

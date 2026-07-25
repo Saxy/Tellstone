@@ -799,15 +799,23 @@ func (c *Conn) readFromUntil(r io.Reader, n int) error {
 		c.readBuf = make([]byte, n)
 	}
 	data := c.readBuf[:n]
-	rn, err := r.Read(data)
-	if err != nil {
-		return err
+	total := 0
+	for total < n {
+		rn, err := r.Read(data[total:])
+		if rn > 0 {
+			if _, werr := c.rawInput.Write(data[total : total+rn]); werr != nil {
+				return werr
+			}
+			total += rn
+		}
+		if err != nil {
+			if total < n {
+				return ErrNotEnough
+			}
+			return err
+		}
 	}
-	if rn < n {
-		return io.ErrShortBuffer
-	}
-	_, err = c.rawInput.Write(data[:rn])
-	return err
+	return nil
 }
 
 // sendAlertLocked sends a TLS alert message.

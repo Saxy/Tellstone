@@ -101,7 +101,7 @@ func BenchmarkGnetServerHandlerParallel(b *testing.B) {
 				if _, err := conn.Write(frame); err != nil {
 					return
 				}
-				if _, err := conn.Read(buf); err != nil {
+				if _, err := io.ReadFull(conn, buf); err != nil {
 					return
 				}
 			}

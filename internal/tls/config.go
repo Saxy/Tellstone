@@ -30,12 +30,15 @@ func NewGnetConnAdapter(c gnet.Conn) *GnetConnAdapter {
 
 func (a *GnetConnAdapter) Read(b []byte) (int, error) {
 	buf, err := a.c.Peek(len(b))
-	if err != nil {
-		return 0, err
+	if len(buf) > 0 {
+		n := copy(b, buf)
+		_, _ = a.c.Discard(n)
+		return n, nil
 	}
-	n := copy(b, buf)
-	_, _ = a.c.Discard(n)
-	return n, nil
+	if err != nil {
+		return 0, ErrNotEnough
+	}
+	return 0, nil
 }
 
 func (a *GnetConnAdapter) Write(b []byte) (int, error) {
@@ -49,9 +52,14 @@ func (a *GnetConnAdapter) Close() error {
 func (a *GnetConnAdapter) LocalAddr() net.Addr  { return a.c.LocalAddr() }
 func (a *GnetConnAdapter) RemoteAddr() net.Addr { return a.c.RemoteAddr() }
 
-func (a *GnetConnAdapter) SetDeadline(t time.Time) error      { return nil }
-func (a *GnetConnAdapter) SetReadDeadline(t time.Time) error   { return nil }
-func (a *GnetConnAdapter) SetWriteDeadline(t time.Time) error  { return nil }
+// SetDeadline is a no-op. Timeout enforcement is handled by the gnet event loop.
+func (a *GnetConnAdapter) SetDeadline(t time.Time) error { return nil }
+
+// SetReadDeadline is a no-op. Timeout enforcement is handled by the gnet event loop.
+func (a *GnetConnAdapter) SetReadDeadline(t time.Time) error { return nil }
+
+// SetWriteDeadline is a no-op. Timeout enforcement is handled by the gnet event loop.
+func (a *GnetConnAdapter) SetWriteDeadline(t time.Time) error { return nil }
 
 // Peek returns the next n bytes without advancing the read cursor.
 // Required by the TLS library for non-blocking handshake negotiation.
@@ -70,6 +78,9 @@ func (a *GnetConnAdapter) InboundBuffered() int {
 // If caPath is non-empty, client certificate verification is enabled (mTLS).
 // Forces TLS 1.3 as the minimum version.
 func BuildConfig(certPath, keyPath, caPath string) (*Config, error) {
+	if (certPath == "") != (keyPath == "") {
+		return nil, fmt.Errorf("tls: both cert and key are required")
+	}
 	if certPath == "" && keyPath == "" {
 		return nil, nil
 	}

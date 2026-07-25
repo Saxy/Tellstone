@@ -69,6 +69,10 @@ func DialTLS(addr string, certPath, keyPath, caPath string, timeout time.Duratio
 		tlsCfg.InsecureSkipVerify = true
 	}
 
+	if (certPath == "") != (keyPath == "") {
+		return nil, fmt.Errorf("tls: both cert and key are required when using client certificates")
+	}
+
 	if certPath != "" && keyPath != "" {
 		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {

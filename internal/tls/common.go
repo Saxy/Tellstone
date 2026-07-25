@@ -9,11 +9,7 @@ import (
 	"container/list"
 	"context"
 	"crypto"
-	"crypto/ecdsa"
-	"crypto/ed25519"
-	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha512"
 	"crypto/x509"
 	"errors"
@@ -735,18 +731,11 @@ type Config struct {
 	WrapSession func(ConnectionState, *SessionState) ([]byte, error)
 
 	// MinVersion contains the minimum TLS version that is acceptable.
-	//
-	// By default, TLS 1.2 is currently used as the minimum. TLS 1.0 is the
-	// minimum supported by this package.
-	//
-	// The server-side default can be reverted to TLS 1.0 by including the value
-	// "tls10server=1" in the GODEBUG environment variable.
+	// Only TLS 1.3 is supported by this package.
 	MinVersion uint16
 
 	// MaxVersion contains the maximum TLS version that is acceptable.
-	//
-	// By default, the maximum version supported by this package is used,
-	// which is currently TLS 1.3.
+	// Only TLS 1.3 is supported by this package.
 	MaxVersion uint16
 
 	// CurvePreferences contains the elliptic curves that will be used in
@@ -1016,17 +1005,11 @@ func (c *Config) cipherSuites() []uint16 {
 	if c.CipherSuites != nil {
 		return c.CipherSuites
 	}
-	/*	if tlsrsakex.Value() == "1" {
-		return defaultCipherSuitesWithRSAKex
-	}*/
-	return defaultCipherSuites
+	return nil
 }
 
 var supportedVersions = []uint16{
 	VersionTLS13,
-	VersionTLS12,
-	VersionTLS11,
-	VersionTLS10,
 }
 
 // roleClient and roleServer are meant to call supportedVersions and parents
@@ -1200,124 +1183,12 @@ func (chi *ClientHelloInfo) SupportsCertificate(c *Certificate) error {
 		}
 	}
 
-	// supportsRSAFallback returns nil if the certificate and connection support
-	// the static RSA key exchange, and unsupported otherwise. The logic for
-	// supporting static RSA is completely disjoint from the logic for
-	// supporting signed key exchanges, so we just check it as a fallback.
-	supportsRSAFallback := func(unsupported error) error {
-		// TLS 1.3 dropped support for the static RSA key exchange.
-		if vers == VersionTLS13 {
-			return unsupported
-		}
-		// The static RSA key exchange works by decrypting a challenge with the
-		// RSA private key, not by signing, so check the PrivateKey implements
-		// crypto.Decrypter, like *rsa.PrivateKey does.
-		if priv, ok := c.PrivateKey.(crypto.Decrypter); ok {
-			if _, ok := priv.Public().(*rsa.PublicKey); !ok {
-				return unsupported
-			}
-		} else {
-			return unsupported
-		}
-		// Finally, there needs to be a mutual cipher suite that uses the static
-		// RSA key exchange instead of ECDHE.
-		rsaCipherSuite := selectCipherSuite(chi.CipherSuites, config.cipherSuites(), func(c *cipherSuite) bool {
-			if c.flags&suiteECDHE != 0 {
-				return false
-			}
-			if vers < VersionTLS12 && c.flags&suiteTLS12 != 0 {
-				return false
-			}
-			return true
-		})
-		if rsaCipherSuite == nil {
-			return unsupported
-		}
-		return nil
-	}
-
 	// If the client sent the signature_algorithms extension, ensure it supports
 	// schemes we can use with this certificate and TLS version.
 	if len(chi.SignatureSchemes) > 0 {
 		if _, err := selectSignatureScheme(vers, c, chi.SignatureSchemes); err != nil {
-			return supportsRSAFallback(err)
+			return err
 		}
-	}
-
-	// In TLS 1.3 we are done because supported_groups is only relevant to the
-	// ECDHE computation, point format negotiation is removed, cipher suites are
-	// only relevant to the AEAD choice, and static RSA does not exist.
-	if vers == VersionTLS13 {
-		return nil
-	}
-
-	// The only signed key exchange we support is ECDHE.
-	if !supportsECDHE(config, chi.SupportedCurves, chi.SupportedPoints) {
-		return supportsRSAFallback(errors.New("client doesn't support ECDHE, can only use legacy RSA key exchange"))
-	}
-
-	var ecdsaCipherSuite bool
-	if priv, ok := c.PrivateKey.(crypto.Signer); ok {
-		switch pub := priv.Public().(type) {
-		case *ecdsa.PublicKey:
-			var curve CurveID
-			switch pub.Curve {
-			case elliptic.P256():
-				curve = CurveP256
-			case elliptic.P384():
-				curve = CurveP384
-			case elliptic.P521():
-				curve = CurveP521
-			default:
-				return supportsRSAFallback(unsupportedCertificateError(c))
-			}
-			var curveOk bool
-			for _, c := range chi.SupportedCurves {
-				if c == curve && config.supportsCurve(c) {
-					curveOk = true
-					break
-				}
-			}
-			if !curveOk {
-				return errors.New("client doesn't support certificate curve")
-			}
-			ecdsaCipherSuite = true
-		case ed25519.PublicKey:
-			if vers < VersionTLS12 || len(chi.SignatureSchemes) == 0 {
-				return errors.New("connection doesn't support Ed25519")
-			}
-			ecdsaCipherSuite = true
-		case *rsa.PublicKey:
-		default:
-			return supportsRSAFallback(unsupportedCertificateError(c))
-		}
-	} else {
-		return supportsRSAFallback(unsupportedCertificateError(c))
-	}
-
-	// Make sure that there is a mutually supported cipher suite that works with
-	// this certificate. Cipher suite selection will then apply the logic in
-	// reverse to pick it. See also serverHandshakeState.cipherSuiteOk.
-	cipherSuite := selectCipherSuite(chi.CipherSuites, config.cipherSuites(), func(c *cipherSuite) bool {
-		if c.flags&suiteECDHE == 0 {
-			return false
-		}
-		if c.flags&suiteECSign != 0 {
-			if !ecdsaCipherSuite {
-				return false
-			}
-		} else {
-			if ecdsaCipherSuite {
-				return false
-			}
-		}
-		if vers < VersionTLS12 && c.flags&suiteTLS12 != 0 {
-			return false
-		}
-		return true
-	})
-	if cipherSuite == nil {
-		return supportsRSAFallback(errors.New("client doesn't support any cipher suites compatible with the certificate"))
 	}
 
 	return nil

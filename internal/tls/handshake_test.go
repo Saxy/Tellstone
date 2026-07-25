@@ -363,7 +363,7 @@ func runMain(m *testing.M) int {
 		Certificates:       make([]Certificate, 2),
 		InsecureSkipVerify: true,
 		CipherSuites:       allCipherSuites(),
-		MinVersion:         VersionTLS10,
+		MinVersion:         VersionTLS13,
 		MaxVersion:         VersionTLS13,
 	}
 	testConfig.Certificates[0].Certificate = [][]byte{testRSACertificate}

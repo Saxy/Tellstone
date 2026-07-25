@@ -33,6 +33,9 @@ const (
 
 // expandLabel implements HKDF-Expand-Label from RFC 8446, Section 7.1.
 func (c *cipherSuiteTLS13) expandLabel(secret []byte, label string, context []byte, length int) []byte {
+	if length < 0 || length > 65535 {
+		panic("tls: ExportKeyingMaterial length out of range")
+	}
 	var hkdfLabel cryptobyte.Builder
 	hkdfLabel.AddUint16(uint16(length))
 	hkdfLabel.AddUint8LengthPrefixed(func(b *cryptobyte.Builder) {

@@ -623,7 +623,7 @@ func (hs *serverHandshakeStateTLS13) sendServerCertificate() error {
 		certReq.scts = true
 		certReq.supportedSignatureAlgorithms = supportedSignatureAlgorithms()
 		if c.config.ClientCAs != nil {
-			certReq.certificateAuthorities = c.config.ClientCAs.Subjects()
+			certReq.certificateAuthorities = c.config.ClientCAs.Subjects() //nolint:staticcheck // SA1019: no replacement API
 		}
 
 		if _, err := hs.c.writeHandshakeRecord(certReq, hs.transcript); err != nil {

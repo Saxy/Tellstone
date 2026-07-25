@@ -39,11 +39,12 @@ type Store interface {
 // connState holds per-connection scratch buffers reused across OnTraffic calls so the hot
 // path stays allocation-free, plus the assigned shard index for per-shard metrics.
 type connState struct {
-	out     []byte
-	args    [][]byte
-	shardID int
-	tlsConn *tlslib.Conn
-	readBuf []byte
+	out               []byte
+	args              [][]byte
+	shardID           int
+	tlsConn           *tlslib.Conn
+	readBuf           []byte
+	handshakeDeadline time.Time
 }
 
 // Server is an edge-triggered RESP2 listener backed by gnet.
@@ -130,6 +131,7 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		adapter := tlslib.NewGnetConnAdapter(c)
 		st.tlsConn = tlslib.Server(adapter, s.tlsConfig)
 		st.readBuf = make([]byte, 0, 4096)
+		st.handshakeDeadline = time.Now().Add(10 * time.Second)
 	}
 	c.SetContext(st)
 	return nil, gnet.None
@@ -154,6 +156,9 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 	}
 
 	if st.tlsConn != nil {
+		if !st.tlsConn.HandshakeCompleted() && time.Now().After(st.handshakeDeadline) {
+			return gnet.Close
+		}
 		return s.onTrafficTLS(c, st)
 	}
 	return s.onTrafficPlaintext(c, st)
@@ -162,11 +167,13 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 // onTrafficTLS reads decrypted application data from the TLS connection,
 // parses RESP frames, and writes encrypted responses.
 func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
-	st.readBuf = st.readBuf[:cap(st.readBuf)]
 	for {
-		n, err := st.tlsConn.Read(st.readBuf)
+		n, err := st.tlsConn.Read(st.readBuf[len(st.readBuf):cap(st.readBuf)])
 		if n > 0 {
-			s.handleDecryptedResp(st, c, st.readBuf[:n])
+			st.readBuf = st.readBuf[:len(st.readBuf)+n]
+			if action := s.handleDecryptedResp(st, c); action != gnet.None {
+				return action
+			}
 		}
 		if err != nil {
 			if errors.Is(err, tlslib.ErrNotEnough) {
@@ -178,12 +185,13 @@ func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 }
 
 // handleDecryptedResp parses RESP commands from decrypted plaintext and
-// writes encrypted responses through the TLS connection.
-func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn, plaintext []byte) {
+// writes encrypted responses through the TLS connection. It returns gnet.Close
+// on protocol or write errors so the caller propagates the close.
+func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
 	st.out = st.out[:0]
 	consumed := 0
-	for consumed < len(plaintext) {
-		args, n, perr := Parse(plaintext[consumed:], st.args)
+	for consumed < len(st.readBuf) {
+		args, n, perr := Parse(st.readBuf[consumed:], st.args)
 		if perr != nil {
 			if errors.Is(perr, errIncomplete) {
 				break
@@ -194,18 +202,18 @@ func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn, plaintext []byt
 					log.String("remote_addr", c.RemoteAddr().String()),
 				)
 			}
-			return
+			return gnet.Close
 		}
 		st.args = args[:0]
 		consumed += n
 		st.out = s.dispatch(args, st.out)
 	}
 	if consumed == 0 {
-		return
+		return gnet.None
 	}
 	if len(st.out) > 0 {
 		if _, err := st.tlsConn.Write(st.out); err != nil {
-			return
+			return gnet.Close
 		}
 		n := uint64(len(st.out))
 		atomic.AddUint64(&s.bytesWritten, n)
@@ -218,6 +226,9 @@ func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn, plaintext []byt
 	if st.shardID >= 0 && st.shardID < len(s.shards) {
 		s.shards[st.shardID].AddBytesRead(n)
 	}
+	remaining := copy(st.readBuf, st.readBuf[consumed:])
+	st.readBuf = st.readBuf[:remaining]
+	return gnet.None
 }
 
 // onTrafficPlaintext is the original zero-copy plaintext path.

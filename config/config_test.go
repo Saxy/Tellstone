@@ -186,9 +186,9 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 }
 
 func TestTLSDefaultsDisabled(t *testing.T) {
-	os.Unsetenv("TSD_TLS_CERT")
-	os.Unsetenv("TSD_TLS_KEY")
-	os.Unsetenv("TSD_TLS_CA")
+	t.Setenv("TSD_TLS_CERT", "")
+	t.Setenv("TSD_TLS_KEY", "")
+	t.Setenv("TSD_TLS_CA", "")
 
 	cfg := LoadConfig(nil)
 

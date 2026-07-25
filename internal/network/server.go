@@ -150,7 +150,11 @@ func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 // calls on the TLS connection.
 func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 	st, _ := c.Context().(*connState)
-	if st != nil && st.tlsConn != nil {
+	if st == nil {
+		st = &connState{}
+		c.SetContext(st)
+	}
+	if st.tlsConn != nil {
 		return s.onTrafficTLS(c, st)
 	}
 	return s.onTrafficPlaintext(c, st)
@@ -160,11 +164,13 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 // our binary protocol frames, dispatches them to the handler, and writes
 // encrypted responses.
 func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
-	st.readBuf = st.readBuf[:cap(st.readBuf)]
 	for {
-		n, err := st.tlsConn.Read(st.readBuf)
+		n, err := st.tlsConn.Read(st.readBuf[len(st.readBuf):cap(st.readBuf)])
 		if n > 0 {
-			s.handleDecryptedFrames(st, st.readBuf[:n])
+			st.readBuf = st.readBuf[:len(st.readBuf)+n]
+			if action := s.handleDecryptedFrames(st); action != gnet.None {
+				return action
+			}
 		}
 		if err != nil {
 			if errors.Is(err, tlslib.ErrNotEnough) {
@@ -182,13 +188,14 @@ func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 
 // handleDecryptedFrames parses zero or more Tellstone binary protocol frames
 // from plaintext data and dispatches each to the handler. Responses are written
-// through the TLS connection for automatic encryption.
-func (s *Server) handleDecryptedFrames(st *connState, plaintext []byte) {
+// through the TLS connection for automatic encryption. It returns gnet.Close
+// on decode, handler, or TLS write errors so the caller propagates the close.
+func (s *Server) handleDecryptedFrames(st *connState) gnet.Action {
 	var msg Message
 	offset := 0
-	for offset < len(plaintext) {
+	for offset < len(st.readBuf) {
 		msg = Message{}
-		payloadLen, err := Decode(plaintext[offset:], s.maxMsgSize, &msg)
+		payloadLen, err := Decode(st.readBuf[offset:], s.maxMsgSize, &msg)
 		if err != nil {
 			if errors.Is(err, errShortRead) {
 				break
@@ -199,7 +206,7 @@ func (s *Server) handleDecryptedFrames(st *connState, plaintext []byte) {
 					log.String("error", err.Error()),
 				)
 			}
-			return
+			return gnet.Close
 		}
 		totalPacketLen := 5 + payloadLen
 		atomic.AddUint64(&s.bytesRead, uint64(totalPacketLen))
@@ -219,7 +226,7 @@ func (s *Server) handleDecryptedFrames(st *connState, plaintext []byte) {
 						log.String("error", err.Error()),
 					)
 				}
-				return
+				return gnet.Close
 			}
 			if respPayload != nil {
 				if err = Write(st.tlsConn, respType, respPayload); err != nil {
@@ -228,7 +235,7 @@ func (s *Server) handleDecryptedFrames(st *connState, plaintext []byte) {
 							log.String("error", err.Error()),
 						)
 					}
-					return
+					return gnet.Close
 				}
 				n := uint64(5 + len(respPayload))
 				atomic.AddUint64(&s.bytesWritten, n)
@@ -239,6 +246,11 @@ func (s *Server) handleDecryptedFrames(st *connState, plaintext []byte) {
 		}
 		offset += totalPacketLen
 	}
+	if offset > 0 {
+		remaining := copy(st.readBuf, st.readBuf[offset:])
+		st.readBuf = st.readBuf[:remaining]
+	}
+	return gnet.None
 }
 
 // onTrafficPlaintext handles the original zero-copy plaintext path. Raw bytes

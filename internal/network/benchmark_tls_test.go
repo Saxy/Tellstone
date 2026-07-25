@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/pem"
+	"io"
 	"math/big"
 	"net"
 	"os"
@@ -40,7 +41,9 @@ func startBenchServer(b *testing.B, handler func(msg *Message) ([]byte, MessageT
 
 	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil)
 	go func() { _ = srv.ListenAndServe() }()
-	time.Sleep(50 * time.Millisecond)
+	if err := waitForServer(addr, 2*time.Second); err != nil {
+		b.Fatalf("server not ready: %v", err)
+	}
 	b.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -89,7 +92,9 @@ func startBenchTLSServer(b *testing.B, handler func(msg *Message) ([]byte, Messa
 	go func() {
 		_ = srv.ListenAndServe()
 	}()
-	time.Sleep(50 * time.Millisecond)
+	if err := waitForServer(addr, 2*time.Second); err != nil {
+		b.Fatalf("server not ready: %v", err)
+	}
 	b.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
@@ -136,7 +141,7 @@ func BenchmarkGnetPlaintext(b *testing.B) {
 		b.Fatalf("warmup write failed: %v", err)
 	}
 	buf := make([]byte, 4096)
-	if _, err := conn.Read(buf); err != nil {
+	if _, err := io.ReadFull(conn, buf); err != nil {
 		b.Fatalf("warmup read failed: %v", err)
 	}
 
@@ -145,7 +150,7 @@ func BenchmarkGnetPlaintext(b *testing.B) {
 		if _, err := conn.Write(frame); err != nil {
 			b.Fatalf("write failed: %v", err)
 		}
-		if _, err := conn.Read(buf); err != nil {
+		if _, err := io.ReadFull(conn, buf); err != nil {
 			b.Fatalf("read failed: %v", err)
 		}
 	}
@@ -160,10 +165,12 @@ func BenchmarkGnetTLS(b *testing.B) {
 	frame := buildPingFrame(payload)
 
 	tlsCfg := &tls.Config{
-		InsecureSkipVerify: true,
-		MinVersion:         tls.VersionTLS13,
-		MaxVersion:         tls.VersionTLS13,
+		MinVersion: tls.VersionTLS13,
+		MaxVersion: tls.VersionTLS13,
 	}
+	pool := x509.NewCertPool()
+	pool.AppendCertsFromPEM(bs.certPEM)
+	tlsCfg.RootCAs = pool
 	conn, err := tls.Dial("tcp", bs.addr, tlsCfg)
 	if err != nil {
 		b.Fatalf("tls dial failed: %v", err)
@@ -175,7 +182,7 @@ func BenchmarkGnetTLS(b *testing.B) {
 	if _, err := conn.Write(frame); err != nil {
 		b.Fatalf("warmup write failed: %v", err)
 	}
-	if _, err := conn.Read(buf); err != nil {
+	if _, err := io.ReadFull(conn, buf); err != nil {
 		b.Fatalf("warmup read failed: %v", err)
 	}
 
@@ -184,7 +191,7 @@ func BenchmarkGnetTLS(b *testing.B) {
 		if _, err := conn.Write(frame); err != nil {
 			b.Fatalf("write failed: %v", err)
 		}
-		if _, err := conn.Read(buf); err != nil {
+		if _, err := io.ReadFull(conn, buf); err != nil {
 			b.Fatalf("read failed: %v", err)
 		}
 	}
@@ -203,7 +210,7 @@ func BenchmarkGnetPlaintextParallel(b *testing.B) {
 	var wg sync.WaitGroup
 	for i := 0; i < numCores; i++ {
 		wg.Add(1)
-		go func() {
+		go func(core int) {
 			defer wg.Done()
 			conn, err := net.Dial("tcp", bs.addr)
 			if err != nil {
@@ -214,15 +221,18 @@ func BenchmarkGnetPlaintextParallel(b *testing.B) {
 
 			buf := make([]byte, 4096)
 			iters := b.N / numCores
+			if core < b.N%numCores {
+				iters++
+			}
 			for j := 0; j < iters; j++ {
 				if _, err := conn.Write(frame); err != nil {
 					return
 				}
-				if _, err := conn.Read(buf); err != nil {
+				if _, err := io.ReadFull(conn, buf); err != nil {
 					return
 				}
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 	b.StopTimer()
@@ -240,12 +250,14 @@ func BenchmarkGnetTLSParallel(b *testing.B) {
 	var wg sync.WaitGroup
 	for i := 0; i < numCores; i++ {
 		wg.Add(1)
-		go func() {
+		go func(core int) {
 			defer wg.Done()
+			pool := x509.NewCertPool()
+			pool.AppendCertsFromPEM(bs.certPEM)
 			tlsCfg := &tls.Config{
-				InsecureSkipVerify: true,
-				MinVersion:         tls.VersionTLS13,
-				MaxVersion:         tls.VersionTLS13,
+				MinVersion: tls.VersionTLS13,
+				MaxVersion: tls.VersionTLS13,
+				RootCAs:    pool,
 			}
 			conn, err := tls.Dial("tcp", bs.addr, tlsCfg)
 			if err != nil {
@@ -256,15 +268,18 @@ func BenchmarkGnetTLSParallel(b *testing.B) {
 
 			buf := make([]byte, 4096)
 			iters := b.N / numCores
+			if core < b.N%numCores {
+				iters++
+			}
 			for j := 0; j < iters; j++ {
 				if _, err := conn.Write(frame); err != nil {
 					return
 				}
-				if _, err := conn.Read(buf); err != nil {
+				if _, err := io.ReadFull(conn, buf); err != nil {
 					return
 				}
 			}
-		}()
+		}(i)
 	}
 	wg.Wait()
 	b.StopTimer()
