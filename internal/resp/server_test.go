@@ -114,7 +114,7 @@ func startServer(t *testing.T, requirePass string) (addr string) {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_ = gnet.Stop(ctx, "tcp://"+addr)
+		_ = srv.Shutdown(ctx)
 	})
 	return addr
 }
@@ -147,6 +147,22 @@ func TestRESPServer_AuthRequired(t *testing.T) {
 	defer conn2.Close()
 	expectReply(t, conn2, "GET on second conn",
 		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "-NOAUTH Authentication required\r\n")
+}
+
+func TestRESPServer_QuitPreAuth(t *testing.T) {
+	addr := startServer(t, "sekret")
+
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	// QUIT is allowed before authentication and must close the connection after +OK.
+	expectReply(t, conn, "QUIT before auth", "*1\r\n$4\r\nQUIT\r\n", "+OK\r\n")
+	if err := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("QUIT deadline: %v", err)
+	}
+	if _, err := conn.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("expected EOF after QUIT, got %v", err)
+	}
 }
 
 func TestRESPServer_AuthWithUsername(t *testing.T) {

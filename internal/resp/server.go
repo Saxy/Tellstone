@@ -50,6 +50,9 @@ type connState struct {
 	handshakeDeadline time.Time
 	authenticated     bool
 	remoteAddr        string
+	// closeAfterReply is set by dispatch (QUIT) so the traffic loop flushes the pending
+	// replies and then returns gnet.Close instead of keeping the connection open.
+	closeAfterReply bool
 }
 
 // Server is an edge-triggered RESP2 listener backed by gnet.
@@ -249,6 +252,10 @@ func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
 		st.args = args[:0]
 		consumed += n
 		st.out = s.dispatch(st, args, st.out)
+		if st.closeAfterReply {
+			// QUIT: stop parsing pipelined commands; flush replies, then close below.
+			break
+		}
 	}
 	if consumed == 0 {
 		return gnet.None
@@ -270,6 +277,9 @@ func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
 	}
 	remaining := copy(st.readBuf, st.readBuf[consumed:])
 	st.readBuf = st.readBuf[:remaining]
+	if st.closeAfterReply {
+		return gnet.Close
+	}
 	return gnet.None
 }
 
@@ -298,6 +308,10 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 		st.args = args[:0]
 		consumed += n
 		st.out = s.dispatch(st, args, st.out)
+		if st.closeAfterReply {
+			// QUIT: stop parsing pipelined commands; flush replies, then close below.
+			break
+		}
 	}
 	if consumed == 0 {
 		return gnet.None
@@ -319,6 +333,9 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 	atomic.AddUint64(&s.bytesRead, n)
 	if st.shardID >= 0 && st.shardID < len(s.shards) {
 		s.shards[st.shardID].AddBytesRead(n)
+	}
+	if st.closeAfterReply {
+		return gnet.Close
 	}
 	return gnet.None
 }
@@ -390,6 +407,10 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 		// redis-cli / some tools probe COMMAND DOCS|COUNT at startup; an empty array keeps
 		// the session alive without implementing the introspection surface.
 		return append(out, "*0\r\n"...)
+
+	case EqualFold(cmd, "QUIT"):
+		st.closeAfterReply = true
+		return append(out, respOK...)
 
 	default:
 		return AppendError(out, "ERR unknown command '"+string(cmd)+"'")
