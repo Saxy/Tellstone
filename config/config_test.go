@@ -317,3 +317,25 @@ func TestTLSFlagsOverrideEnvVars(t *testing.T) {
 		t.Fatalf("flag should override env for key: %s", cfg.GetTLSKey())
 	}
 }
+
+func TestRequirePassDefaultEmpty(t *testing.T) {
+	cfg := LoadConfig(nil)
+	if cfg.GetRequirePass() != "" {
+		t.Fatalf("require-pass should default to empty, got %q", cfg.GetRequirePass())
+	}
+}
+
+func TestRequirePassFlag(t *testing.T) {
+	cfg := LoadConfig([]string{"--require-pass", "hunter2"})
+	if cfg.GetRequirePass() != "hunter2" {
+		t.Fatalf("require-pass flag mismatch: %q", cfg.GetRequirePass())
+	}
+}
+
+func TestRequirePassEnvVar(t *testing.T) {
+	t.Setenv("TSD_REQUIRE_PASS", "envpass")
+	cfg := LoadConfig(nil)
+	if cfg.GetRequirePass() != "envpass" {
+		t.Fatalf("require-pass env mismatch: %q", cfg.GetRequirePass())
+	}
+}

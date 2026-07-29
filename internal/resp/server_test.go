@@ -54,7 +54,7 @@ func freeAddr(t *testing.T) string {
 
 func TestRESPServer_GetSetPingPipeline(t *testing.T) {
 	addr := freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil)
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "")
 	go func() { _ = srv.ListenAndServe() }()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -88,6 +88,105 @@ func TestRESPServer_GetSetPingPipeline(t *testing.T) {
 	expect("pipeline",
 		"*3\r\n$3\r\nSET\r\n$1\r\np\r\n$2\r\nhi\r\n*2\r\n$3\r\nGET\r\n$1\r\np\r\n",
 		"+OK\r\n$2\r\nhi\r\n")
+}
+
+// expectReply writes send on conn and asserts the exact reply bytes.
+func expectReply(t *testing.T, conn net.Conn, name, send, want string) {
+	t.Helper()
+	if _, err := conn.Write([]byte(send)); err != nil {
+		t.Fatalf("%s write: %v", name, err)
+	}
+	got := make([]byte, len(want))
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("%s read: %v", name, err)
+	}
+	if string(got) != want {
+		t.Fatalf("%s: got %q want %q", name, got, want)
+	}
+}
+
+func startServer(t *testing.T, requirePass string) (addr string) {
+	t.Helper()
+	addr = freeAddr(t)
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, requirePass)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = gnet.Stop(ctx, "tcp://"+addr)
+	})
+	return addr
+}
+
+func TestRESPServer_AuthRequired(t *testing.T) {
+	addr := startServer(t, "sekret")
+
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	expectReply(t, conn, "GET before auth",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "-NOAUTH Authentication required\r\n")
+	expectReply(t, conn, "SET before auth",
+		"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n", "-NOAUTH Authentication required\r\n")
+	expectReply(t, conn, "PING before auth",
+		"*1\r\n$4\r\nPING\r\n", "+PONG\r\n")
+	expectReply(t, conn, "AUTH wrong password",
+		"*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n", "-ERR invalid password\r\n")
+	expectReply(t, conn, "GET after failed auth",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "-NOAUTH Authentication required\r\n")
+	expectReply(t, conn, "AUTH correct password",
+		"*2\r\n$4\r\nAUTH\r\n$6\r\nsekret\r\n", "+OK\r\n")
+	expectReply(t, conn, "SET after auth",
+		"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n", "+OK\r\n")
+	expectReply(t, conn, "GET after auth",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "$1\r\nv\r\n")
+
+	// Auth state is per-connection: a fresh connection must authenticate again.
+	conn2 := dialWithRetry(t, addr)
+	defer conn2.Close()
+	expectReply(t, conn2, "GET on second conn",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "-NOAUTH Authentication required\r\n")
+}
+
+func TestRESPServer_AuthWithUsername(t *testing.T) {
+	addr := startServer(t, "sekret")
+
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	expectReply(t, conn, "AUTH wrong username",
+		"*3\r\n$4\r\nAUTH\r\n$5\r\nadmin\r\n$6\r\nsekret\r\n", "-ERR invalid password\r\n")
+	expectReply(t, conn, "AUTH default user",
+		"*3\r\n$4\r\nAUTH\r\n$7\r\ndefault\r\n$6\r\nsekret\r\n", "+OK\r\n")
+	expectReply(t, conn, "GET after auth",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "$-1\r\n")
+}
+
+func TestRESPServer_AuthNoPasswordConfigured(t *testing.T) {
+	addr := startServer(t, "")
+
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	// Without --require-pass every connection starts authenticated and AUTH is a no-op.
+	expectReply(t, conn, "GET without auth",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "$-1\r\n")
+	expectReply(t, conn, "AUTH no-op",
+		"*2\r\n$4\r\nAUTH\r\n$8\r\nwhatever\r\n", "+OK\r\n")
+}
+
+func TestRESPServer_AuthWrongArity(t *testing.T) {
+	addr := startServer(t, "sekret")
+
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	expectReply(t, conn, "AUTH no args",
+		"*1\r\n$4\r\nAUTH\r\n", "-ERR wrong number of arguments for 'auth' command\r\n")
+	expectReply(t, conn, "AUTH too many args",
+		"*4\r\n$4\r\nAUTH\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n",
+		"-ERR wrong number of arguments for 'auth' command\r\n")
 }
 
 func dialWithRetry(t *testing.T, addr string) net.Conn {

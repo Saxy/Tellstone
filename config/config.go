@@ -41,6 +41,7 @@ type Config struct {
 	tlsCert           string
 	tlsKey            string
 	tlsCA             string
+	requirePass       string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -116,6 +117,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_TLS_CERT         – path to TLS certificate file (PEM; empty = TLS disabled)
 //		TSD_TLS_KEY          – path to TLS private key file (PEM)
 //		TSD_TLS_CA           – path to CA certificate for client verification (enables mTLS)
+//		TSD_REQUIRE_PASS     – server password required by AUTH (empty = no authentication)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -270,6 +272,13 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_TLS_CA", ""),
 		"Path to CA certificate for client verification (PEM); enables mTLS when set",
 	)
+	// Optional server password enforced via the RESP AUTH command.
+	fs.StringVar(
+		&cfg.requirePass,
+		"require-pass",
+		getEnv("TSD_REQUIRE_PASS", ""),
+		"Password clients must supply via AUTH; empty disables authentication (default: none)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -319,6 +328,7 @@ func (cfg *Config) TLSEnabled() bool                  { return cfg.tlsCert != ""
 func (cfg *Config) GetTLSCert() string                { return cfg.tlsCert }
 func (cfg *Config) GetTLSKey() string                 { return cfg.tlsKey }
 func (cfg *Config) GetTLSCA() string                  { return cfg.tlsCA }
+func (cfg *Config) GetRequirePass() string            { return cfg.requirePass }
 func (cfg *Config) MTLSEnabled() bool {
 	return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != ""
 }

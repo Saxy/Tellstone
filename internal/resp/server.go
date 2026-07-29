@@ -3,10 +3,12 @@ Package resp
 Tellstone Redis-Compatible Wire Protocol
 File: server.go
 Description: Optional gnet event-loop server speaking RESP2, reusing the shared storage engine
-via a small Store interface. Supports PING, GET, SET (with optional EX/PX), and DEL; unknown
-commands return an error without dropping the connection. Exists so Tellstone can be driven by
-standard Redis tooling (redis-benchmark, memtier_benchmark) for cross-system comparison.
-Supports optional TLS 1.3 transport encryption via the internal TLS library.
+via a small Store interface. Supports PING, GET, SET (with optional EX/PX), DEL, and AUTH;
+unknown commands return an error without dropping the connection. Exists so Tellstone can be
+driven by standard Redis tooling (redis-benchmark, memtier_benchmark) for cross-system
+comparison. Supports optional TLS 1.3 transport encryption via the internal TLS library.
+When a server password is configured (--require-pass / TSD_REQUIRE_PASS), connections must
+authenticate via AUTH before issuing commands other than PING and QUIT.
 
 Authors:
 
@@ -26,6 +28,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/shard"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 	"github.com/panjf2000/gnet/v2"
+	"golang.org/x/crypto/bcrypt"
 )
 
 // Store is the subset of the storage engine the RESP server needs. *storage.Engine satisfies
@@ -45,6 +48,8 @@ type connState struct {
 	tlsConn           *tlslib.Conn
 	readBuf           []byte
 	handshakeDeadline time.Time
+	authenticated     bool
+	remoteAddr        string
 }
 
 // Server is an edge-triggered RESP2 listener backed by gnet.
@@ -66,22 +71,38 @@ type Server struct {
 	protocolErrors   uint64
 	shards           []*shard.Shard
 	nextConn         uint64
+	// requirePassHash is the bcrypt hash of the server password. nil means AUTH is not
+	// required and every connection starts authenticated (zero-overhead no-op path).
+	requirePassHash []byte
 }
 
 // NewServer creates a RESP server bound to addr that dispatches commands to store.
 // shards is optional — if nil, per-shard metrics are not tracked.
 // tlsCfg is optional — if nil, plaintext TCP is used.
-func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsCfg *tlslib.Config) *Server {
+// requirePass is optional — if empty, AUTH is a no-op and connections start authenticated;
+// otherwise it is hashed once at startup and clients must AUTH before issuing commands.
+func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsCfg *tlslib.Config, requirePass string) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
+	var passHash []byte
+	if requirePass != "" {
+		var err error
+		passHash, err = bcrypt.GenerateFromPassword([]byte(requirePass), bcrypt.DefaultCost)
+		if err != nil {
+			// bcrypt only fails on invalid cost or a password over 72 bytes — a
+			// misconfiguration that must surface at startup, not at first AUTH.
+			panic("resp: invalid --require-pass value: " + err.Error())
+		}
+	}
 	return &Server{
-		addr:      addr,
-		store:     store,
-		shards:    shards,
-		logger:    logger,
-		tlsConfig: tlsCfg,
-		ready:     make(chan struct{}),
+		addr:            addr,
+		store:           store,
+		shards:          shards,
+		logger:          logger,
+		tlsConfig:       tlsCfg,
+		requirePassHash: passHash,
+		ready:           make(chan struct{}),
 	}
 }
 
@@ -123,9 +144,11 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		s.shards[sid].IncTotalConnections()
 	}
 	st := &connState{
-		out:     make([]byte, 0, 4096),
-		args:    make([][]byte, 0, 8),
-		shardID: shardID,
+		out:           make([]byte, 0, 4096),
+		args:          make([][]byte, 0, 8),
+		shardID:       shardID,
+		authenticated: s.requirePassHash == nil,
+		remoteAddr:    c.RemoteAddr().String(),
 	}
 	if s.tlsConfig != nil {
 		adapter := tlslib.NewGnetConnAdapter(c)
@@ -151,7 +174,12 @@ func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 	st, _ := c.Context().(*connState)
 	if st == nil {
-		st = &connState{out: make([]byte, 0, 4096), args: make([][]byte, 0, 8)}
+		st = &connState{
+			out:           make([]byte, 0, 4096),
+			args:          make([][]byte, 0, 8),
+			authenticated: s.requirePassHash == nil,
+			remoteAddr:    c.RemoteAddr().String(),
+		}
 		c.SetContext(st)
 	}
 
@@ -220,7 +248,7 @@ func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
 		}
 		st.args = args[:0]
 		consumed += n
-		st.out = s.dispatch(args, st.out)
+		st.out = s.dispatch(st, args, st.out)
 	}
 	if consumed == 0 {
 		return gnet.None
@@ -269,7 +297,7 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 		}
 		st.args = args[:0]
 		consumed += n
-		st.out = s.dispatch(args, st.out)
+		st.out = s.dispatch(st, args, st.out)
 	}
 	if consumed == 0 {
 		return gnet.None
@@ -300,11 +328,18 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 // Lookup keys use a zero-copy unsafe string over the argument bytes (which alias the gnet read
 // buffer): this is safe because Get does not retain the key, and Set clones the key and copies
 // the value before storing them.
-func (s *Server) dispatch(args [][]byte, out []byte) []byte {
+func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 	if len(args) == 0 {
 		return AppendError(out, "ERR empty command")
 	}
 	cmd := args[0]
+	if EqualFold(cmd, shard.CmdAuth) {
+		return s.auth(st, args, out)
+	}
+	// Unauthenticated connections may only issue AUTH, PING, and QUIT (Redis semantics).
+	if !st.authenticated && !EqualFold(cmd, shard.CmdPing) && !EqualFold(cmd, "QUIT") {
+		return AppendError(out, "NOAUTH Authentication required")
+	}
 	switch {
 	case EqualFold(cmd, shard.CmdGet):
 		if len(args) != 2 {
@@ -359,6 +394,38 @@ func (s *Server) dispatch(args [][]byte, out []byte) []byte {
 	default:
 		return AppendError(out, "ERR unknown command '"+string(cmd)+"'")
 	}
+}
+
+// auth handles the AUTH command in both single-password (AUTH <password>) and ACL
+// (AUTH <username> <password>) forms. When no server password is configured, AUTH is a
+// backward-compatible no-op that replies +OK. bcrypt comparison happens only here, never
+// on the hot path.
+func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
+	if len(args) != 2 && len(args) != 3 {
+		return AppendError(out, "ERR wrong number of arguments for 'auth' command")
+	}
+	if s.requirePassHash == nil {
+		return append(out, respOK...)
+	}
+	// Only the implicit "default" user exists until an ACL system lands (issue #9).
+	if len(args) == 3 && string(args[1]) != "default" {
+		return s.authFailed(st, out)
+	}
+	if bcrypt.CompareHashAndPassword(s.requirePassHash, args[len(args)-1]) != nil {
+		return s.authFailed(st, out)
+	}
+	st.authenticated = true
+	return append(out, respOK...)
+}
+
+// authFailed logs a rejected AUTH attempt and appends the RESP error reply.
+func (s *Server) authFailed(st *connState, out []byte) []byte {
+	if s.logger.Enabled(log.LevelWarn) {
+		s.logger.Log(log.LevelWarn, "resp: failed AUTH attempt",
+			log.String("remote_addr", st.remoteAddr),
+		)
+	}
+	return AppendError(out, "ERR invalid password")
 }
 
 // parseSetTTL extracts the TTL from a SET command. Returns (0, true) for a plain 3-arg SET,

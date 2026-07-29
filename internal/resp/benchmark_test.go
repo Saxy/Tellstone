@@ -64,11 +64,12 @@ func BenchmarkDispatchGetHit(b *testing.B) {
 	store := newFakeStore()
 	_ = store.Set("k", []byte("benchmark_value"), 0)
 	srv := &Server{store: store, logger: log.NewNoOpLogger()}
+	st := &connState{authenticated: true}
 	args := [][]byte{[]byte("GET"), []byte("k")}
 	out := make([]byte, 0, 128)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		out = srv.dispatch(args, out[:0])
+		out = srv.dispatch(st, args, out[:0])
 	}
 }
 
@@ -76,11 +77,12 @@ func BenchmarkDispatchGetHit(b *testing.B) {
 func BenchmarkDispatchSet(b *testing.B) {
 	store := newFakeStore()
 	srv := &Server{store: store, logger: log.NewNoOpLogger()}
+	st := &connState{authenticated: true}
 	args := [][]byte{[]byte("SET"), []byte("k"), []byte("benchmark_value")}
 	out := make([]byte, 0, 128)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		out = srv.dispatch(args, out[:0])
+		out = srv.dispatch(st, args, out[:0])
 	}
 }
 
@@ -91,10 +93,11 @@ func BenchmarkDispatchSetParallel(b *testing.B) {
 	srv := &Server{store: store, logger: log.NewNoOpLogger()}
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
+		st := &connState{authenticated: true}
 		args := [][]byte{[]byte("SET"), []byte("k"), []byte("benchmark_value")}
 		out := make([]byte, 0, 128)
 		for pb.Next() {
-			out = srv.dispatch(args, out[:0])
+			out = srv.dispatch(st, args, out[:0])
 		}
 	})
 }

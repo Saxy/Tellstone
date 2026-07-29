@@ -251,7 +251,7 @@ func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	store := &RouterStore{router: s.router}
-	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfig)
+	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfig, cfg.GetRequirePass())
 	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {
