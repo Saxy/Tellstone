@@ -24,6 +24,9 @@ const (
 	MsgPong
 	MsgRequest
 	MsgResponse
+	MsgAuth
+	MsgAuthOk
+	MsgAuthErr
 )
 
 // OpCode defines the backend database operation.
@@ -73,6 +76,7 @@ var (
 	ResponseEmptyKey       = []byte("ERR EMPTY_KEY")
 	ResponseStorageFailure = []byte("ERR STORAGE_FAILURE")
 	ResponseInvalidOpCode  = []byte("ERR INVALID_OPCODE")
+	ResponseAuthErr        = []byte("ERR INVALID_AUTH")
 )
 
 // Marshal encodes the Message into its binary wire format.

@@ -12,6 +12,7 @@ package network
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync/atomic"
 
@@ -19,6 +20,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/shard"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 	"github.com/panjf2000/gnet/v2"
+	"golang.org/x/crypto/bcrypt"
 )
 
 const defaultAddr = "127.0.0.1:9988"
@@ -27,10 +29,14 @@ const defaultMaxMsgSize = 16 * 1024 * 1024
 // connState holds per-connection state. When TLS is enabled, tlsConn wraps the
 // raw gnet connection with TLS 1.3 encryption via the internal TLS library. readBuf is a
 // reusable scratch buffer for TLS Read calls to avoid per-traffic allocations.
+// authenticated tracks whether the client has passed AUTH (always true when no
+// server password is configured, so the hot path is branch-predictable).
 type connState struct {
-	shardID uint64
-	tlsConn *tlslib.Conn
-	readBuf []byte
+	shardID       uint64
+	authenticated bool
+	remoteAddr    string
+	tlsConn       *tlslib.Conn
+	readBuf       []byte
 }
 
 type Server struct {
@@ -56,13 +62,19 @@ type Server struct {
 
 	shards   []*shard.Shard
 	nextConn uint64
+
+	// requirePassHash is the bcrypt hash of the server password. nil means AUTH is not
+	// required and every connection starts authenticated (zero-overhead no-op path).
+	requirePassHash []byte
 }
 
 // NewServer initializes an edge-triggered networking server engine instance.
 // It applies defensive configuration defaults before spawning infrastructure.
 // shards is optional — if nil, per-shard metrics are not tracked.
 // tlsCfg is optional — if nil, plaintext TCP is used.
-func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsCfg *tlslib.Config) *Server {
+// requirePass is optional — if empty, AUTH is a no-op and connections start authenticated;
+// otherwise it is hashed at startup and clients must AUTH before issuing data commands.
+func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsCfg *tlslib.Config, requirePass string) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -75,14 +87,23 @@ func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler fu
 	if maxMsgSize == 0 {
 		maxMsgSize = defaultMaxMsgSize
 	}
+	var passHash []byte
+	if requirePass != "" {
+		var err error
+		passHash, err = bcrypt.GenerateFromPassword([]byte(requirePass), bcrypt.DefaultCost)
+		if err != nil {
+			panic("network: invalid --require-pass value: " + err.Error())
+		}
+	}
 	s := &Server{
-		addr:       addr,
-		handler:    handler,
-		logger:     logger,
-		maxMsgSize: maxMsgSize,
-		tlsConfig:  tlsCfg,
-		ready:      make(chan struct{}),
-		shards:     shards,
+		addr:            addr,
+		handler:         handler,
+		logger:          logger,
+		maxMsgSize:      maxMsgSize,
+		tlsConfig:       tlsCfg,
+		ready:           make(chan struct{}),
+		shards:          shards,
+		requirePassHash: passHash,
 	}
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "tcp server created", log.Int("max_msg_size", int(maxMsgSize)))
@@ -126,7 +147,11 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		s.shards[sid].IncConnectedClients()
 		s.shards[sid].IncTotalConnections()
 	}
-	st := &connState{shardID: sid}
+	st := &connState{
+		shardID:       sid,
+		authenticated: s.requirePassHash == nil,
+		remoteAddr:    c.RemoteAddr().String(),
+	}
 	if s.tlsConfig != nil {
 		adapter := tlslib.NewGnetConnAdapter(c)
 		st.tlsConn = tlslib.Server(adapter, s.tlsConfig)
@@ -217,8 +242,18 @@ func (s *Server) handleDecryptedFrames(st *connState) gnet.Action {
 			var (
 				respType    MessageType
 				respPayload []byte
+				skipHandler bool
 			)
-			respPayload, respType, err = s.handler(&msg)
+			if msg.Type == MsgAuth {
+				respPayload, respType = s.processAuth(st, msg.Value)
+				skipHandler = true
+			} else if !st.authenticated && msg.Type != MsgPing {
+				respPayload, respType = ResponseAuthErr, MsgAuthErr
+				skipHandler = true
+			}
+			if !skipHandler {
+				respPayload, respType, err = s.handler(&msg)
+			}
 			if err != nil {
 				atomic.AddUint64(&s.handlerErrors, 1)
 				if s.logger.Enabled(log.LevelWarn) {
@@ -294,8 +329,18 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 			var (
 				respType    MessageType
 				respPayload []byte
+				skipHandler bool
 			)
-			respPayload, respType, err = s.handler(&msg)
+			if msg.Type == MsgAuth {
+				respPayload, respType = s.processAuth(st, msg.Value)
+				skipHandler = true
+			} else if !st.authenticated && msg.Type != MsgPing {
+				respPayload, respType = ResponseAuthErr, MsgAuthErr
+				skipHandler = true
+			}
+			if !skipHandler {
+				respPayload, respType, err = s.handler(&msg)
+			}
 			if err != nil {
 				atomic.AddUint64(&s.handlerErrors, 1)
 				if s.logger.Enabled(log.LevelWarn) {
@@ -335,6 +380,64 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 		}
 	}
 	return gnet.None
+}
+
+// processAuth handles the MsgAuth wire-level handshake. When no server password is
+// configured it is a no-op (backward-compatible). bcrypt comparison happens only here,
+// never on the hot path.
+func (s *Server) processAuth(st *connState, value []byte) ([]byte, MessageType) {
+	if s.requirePassHash == nil {
+		return ResponseOK, MsgAuthOk
+	}
+	username, password := parseAuthPayload(value)
+	if len(username) > 0 && string(username) != "default" {
+		return s.authFailed(st), MsgAuthErr
+	}
+	if bcrypt.CompareHashAndPassword(s.requirePassHash, password) != nil {
+		return s.authFailed(st), MsgAuthErr
+	}
+	st.authenticated = true
+	if s.logger.Enabled(log.LevelDebug) {
+		s.logger.Log(log.LevelDebug, "network: client authenticated",
+			log.String("remote_addr", st.remoteAddr),
+		)
+	}
+	return ResponseOK, MsgAuthOk
+}
+
+// authFailed logs a rejected AUTH attempt and returns the error payload.
+func (s *Server) authFailed(st *connState) []byte {
+	if s.logger.Enabled(log.LevelWarn) {
+		s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",
+			log.String("remote_addr", st.remoteAddr),
+		)
+	}
+	return ResponseAuthErr
+}
+
+// parseAuthPayload extracts username and password from the MsgAuth wire format:
+//
+//	[2B usernameLen][username bytes][2B passwordLen][password bytes]
+//
+// Returns (nil, nil) on a malformed frame.
+func parseAuthPayload(value []byte) (username, password []byte) {
+	if len(value) < 2 {
+		return nil, nil
+	}
+	usernameLen := int(binary.BigEndian.Uint16(value[:2]))
+	pos := 2
+	if len(value) < pos+usernameLen+2 {
+		return nil, nil
+	}
+	username = value[pos : pos+usernameLen]
+	pos += usernameLen
+	passwordLen := int(binary.BigEndian.Uint16(value[pos : pos+2]))
+	pos += 2
+	if len(value) < pos+passwordLen {
+		return nil, nil
+	}
+	password = value[pos : pos+passwordLen]
+	return
 }
 
 func (s *Server) ConnectedClients() uint64 { return atomic.LoadUint64(&s.connectedClients) }

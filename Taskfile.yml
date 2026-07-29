@@ -141,6 +141,14 @@ tasks:
         fi
 
   # ---------- benchmarks (self-contained: start pinned server, load, clean up) ----------
+  bench:go:
+    desc: "Run Go package benchmarks. Vars: PKG (default ./...), BENCH (default .), COUNT (default 1)"
+    vars:
+      PKG: '{{.PKG | default "./..."}}'
+      BENCH: '{{.BENCH | default "."}}'
+      COUNT: '{{.COUNT | default "1"}}'
+    cmds:
+      - go test -bench={{.BENCH}} -benchmem -count={{.COUNT}} -run='^$' {{.PKG}}
   bench:native:
     desc: Native binary-protocol benchmark, server & client pinned to disjoint cores (Linux only)
     deps: [ build, build:bench ]

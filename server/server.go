@@ -99,6 +99,7 @@ func (s *Server) Run() error {
 		s.networkHandler,
 		logger,
 		tlsCfg,
+		cfg.GetRequirePass(),
 	)
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(s.netSrv)

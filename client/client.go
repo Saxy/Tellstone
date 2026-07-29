@@ -65,6 +65,16 @@ func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
 	return c.c.Delete(key, scratchBuf)
 }
 
+// Auth authenticates the client with a password (single-password mode).
+// Must be called after Dial/DialTLS when the server has --require-pass set.
+// scratchBuf must be large enough to hold the server response.
+func (c *Client) Auth(password string, scratchBuf []byte) error {
+	if err := c.valid(); err != nil {
+		return err
+	}
+	return c.c.Auth(password, scratchBuf)
+}
+
 func (c *Client) valid() error {
 	if c == nil || c.c == nil {
 		return ErrClientClosed

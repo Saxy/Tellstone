@@ -163,6 +163,28 @@ func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
 	return resp.Value, nil
 }
 
+// Auth authenticates the client with a password (single-password mode, username empty).
+// scratchBuf must be large enough to hold the server response. Returns nil on success.
+func (c *Client) Auth(password string, scratchBuf []byte) error {
+	payloadLen := 2 + 0 + 2 + len(password)
+	var reqBuf [512]byte
+	if payloadLen > len(reqBuf) {
+		return ErrRequestTooLarge
+	}
+	binary.BigEndian.PutUint16(reqBuf[0:2], 0) // usernameLen = 0 (single-password mode)
+	binary.BigEndian.PutUint16(reqBuf[2:4], uint16(len(password)))
+	copy(reqBuf[4:payloadLen], password)
+
+	var resp Message
+	if err := c.Call(MsgAuth, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
+		return err
+	}
+	if resp.Type != MsgAuthOk {
+		return fmt.Errorf("auth failed: %s", resp.Value)
+	}
+	return nil
+}
+
 // Call executes a synchronous Request-Response cycle completely allocation-free.
 func (c *Client) Call(msgType MessageType, reqPayload []byte, buf []byte, out *Message) error {
 	if err := Write(c.conn, msgType, reqPayload); err != nil {
