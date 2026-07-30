@@ -275,26 +275,13 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 				skipHandler bool
 			)
 			if msg.Type == MsgAuth {
-				if s.requirePassHash == nil {
-					respPayload, respType = ResponseOK, MsgAuthOk
-					skipHandler = true
-				} else {
-					username, password := parseAuthPayload(msg.Value)
-					if len(username) > 0 && string(username) != "default" {
-						respPayload, respType = s.authFailed(st), MsgAuthErr
-						skipHandler = true
-					} else {
-						passwordCopy := make([]byte, len(password))
-						copy(passwordCopy, password)
-						if s.dispatchAuth(c, passwordCopy) {
-							st.authPending = true
-							offset += totalPacketLen
-							break
-						}
-						respPayload, respType = s.authFailed(st), MsgAuthErr
-						skipHandler = true
-					}
+				result := s.handleAuthMessage(c, st, msg.Value)
+				if result.dispatched {
+					offset += totalPacketLen
+					break
 				}
+				respPayload, respType = result.respPayload, result.respType
+				skipHandler = true
 			} else if !st.authenticated && msg.Type != MsgPing {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
@@ -386,26 +373,13 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 				skipHandler bool
 			)
 			if msg.Type == MsgAuth {
-				if s.requirePassHash == nil {
-					respPayload, respType = ResponseOK, MsgAuthOk
-					skipHandler = true
-				} else {
-					username, password := parseAuthPayload(msg.Value)
-					if len(username) > 0 && string(username) != "default" {
-						respPayload, respType = s.authFailed(st), MsgAuthErr
-						skipHandler = true
-					} else {
-						passwordCopy := make([]byte, len(password))
-						copy(passwordCopy, password)
-						if s.dispatchAuth(c, passwordCopy) {
-							st.authPending = true
-							_, _ = c.Discard(totalPacketLen)
-							return gnet.None
-						}
-						respPayload, respType = s.authFailed(st), MsgAuthErr
-						skipHandler = true
-					}
+				result := s.handleAuthMessage(c, st, msg.Value)
+				if result.dispatched {
+					_, _ = c.Discard(totalPacketLen)
+					return gnet.None
 				}
+				respPayload, respType = result.respPayload, result.respType
+				skipHandler = true
 			} else if !st.authenticated && msg.Type != MsgPing {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
@@ -473,6 +447,39 @@ func (s *Server) authFailed(st *connState) []byte {
 	return ResponseAuthErr
 }
 
+// authResult conveys the outcome of synchronous AUTH processing.
+type authResult struct {
+	respPayload []byte
+	respType    MessageType
+	dispatched  bool // true when bcrypt was sent to the worker pool
+}
+
+// handleAuthMessage consolidates the MsgAuth branch shared by the TLS and
+// plaintext OnTraffic paths. It handles the no-password bypass, fast-rejects
+// malformed payloads, validates the username, makes a copy of the password for
+// the worker, and submits the job via dispatchAuth. It returns an authResult:
+// dispatched == true means the caller must consume the current frame and skip
+// response writing; otherwise respPayload/respType hold the synchronous result.
+func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) authResult {
+	if s.requirePassHash == nil {
+		return authResult{respPayload: ResponseOK, respType: MsgAuthOk}
+	}
+	username, password, malformed := parseAuthPayload(value)
+	if malformed {
+		return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
+	}
+	if len(username) > 0 && string(username) != "default" {
+		return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+	}
+	passwordCopy := make([]byte, len(password))
+	copy(passwordCopy, password)
+	if s.dispatchAuth(c, passwordCopy) {
+		st.authPending = true
+		return authResult{dispatched: true}
+	}
+	return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
+}
+
 // authWorker is a background goroutine that runs bcrypt verification off the
 // gnet event loop. On completion it wakes the connection on the event loop to
 // deliver the result and write the response.
@@ -487,21 +494,19 @@ func (s *Server) authWorker() {
 				return nil
 			}
 			st.authPending = false
+			var respPayload []byte
+			var respType MessageType
 			if success {
 				st.authenticated = true
+				respPayload, respType = ResponseOK, MsgAuthOk
 				if s.logger.Enabled(log.LevelDebug) {
 					s.logger.Log(log.LevelDebug, "network: client authenticated",
 						log.String("remote_addr", st.remoteAddr),
 					)
 				}
-				if st.tlsConn != nil {
-					_ = Write(st.tlsConn, MsgAuthOk, ResponseOK)
-				} else {
-					_ = Write(c, MsgAuthOk, ResponseOK)
-				}
-				_ = c.Wake(nil)
 			} else {
 				st.authFails++
+				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				if s.logger.Enabled(log.LevelWarn) {
 					s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",
 						log.String("remote_addr", st.remoteAddr),
@@ -511,15 +516,32 @@ func (s *Server) authWorker() {
 				if st.authFails >= maxAuthFails {
 					st.closeAfterReply = true
 				}
-				if st.tlsConn != nil {
-					_ = Write(st.tlsConn, MsgAuthErr, ResponseAuthErr)
-				} else {
-					_ = Write(c, MsgAuthErr, ResponseAuthErr)
-				}
-				if st.closeAfterReply {
-					_ = c.Close()
-				}
 			}
+			var writeErr error
+			if st.tlsConn != nil {
+				writeErr = Write(st.tlsConn, respType, respPayload)
+			} else {
+				writeErr = Write(c, respType, respPayload)
+			}
+			if writeErr != nil {
+				if s.logger.Enabled(log.LevelError) {
+					s.logger.Log(log.LevelError, "network: auth write failed",
+						log.String("error", writeErr.Error()),
+					)
+				}
+				_ = c.Close()
+				return nil
+			}
+			n := uint64(5 + len(respPayload))
+			atomic.AddUint64(&s.bytesWritten, n)
+			if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
+				s.shards[st.shardID].AddBytesWritten(n)
+			}
+			if st.closeAfterReply {
+				_ = c.Close()
+				return nil
+			}
+			_ = c.Wake(nil)
 			return nil
 		})
 	}
@@ -540,22 +562,23 @@ func (s *Server) dispatchAuth(c gnet.Conn, password []byte) bool {
 //
 //	[2B usernameLen][username bytes][2B passwordLen][password bytes]
 //
-// Returns (nil, nil) on a malformed frame.
-func parseAuthPayload(value []byte) (username, password []byte) {
+// malformed is true when the payload is truncated. (nil, nil) with malformed=false
+// is a valid frame with an empty username ("default" user).
+func parseAuthPayload(value []byte) (username, password []byte, malformed bool) {
 	if len(value) < 2 {
-		return nil, nil
+		return nil, nil, true
 	}
 	usernameLen := int(binary.BigEndian.Uint16(value[:2]))
 	pos := 2
 	if len(value) < pos+usernameLen+2 {
-		return nil, nil
+		return nil, nil, true
 	}
 	username = value[pos : pos+usernameLen]
 	pos += usernameLen
 	passwordLen := int(binary.BigEndian.Uint16(value[pos : pos+2]))
 	pos += 2
 	if len(value) < pos+passwordLen {
-		return nil, nil
+		return nil, nil, true
 	}
 	password = value[pos : pos+passwordLen]
 	return
