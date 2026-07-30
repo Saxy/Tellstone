@@ -25,6 +25,7 @@ import (
 
 const defaultAddr = "127.0.0.1:9988"
 const defaultMaxMsgSize = 16 * 1024 * 1024
+const maxAuthFails = 3
 
 // connState holds per-connection state. When TLS is enabled, tlsConn wraps the
 // raw gnet connection with TLS 1.3 encryption via the internal TLS library. readBuf is a
@@ -35,6 +36,8 @@ type connState struct {
 	shardID       uint64
 	authenticated bool
 	remoteAddr    string
+	authFails     int
+	closeAfterReply bool
 	tlsConn       *tlslib.Conn
 	readBuf       []byte
 }
@@ -278,6 +281,9 @@ func (s *Server) handleDecryptedFrames(st *connState) gnet.Action {
 					s.shards[st.shardID].AddBytesWritten(n)
 				}
 			}
+			if st.closeAfterReply {
+				return gnet.Close
+			}
 		}
 		offset += totalPacketLen
 	}
@@ -367,6 +373,9 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 					}
 				}
 			}
+			if st.closeAfterReply {
+				return gnet.Close
+			}
 		}
 		_, err = c.Discard(totalPacketLen)
 		if err != nil {
@@ -384,7 +393,8 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 
 // processAuth handles the MsgAuth wire-level handshake. When no server password is
 // configured it is a no-op (backward-compatible). bcrypt comparison happens only here,
-// never on the hot path.
+// never on the hot path. Repeated failures trigger a per-connection rate limit that
+// closes the connection after maxAuthFails attempts.
 func (s *Server) processAuth(st *connState, value []byte) ([]byte, MessageType) {
 	if s.requirePassHash == nil {
 		return ResponseOK, MsgAuthOk
@@ -405,12 +415,18 @@ func (s *Server) processAuth(st *connState, value []byte) ([]byte, MessageType) 
 	return ResponseOK, MsgAuthOk
 }
 
-// authFailed logs a rejected AUTH attempt and returns the error payload.
+// authFailed logs a rejected AUTH attempt, increments the per-connection fail
+// counter, and marks the connection for closure when the rate limit is exceeded.
 func (s *Server) authFailed(st *connState) []byte {
+	st.authFails++
 	if s.logger.Enabled(log.LevelWarn) {
 		s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",
 			log.String("remote_addr", st.remoteAddr),
+			log.Int("attempts", st.authFails),
 		)
+	}
+	if st.authFails >= maxAuthFails {
+		st.closeAfterReply = true
 	}
 	return ResponseAuthErr
 }

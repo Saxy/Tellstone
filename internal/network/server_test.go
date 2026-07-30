@@ -34,6 +34,12 @@ func (f *fakeStore) set(key string, value []byte) {
 	f.m[string([]byte(key))] = append([]byte(nil), value...)
 }
 
+func (f *fakeStore) delete(key string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.m, key)
+}
+
 // storeHandler is a Server handler that dispatches MsgRequest operations against
 // a fakeStore and echoes MsgPing payloads.
 func storeHandler(store *fakeStore) func(msg *Message) ([]byte, MessageType, error) {
@@ -54,7 +60,7 @@ func storeHandler(store *fakeStore) func(msg *Message) ([]byte, MessageType, err
 				store.set(key, msg.Value)
 				return ResponseOK, MsgResponse, nil
 			case OpDelete:
-				store.set(key, nil) // no-op for test
+				store.delete(key)
 				return ResponseOK, MsgResponse, nil
 			}
 		}
