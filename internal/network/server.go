@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"sync"
 	"sync/atomic"
 
 	"github.com/Saxy/Tellstone/internal/log"
@@ -26,6 +27,13 @@ import (
 const defaultAddr = "127.0.0.1:9988"
 const defaultMaxMsgSize = 16 * 1024 * 1024
 const maxAuthFails = 3
+const numAuthWorkers = 4
+
+type authJob struct {
+	c        gnet.Conn
+	password []byte
+	passHash []byte
+}
 
 // connState holds per-connection state. When TLS is enabled, tlsConn wraps the
 // raw gnet connection with TLS 1.3 encryption via the internal TLS library. readBuf is a
@@ -37,6 +45,7 @@ type connState struct {
 	authenticated bool
 	remoteAddr    string
 	authFails     int
+	authPending   bool
 	closeAfterReply bool
 	tlsConn       *tlslib.Conn
 	readBuf       []byte
@@ -69,6 +78,9 @@ type Server struct {
 	// requirePassHash is the bcrypt hash of the server password. nil means AUTH is not
 	// required and every connection starts authenticated (zero-overhead no-op path).
 	requirePassHash []byte
+
+	authJobs chan authJob
+	workerWg sync.WaitGroup
 }
 
 // NewServer initializes an edge-triggered networking server engine instance.
@@ -107,6 +119,11 @@ func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler fu
 		ready:           make(chan struct{}),
 		shards:          shards,
 		requirePassHash: passHash,
+		authJobs:        make(chan authJob, 256),
+	}
+	for i := 0; i < numAuthWorkers; i++ {
+		s.workerWg.Add(1)
+		go s.authWorker()
 	}
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "tcp server created", log.Int("max_msg_size", int(maxMsgSize)))
@@ -129,8 +146,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-s.ready:
 	case <-ctx.Done():
+		close(s.authJobs)
+		s.workerWg.Wait()
 		return ctx.Err()
 	}
+	close(s.authJobs)
+	s.workerWg.Wait()
 	return s.eng.Stop(ctx)
 }
 
@@ -196,7 +217,7 @@ func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 		n, err := st.tlsConn.Read(st.readBuf[len(st.readBuf):cap(st.readBuf)])
 		if n > 0 {
 			st.readBuf = st.readBuf[:len(st.readBuf)+n]
-			if action := s.handleDecryptedFrames(st); action != gnet.None {
+			if action := s.handleDecryptedFrames(c, st); action != gnet.None {
 				return action
 			}
 		}
@@ -218,7 +239,10 @@ func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 // from plaintext data and dispatches each to the handler. Responses are written
 // through the TLS connection for automatic encryption. It returns gnet.Close
 // on decode, handler, or TLS write errors so the caller propagates the close.
-func (s *Server) handleDecryptedFrames(st *connState) gnet.Action {
+func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
+	if st.authPending {
+		return gnet.None
+	}
 	var msg Message
 	offset := 0
 	for offset < len(st.readBuf) {
@@ -248,8 +272,26 @@ func (s *Server) handleDecryptedFrames(st *connState) gnet.Action {
 				skipHandler bool
 			)
 			if msg.Type == MsgAuth {
-				respPayload, respType = s.processAuth(st, msg.Value)
-				skipHandler = true
+				if s.requirePassHash == nil {
+					respPayload, respType = ResponseOK, MsgAuthOk
+					skipHandler = true
+				} else {
+					username, password := parseAuthPayload(msg.Value)
+					if len(username) > 0 && string(username) != "default" {
+						respPayload, respType = s.authFailed(st), MsgAuthErr
+						skipHandler = true
+					} else {
+						passwordCopy := make([]byte, len(password))
+						copy(passwordCopy, password)
+						if s.dispatchAuth(c, passwordCopy) {
+							st.authPending = true
+							offset += totalPacketLen
+							break
+						}
+						respPayload, respType = s.authFailed(st), MsgAuthErr
+						skipHandler = true
+					}
+				}
 			} else if !st.authenticated && msg.Type != MsgPing {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
@@ -298,6 +340,9 @@ func (s *Server) handleDecryptedFrames(st *connState) gnet.Action {
 // are peeked directly from the gnet ring buffer, parsed, and responses are
 // written back through gnet without any intermediate copies.
 func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
+	if st.authPending {
+		return gnet.None
+	}
 	var msg Message
 	for {
 		buf, err := c.Peek(-1)
@@ -338,8 +383,26 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 				skipHandler bool
 			)
 			if msg.Type == MsgAuth {
-				respPayload, respType = s.processAuth(st, msg.Value)
-				skipHandler = true
+				if s.requirePassHash == nil {
+					respPayload, respType = ResponseOK, MsgAuthOk
+					skipHandler = true
+				} else {
+					username, password := parseAuthPayload(msg.Value)
+					if len(username) > 0 && string(username) != "default" {
+						respPayload, respType = s.authFailed(st), MsgAuthErr
+						skipHandler = true
+					} else {
+						passwordCopy := make([]byte, len(password))
+						copy(passwordCopy, password)
+						if s.dispatchAuth(c, passwordCopy) {
+							st.authPending = true
+							_, _ = c.Discard(totalPacketLen)
+							return gnet.None
+						}
+						respPayload, respType = s.authFailed(st), MsgAuthErr
+						skipHandler = true
+					}
+				}
 			} else if !st.authenticated && msg.Type != MsgPing {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
@@ -391,30 +454,6 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 	return gnet.None
 }
 
-// processAuth handles the MsgAuth wire-level handshake. When no server password is
-// configured it is a no-op (backward-compatible). bcrypt comparison happens only here,
-// never on the hot path. Repeated failures trigger a per-connection rate limit that
-// closes the connection after maxAuthFails attempts.
-func (s *Server) processAuth(st *connState, value []byte) ([]byte, MessageType) {
-	if s.requirePassHash == nil {
-		return ResponseOK, MsgAuthOk
-	}
-	username, password := parseAuthPayload(value)
-	if len(username) > 0 && string(username) != "default" {
-		return s.authFailed(st), MsgAuthErr
-	}
-	if bcrypt.CompareHashAndPassword(s.requirePassHash, password) != nil {
-		return s.authFailed(st), MsgAuthErr
-	}
-	st.authenticated = true
-	if s.logger.Enabled(log.LevelDebug) {
-		s.logger.Log(log.LevelDebug, "network: client authenticated",
-			log.String("remote_addr", st.remoteAddr),
-		)
-	}
-	return ResponseOK, MsgAuthOk
-}
-
 // authFailed logs a rejected AUTH attempt, increments the per-connection fail
 // counter, and marks the connection for closure when the rate limit is exceeded.
 func (s *Server) authFailed(st *connState) []byte {
@@ -429,6 +468,69 @@ func (s *Server) authFailed(st *connState) []byte {
 		st.closeAfterReply = true
 	}
 	return ResponseAuthErr
+}
+
+// authWorker is a background goroutine that runs bcrypt verification off the
+// gnet event loop. On completion it wakes the connection on the event loop to
+// deliver the result and write the response.
+func (s *Server) authWorker() {
+	defer s.workerWg.Done()
+	for job := range s.authJobs {
+		err := bcrypt.CompareHashAndPassword(job.passHash, job.password)
+		success := err == nil
+		_ = job.c.Wake(func(c gnet.Conn, _ error) error {
+			st, _ := c.Context().(*connState)
+			if st == nil {
+				return nil
+			}
+			st.authPending = false
+			if success {
+				st.authenticated = true
+				if s.logger.Enabled(log.LevelDebug) {
+					s.logger.Log(log.LevelDebug, "network: client authenticated",
+						log.String("remote_addr", st.remoteAddr),
+					)
+				}
+				if st.tlsConn != nil {
+					_ = Write(st.tlsConn, MsgAuthOk, ResponseOK)
+				} else {
+					_ = Write(c, MsgAuthOk, ResponseOK)
+				}
+				_ = c.Wake(nil)
+			} else {
+				st.authFails++
+				if s.logger.Enabled(log.LevelWarn) {
+					s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",
+						log.String("remote_addr", st.remoteAddr),
+						log.Int("attempts", st.authFails),
+					)
+				}
+				if st.authFails >= maxAuthFails {
+					st.closeAfterReply = true
+				}
+				if st.tlsConn != nil {
+					_ = Write(st.tlsConn, MsgAuthErr, ResponseAuthErr)
+				} else {
+					_ = Write(c, MsgAuthErr, ResponseAuthErr)
+				}
+				if st.closeAfterReply {
+					_ = c.Close()
+				}
+			}
+			return nil
+		})
+	}
+}
+
+// dispatchAuth submits an auth verification job to the bounded worker pool.
+// Returns true if the job was accepted, false if the pool is saturated.
+func (s *Server) dispatchAuth(c gnet.Conn, password []byte) bool {
+	select {
+	case s.authJobs <- authJob{c: c, password: password, passHash: s.requirePassHash}:
+		return true
+	default:
+		return false
+	}
 }
 
 // parseAuthPayload extracts username and password from the MsgAuth wire format:
