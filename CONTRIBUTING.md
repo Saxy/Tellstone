@@ -144,6 +144,7 @@ chore(deps): bump go.mod to Go 1.26
 - Description is lowercase, imperative mood, no period, max 72 characters.
 - Reference issues in the footer: `Closes #123`, `Fixes #456`.
 - Breaking changes must include `BREAKING CHANGE:` in the footer or append `!` after the type/scope: `feat(resp)!: remove deprecated HELLO command`.
+- Do not include AI-generated or co-authored trailers (`Co-authored-by: Claude ...`, `Generated with ...`). Such tags create legal and licensing gray areas, and only a person can certify the DCO. See [AGENTS.md](AGENTS.md).
 
 ### Code Standards
 
@@ -212,6 +213,8 @@ task bench:resp
 5. **Open a PR** against `main` using the PR template.
 6. **Fill out the PR template** completely — especially the benchmark table for performance changes.
 7. **Respond to review feedback** promptly.
+
+If you used a coding agent for any part of the change, follow [AGENTS.md](AGENTS.md).
 
 PRs that introduce new dependencies, change the public API, or affect performance will receive extra scrutiny. This is by design — it protects the project's core principles.
 
