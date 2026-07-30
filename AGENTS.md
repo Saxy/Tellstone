@@ -13,14 +13,14 @@ truth for everything summarised here.
 Do not add AI attribution trailers or footers to commits or pull request descriptions. None
 of the following, in any form:
 
-```
+```text
 Co-authored-by: Claude <noreply@anthropic.com>
 Co-Authored-By: Claude Code <...>
 Generated with Claude Code
 🤖 Generated with ...
 ```
 
-AI generated/co-authored tags create legal and licensing gray areas. This project uses the
+AI-generated/co-authored tags create legal and licensing gray areas. This project uses the
 [DCO](https://developercertificate.org/): `Signed-off-by` is a certification by a real
 person who has the right to submit the work under Apache 2.0. A model is not a legal person
 and cannot make that certification, so naming one as an author muddies the provenance of
@@ -47,7 +47,7 @@ git rebase --signoff HEAD~3    # the last 3 commits
 
 [Conventional Commits](https://www.conventionalcommits.org/):
 
-```
+```text
 <type>(<scope>): <description>
 ```
 
@@ -56,6 +56,8 @@ git rebase --signoff HEAD~3    # the last 3 commits
 | Type | `feat` `fix` `perf` `refactor` `docs` `test` `chore` `ci` `build` `style` |
 | Scope | `resp` `binary` `storage` `shard` `router` `persistence` `crypto` `metrics` `trace` `cli` `server` |
 
+- The scope is optional. Omit it when the change is not specific to one area, as
+  `CONTRIBUTING.md` does with `docs: update benchmark methodology section`.
 - Description: lowercase, imperative mood, no period, max 72 characters.
 - Reference issues in the footer: `Closes #123`.
 - Breaking changes: append `!` after the type/scope, or put `BREAKING CHANGE:` in the
