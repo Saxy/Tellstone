@@ -150,9 +150,12 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		s.workerWg.Wait()
 		return ctx.Err()
 	}
+	// Stop the engine first: this synchronously shuts down all event-loop
+	// goroutines, so no more concurrent sends to s.authJobs can occur.
+	err := s.eng.Stop(ctx)
 	close(s.authJobs)
 	s.workerWg.Wait()
-	return s.eng.Stop(ctx)
+	return err
 }
 
 func (s *Server) OnBoot(eng gnet.Engine) gnet.Action {
