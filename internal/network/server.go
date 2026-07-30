@@ -119,11 +119,13 @@ func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler fu
 		ready:           make(chan struct{}),
 		shards:          shards,
 		requirePassHash: passHash,
-		authJobs:        make(chan authJob, 256),
 	}
-	for i := 0; i < numAuthWorkers; i++ {
-		s.workerWg.Add(1)
-		go s.authWorker()
+	if requirePass != "" {
+		s.authJobs = make(chan authJob, 256)
+		for i := 0; i < numAuthWorkers; i++ {
+			s.workerWg.Add(1)
+			go s.authWorker()
+		}
 	}
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "tcp server created", log.Int("max_msg_size", int(maxMsgSize)))
@@ -146,14 +148,18 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-s.ready:
 	case <-ctx.Done():
-		close(s.authJobs)
+		if s.authJobs != nil {
+			close(s.authJobs)
+		}
 		s.workerWg.Wait()
 		return ctx.Err()
 	}
 	// Stop the engine first: this synchronously shuts down all event-loop
 	// goroutines, so no more concurrent sends to s.authJobs can occur.
 	err := s.eng.Stop(ctx)
-	close(s.authJobs)
+	if s.authJobs != nil {
+		close(s.authJobs)
+	}
 	s.workerWg.Wait()
 	return err
 }
@@ -375,7 +381,16 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 			if msg.Type == MsgAuth {
 				result := s.handleAuthMessage(c, st, msg.Value)
 				if result.dispatched {
-					_, _ = c.Discard(totalPacketLen)
+					_, err = c.Discard(totalPacketLen)
+					if err != nil {
+						atomic.AddUint64(&s.protocolErrors, 1)
+						if s.logger.Enabled(log.LevelWarn) {
+							s.logger.Log(log.LevelWarn, "discarding packages not possible",
+								log.Int("total packet length", totalPacketLen),
+								log.String("error", err.Error()),
+							)
+						}
+					}
 					return gnet.None
 				}
 				respPayload, respType = result.respPayload, result.respType
@@ -505,17 +520,7 @@ func (s *Server) authWorker() {
 					)
 				}
 			} else {
-				st.authFails++
-				respPayload, respType = ResponseAuthErr, MsgAuthErr
-				if s.logger.Enabled(log.LevelWarn) {
-					s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",
-						log.String("remote_addr", st.remoteAddr),
-						log.Int("attempts", st.authFails),
-					)
-				}
-				if st.authFails >= maxAuthFails {
-					st.closeAfterReply = true
-				}
+				respPayload, respType = s.authFailed(st), MsgAuthErr
 			}
 			var writeErr error
 			if st.tlsConn != nil {
