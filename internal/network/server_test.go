@@ -57,7 +57,7 @@ func storeHandler(store *fakeStore) func(msg *Message) ([]byte, MessageType, err
 			case OpGet:
 				val, ok := store.get(key)
 				if !ok {
-					return ResponseNotFound, MsgResponse, nil
+					return ResponseNotFound, MsgError, nil
 				}
 				return val, MsgResponse, nil
 			case OpSet:
@@ -68,7 +68,7 @@ func storeHandler(store *fakeStore) func(msg *Message) ([]byte, MessageType, err
 				return ResponseOK, MsgResponse, nil
 			}
 		}
-		return ResponseInvalidOpCode, MsgResponse, nil
+		return ResponseInvalidOpCode, MsgError, nil
 	}
 }
 
@@ -376,6 +376,45 @@ func TestServerAuthNoPassword(t *testing.T) {
 	resp = sendAndRecv(t, conn, MsgAuth, buildAuthPayload("anything"))
 	if resp.Type != MsgAuthOk {
 		t.Fatalf("expected MsgAuthOk (no-op), got %v", resp.Type)
+	}
+}
+
+// TestServerErrorFrameDistinctFromData verifies that a stored value beginning
+// with "ERR " is returned verbatim in a MsgResponse frame, while real failures
+// arrive in a MsgError frame — the frame type, not a payload prefix, signals an
+// error on the wire.
+func TestServerErrorFrameDistinctFromData(t *testing.T) {
+	store := newFakeStore()
+	store.set("k", []byte("ERR upstream timeout"))
+	addr := startAuthServer(t, "", storeHandler(store))
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	var reqBuf [32]byte
+	reqBuf[0] = byte(OpGet)
+	binary.BigEndian.PutUint16(reqBuf[1:3], uint16(len("k")))
+	binary.BigEndian.PutUint64(reqBuf[3:11], 0)
+	copy(reqBuf[11:], "k")
+
+	resp := sendAndRecv(t, conn, MsgRequest, reqBuf[:11+1])
+	if resp.Type != MsgResponse {
+		t.Fatalf("expected MsgResponse for a data value, got %v", resp.Type)
+	}
+	if !bytes.Equal(resp.Payload, []byte("ERR upstream timeout")) {
+		t.Fatalf("stored value changed on the wire: got %q", resp.Payload)
+	}
+
+	// A miss is a real failure and must arrive in the dedicated error frame.
+	resp = sendAndRecv(t, conn, MsgRequest, []byte{byte(OpGet), 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'x'})
+	if resp.Type != MsgError {
+		t.Fatalf("expected MsgError for a miss, got %v", resp.Type)
+	}
+	if !bytes.Equal(resp.Payload, ResponseNotFound) {
+		t.Fatalf("expected NOT_FOUND payload, got %q", resp.Payload)
 	}
 }
 

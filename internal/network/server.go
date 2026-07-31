@@ -309,7 +309,7 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
 			} else if s.policy != nil && !s.opAuthorized(msg, st) {
-				respPayload, respType = ResponseNotAuthorized, MsgResponse
+				respPayload, respType = ResponseNotAuthorized, MsgError
 				skipHandler = true
 			}
 			if !skipHandler {
@@ -419,7 +419,7 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
 			} else if s.policy != nil && !s.opAuthorized(msg, st) {
-				respPayload, respType = ResponseNotAuthorized, MsgResponse
+				respPayload, respType = ResponseNotAuthorized, MsgError
 				skipHandler = true
 			}
 			if !skipHandler {

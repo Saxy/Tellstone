@@ -370,12 +370,12 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 	case network.OpGet:
 		resp := s.router.Dispatch(shard.CmdGet, keyStr, nil, 0)
 		if !resp.OK {
-			return network.ResponseNotFound, network.MsgResponse, nil
+			return network.ResponseNotFound, network.MsgError, nil
 		}
 		return resp.Value, network.MsgResponse, nil
 	case network.OpSet:
 		if len(msg.Key) == 0 {
-			return network.ResponseEmptyKey, network.MsgResponse, ErrEmptyKey
+			return network.ResponseEmptyKey, network.MsgError, ErrEmptyKey
 		}
 		ttlDuration := time.Duration(msg.TTL) * time.Millisecond
 		resp := s.router.Dispatch(shard.CmdSet, keyStr, msg.Value, ttlDuration)
@@ -383,7 +383,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 			if s.app.GetLogger().Enabled(log.LevelError) {
 				s.app.GetLogger().Log(log.LevelError, "failed to store inside storage engine", log.String("error", resp.Err.Error()))
 			}
-			return network.ResponseStorageFailure, network.MsgResponse, ErrStorageFailure
+			return network.ResponseStorageFailure, network.MsgError, ErrStorageFailure
 		}
 		return network.ResponseOK, network.MsgResponse, nil
 	case network.OpDelete:
@@ -412,18 +412,19 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 			return s.roleGetUser(msg)
 		}
 	default:
-		return network.ResponseNotFound, network.MsgResponse, ErrInvalidOpCode
+		return network.ResponseNotFound, network.MsgError, ErrInvalidOpCode
 	}
 }
 
-// roleReply wraps a ROLE result: ResponseOK on success, an "ERR <detail>"
-// payload otherwise. The client surfaces the latter as an error without
-// tearing down the connection, so a failed admin op never kicks the client.
+// roleReply wraps a ROLE result: ResponseOK in a MsgResponse frame on success,
+// the error detail in a MsgError frame otherwise. The client surfaces the
+// latter as an error without tearing down the connection, so a failed admin op
+// never kicks the client.
 func roleReply(err error) ([]byte, network.MessageType, error) {
 	if err == nil {
 		return network.ResponseOK, network.MsgResponse, nil
 	}
-	return []byte("ERR " + err.Error()), network.MsgResponse, nil
+	return []byte(err.Error()), network.MsgError, nil
 }
 
 func (s *Server) roleCreate(msg *network.Message) ([]byte, network.MessageType, error) {

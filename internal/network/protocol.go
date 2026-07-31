@@ -27,6 +27,9 @@ const (
 	MsgAuth
 	MsgAuthOk
 	MsgAuthErr
+	// MsgError is the dedicated error frame for the data path. It is appended
+	// after the original set so existing type byte values stay stable.
+	MsgError
 )
 
 // OpCode defines the backend database operation.
@@ -88,14 +91,18 @@ var (
 	errMalformedFrame = errors.New("network: malformed frame structure")
 )
 
+// Response payloads for the data path. Failures ride in MsgError frames with
+// the bare code — the frame type, not an in-band "ERR " marker, distinguishes
+// them from data, so a stored value that happens to begin with "ERR " survives
+// a round trip untouched.
 var (
 	ResponseOK             = []byte("OK")
-	ResponseNotFound       = []byte("ERR NOT_FOUND")
-	ResponseEmptyKey       = []byte("ERR EMPTY_KEY")
-	ResponseStorageFailure = []byte("ERR STORAGE_FAILURE")
-	ResponseInvalidOpCode  = []byte("ERR INVALID_OPCODE")
-	ResponseAuthErr        = []byte("ERR INVALID_AUTH")
-	ResponseNotAuthorized  = []byte("ERR NOT_AUTHORIZED")
+	ResponseNotFound       = []byte("NOT_FOUND")
+	ResponseEmptyKey       = []byte("EMPTY_KEY")
+	ResponseStorageFailure = []byte("STORAGE_FAILURE")
+	ResponseInvalidOpCode  = []byte("INVALID_OPCODE")
+	ResponseAuthErr        = []byte("INVALID_AUTH")
+	ResponseNotAuthorized  = []byte("NOT_AUTHORIZED")
 )
 
 // Marshal encodes the Message into its binary wire format.

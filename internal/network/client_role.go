@@ -4,8 +4,9 @@ Tellstone Cloud-Native In-Memory Database
 File: client_role.go
 Description: Binary-protocol client methods for the ROLE command family. Requests carry
 their arguments in the message Value as length-prefixed tokens (EncodeRoleArgs); the server
-replies with ResponseOK, an encoded typed payload (LIST/GETUSER), or an "ERR ..." text that
-surfaces as the returned error. Admin ops only — no allocation concerns on the hot path.
+replies with ResponseOK in a MsgResponse frame on success, an encoded typed payload
+(LIST/GETUSER), or the error detail in a MsgError frame that surfaces as the returned error.
+Admin ops only — no allocation concerns on the hot path.
 
 Authors:
 
@@ -19,8 +20,8 @@ import (
 	"fmt"
 )
 
-// errRBACReply converts a non-OK server payload into an error. The server
-// signals ROLE failures with an "ERR ..." response in a MsgResponse frame.
+// errRBACReply converts a non-success response into an error. The server
+// signals ROLE failures with a MsgError frame carrying the error detail.
 func errRBACReply(payload []byte) error {
 	return fmt.Errorf("server: %s", payload)
 }
@@ -48,7 +49,9 @@ func (c *Client) roleMutate(op OpCode, args [][]byte, scratchBuf []byte) error {
 	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
 		return err
 	}
-	if !bytes.Equal(resp.Value, ResponseOK) {
+	// Success is exactly a MsgResponse carrying ResponseOK; every other frame
+	// (MsgError, MsgAuthErr, ...) is a failure surfaced as an error.
+	if resp.Type != MsgResponse || !bytes.Equal(resp.Value, ResponseOK) {
 		return errRBACReply(resp.Value)
 	}
 	return nil
@@ -92,7 +95,7 @@ func (c *Client) RoleList(scratchBuf []byte) ([]RoleListEntry, error) {
 	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
 		return nil, err
 	}
-	if bytes.HasPrefix(resp.Value, []byte("ERR ")) {
+	if resp.Type != MsgResponse {
 		return nil, errRBACReply(resp.Value)
 	}
 	entries, ok := DecodeRoleListResponse(resp.Value)
@@ -112,7 +115,7 @@ func (c *Client) RoleGetUser(username string, scratchBuf []byte) (RoleUser, erro
 	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
 		return RoleUser{}, err
 	}
-	if bytes.HasPrefix(resp.Value, []byte("ERR ")) {
+	if resp.Type != MsgResponse {
 		return RoleUser{}, errRBACReply(resp.Value)
 	}
 	u, ok := DecodeRoleGetUserResponse(resp.Value)

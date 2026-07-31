@@ -174,46 +174,46 @@ func rbacTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType,
 		case OpRoleCreate:
 			args, ok := DecodeRoleArgs(msg.Value, nil)
 			if !ok || len(args) < 2 {
-				return []byte("ERR invalid ROLE CREATE arguments"), MsgResponse, nil
+				return []byte("invalid ROLE CREATE arguments"), MsgError, nil
 			}
 			rules := make([]string, 0, len(args)-1)
 			for _, r := range args[1:] {
 				rules = append(rules, string(r))
 			}
 			if err := store.CreateRole(string(args[0]), rules); err != nil {
-				return []byte("ERR " + err.Error()), MsgResponse, nil
+				return []byte(err.Error()), MsgError, nil
 			}
 			return ResponseOK, MsgResponse, nil
 		case OpRoleSetUser:
 			args, ok := DecodeRoleArgs(msg.Value, nil)
 			if !ok || len(args) < 2 {
-				return []byte("ERR invalid ROLE SETUSER arguments"), MsgResponse, nil
+				return []byte("invalid ROLE SETUSER arguments"), MsgError, nil
 			}
 			if len(args) == 2 {
-				return []byte("ERR ROLE SETUSER requires a '>password' or 'nopass' option"), MsgResponse, nil
+				return []byte("ROLE SETUSER requires a '>password' or 'nopass' option"), MsgError, nil
 			}
 			hash, err := rbac.PasswordFromOpts(args[2:])
 			if err != nil {
-				return []byte("ERR " + err.Error()), MsgResponse, nil
+				return []byte(err.Error()), MsgError, nil
 			}
 			if err := store.SetUser(string(args[0]), string(args[1]), hash); err != nil {
-				return []byte("ERR " + err.Error()), MsgResponse, nil
+				return []byte(err.Error()), MsgError, nil
 			}
 			return ResponseOK, MsgResponse, nil
 		case OpRoleDelUser:
 			args, ok := DecodeRoleArgs(msg.Value, nil)
 			if !ok || len(args) != 1 {
-				return []byte("ERR invalid ROLE DELUSER arguments"), MsgResponse, nil
+				return []byte("invalid ROLE DELUSER arguments"), MsgError, nil
 			}
 			store.DelUser(string(args[0]))
 			return ResponseOK, MsgResponse, nil
 		case OpRoleDelete:
 			args, ok := DecodeRoleArgs(msg.Value, nil)
 			if !ok || len(args) != 1 {
-				return []byte("ERR invalid ROLE DELETE arguments"), MsgResponse, nil
+				return []byte("invalid ROLE DELETE arguments"), MsgError, nil
 			}
 			if err := store.DeleteRole(string(args[0])); err != nil {
-				return []byte("ERR " + err.Error()), MsgResponse, nil
+				return []byte(err.Error()), MsgError, nil
 			}
 			return ResponseOK, MsgResponse, nil
 		case OpRoleList:
@@ -228,22 +228,22 @@ func rbacTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType,
 			}
 			payload, ok := EncodeRoleListResponse(entries)
 			if !ok {
-				return []byte("ERR role rule exceeds the 64 KiB wire limit"), MsgResponse, nil
+				return []byte("role rule exceeds the 64 KiB wire limit"), MsgError, nil
 			}
 			return payload, MsgResponse, nil
 		case OpRoleGetUser:
 			args, ok := DecodeRoleArgs(msg.Value, nil)
 			if !ok || len(args) != 1 {
-				return []byte("ERR invalid ROLE GETUSER arguments"), MsgResponse, nil
+				return []byte("invalid ROLE GETUSER arguments"), MsgError, nil
 			}
 			p := store.Load()
 			u := p.UserFor(string(args[0]))
 			if u == nil {
-				return []byte("ERR user does not exist"), MsgResponse, nil
+				return []byte("user does not exist"), MsgError, nil
 			}
 			return EncodeRoleGetUserResponse(RoleUser{Role: u.Role, HasPass: len(u.PasswordHash) > 0}), MsgResponse, nil
 		default:
-			return ResponseNotFound, MsgResponse, nil
+			return ResponseNotFound, MsgError, nil
 		}
 	}
 }

@@ -11,7 +11,6 @@ Authors:
 package network
 
 import (
-	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -95,15 +94,14 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
-// errReply converts a server payload into an error when it carries the "ERR "
-// prefix — the binary protocol's error convention (denied ops, missing keys).
-// Arbitrary stored values and OK responses pass through as nil. The protocol
-// has no dedicated error MessageType: data-op successes and failures both ride
-// in MsgResponse frames, so a stored value that itself begins with "ERR " is
-// indistinguishable from an error and is dropped as one.
-func errReply(value []byte) error {
-	if bytes.HasPrefix(value, []byte("ERR ")) {
-		return fmt.Errorf("server: %s", value)
+// errReply converts a response into an error when it arrives in a MsgError
+// frame — the binary protocol's dedicated error type. Data values ride in
+// MsgResponse frames and pass through unchanged, including a stored value that
+// itself begins with "ERR ": the frame type, not the payload, distinguishes an
+// error from data.
+func errReply(resp Message) error {
+	if resp.Type == MsgError {
+		return fmt.Errorf("server: %s", resp.Value)
 	}
 	return nil
 }
@@ -130,7 +128,7 @@ func (c *Client) Set(key, value []byte, ttlMs int64, scratchBuf []byte) ([]byte,
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
 		return nil, err
 	}
-	if err := errReply(resp.Value); err != nil {
+	if err := errReply(resp); err != nil {
 		return nil, err
 	}
 	return resp.Value, nil
@@ -155,7 +153,7 @@ func (c *Client) Get(key []byte, scratchBuf []byte) ([]byte, error) {
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
 		return nil, err
 	}
-	if err := errReply(resp.Value); err != nil {
+	if err := errReply(resp); err != nil {
 		return nil, err
 	}
 	return resp.Value, nil
@@ -180,7 +178,7 @@ func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
 		return nil, err
 	}
-	if err := errReply(resp.Value); err != nil {
+	if err := errReply(resp); err != nil {
 		return nil, err
 	}
 	return resp.Value, nil

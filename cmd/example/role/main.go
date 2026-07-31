@@ -80,7 +80,7 @@ func main() {
 	// Open a second connection as alice and prove the role's limits: GET on a
 	// matching key passes, SET and keys outside the whitelist are denied. The
 	// client surfaces authorization denials as errors carrying the server's
-	// "ERR NOT_AUTHORIZED" payload.
+	// NOT_AUTHORIZED error frame.
 	alice, err := client.Dial("127.0.0.1:9988", 5*time.Second)
 	if err != nil {
 		log.Fatalf("failed to dial server: %v", err)
