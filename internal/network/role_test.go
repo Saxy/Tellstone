@@ -54,6 +54,19 @@ func TestRoleCodecOverflow(t *testing.T) {
 	}
 }
 
+// TestRoleCodecCountOverflow verifies that an argument or entry count that
+// cannot fit the 16-bit count field is rejected instead of silently wrapping.
+func TestRoleCodecCountOverflow(t *testing.T) {
+	tooMany := make([][]byte, 65536)
+	if _, ok := EncodeRoleArgs(tooMany); ok {
+		t.Fatal("expected args encoder to reject a >64 KiB argument count")
+	}
+	entries := make([]RoleListEntry, 65536)
+	if _, ok := EncodeRoleListResponse(entries); ok {
+		t.Fatal("expected list encoder to reject a >64 KiB entry count")
+	}
+}
+
 func TestRoleCodecMalformed(t *testing.T) {
 	if _, ok := DecodeRoleArgs([]byte{0, 2, 0, 5}, nil); ok {
 		t.Fatal("expected truncated payload to be rejected")

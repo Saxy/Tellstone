@@ -22,9 +22,13 @@ import (
 // The message Key field stays empty and the whole token list rides in Value.
 
 // EncodeRoleArgs packs args into a request payload. Empty args yield a
-// two-byte zero count. ok is false when an argument exceeds the 64 KiB
-// length-prefix limit — encoding it would silently truncate the wire form.
+// two-byte zero count. ok is false when the argument count or any single
+// argument exceeds the 64 KiB length-prefix limit — encoding it would
+// silently truncate the wire form.
 func EncodeRoleArgs(args [][]byte) ([]byte, bool) {
+	if len(args) > math.MaxUint16 {
+		return nil, false
+	}
 	size := 2
 	for _, a := range args {
 		if len(a) > math.MaxUint16 {
@@ -114,9 +118,13 @@ func DecodeRoleGetUserResponse(payload []byte) (RoleUser, bool) {
 // LIST response: [2B roleCount] then per role
 // [2B nameLen][name][2B cmdCount]{[2B len][cmd]}[2B nsCount]{[2B len][ns]}.
 
-// EncodeRoleListResponse packs a ROLE LIST response. ok is false when a name,
-// command, or namespace exceeds the 64 KiB length-prefix limit.
+// EncodeRoleListResponse packs a ROLE LIST response. ok is false when the
+// entry count or a name, command, or namespace exceeds the 64 KiB length-prefix
+// limit.
 func EncodeRoleListResponse(entries []RoleListEntry) ([]byte, bool) {
+	if len(entries) > math.MaxUint16 {
+		return nil, false
+	}
 	buf := make([]byte, 0, 2)
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(entries)))
 	for _, e := range entries {
