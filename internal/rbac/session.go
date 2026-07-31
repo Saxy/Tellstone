@@ -13,9 +13,7 @@ package rbac
 
 // SessionContext is the authorization state pinned to one connection at
 // handshake time. It references the resolved Role — roles are immutable once
-//
-//	built, and policy updates replace the whole store, so a pinned session is
-//
+// built, and policy updates replace the whole store, so a pinned session is
 // unaffected by hot-swaps. Fail-closed: a session with no role denies
 // everything.
 type SessionContext struct {

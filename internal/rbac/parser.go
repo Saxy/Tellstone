@@ -65,9 +65,15 @@ func ParseRole(name string, rules ...string) (*Role, error) {
 			// Matching is literal prefix matching (HasPrefix), but the wire
 			// convention is Redis-style "~users:*". Strip the trailing glob
 			// star so "~users:*" stores the prefix "users." "~*" maps to an
-			// empty whitelist (all keys), so nothing is added.
+			// empty whitelist (all keys), so nothing is added. A bare "~"
+			// would store an empty prefix that matches every key, silently
+			// defeating the default-deny whitelist — reject it.
 			if rule != "~*" {
-				r.Namespaces = append(r.Namespaces, []byte(strings.TrimSuffix(rule[1:], "*")))
+				prefix := strings.TrimSuffix(rule[1:], "*")
+				if prefix == "" {
+					return nil, fmt.Errorf("rbac: malformed rule %q in role %q", rule, name)
+				}
+				r.Namespaces = append(r.Namespaces, []byte(prefix))
 			}
 		default:
 			return nil, fmt.Errorf("rbac: malformed rule %q in role %q", rule, name)

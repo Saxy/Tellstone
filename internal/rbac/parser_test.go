@@ -69,6 +69,12 @@ func TestParseRoleCompositeCategoryIncludesAuth(t *testing.T) {
 	}
 }
 
+func TestParseRoleRejectsBareTilde(t *testing.T) {
+	if _, err := ParseRole("x", "~cache:", "~"); err == nil {
+		t.Fatal("bare ~ rule must be rejected, got no error")
+	}
+}
+
 func TestParseRoleErrors(t *testing.T) {
 	cases := []struct {
 		name  string
