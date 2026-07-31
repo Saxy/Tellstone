@@ -13,7 +13,9 @@ package metrics
 import (
 	"io"
 	"runtime"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/network"
@@ -139,17 +141,28 @@ type TLSMetrics interface {
 	CertificateExpirySeconds() int64
 }
 
+// RBACMetrics exposes authorization counters without coupling the metrics
+// package to the concrete policy store — mirrors TLSMetrics above. The role
+// counts map allocates at scrape time, never on the request path.
+type RBACMetrics interface {
+	AuthFailures() uint64
+	DeniedCommands() uint64
+	RoleCommandCounts() map[string]uint64
+}
+
 type AggregateCollector struct {
 	shardCollectors []*Collector
 	networkServer   *network.Server
 	tlsMetrics      TLSMetrics
+	rbacMetrics     RBACMetrics
 }
 
-func NewAggregateCollector(shardCollectors []*Collector, netSrv *network.Server, tlsMetrics TLSMetrics) *AggregateCollector {
+func NewAggregateCollector(shardCollectors []*Collector, netSrv *network.Server, tlsMetrics TLSMetrics, rbacMetrics RBACMetrics) *AggregateCollector {
 	return &AggregateCollector{
 		shardCollectors: shardCollectors,
 		networkServer:   netSrv,
 		tlsMetrics:      tlsMetrics,
+		rbacMetrics:     rbacMetrics,
 	}
 }
 
@@ -168,6 +181,14 @@ func (ac *AggregateCollector) WritePrometheus(w io.Writer) {
 		_, _ = w.Write(b)
 		_, _ = w.Write([]byte("\n\n"))
 	}
+	writeLabeled := func(name, labelName, labelValue, mType, help string, value uint64) {
+		_, _ = w.Write([]byte("# HELP " + name + " " + help + "\n"))
+		_, _ = w.Write([]byte("# TYPE " + name + " " + mType + "\n"))
+		_, _ = w.Write([]byte(name + `{` + labelName + `="` + escapeLabelValue(labelValue) + `"} `))
+		b := strconv.AppendUint(buf[:0], value, 10)
+		_, _ = w.Write(b)
+		_, _ = w.Write([]byte("\n\n"))
+	}
 	writeRaw("tellstone_runtime_heap_alloc_bytes", "gauge", "Heap alloc bytes.", mem.HeapAlloc)
 	writeRaw("tellstone_runtime_heap_allocs_total", "counter", "Total heap allocations.", mem.Mallocs)
 	writeRaw("tellstone_runtime_gc_cycles_total", "counter", "Total GC cycles.", uint64(mem.NumGC))
@@ -179,4 +200,38 @@ func (ac *AggregateCollector) WritePrometheus(w io.Writer) {
 			writeRaw("tellstone_tls_cert_expiry_seconds", "gauge", "Active TLS leaf certificate NotAfter as Unix epoch seconds.", uint64(expiry))
 		}
 	}
+	if ac.rbacMetrics != nil {
+		writeRaw("tellstone_rbac_auth_failures_total", "counter", "Failed AUTH attempts.", ac.rbacMetrics.AuthFailures())
+		writeRaw("tellstone_rbac_denied_commands_total", "counter", "Authorization-denied command attempts.", ac.rbacMetrics.DeniedCommands())
+		counts := ac.rbacMetrics.RoleCommandCounts()
+		names := make([]string, 0, len(counts))
+		for name := range counts {
+			names = append(names, name)
+		}
+		// Map iteration is unordered; sort so identical states render identically.
+		sort.Strings(names)
+		for _, name := range names {
+			writeLabeled("tellstone_rbac_commands_total", "role", name, "counter", "Data commands executed per role.", counts[name])
+		}
+	}
+}
+
+// escapeLabelValue escapes the three characters the Prometheus exposition
+// format requires in quoted label values: backslash, double quote, and newline.
+// Role names are operator-controlled, so they must not break the text format.
+func escapeLabelValue(v string) string {
+	var b strings.Builder
+	for i := 0; i < len(v); i++ {
+		switch v[i] {
+		case '\\':
+			b.WriteString(`\\`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\n':
+			b.WriteString(`\n`)
+		default:
+			b.WriteByte(v[i])
+		}
+	}
+	return b.String()
 }

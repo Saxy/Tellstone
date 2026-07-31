@@ -336,6 +336,61 @@ func TestServerRBACAuthorizationDenial(t *testing.T) {
 	}
 }
 
+// TestServerRBACMetrics verifies the authorization counters move in the binary
+// protocol: failed AUTH bumps the auth-failure counter, denied ops bump the
+// denial counter, and permitted ops bump the per-role executed counter.
+func TestServerRBACMetrics(t *testing.T) {
+	addr, store := startRBACNetworkServer(t)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Failed AUTH: wrong password for an existing user, then an unknown user.
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("admin", "wrong")); resp.Type != MsgAuthErr {
+		t.Fatalf("expected MsgAuthErr for wrong password, got %v", resp.Type)
+	}
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("ghost", "x")); resp.Type != MsgAuthErr {
+		t.Fatalf("expected MsgAuthErr for unknown user, got %v", resp.Type)
+	}
+	// Successful AUTH as the get-only user.
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("limited", "anything")); resp.Type != MsgAuthOk {
+		t.Fatalf("expected MsgAuthOk for nopass user, got %v", resp.Type)
+	}
+	// Permitted GET counts one executed command for the limited role.
+	if resp := sendAndRecv(t, conn, MsgRequest, []byte{byte(OpGet), 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'k'}); !bytes.Equal(resp.Value, ResponseOK) {
+		t.Fatalf("expected OK for GET, got %q", resp.Value)
+	}
+	// Denied SET bumps the denial counter.
+	if resp := sendAndRecv(t, conn, MsgRequest, []byte{byte(OpSet), 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'k', 'v'}); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
+		t.Fatalf("expected ResponseNotAuthorized for SET, got %q", resp.Value)
+	}
+	// Denied ROLE CREATE bumps the denial counter again.
+	payload, err := roleRequestPayload(OpRoleCreate, [][]byte{[]byte("operator"), []byte("+get")})
+	if err != nil {
+		t.Fatalf("roleRequestPayload: %v", err)
+	}
+	if resp := sendAndRecv(t, conn, MsgRequest, payload); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
+		t.Fatalf("expected ResponseNotAuthorized for ROLE, got %q", resp.Value)
+	}
+
+	if got := store.AuthFailures(); got != 2 {
+		t.Fatalf("AuthFailures = %d, want 2", got)
+	}
+	if got := store.DeniedCommands(); got != 2 {
+		t.Fatalf("DeniedCommands = %d, want 2", got)
+	}
+	counts := store.RoleCommandCounts()
+	if counts["limited"] != 1 {
+		t.Fatalf("limited command count = %d, want 1", counts["limited"])
+	}
+	if counts["admin"] != 0 {
+		t.Fatalf("admin command count = %d, want 0", counts["admin"])
+	}
+}
+
 // TestClientRoleMethods exercises the client API against a live RBAC server.
 func TestClientRoleMethods(t *testing.T) {
 	addr, _ := startRBACNetworkServer(t)

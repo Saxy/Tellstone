@@ -25,6 +25,10 @@ type Role struct {
 	Name        string
 	Permissions Bitset
 	Namespaces  [][]byte
+	// commands counts data commands executed by sessions pinned to this role.
+	// It is the only mutable field — roles are otherwise immutable once built —
+	// and is bumped with a lone atomic add, never a lock or allocation.
+	commands uint64
 }
 
 // AllowsKey reports whether a key matches the role's namespace whitelist.

@@ -321,7 +321,7 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	if s.tlsReloader != nil {
 		tlsMetrics = s.tlsReloader
 	}
-	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics)
+	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics, s.policy)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

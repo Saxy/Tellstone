@@ -144,10 +144,56 @@ Every optional feature is disabled by default and has zero overhead when off:
 |---------|------|---------|
 | RESP protocol | `--enable-resp` | off |
 | TLS / mTLS | `--tls-cert`, `--tls-key`, `--tls-ca` | off |
+| RBAC | `--rbac-config` | off |
 | Encryption | `--enable-encryption` | off |
 | Metrics | `--enable-metrics` | off |
 | Persistence | `--enable-persistence` | off |
 | Tracing | `--trace-ratio 0` | off |
+
+### Role-Based Access Control (RBAC)
+
+Opt-in via `--rbac-config` / `TSD_RBAC_CONFIG`. When a policy file is configured, the RESP and
+binary listeners switch from the shared `--require-pass` password to per-user credentials and
+role-based command gating; without one, both servers keep their legacy zero-overhead paths. The
+file (YAML or JSON) is loaded once at startup and hot-reloaded on SIGHUP with a single atomic
+swap, so a rejected file never half-applies and running connections keep their pinned sessions.
+
+**Permission model.** Commands map to bit positions in a dynamic `[]uint64` bitset
+(`internal/rbac`). IDs are stable wire values — append-only, never renumbered or reused. Roles
+expand their rules into a bitset at creation time, so the authorization hot path is one bit test
+plus a prefix scan: `IsAllowed` runs in single-digit nanoseconds with zero allocations
+(see `internal/rbac/bench_test.go`).
+
+**Rule syntax.** `ROLE CREATE <name> <rule>...` takes Redis-style tokens left to right:
+`+cmd` / `-cmd` grant or revoke one command, `+@cat` / `-@cat` a whole category, and `~prefix`
+whitelists a key namespace. The bulk categories:
+
+| Category | Commands |
+|----------|----------|
+| `login` | AUTH, PING, COMMAND |
+| `read` | GET, INFO |
+| `write` | SET, DEL |
+| `readwrite` | GET, SET, DEL, PING, COMMAND, INFO, AUTH |
+| `operator` | readwrite + FLUSH |
+| `maintenance` | FLUSH, SHUTDOWN, CONFIG, DEBUG, MONITOR |
+| `admin` | AUTH, ROLE, ACL, USER, GRANT, REVOKE |
+| `all` / `none` | every registered command / nothing |
+
+**Namespaces.** A role's `~prefix` list is a whitelist: any non-empty list allows only matching
+key prefixes (default-deny); an empty list or explicit `~*` allows every key. This stops a role
+that may `SET` from writing outside its prefix.
+
+**Fail-closed.** A session resolves its role once at handshake (AUTH, or the nopass `default`
+user) and pins it for the connection's lifetime — a policy hot-swap never re-evaluates
+mid-session. A session with no role is deny-all. Denials are reported per command (`-NOPERM`, or
+`-NOAUTH` for unauthenticated data commands) rather than by dropping the connection, so the
+client sees exactly which permission it lacks. Passwords are bcrypt hashes verified with
+`bcrypt.CompareHashAndPassword` (constant-time by construction); hashes are never rendered by
+`ROLE LIST` / `ROLE GETUSER`.
+
+**Integration seams.** `SessionContext` already carries `RoleName` and `Username` for audit
+logging. Planned integrations: API keys intersect role permissions (most restrictive wins), and
+OIDC `groups` claims map to roles through the policy store.
 
 ### Event-Driven Networking
 

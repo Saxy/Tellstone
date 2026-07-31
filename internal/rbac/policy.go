@@ -88,6 +88,12 @@ func (p *PolicyStore) Clone() *PolicyStore {
 type Store struct {
 	active atomic.Pointer[PolicyStore]
 	mu     sync.Mutex
+	// authFailures counts rejected AUTH attempts, deniedCommands counts
+	// authorization-denied command attempts. Unlike the per-role command
+	// counter, both are store-wide: a denial can happen without a pinned role
+	// (fail-closed deny-all). The request path only bumps them atomically.
+	authFailures   uint64
+	deniedCommands uint64
 }
 
 // NewStore returns a Store seeded with policy.

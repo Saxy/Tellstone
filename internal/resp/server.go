@@ -395,8 +395,10 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 			return AppendError(out, "ERR wrong number of arguments for 'get' command")
 		}
 		if !s.authorized(st, rbac.CmdGet, args[1]) {
+			s.countDenied()
 			return AppendError(out, "NOPERM no permission for 'get' command on this key")
 		}
+		s.countCommand(st)
 		key := *(*string)(unsafe.Pointer(&args[1]))
 		val, ok := s.store.Get(key)
 		if !ok {
@@ -409,8 +411,10 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 			return AppendError(out, "ERR wrong number of arguments for 'set' command")
 		}
 		if !s.authorized(st, rbac.CmdSet, args[1]) {
+			s.countDenied()
 			return AppendError(out, "NOPERM no permission for 'set' command on this key")
 		}
+		s.countCommand(st)
 		key := *(*string)(unsafe.Pointer(&args[1]))
 		ttl, ok := parseSetTTL(args)
 		if !ok {
@@ -427,9 +431,11 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 		}
 		for _, k := range args[1:] {
 			if !s.authorized(st, rbac.CmdDel, k) {
+				s.countDenied()
 				return AppendError(out, "NOPERM no permission for 'del' command on this key")
 			}
 		}
+		s.countCommand(st)
 		var n int64
 		for _, k := range args[1:] {
 			ks := *(*string)(unsafe.Pointer(&k))
@@ -453,8 +459,10 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 
 	case EqualFold(cmd, shard.CmdRole):
 		if !s.authorizedCmd(st, rbac.CmdRole) {
+			s.countDenied()
 			return AppendError(out, "NOPERM no permission for 'role' command")
 		}
+		s.countCommand(st)
 		return s.role(st, args, out)
 
 	case EqualFold(cmd, "QUIT"):
@@ -483,6 +491,23 @@ func (s *Server) authorizedCmd(st *connState, cmd uint16) bool {
 		return true
 	}
 	return st.session != nil && st.session.AllowsCommand(cmd)
+}
+
+// countCommand records one permitted command against the connection's pinned
+// role. It is a no-op when RBAC is disabled (the zero-overhead path) and is
+// called once per dispatched command, never per key.
+func (s *Server) countCommand(st *connState) {
+	if s.policy != nil && st.session != nil {
+		st.session.CountCommand()
+	}
+}
+
+// countDenied records one authorization denial (NOPERM). The denial branches
+// in dispatch only run when RBAC is enabled, so this is a no-op path otherwise.
+func (s *Server) countDenied() {
+	if s.policy != nil {
+		s.policy.IncDenied()
+	}
 }
 
 // auth handles the AUTH command in both single-password (AUTH <password>) and ACL
@@ -546,6 +571,9 @@ func (s *Server) authRBAC(st *connState, args [][]byte, out []byte) []byte {
 
 // authFailed logs a rejected AUTH attempt and appends the RESP error reply.
 func (s *Server) authFailed(st *connState, out []byte) []byte {
+	if s.policy != nil {
+		s.policy.IncAuthFailure()
+	}
 	if s.logger.Enabled(log.LevelWarn) {
 		s.logger.Log(log.LevelWarn, "resp: failed AUTH attempt",
 			log.String("remote_addr", st.remoteAddr),

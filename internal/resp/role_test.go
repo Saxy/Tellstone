@@ -180,3 +180,66 @@ func TestRESPServer_RBACNamespacePrefix(t *testing.T) {
 	expectReply(t, conn, "SET inside prefix denied",
 		"*3\r\n$3\r\nSET\r\n$7\r\nusers:1\r\n$1\r\nx\r\n", "-NOPERM no permission for 'set' command on this key\r\n")
 }
+
+// TestRESPServer_RBACMetrics verifies the authorization counters move before
+// and after allowed and denied activity: failed AUTH bumps the auth-failure
+// counter, NOPERM replies bump the denial counter, and permitted commands bump
+// the per-role executed counter.
+func TestRESPServer_RBACMetrics(t *testing.T) {
+	addr := freeAddr(t)
+	store := rbac.NewStore(rbacTestPolicy(t))
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", store)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	counts := store.RoleCommandCounts()
+	if counts["admin"] != 0 || counts["limited"] != 0 {
+		t.Fatalf("role command counts before activity: %v, want both zero", counts)
+	}
+
+	// A failed AUTH (unknown user) bumps the auth-failure counter.
+	expectReply(t, conn, "AUTH unknown user",
+		"*3\r\n$4\r\nAUTH\r\n$5\r\nghost\r\n$5\r\nwrong\r\n", "-ERR invalid password\r\n")
+	// A failed AUTH with a wrong password for an existing user also counts.
+	expectReply(t, conn, "AUTH wrong password",
+		"*3\r\n$4\r\nAUTH\r\n$5\r\nadmin\r\n$5\r\nwrong\r\n", "-ERR invalid password\r\n")
+
+	expectReply(t, conn, "AUTH admin",
+		"*3\r\n$4\r\nAUTH\r\n$5\r\nadmin\r\n$6\r\nsekret\r\n", "+OK\r\n")
+	// Admin has +@all: two permitted data commands.
+	expectReply(t, conn, "GET allowed",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "$-1\r\n")
+	expectReply(t, conn, "SET allowed",
+		"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n", "+OK\r\n")
+
+	// Switch to the limited user (only GET): SET is a violation.
+	expectReply(t, conn, "AUTH limited",
+		"*3\r\n$4\r\nAUTH\r\n$7\r\nlimited\r\n$8\r\nwhatever\r\n", "+OK\r\n")
+	expectReply(t, conn, "GET allowed (limited)",
+		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "$1\r\nv\r\n")
+	expectReply(t, conn, "SET denied (limited)",
+		"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n", "-NOPERM no permission for 'set' command on this key\r\n")
+	expectReply(t, conn, "ROLE denied (limited)",
+		"*2\r\n$4\r\nROLE\r\n$4\r\nLIST\r\n", "-NOPERM no permission for 'role' command\r\n")
+
+	if got := store.AuthFailures(); got != 2 {
+		t.Fatalf("AuthFailures = %d, want 2", got)
+	}
+	if got := store.DeniedCommands(); got != 2 {
+		t.Fatalf("DeniedCommands = %d, want 2", got)
+	}
+	counts = store.RoleCommandCounts()
+	if counts["admin"] != 2 {
+		t.Fatalf("admin command count = %d, want 2", counts["admin"])
+	}
+	if counts["limited"] != 1 {
+		t.Fatalf("limited command count = %d, want 1", counts["limited"])
+	}
+}

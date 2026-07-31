@@ -309,10 +309,16 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
 			} else if s.policy != nil && !s.opAuthorized(msg, st) {
+				s.policy.IncDenied()
 				respPayload, respType = ResponseNotAuthorized, MsgError
 				skipHandler = true
 			}
 			if !skipHandler {
+				// PING is not gated by RBAC and never counted as a role command,
+				// keeping per-role counts symmetric with the RESP data commands.
+				if s.policy != nil && st.session != nil && msg.Type != MsgPing {
+					st.session.CountCommand()
+				}
 				respPayload, respType, err = s.handler(&msg)
 			}
 			if err != nil {
@@ -419,10 +425,16 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
 			} else if s.policy != nil && !s.opAuthorized(msg, st) {
+				s.policy.IncDenied()
 				respPayload, respType = ResponseNotAuthorized, MsgError
 				skipHandler = true
 			}
 			if !skipHandler {
+				// PING is not gated by RBAC and never counted as a role command,
+				// keeping per-role counts symmetric with the RESP data commands.
+				if s.policy != nil && st.session != nil && msg.Type != MsgPing {
+					st.session.CountCommand()
+				}
 				respPayload, respType, err = s.handler(&msg)
 			}
 			if err != nil {
@@ -472,6 +484,9 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 // authFailed logs a rejected AUTH attempt, increments the per-connection fail
 // counter, and marks the connection for closure when the rate limit is exceeded.
 func (s *Server) authFailed(st *connState) []byte {
+	if s.policy != nil {
+		s.policy.IncAuthFailure()
+	}
 	st.authFails++
 	if s.logger.Enabled(log.LevelWarn) {
 		s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",

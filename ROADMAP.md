@@ -18,8 +18,9 @@ runs plaintext TCP with no access control — a non-starter for any real deploym
 
 ### 2b — Authentication & Authorization
 
-- [ ] `AUTH` command for RESP protocol (password-based, `AUTH <user> <password>`)
-- [ ] `AUTH` handshake for binary protocol (challenge-response or token-based)
+- [x] `AUTH` command for RESP protocol (password-based, `AUTH <user> <password>`)
+- [x] `AUTH` handshake for binary protocol (challenge-response or token-based)
+- [x] RBAC – with policy store ROLE commands, per-user auth, namespace whitelists
 - [ ] API key system — per-key ACLs with configurable command/namespace restrictions
 - [ ] OIDC / OAuth2 integration for SSO (optional, pluggable provider interface)
 - [ ] `ACL SETUSER` / `ACL DELUSER` / `ACL LIST` for managing access rules at runtime

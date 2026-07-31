@@ -23,8 +23,18 @@ func (m fakeTLSMetrics) ReloadTotal() uint64             { return m.reloads }
 func (m fakeTLSMetrics) ReloadErrorsTotal() uint64       { return m.errors }
 func (m fakeTLSMetrics) CertificateExpirySeconds() int64 { return m.expiry }
 
+type fakeRBACMetrics struct {
+	authFailures   uint64
+	deniedCommands uint64
+	roleCounts     map[string]uint64
+}
+
+func (m fakeRBACMetrics) AuthFailures() uint64                 { return m.authFailures }
+func (m fakeRBACMetrics) DeniedCommands() uint64               { return m.deniedCommands }
+func (m fakeRBACMetrics) RoleCommandCounts() map[string]uint64 { return m.roleCounts }
+
 func TestAggregateCollectorTLSMetrics(t *testing.T) {
-	collector := NewAggregateCollector(nil, nil, fakeTLSMetrics{reloads: 2, errors: 1, expiry: 1234})
+	collector := NewAggregateCollector(nil, nil, fakeTLSMetrics{reloads: 2, errors: 1, expiry: 1234}, nil)
 	var output bytes.Buffer
 	collector.WritePrometheus(&output)
 	got := output.String()
@@ -39,9 +49,50 @@ func TestAggregateCollectorTLSMetrics(t *testing.T) {
 	}
 
 	output.Reset()
-	NewAggregateCollector(nil, nil, nil).WritePrometheus(&output)
+	NewAggregateCollector(nil, nil, nil, nil).WritePrometheus(&output)
 	if strings.Contains(output.String(), "tellstone_tls_") {
 		t.Fatalf("TLS metrics must be omitted when rotation is disabled:\n%s", output.String())
+	}
+}
+
+func TestAggregateCollectorRBACMetrics(t *testing.T) {
+	collector := NewAggregateCollector(nil, nil, nil, fakeRBACMetrics{
+		authFailures:   3,
+		deniedCommands: 7,
+		roleCounts:     map[string]uint64{"admin": 10, "readonly": 2},
+	})
+	var output bytes.Buffer
+	collector.WritePrometheus(&output)
+	got := output.String()
+	for _, want := range []string{
+		"tellstone_rbac_auth_failures_total 3",
+		"tellstone_rbac_denied_commands_total 7",
+		`tellstone_rbac_commands_total{role="admin"} 10`,
+		`tellstone_rbac_commands_total{role="readonly"} 2`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing RBAC metric %q in output:\n%s", want, got)
+		}
+	}
+	// Sorted role output: admin must be rendered before readonly.
+	adminIdx := strings.Index(got, `role="admin"`)
+	readonlyIdx := strings.Index(got, `role="readonly"`)
+	if adminIdx < 0 || readonlyIdx < 0 || adminIdx > readonlyIdx {
+		t.Fatalf("role metrics not sorted alphabetically:\n%s", got)
+	}
+
+	output.Reset()
+	NewAggregateCollector(nil, nil, nil, nil).WritePrometheus(&output)
+	if strings.Contains(output.String(), "tellstone_rbac_") {
+		t.Fatalf("RBAC metrics must be omitted when RBAC is disabled:\n%s", output.String())
+	}
+}
+
+func TestEscapeLabelValue(t *testing.T) {
+	got := escapeLabelValue(`a"b\c
+d`)
+	if got != `a\"b\\c\nd` {
+		t.Fatalf("escapeLabelValue = %q, want %q", got, `a\"b\\c\nd`)
 	}
 }
 
