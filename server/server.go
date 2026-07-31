@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 	"unsafe"
@@ -427,7 +428,7 @@ func roleReply(err error) ([]byte, network.MessageType, error) {
 
 func (s *Server) roleCreate(msg *network.Message) ([]byte, network.MessageType, error) {
 	args, ok := network.DecodeRoleArgs(msg.Value, nil)
-	if !ok || len(args) < 3 {
+	if !ok || len(args) < 2 {
 		return roleReply(fmt.Errorf("invalid ROLE CREATE arguments"))
 	}
 	rules := make([]string, 0, len(args)-1)
@@ -482,6 +483,9 @@ func (s *Server) roleList(msg *network.Message) ([]byte, network.MessageType, er
 		}
 		entries = append(entries, e)
 	}
+	// Map iteration is unordered; sort by name so identical policies produce
+	// a stable, name-ordered response (mirrors the RESP LIST handler).
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	payload, ok := network.EncodeRoleListResponse(entries)
 	if !ok {
 		return roleReply(fmt.Errorf("role rule exceeds the 64 KiB wire limit"))

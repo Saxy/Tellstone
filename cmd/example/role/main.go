@@ -91,22 +91,33 @@ func main() {
 	}
 	fmt.Println("AUTH alice => OK")
 
-	// GET on a matching key passes the role gate; the storage layer then
-	// reports whether the key exists. A NOT_AUTHORIZED error would mean the
-	// role denied an allowed op — fail on that, print anything else.
-	if res, err := alice.Get([]byte("users:1"), buf); err != nil && strings.Contains(err.Error(), "NOT_AUTHORIZED") {
-		log.Fatalf("GET users:1 as alice denied: %v", err)
-	} else {
-		fmt.Printf("GET users:1 as alice => %s %v\n", res, err)
+	// GET on a matching key must pass the role gate. The key was seeded
+	// above, so any error here — NOT_AUTHORIZED, a transport fault, or a
+	// storage miss — is a bug, not a valid outcome.
+	res, err := alice.Get([]byte("users:1"), buf)
+	if err != nil {
+		log.Fatalf("GET users:1 as alice failed: %v", err)
 	}
-	if _, err := alice.Set([]byte("users:1"), []byte("hacked"), 0, buf); err != nil {
+	fmt.Printf("GET users:1 as alice => %s\n", res)
+
+	// SET is not in alice's role, so it must come back as a NOT_AUTHORIZED
+	// denial. Success means the ACL let an op through it should have blocked;
+	// any other error means the transport or storage broke, not the role.
+	if _, err := alice.Set([]byte("users:1"), []byte("hacked"), 0, buf); err == nil {
+		log.Fatalf("SET as alice unexpectedly allowed")
+	} else if !strings.Contains(err.Error(), "NOT_AUTHORIZED") {
+		log.Fatalf("SET as alice denied with the wrong error: %v", err)
+	} else {
 		fmt.Printf("SET as alice denied => %v\n", err)
-	} else {
-		fmt.Println("SET as alice unexpectedly allowed")
 	}
-	if _, err := alice.Get([]byte("accounts:1"), buf); err != nil {
-		fmt.Printf("GET accounts:1 as alice denied => %v\n", err)
+
+	// Same fail-closed check for a key outside the whitelist: the namespace
+	// gate must deny it with NOT_AUTHORIZED.
+	if _, err := alice.Get([]byte("accounts:1"), buf); err == nil {
+		log.Fatalf("GET accounts:1 as alice unexpectedly allowed")
+	} else if !strings.Contains(err.Error(), "NOT_AUTHORIZED") {
+		log.Fatalf("GET accounts:1 as alice denied with the wrong error: %v", err)
 	} else {
-		fmt.Println("GET accounts:1 as alice unexpectedly allowed")
+		fmt.Printf("GET accounts:1 as alice denied => %v\n", err)
 	}
 }
