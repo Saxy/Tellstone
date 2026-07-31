@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/shard"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 	"github.com/panjf2000/gnet/v2"
@@ -33,6 +34,9 @@ type authJob struct {
 	c        gnet.Conn
 	password []byte
 	passHash []byte
+	// session is the RBAC context pinned on success. nil when RBAC is disabled
+	// (single-password mode).
+	session *rbac.SessionContext
 }
 
 // connState holds per-connection state. When TLS is enabled, tlsConn wraps the
@@ -41,8 +45,11 @@ type authJob struct {
 // authenticated tracks whether the client has passed AUTH (always true when no
 // server password is configured, so the hot path is branch-predictable).
 type connState struct {
-	shardID         uint64
-	authenticated   bool
+	shardID       uint64
+	authenticated bool
+	// session is the RBAC context pinned at AUTH time. nil when RBAC is
+	// disabled (the zero-overhead no-op path) or before authentication.
+	session         *rbac.SessionContext
 	remoteAddr      string
 	authFails       int
 	authPending     bool
@@ -77,7 +84,13 @@ type Server struct {
 
 	// requirePassHash is the bcrypt hash of the server password. nil means AUTH is not
 	// required and every connection starts authenticated (zero-overhead no-op path).
+	// Ignored when a policy store is configured — per-user RBAC supersedes it.
 	requirePassHash []byte
+
+	// policy is the atomic RBAC policy store. nil means RBAC is disabled and no
+	// authorization checks run (zero-overhead no-op path). When set, AUTH resolves
+	// per-user bcrypt hashes and every data op is gated by the session.
+	policy *rbac.Store
 
 	authJobs chan authJob
 	workerWg sync.WaitGroup
@@ -90,7 +103,9 @@ type Server struct {
 // accepted connection atomically loads the latest immutable TLS configuration.
 // requirePass is optional — if empty, AUTH is a no-op and connections start authenticated;
 // otherwise it is hashed at startup and clients must AUTH before issuing data commands.
-func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string) *Server {
+// policy is optional — if nil, RBAC is disabled and every authenticated op is allowed;
+// otherwise AUTH resolves per-user credentials and sessions gate data ops.
+func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, policy *rbac.Store) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -104,7 +119,7 @@ func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler fu
 		maxMsgSize = defaultMaxMsgSize
 	}
 	var passHash []byte
-	if requirePass != "" {
+	if requirePass != "" && policy == nil {
 		var err error
 		passHash, err = bcrypt.GenerateFromPassword([]byte(requirePass), bcrypt.DefaultCost)
 		if err != nil {
@@ -120,8 +135,9 @@ func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler fu
 		ready:           make(chan struct{}),
 		shards:          shards,
 		requirePassHash: passHash,
+		policy:          policy,
 	}
-	if requirePass != "" {
+	if passHash != nil || policy != nil {
 		s.authJobs = make(chan authJob, 256)
 		for i := 0; i < numAuthWorkers; i++ {
 			s.workerWg.Add(1)
@@ -183,7 +199,7 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 	}
 	st := &connState{
 		shardID:       sid,
-		authenticated: s.requirePassHash == nil,
+		authenticated: s.requirePassHash == nil && s.policy == nil,
 		remoteAddr:    c.RemoteAddr().String(),
 	}
 	if tlsCfg := s.tlsConfigs.Load(); tlsCfg != nil {
@@ -292,6 +308,9 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 			} else if !st.authenticated && msg.Type != MsgPing {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
+			} else if s.policy != nil && !s.opAuthorized(msg, st) {
+				respPayload, respType = ResponseNotAuthorized, MsgError
+				skipHandler = true
 			}
 			if !skipHandler {
 				respPayload, respType, err = s.handler(&msg)
@@ -399,6 +418,9 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 			} else if !st.authenticated && msg.Type != MsgPing {
 				respPayload, respType = ResponseAuthErr, MsgAuthErr
 				skipHandler = true
+			} else if s.policy != nil && !s.opAuthorized(msg, st) {
+				respPayload, respType = ResponseNotAuthorized, MsgError
+				skipHandler = true
 			}
 			if !skipHandler {
 				respPayload, respType, err = s.handler(&msg)
@@ -477,19 +499,44 @@ type authResult struct {
 // dispatched == true means the caller must consume the current frame and skip
 // response writing; otherwise respPayload/respType hold the synchronous result.
 func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) authResult {
-	if s.requirePassHash == nil {
+	if s.requirePassHash == nil && s.policy == nil {
 		return authResult{respPayload: ResponseOK, respType: MsgAuthOk}
 	}
 	username, password, malformed := parseAuthPayload(value)
 	if malformed {
 		return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
 	}
-	if len(username) > 0 && string(username) != "default" {
-		return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+	var (
+		passHash []byte
+		session  *rbac.SessionContext
+	)
+	if s.policy != nil {
+		p := s.policy.Load()
+		if p == nil {
+			return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
+		}
+		name := "default"
+		if len(username) > 0 {
+			name = string(username)
+		}
+		u := p.UserFor(name)
+		if u == nil {
+			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+		}
+		// Empty hash marks a nopass user that accepts any password (Redis ACL
+		// semantics). The session is built from the same snapshot that yielded
+		// the hash, and the *Role it references is immutable across hot-swaps.
+		passHash = u.PasswordHash
+		session = rbac.NewSessionContext(name, p.RoleFor(name))
+	} else {
+		if len(username) > 0 && string(username) != "default" {
+			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+		}
+		passHash = s.requirePassHash
 	}
 	passwordCopy := make([]byte, len(password))
 	copy(passwordCopy, password)
-	if s.dispatchAuth(c, passwordCopy) {
+	if s.dispatchAuth(c, passwordCopy, passHash, session) {
 		st.authPending = true
 		return authResult{dispatched: true}
 	}
@@ -502,8 +549,10 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 func (s *Server) authWorker() {
 	defer s.workerWg.Done()
 	for job := range s.authJobs {
-		err := bcrypt.CompareHashAndPassword(job.passHash, job.password)
-		success := err == nil
+		// A nil passHash marks a nopass user that accepts any password
+		// (Redis ACL semantics). In single-password mode passHash is never
+		// nil because the workers only run when a hash or a policy exists.
+		success := job.passHash == nil || bcrypt.CompareHashAndPassword(job.passHash, job.password) == nil
 		_ = job.c.Wake(func(c gnet.Conn, _ error) error {
 			st, _ := c.Context().(*connState)
 			if st == nil {
@@ -514,6 +563,7 @@ func (s *Server) authWorker() {
 			var respType MessageType
 			if success {
 				st.authenticated = true
+				st.session = job.session
 				respPayload, respType = ResponseOK, MsgAuthOk
 				if s.logger.Enabled(log.LevelDebug) {
 					s.logger.Log(log.LevelDebug, "network: client authenticated",
@@ -555,10 +605,38 @@ func (s *Server) authWorker() {
 
 // dispatchAuth submits an auth verification job to the bounded worker pool.
 // Returns true if the job was accepted, false if the pool is saturated.
-func (s *Server) dispatchAuth(c gnet.Conn, password []byte) bool {
+func (s *Server) dispatchAuth(c gnet.Conn, password, passHash []byte, session *rbac.SessionContext) bool {
 	select {
-	case s.authJobs <- authJob{c: c, password: password, passHash: s.requirePassHash}:
+	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session}:
 		return true
+	default:
+		return false
+	}
+}
+
+// opAuthorized gates a data op against the connection's pinned RBAC session.
+// PING and AUTH always pass; ROLE admin ops require the ROLE command bit; data
+// ops map their OpCode to the registered command and check the bit plus the key
+// namespace whitelist. Sessions without a role deny everything (fail-closed).
+func (s *Server) opAuthorized(msg Message, st *connState) bool {
+	switch msg.Type {
+	case MsgPing, MsgAuth:
+		return true
+	}
+	if st.session == nil {
+		return false
+	}
+	switch msg.Op {
+	// ROLE admin ops are keyless: the namespace whitelist must not be
+	// consulted, only the command bit (mirrors RESP's authorizedCmd).
+	case OpRoleCreate, OpRoleSetUser, OpRoleDelUser, OpRoleDelete, OpRoleList, OpRoleGetUser:
+		return st.session.AllowsCommand(rbac.CmdRole)
+	case OpGet:
+		return st.session.IsAllowed(rbac.CmdGet, msg.Key)
+	case OpSet:
+		return st.session.IsAllowed(rbac.CmdSet, msg.Key)
+	case OpDelete:
+		return st.session.IsAllowed(rbac.CmdDel, msg.Key)
 	default:
 		return false
 	}

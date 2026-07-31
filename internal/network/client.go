@@ -94,6 +94,18 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// errReply converts a response into an error when it arrives in a MsgError
+// frame — the binary protocol's dedicated error type. Data values ride in
+// MsgResponse frames and pass through unchanged, including a stored value that
+// itself begins with "ERR ": the frame type, not the payload, distinguishes an
+// error from data.
+func errReply(resp Message) error {
+	if resp.Type == MsgError {
+		return fmt.Errorf("server: %s", resp.Value)
+	}
+	return nil
+}
+
 // Set stores a binary key-value pair with a millisecond-based TTL inside the remote engine.
 func (c *Client) Set(key, value []byte, ttlMs int64, scratchBuf []byte) ([]byte, error) {
 	payloadLen := 1 + 2 + 8 + len(key) + len(value)
@@ -114,6 +126,9 @@ func (c *Client) Set(key, value []byte, ttlMs int64, scratchBuf []byte) ([]byte,
 	var resp Message
 	// scratchBuf is now exclusively used to catch the incoming wire data safely
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
+		return nil, err
+	}
+	if err := errReply(resp); err != nil {
 		return nil, err
 	}
 	return resp.Value, nil
@@ -138,6 +153,9 @@ func (c *Client) Get(key []byte, scratchBuf []byte) ([]byte, error) {
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
 		return nil, err
 	}
+	if err := errReply(resp); err != nil {
+		return nil, err
+	}
 	return resp.Value, nil
 }
 
@@ -158,6 +176,9 @@ func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
 
 	var resp Message
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
+		return nil, err
+	}
+	if err := errReply(resp); err != nil {
 		return nil, err
 	}
 	return resp.Value, nil

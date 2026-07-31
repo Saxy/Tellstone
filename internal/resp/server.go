@@ -25,6 +25,7 @@ import (
 	"unsafe"
 
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/shard"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 	"github.com/panjf2000/gnet/v2"
@@ -49,7 +50,10 @@ type connState struct {
 	readBuf           []byte
 	handshakeDeadline time.Time
 	authenticated     bool
-	remoteAddr        string
+	// session is the RBAC context pinned at AUTH time. nil when RBAC is
+	// disabled (the zero-overhead no-op path) or before authentication.
+	session    *rbac.SessionContext
+	remoteAddr string
 	// closeAfterReply is set by dispatch (QUIT) so the traffic loop flushes the pending
 	// replies and then returns gnet.Close instead of keeping the connection open.
 	closeAfterReply bool
@@ -76,7 +80,12 @@ type Server struct {
 	nextConn         uint64
 	// requirePassHash is the bcrypt hash of the server password. nil means AUTH is not
 	// required and every connection starts authenticated (zero-overhead no-op path).
+	// Ignored when a policy store is configured — per-user RBAC supersedes it.
 	requirePassHash []byte
+	// policy is the atomic RBAC policy store. nil means RBAC is disabled and no
+	// authorization checks run (zero-overhead no-op path). When set, AUTH resolves
+	// per-user bcrypt hashes and every data command is gated by the session.
+	policy *rbac.Store
 }
 
 // NewServer creates a RESP server bound to addr that dispatches commands to store.
@@ -85,12 +94,14 @@ type Server struct {
 // accepted connection atomically loads the latest immutable TLS configuration.
 // requirePass is optional — if empty, AUTH is a no-op and connections start authenticated;
 // otherwise it is hashed once at startup and clients must AUTH before issuing commands.
-func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string) *Server {
+// policy is optional — if nil, RBAC is disabled and every authenticated command is allowed;
+// otherwise AUTH resolves per-user credentials and sessions gate data commands.
+func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, policy *rbac.Store) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
 	var passHash []byte
-	if requirePass != "" {
+	if requirePass != "" && policy == nil {
 		var err error
 		passHash, err = bcrypt.GenerateFromPassword([]byte(requirePass), bcrypt.DefaultCost)
 		if err != nil {
@@ -106,6 +117,7 @@ func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logge
 		logger:          logger,
 		tlsConfigs:      tlsConfigs,
 		requirePassHash: passHash,
+		policy:          policy,
 		ready:           make(chan struct{}),
 	}
 }
@@ -130,6 +142,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.eng.Stop(ctx)
 }
 
+// connectionAuth resolves the starting authentication state for a new connection.
+// Without RBAC this mirrors --require-pass: authenticated unless a password is
+// required. With RBAC, connections start authenticated only when a nopass
+// "default" user exists, pinned to that user's effective role (Redis semantics).
+func (s *Server) connectionAuth() (bool, *rbac.SessionContext) {
+	if s.policy != nil {
+		p := s.policy.Load()
+		if p != nil && p.NoPassDefault() {
+			return true, rbac.NewSessionContext("default", p.RoleFor("default"))
+		}
+		return false, nil
+	}
+	return s.requirePassHash == nil, nil
+}
+
 func (s *Server) OnBoot(eng gnet.Engine) gnet.Action {
 	s.eng = eng
 	close(s.ready)
@@ -147,11 +174,13 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		s.shards[sid].IncConnectedClients()
 		s.shards[sid].IncTotalConnections()
 	}
+	authenticated, session := s.connectionAuth()
 	st := &connState{
 		out:           make([]byte, 0, 4096),
 		args:          make([][]byte, 0, 8),
 		shardID:       shardID,
-		authenticated: s.requirePassHash == nil,
+		authenticated: authenticated,
+		session:       session,
 		remoteAddr:    c.RemoteAddr().String(),
 	}
 	if tlsCfg := s.tlsConfigs.Load(); tlsCfg != nil {
@@ -178,10 +207,12 @@ func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 	st, _ := c.Context().(*connState)
 	if st == nil {
+		authenticated, session := s.connectionAuth()
 		st = &connState{
 			out:           make([]byte, 0, 4096),
 			args:          make([][]byte, 0, 8),
-			authenticated: s.requirePassHash == nil,
+			authenticated: authenticated,
+			session:       session,
 			remoteAddr:    c.RemoteAddr().String(),
 		}
 		c.SetContext(st)
@@ -363,6 +394,9 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 		if len(args) != 2 {
 			return AppendError(out, "ERR wrong number of arguments for 'get' command")
 		}
+		if !s.authorized(st, rbac.CmdGet, args[1]) {
+			return AppendError(out, "NOPERM no permission for 'get' command on this key")
+		}
 		key := *(*string)(unsafe.Pointer(&args[1]))
 		val, ok := s.store.Get(key)
 		if !ok {
@@ -373,6 +407,9 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 	case EqualFold(cmd, shard.CmdSet):
 		if len(args) != 3 && len(args) != 5 {
 			return AppendError(out, "ERR wrong number of arguments for 'set' command")
+		}
+		if !s.authorized(st, rbac.CmdSet, args[1]) {
+			return AppendError(out, "NOPERM no permission for 'set' command on this key")
 		}
 		key := *(*string)(unsafe.Pointer(&args[1]))
 		ttl, ok := parseSetTTL(args)
@@ -387,6 +424,11 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 	case EqualFold(cmd, shard.CmdDel):
 		if len(args) < 2 {
 			return AppendError(out, "ERR wrong number of arguments for 'del' command")
+		}
+		for _, k := range args[1:] {
+			if !s.authorized(st, rbac.CmdDel, k) {
+				return AppendError(out, "NOPERM no permission for 'del' command on this key")
+			}
 		}
 		var n int64
 		for _, k := range args[1:] {
@@ -409,6 +451,12 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 		// the session alive without implementing the introspection surface.
 		return append(out, "*0\r\n"...)
 
+	case EqualFold(cmd, shard.CmdRole):
+		if !s.authorizedCmd(st, rbac.CmdRole) {
+			return AppendError(out, "NOPERM no permission for 'role' command")
+		}
+		return s.role(st, args, out)
+
 	case EqualFold(cmd, "QUIT"):
 		st.closeAfterReply = true
 		return append(out, respOK...)
@@ -418,13 +466,36 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 	}
 }
 
+// authorized reports whether the connection may run the RBAC command cmd on
+// key. When RBAC is disabled (no policy store) every command is allowed and
+// the check is a single pointer comparison — the zero-overhead no-op path.
+func (s *Server) authorized(st *connState, cmd uint16, key []byte) bool {
+	if s.policy == nil {
+		return true
+	}
+	return st.session != nil && st.session.IsAllowed(cmd, key)
+}
+
+// authorizedCmd is authorized for keyless commands: the namespace whitelist is
+// not consulted, only the command bit (e.g. ROLE for the ROLE command family).
+func (s *Server) authorizedCmd(st *connState, cmd uint16) bool {
+	if s.policy == nil {
+		return true
+	}
+	return st.session != nil && st.session.AllowsCommand(cmd)
+}
+
 // auth handles the AUTH command in both single-password (AUTH <password>) and ACL
-// (AUTH <username> <password>) forms. When no server password is configured, AUTH is a
-// backward-compatible no-op that replies +OK. bcrypt comparison happens only here, never
-// on the hot path.
+// (AUTH <username> <password>) forms. When RBAC is enabled, per-user bcrypt hashes
+// from the policy store are verified instead of the single --require-pass password;
+// otherwise, when no password is configured, AUTH is a backward-compatible no-op
+// that replies +OK. bcrypt comparison happens only here, never on the hot path.
 func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
 	if len(args) != 2 && len(args) != 3 {
 		return AppendError(out, "ERR wrong number of arguments for 'auth' command")
+	}
+	if s.policy != nil {
+		return s.authRBAC(st, args, out)
 	}
 	if s.requirePassHash == nil {
 		return append(out, respOK...)
@@ -437,6 +508,39 @@ func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
 		return s.authFailed(st, out)
 	}
 	st.authenticated = true
+	return append(out, respOK...)
+}
+
+// dummyAuthHash is a fixed bcrypt hash compared against an unknown user's
+// password so that a failed AUTH for a nonexistent username takes as long as
+// one for a real user — otherwise response latency leaks which users exist.
+var dummyAuthHash = []byte("$2a$10$cwFksVIrb4lyV/GA2fAmWeUFmAkmYlUGwkxVoF9r3Ccaus0H5LdOW")
+
+// authRBAC authenticates against the policy store's per-user bcrypt hashes.
+// A nopass user accepts any password (Redis semantics). On success the
+// resolved role is pinned to the connection as a SessionContext; a user
+// without an assignable role gets a deny-all session (fail-closed).
+func (s *Server) authRBAC(st *connState, args [][]byte, out []byte) []byte {
+	username := "default"
+	if len(args) == 3 {
+		username = string(args[1])
+	}
+	p := s.policy.Load()
+	if p == nil {
+		return s.authFailed(st, out)
+	}
+	u := p.UserFor(username)
+	if u == nil {
+		// Burn one bcrypt comparison so the failure latency matches an
+		// existing user with a wrong password (see dummyAuthHash).
+		_ = bcrypt.CompareHashAndPassword(dummyAuthHash, args[len(args)-1])
+		return s.authFailed(st, out)
+	}
+	if len(u.PasswordHash) > 0 && bcrypt.CompareHashAndPassword(u.PasswordHash, args[len(args)-1]) != nil {
+		return s.authFailed(st, out)
+	}
+	st.authenticated = true
+	st.session = rbac.NewSessionContext(username, p.RoleFor(username))
 	return append(out, respOK...)
 }
 

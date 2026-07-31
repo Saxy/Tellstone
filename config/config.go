@@ -42,6 +42,7 @@ type Config struct {
 	tlsKey            string
 	tlsCA             string
 	requirePass       string
+	rbacConfig        string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -118,6 +119,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_TLS_KEY          – path to TLS private key file (PEM)
 //		TSD_TLS_CA           – path to CA certificate for client verification (enables mTLS)
 //		TSD_REQUIRE_PASS     – server password required by AUTH (empty = no authentication)
+//		TSD_RBAC_CONFIG     – path to a YAML/JSON RBAC policy file (roles, users, default_role)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -279,6 +281,15 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_REQUIRE_PASS", ""),
 		"Password clients must supply via AUTH; empty disables authentication (default: none)",
 	)
+	// Optional RBAC policy file. When set, per-user authentication and
+	// role-based access control replace the single --require-pass password, and
+	// SIGHUP re-reads the file for hot-reload.
+	fs.StringVar(
+		&cfg.rbacConfig,
+		"rbac-config",
+		getEnv("TSD_RBAC_CONFIG", ""),
+		"Path to YAML/JSON RBAC policy file (roles, users, default_role); empty disables RBAC (default: none)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -329,6 +340,7 @@ func (cfg *Config) GetTLSCert() string                { return cfg.tlsCert }
 func (cfg *Config) GetTLSKey() string                 { return cfg.tlsKey }
 func (cfg *Config) GetTLSCA() string                  { return cfg.tlsCA }
 func (cfg *Config) GetRequirePass() string            { return cfg.requirePass }
+func (cfg *Config) GetRBACConfig() string             { return cfg.rbacConfig }
 func (cfg *Config) MTLSEnabled() bool {
 	return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != ""
 }

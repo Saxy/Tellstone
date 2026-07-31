@@ -18,8 +18,8 @@ The **`network`** package provides a high‑performance, zero‑allocation TCP e
 
 ```
 - **length** – Total size of the `type` byte + the variable length `payload` (Big-Endian).
-- **type** – An 8-bit unsigned integer representing `MessageType` (`MsgPing`, `MsgPong`, `MsgRequest`, `MsgResponse`).
-- **payload** – Optional binary array representing data instructions (e.g., Tellstone raw SQL statements).
+- **type** – An 8-bit unsigned integer representing `MessageType` (`MsgPing`, `MsgPong`, `MsgRequest`, `MsgResponse`, `MsgError`, `MsgAuth`, `MsgAuthOk`, `MsgAuthErr`).
+- **payload** – Optional binary array representing data instructions (e.g., Tellstone raw SQL statements). Failures for the data path ride in `MsgError` frames; `MsgResponse` frames carry data values unchanged, so a stored value may begin with `"ERR "` without being mistaken for an error.
 
 ## Usage Examples
 

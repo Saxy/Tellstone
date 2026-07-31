@@ -30,6 +30,7 @@ const (
 	CmdPing    string = "PING"
 	CmdCommand string = "COMMAND"
 	CmdAuth    string = "AUTH"
+	CmdRole    string = "ROLE"
 )
 
 type Shard struct {

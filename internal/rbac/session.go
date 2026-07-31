@@ -33,14 +33,21 @@ func NewSessionContext(username string, role *Role) *SessionContext {
 	return sc
 }
 
+// AllowsCommand reports whether the session may run cmd, ignoring key scope.
+// Used for keyless commands (ROLE, PING, AUTH) where the namespace whitelist
+// must not be consulted. Single bit test, no allocations.
+func (s *SessionContext) AllowsCommand(cmd uint16) bool {
+	if s.role == nil {
+		return false
+	}
+	return s.role.Permissions.Has(cmd)
+}
+
 // IsAllowed reports whether the session may run cmd on a key. The command check
 // is a single bit test; the namespace check iterates the role's prefix
 // whitelist over the raw key bytes. No allocations, no locks.
 func (s *SessionContext) IsAllowed(cmd uint16, key []byte) bool {
-	if s.role == nil {
-		return false
-	}
-	if !s.role.Permissions.Has(cmd) {
+	if !s.AllowsCommand(cmd) {
 		return false
 	}
 	return s.role.AllowsKey(key)

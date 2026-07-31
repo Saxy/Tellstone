@@ -19,7 +19,7 @@ func TestPolicyStoreRoleFor(t *testing.T) {
 	}
 	p := &PolicyStore{
 		Roles:   map[string]*Role{"readonly": readonly, "default": defaultRole},
-		Users:   map[string]string{"alice": "readonly"},
+		Users:   map[string]*User{"alice": {Role: "readonly"}},
 		Default: defaultRole,
 	}
 	if got := p.RoleFor("alice"); got != readonly {

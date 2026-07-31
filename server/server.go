@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
 	"syscall"
 	"time"
 	"unsafe"
@@ -28,6 +29,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/metrics"
 	"github.com/Saxy/Tellstone/internal/network"
 	"github.com/Saxy/Tellstone/internal/persistence"
+	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/resp"
 	"github.com/Saxy/Tellstone/internal/router"
 	"github.com/Saxy/Tellstone/internal/shard"
@@ -67,6 +69,10 @@ type Server struct {
 	metricsSrv  *http.Server
 	tlsConfigs  *tlslib.ConfigStore
 	tlsReloader *tlslib.Reloader
+	// policy is the atomic RBAC policy store shared by the binary and RESP
+	// listeners. nil means RBAC is disabled and both servers keep their
+	// legacy zero-overhead paths. SIGHUP swaps a fresh snapshot into it.
+	policy *rbac.Store
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -98,6 +104,9 @@ func (s *Server) Run() error {
 	if err = s.initShards(cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
+	if err = s.initRBAC(); err != nil {
+		return fmt.Errorf("rbac init: %w", err)
+	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
@@ -106,6 +115,7 @@ func (s *Server) Run() error {
 		logger,
 		s.tlsConfigs,
 		cfg.GetRequirePass(),
+		s.policy,
 	)
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(s.netSrv)
@@ -134,6 +144,15 @@ func (s *Server) Run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			// Hot-reload the RBAC policy on SIGHUP. Atomic swap: a rejected
+			// file leaves the running policy untouched.
+			s.reloadRBAC()
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		stop()
@@ -147,14 +166,65 @@ func (s *Server) Run() error {
 
 	if err = s.netSrv.ListenAndServe(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		if logger.Enabled(log.LevelError) {
+			err = nil
+		} else if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "tcp error", log.String("error", err.Error()))
+		}
+	}
+	// Stop the SIGHUP watcher so its goroutine exits with Run instead of
+	// lingering until the process dies.
+	signal.Stop(hup)
+	close(hup)
+	return err
+}
+
+// initRBAC loads the --rbac-config policy file once at startup. No file
+// configured means RBAC is disabled (legacy behavior, zero overhead). A
+// configured-but-unreadable or invalid file aborts startup: a server that
+// silently runs without the operator's ACLs is a security hole.
+func (s *Server) initRBAC() error {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	path := cfg.GetRBACConfig()
+	if path == "" {
+		return nil
+	}
+	policy, err := rbac.LoadFile(path)
+	if err != nil {
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "rbac policy load failed", log.String("error", err.Error()))
 		}
 		return err
 	}
+	s.policy = rbac.NewStore(policy)
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "rbac policy loaded", log.String("path", path))
+	}
 	return nil
+}
+
+// reloadRBAC re-reads the policy file on SIGHUP and swaps it into the store in
+// one atomic operation. A bad file is rejected and the running policy stays in
+// effect; only a fully valid snapshot is ever published.
+func (s *Server) reloadRBAC() {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	path := cfg.GetRBACConfig()
+	if path == "" || s.policy == nil {
+		return
+	}
+	policy, err := rbac.LoadFile(path)
+	if err != nil {
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "rbac policy reload rejected, keeping running policy",
+				log.String("error", err.Error()))
+		}
+		return
+	}
+	s.policy.Store(policy)
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "rbac policy reloaded", log.String("path", path))
+	}
 }
 
 func (s *Server) shutdown(ctx context.Context) {
@@ -280,7 +350,7 @@ func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	store := &RouterStore{router: s.router}
-	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfigs, cfg.GetRequirePass())
+	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfigs, cfg.GetRequirePass(), s.policy)
 	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {
@@ -300,12 +370,12 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 	case network.OpGet:
 		resp := s.router.Dispatch(shard.CmdGet, keyStr, nil, 0)
 		if !resp.OK {
-			return network.ResponseNotFound, network.MsgResponse, nil
+			return network.ResponseNotFound, network.MsgError, nil
 		}
 		return resp.Value, network.MsgResponse, nil
 	case network.OpSet:
 		if len(msg.Key) == 0 {
-			return network.ResponseEmptyKey, network.MsgResponse, ErrEmptyKey
+			return network.ResponseEmptyKey, network.MsgError, ErrEmptyKey
 		}
 		ttlDuration := time.Duration(msg.TTL) * time.Millisecond
 		resp := s.router.Dispatch(shard.CmdSet, keyStr, msg.Value, ttlDuration)
@@ -313,13 +383,129 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 			if s.app.GetLogger().Enabled(log.LevelError) {
 				s.app.GetLogger().Log(log.LevelError, "failed to store inside storage engine", log.String("error", resp.Err.Error()))
 			}
-			return network.ResponseStorageFailure, network.MsgResponse, ErrStorageFailure
+			return network.ResponseStorageFailure, network.MsgError, ErrStorageFailure
 		}
 		return network.ResponseOK, network.MsgResponse, nil
 	case network.OpDelete:
 		s.router.Dispatch(shard.CmdDel, keyStr, nil, 0)
 		return network.ResponseOK, network.MsgResponse, nil
+	case network.OpRoleCreate, network.OpRoleSetUser, network.OpRoleDelUser,
+		network.OpRoleDelete, network.OpRoleList, network.OpRoleGetUser:
+		// RBAC is disabled without --rbac-config; the RESP layer rejects ROLE
+		// with "RBAC is not enabled" and the binary layer must do the same
+		// instead of panicking on a nil policy store.
+		if s.policy == nil {
+			return roleReply(fmt.Errorf("rbac not enabled"))
+		}
+		switch msg.Op {
+		case network.OpRoleCreate:
+			return s.roleCreate(msg)
+		case network.OpRoleSetUser:
+			return s.roleSetUser(msg)
+		case network.OpRoleDelUser:
+			return s.roleDelUser(msg)
+		case network.OpRoleDelete:
+			return s.roleDelete(msg)
+		case network.OpRoleList:
+			return s.roleList(msg)
+		default:
+			return s.roleGetUser(msg)
+		}
 	default:
-		return network.ResponseNotFound, network.MsgResponse, ErrInvalidOpCode
+		return network.ResponseNotFound, network.MsgError, ErrInvalidOpCode
 	}
+}
+
+// roleReply wraps a ROLE result: ResponseOK in a MsgResponse frame on success,
+// the error detail in a MsgError frame otherwise. The client surfaces the
+// latter as an error without tearing down the connection, so a failed admin op
+// never kicks the client.
+func roleReply(err error) ([]byte, network.MessageType, error) {
+	if err == nil {
+		return network.ResponseOK, network.MsgResponse, nil
+	}
+	return []byte(err.Error()), network.MsgError, nil
+}
+
+func (s *Server) roleCreate(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) < 2 {
+		return roleReply(fmt.Errorf("invalid ROLE CREATE arguments"))
+	}
+	rules := make([]string, 0, len(args)-1)
+	for _, r := range args[1:] {
+		rules = append(rules, string(r))
+	}
+	return roleReply(s.policy.CreateRole(string(args[0]), rules))
+}
+
+func (s *Server) roleSetUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) < 2 {
+		return roleReply(fmt.Errorf("invalid ROLE SETUSER arguments"))
+	}
+	if len(args) == 2 {
+		return roleReply(fmt.Errorf("ROLE SETUSER requires a '>password' or 'nopass' option"))
+	}
+	passHash, err := rbac.PasswordFromOpts(args[2:])
+	if err != nil {
+		return roleReply(err)
+	}
+	return roleReply(s.policy.SetUser(string(args[0]), string(args[1]), passHash))
+}
+
+func (s *Server) roleDelUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) != 1 {
+		return roleReply(fmt.Errorf("invalid ROLE DELUSER arguments"))
+	}
+	s.policy.DelUser(string(args[0]))
+	return network.ResponseOK, network.MsgResponse, nil
+}
+
+func (s *Server) roleDelete(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) != 1 {
+		return roleReply(fmt.Errorf("invalid ROLE DELETE arguments"))
+	}
+	return roleReply(s.policy.DeleteRole(string(args[0])))
+}
+
+func (s *Server) roleList(msg *network.Message) ([]byte, network.MessageType, error) {
+	p := s.policy.Load()
+	if p == nil {
+		return roleReply(fmt.Errorf("rbac policy not loaded"))
+	}
+	entries := make([]network.RoleListEntry, 0, len(p.Roles))
+	for name, r := range p.Roles {
+		e := network.RoleListEntry{Name: name, Commands: r.GrantedCommands()}
+		for _, ns := range r.Namespaces {
+			e.Namespaces = append(e.Namespaces, append([]byte(nil), ns...))
+		}
+		entries = append(entries, e)
+	}
+	// Map iteration is unordered; sort by name so identical policies produce
+	// a stable, name-ordered response (mirrors the RESP LIST handler).
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
+	payload, ok := network.EncodeRoleListResponse(entries)
+	if !ok {
+		return roleReply(fmt.Errorf("role rule exceeds the 64 KiB wire limit"))
+	}
+	return payload, network.MsgResponse, nil
+}
+
+func (s *Server) roleGetUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) != 1 {
+		return roleReply(fmt.Errorf("invalid ROLE GETUSER arguments"))
+	}
+	p := s.policy.Load()
+	if p == nil {
+		return roleReply(fmt.Errorf("rbac policy not loaded"))
+	}
+	u := p.UserFor(string(args[0]))
+	if u == nil {
+		return roleReply(fmt.Errorf("user '%s' does not exist", args[0]))
+	}
+	return network.EncodeRoleGetUserResponse(network.RoleUser{Role: u.Role, HasPass: len(u.PasswordHash) > 0}), network.MsgResponse, nil
 }
