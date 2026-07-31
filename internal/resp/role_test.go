@@ -154,3 +154,29 @@ func TestRESPServer_RBACCommands(t *testing.T) {
 	expectReply(t, conn, "ROLE LIST",
 		"*2\r\n$4\r\nROLE\r\n$4\r\nLIST\r\n", string(want))
 }
+
+// TestRESPServer_RBACNamespacePrefix proves that a namespace-scoped role gates
+// data commands end-to-end: GET inside the prefix passes, GET on a key outside
+// it is denied, and SET is denied even inside the prefix. SETUSER with the
+// explicit nopass option creates the passwordless user.
+func TestRESPServer_RBACNamespacePrefix(t *testing.T) {
+	addr := startRBACServer(t)
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	expectReply(t, conn, "AUTH admin",
+		"*3\r\n$4\r\nAUTH\r\n$5\r\nadmin\r\n$6\r\nsekret\r\n", "+OK\r\n")
+	expectReply(t, conn, "ROLE CREATE user-reader",
+		"*5\r\n$4\r\nROLE\r\n$6\r\nCREATE\r\n$11\r\nuser-reader\r\n$4\r\n+get\r\n$8\r\n~users:*\r\n", "+OK\r\n")
+	expectReply(t, conn, "ROLE SETUSER carol nopass",
+		"*5\r\n$4\r\nROLE\r\n$7\r\nSETUSER\r\n$5\r\ncarol\r\n$11\r\nuser-reader\r\n$6\r\nnopass\r\n", "+OK\r\n")
+
+	expectReply(t, conn, "AUTH carol",
+		"*3\r\n$4\r\nAUTH\r\n$5\r\ncarol\r\n$8\r\nwhatever\r\n", "+OK\r\n")
+	expectReply(t, conn, "GET inside prefix",
+		"*2\r\n$3\r\nGET\r\n$7\r\nusers:1\r\n", "$-1\r\n")
+	expectReply(t, conn, "GET outside prefix denied",
+		"*2\r\n$3\r\nGET\r\n$10\r\naccounts:1\r\n", "-NOPERM no permission for 'get' command on this key\r\n")
+	expectReply(t, conn, "SET inside prefix denied",
+		"*3\r\n$3\r\nSET\r\n$7\r\nusers:1\r\n$1\r\nx\r\n", "-NOPERM no permission for 'set' command on this key\r\n")
+}

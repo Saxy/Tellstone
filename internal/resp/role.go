@@ -66,10 +66,15 @@ func (s *Server) roleCreate(args [][]byte, out []byte) []byte {
 }
 
 // roleSetUser implements ROLE SETUSER <username> <role> [>password] [nopass].
-// The last password option wins; nopass clears the hash (passwordless user).
+// At least one password option is required: an omitted option would silently
+// create a nopass user, so the operator must write nopass explicitly. The last
+// password option wins; nopass clears the hash (passwordless user).
 func (s *Server) roleSetUser(args [][]byte, out []byte) []byte {
 	if len(args) < 4 {
 		return AppendError(out, "ERR wrong number of arguments for 'role|setuser' command")
+	}
+	if len(args) == 4 {
+		return AppendError(out, "ERR role|setuser requires a '>password' or 'nopass' option")
 	}
 	passHash, err := rbac.PasswordFromOpts(args[4:])
 	if err != nil {

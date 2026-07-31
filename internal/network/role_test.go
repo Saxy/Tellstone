@@ -22,7 +22,10 @@ func TestRoleCodecRoundTrip(t *testing.T) {
 		{[]byte("bob"), []byte("opérateur")},
 	}
 	for _, args := range cases {
-		payload := EncodeRoleArgs(args)
+		payload, ok := EncodeRoleArgs(args)
+		if !ok {
+			t.Fatalf("EncodeRoleArgs(%q) reported overflow", args)
+		}
 		got, ok := DecodeRoleArgs(payload, nil)
 		if !ok {
 			t.Fatalf("DecodeRoleArgs(%q) reported malformed", args)
@@ -35,6 +38,19 @@ func TestRoleCodecRoundTrip(t *testing.T) {
 				t.Fatalf("arg %d: got %q want %q", i, got[i], args[i])
 			}
 		}
+	}
+}
+
+// TestRoleCodecOverflow verifies that a token over the 64 KiB length-prefix
+// limit is rejected by the encoder instead of being silently truncated.
+func TestRoleCodecOverflow(t *testing.T) {
+	big := make([]byte, 65536)
+	if _, ok := EncodeRoleArgs([][]byte{big}); ok {
+		t.Fatal("expected args encoder to reject a >64 KiB token")
+	}
+	entry := RoleListEntry{Name: "r", Namespaces: [][]byte{big}}
+	if _, ok := EncodeRoleListResponse([]RoleListEntry{entry}); ok {
+		t.Fatal("expected list encoder to reject a >64 KiB namespace")
 	}
 }
 
@@ -68,12 +84,22 @@ func TestRoleGetUserCodec(t *testing.T) {
 	}
 }
 
+// encodeEntries packs entries, failing the test on encoder rejection.
+func encodeEntries(t *testing.T, entries []RoleListEntry) []byte {
+	t.Helper()
+	payload, ok := EncodeRoleListResponse(entries)
+	if !ok {
+		t.Fatal("encode of LIST response failed")
+	}
+	return payload
+}
+
 func TestRoleListCodec(t *testing.T) {
 	entries := []RoleListEntry{
 		{Name: "admin", Commands: []string{"GET", "SET"}, Namespaces: [][]byte{}},
 		{Name: "operator", Commands: []string{"GET"}, Namespaces: [][]byte{[]byte("users:")}},
 	}
-	decoded, ok := DecodeRoleListResponse(EncodeRoleListResponse(entries))
+	decoded, ok := DecodeRoleListResponse(encodeEntries(t, entries))
 	if !ok {
 		t.Fatal("decode of LIST response failed")
 	}
@@ -150,6 +176,9 @@ func rbacTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType,
 			if !ok || len(args) < 2 {
 				return []byte("ERR invalid ROLE SETUSER arguments"), MsgResponse, nil
 			}
+			if len(args) == 2 {
+				return []byte("ERR ROLE SETUSER requires a '>password' or 'nopass' option"), MsgResponse, nil
+			}
 			hash, err := rbac.PasswordFromOpts(args[2:])
 			if err != nil {
 				return []byte("ERR " + err.Error()), MsgResponse, nil
@@ -184,7 +213,11 @@ func rbacTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType,
 				}
 				entries = append(entries, e)
 			}
-			return EncodeRoleListResponse(entries), MsgResponse, nil
+			payload, ok := EncodeRoleListResponse(entries)
+			if !ok {
+				return []byte("ERR role rule exceeds the 64 KiB wire limit"), MsgResponse, nil
+			}
+			return payload, MsgResponse, nil
 		case OpRoleGetUser:
 			args, ok := DecodeRoleArgs(msg.Value, nil)
 			if !ok || len(args) != 1 {
@@ -252,7 +285,11 @@ func TestServerRBACAuthGating(t *testing.T) {
 		t.Fatalf("expected MsgAuthOk, got %v", resp.Type)
 	}
 	// ROLE CREATE now permitted (admin role).
-	if resp := sendAndRecv(t, conn, MsgRequest, roleRequestPayload(OpRoleCreate, [][]byte{[]byte("operator"), []byte("+get"), []byte("~*")})); !bytes.Equal(resp.Value, ResponseOK) {
+	payload, err := roleRequestPayload(OpRoleCreate, [][]byte{[]byte("operator"), []byte("+get"), []byte("~*")})
+	if err != nil {
+		t.Fatalf("roleRequestPayload: %v", err)
+	}
+	if resp := sendAndRecv(t, conn, MsgRequest, payload); !bytes.Equal(resp.Value, ResponseOK) {
 		t.Fatalf("expected ROLE CREATE OK, got %q type %v", resp.Value, resp.Type)
 	}
 }
@@ -271,7 +308,11 @@ func TestServerRBACAuthorizationDenial(t *testing.T) {
 	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("limited", "anything")); resp.Type != MsgAuthOk {
 		t.Fatalf("expected MsgAuthOk for nopass user, got %v", resp.Type)
 	}
-	if resp := sendAndRecv(t, conn, MsgRequest, roleRequestPayload(OpRoleCreate, [][]byte{[]byte("operator"), []byte("+get")})); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
+	payload, err := roleRequestPayload(OpRoleCreate, [][]byte{[]byte("operator"), []byte("+get")})
+	if err != nil {
+		t.Fatalf("roleRequestPayload: %v", err)
+	}
+	if resp := sendAndRecv(t, conn, MsgRequest, payload); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
 		t.Fatalf("expected ResponseNotAuthorized for ROLE, got %q", resp.Value)
 	}
 	if resp := sendAndRecv(t, conn, MsgRequest, []byte{byte(OpSet), 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'k', 'v'}); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
@@ -345,7 +386,7 @@ func TestClientRoleMethodsGating(t *testing.T) {
 	if err := admin.RoleCreate("limited2", []string{"+get", "~users:*"}, scratch); err != nil {
 		t.Fatalf("RoleCreate: %v", err)
 	}
-	if err := admin.RoleSetUser("carol", "limited2", nil, scratch); err != nil {
+	if err := admin.RoleSetUser("carol", "limited2", [][]byte{[]byte("nopass")}, scratch); err != nil {
 		t.Fatalf("RoleSetUser: %v", err)
 	}
 

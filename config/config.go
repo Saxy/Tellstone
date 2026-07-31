@@ -119,7 +119,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_TLS_KEY          – path to TLS private key file (PEM)
 //		TSD_TLS_CA           – path to CA certificate for client verification (enables mTLS)
 //		TSD_REQUIRE_PASS     – server password required by AUTH (empty = no authentication)
-//		TELLSTONE_RBAC_CONFIG – path to a YAML/JSON RBAC policy file (roles, users, default_role)
+//		TSD_RBAC_CONFIG     – path to a YAML/JSON RBAC policy file (roles, users, default_role)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -287,7 +287,7 @@ func LoadConfig(args []string) *Config {
 	fs.StringVar(
 		&cfg.rbacConfig,
 		"rbac-config",
-		getEnv("TELLSTONE_RBAC_CONFIG", ""),
+		getEnv("TSD_RBAC_CONFIG", ""),
 		"Path to YAML/JSON RBAC policy file (roles, users, default_role); empty disables RBAC (default: none)",
 	)
 	// Custom usage output to guide operators.

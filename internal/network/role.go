@@ -13,16 +13,23 @@ Authors:
 */
 package network
 
-import "encoding/binary"
+import (
+	"encoding/binary"
+	"math"
+)
 
 // Request encoding: [2B argCount] then, for each argument, [2B len][bytes].
 // The message Key field stays empty and the whole token list rides in Value.
 
 // EncodeRoleArgs packs args into a request payload. Empty args yield a
-// two-byte zero count.
-func EncodeRoleArgs(args [][]byte) []byte {
+// two-byte zero count. ok is false when an argument exceeds the 64 KiB
+// length-prefix limit — encoding it would silently truncate the wire form.
+func EncodeRoleArgs(args [][]byte) ([]byte, bool) {
 	size := 2
 	for _, a := range args {
+		if len(a) > math.MaxUint16 {
+			return nil, false
+		}
 		size += 2 + len(a)
 	}
 	buf := make([]byte, size)
@@ -34,7 +41,7 @@ func EncodeRoleArgs(args [][]byte) []byte {
 		copy(buf[pos:], a)
 		pos += len(a)
 	}
-	return buf
+	return buf, true
 }
 
 // DecodeRoleArgs unpacks a role request payload into dst[:0]. ok is false when
@@ -107,25 +114,41 @@ func DecodeRoleGetUserResponse(payload []byte) (RoleUser, bool) {
 // LIST response: [2B roleCount] then per role
 // [2B nameLen][name][2B cmdCount]{[2B len][cmd]}[2B nsCount]{[2B len][ns]}.
 
-// EncodeRoleListResponse packs a ROLE LIST response.
-func EncodeRoleListResponse(entries []RoleListEntry) []byte {
+// EncodeRoleListResponse packs a ROLE LIST response. ok is false when a name,
+// command, or namespace exceeds the 64 KiB length-prefix limit.
+func EncodeRoleListResponse(entries []RoleListEntry) ([]byte, bool) {
 	buf := make([]byte, 0, 2)
 	buf = binary.BigEndian.AppendUint16(buf, uint16(len(entries)))
 	for _, e := range entries {
+		if len(e.Name) > math.MaxUint16 {
+			return nil, false
+		}
 		buf = binary.BigEndian.AppendUint16(buf, uint16(len(e.Name)))
 		buf = append(buf, e.Name...)
+		if len(e.Commands) > math.MaxUint16 {
+			return nil, false
+		}
 		buf = binary.BigEndian.AppendUint16(buf, uint16(len(e.Commands)))
 		for _, cmd := range e.Commands {
+			if len(cmd) > math.MaxUint16 {
+				return nil, false
+			}
 			buf = binary.BigEndian.AppendUint16(buf, uint16(len(cmd)))
 			buf = append(buf, cmd...)
 		}
+		if len(e.Namespaces) > math.MaxUint16 {
+			return nil, false
+		}
 		buf = binary.BigEndian.AppendUint16(buf, uint16(len(e.Namespaces)))
 		for _, ns := range e.Namespaces {
+			if len(ns) > math.MaxUint16 {
+				return nil, false
+			}
 			buf = binary.BigEndian.AppendUint16(buf, uint16(len(ns)))
 			buf = append(buf, ns...)
 		}
 	}
-	return buf
+	return buf, true
 }
 
 // DecodeRoleListResponse unpacks a ROLE LIST response. ok is false on a
@@ -180,7 +203,7 @@ func DecodeRoleListResponse(payload []byte) ([]RoleListEntry, bool) {
 			if pos+nsl > len(payload) {
 				return nil, false
 			}
-			e.Namespaces = append(e.Namespaces, payload[pos:pos+nsl])
+			e.Namespaces = append(e.Namespaces, append([]byte(nil), payload[pos:pos+nsl]...))
 			pos += nsl
 		}
 		entries = append(entries, e)

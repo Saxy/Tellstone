@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 
+	"golang.org/x/crypto/bcrypt"
 	"gopkg.in/yaml.v3"
 )
 
@@ -26,7 +27,7 @@ import (
 //	    rules: ["+@read", "~*"]
 //	users:
 //	  - name: service-a
-//	    password: "$2a$10$..."  # bcrypt hash; omit or set nopass for a passwordless user
+//	    password: "$2a$10$..."  # bcrypt hash; required unless nopass: true
 //	    role: reader
 //	default_role: reader / optional fallback for users without an explicit role
 type fileConfig struct {
@@ -98,6 +99,15 @@ func (fc *fileConfig) build() (*PolicyStore, error) {
 		}
 		var hash []byte
 		if !u.Nopass {
+			// A missing password silently turns a "passwordless" user into a
+			// nopass one without the operator ever writing nopass — reject it
+			// so the policy file says what it means.
+			if u.Password == "" {
+				return nil, fmt.Errorf("rbac: user %q has no password; set nopass: true for a passwordless user", u.Name)
+			}
+			if !isBcryptHash(u.Password) {
+				return nil, fmt.Errorf("rbac: user %q password is not a valid bcrypt hash", u.Name)
+			}
 			hash = []byte(u.Password)
 		}
 		p.Users[u.Name] = &User{Role: u.Role, PasswordHash: hash}
@@ -110,4 +120,16 @@ func (fc *fileConfig) build() (*PolicyStore, error) {
 		p.Default = r
 	}
 	return p, nil
+}
+
+// isBcryptHash sanity-checks that a config password looks like a bcrypt hash.
+// bcrypt hashes are "$2[a|b|y]$<cost>$" plus 53 base64 chars; the length and
+// prefix checks are cheap and catch pasted plaintext or truncated hashes. The
+// full verification still happens at the first AUTH.
+func isBcryptHash(h string) bool {
+	if len(h) < 59 {
+		return false
+	}
+	_, err := bcrypt.Cost([]byte(h))
+	return err == nil
 }

@@ -28,17 +28,24 @@ func errRBACReply(payload []byte) error {
 // roleRequestPayload packs a ROLE op into the MsgRequest wire layout
 // [1B op][2B keyLen][8B ttl][key][value]. ROLE ops carry no key, so the fixed
 // header is zeroed and the encoded args ride in the value section.
-func roleRequestPayload(op OpCode, args [][]byte) []byte {
-	enc := EncodeRoleArgs(args)
+func roleRequestPayload(op OpCode, args [][]byte) ([]byte, error) {
+	enc, ok := EncodeRoleArgs(args)
+	if !ok {
+		return nil, fmt.Errorf("role request argument exceeds the 64 KiB wire limit")
+	}
 	buf := make([]byte, 11+len(enc))
 	buf[0] = byte(op)
 	copy(buf[11:], enc)
-	return buf
+	return buf, nil
 }
 
 func (c *Client) roleMutate(op OpCode, args [][]byte, scratchBuf []byte) error {
+	payload, err := roleRequestPayload(op, args)
+	if err != nil {
+		return err
+	}
 	var resp Message
-	if err := c.Call(MsgRequest, roleRequestPayload(op, args), scratchBuf, &resp); err != nil {
+	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
 		return err
 	}
 	if !bytes.Equal(resp.Value, ResponseOK) {
@@ -77,8 +84,12 @@ func (c *Client) RoleDelete(role string, scratchBuf []byte) error {
 
 // RoleList issues ROLE LIST and decodes the typed response.
 func (c *Client) RoleList(scratchBuf []byte) ([]RoleListEntry, error) {
+	payload, err := roleRequestPayload(OpRoleList, nil)
+	if err != nil {
+		return nil, err
+	}
 	var resp Message
-	if err := c.Call(MsgRequest, roleRequestPayload(OpRoleList, nil), scratchBuf, &resp); err != nil {
+	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
 		return nil, err
 	}
 	if bytes.HasPrefix(resp.Value, []byte("ERR ")) {
@@ -93,8 +104,12 @@ func (c *Client) RoleList(scratchBuf []byte) ([]RoleListEntry, error) {
 
 // RoleGetUser issues ROLE GETUSER <username> and decodes the typed response.
 func (c *Client) RoleGetUser(username string, scratchBuf []byte) (RoleUser, error) {
+	payload, err := roleRequestPayload(OpRoleGetUser, [][]byte{[]byte(username)})
+	if err != nil {
+		return RoleUser{}, err
+	}
 	var resp Message
-	if err := c.Call(MsgRequest, roleRequestPayload(OpRoleGetUser, [][]byte{[]byte(username)}), scratchBuf, &resp); err != nil {
+	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
 		return RoleUser{}, err
 	}
 	if bytes.HasPrefix(resp.Value, []byte("ERR ")) {
@@ -108,7 +123,10 @@ func (c *Client) RoleGetUser(username string, scratchBuf []byte) (RoleUser, erro
 }
 
 // AuthUser authenticates with a username/password pair (RBAC mode). Returns
-// nil on success, an error on wrong credentials or a missing user.
+// nil on success, an error on wrong credentials or a missing user. The
+// password is transmitted in cleartext unless the connection was made via
+// DialTLS — TLS is an operator opt-in and this payload rides the same
+// transport as every other message.
 func (c *Client) AuthUser(username, password string, scratchBuf []byte) error {
 	payloadLen := 2 + len(username) + 2 + len(password)
 	var reqBuf [512]byte

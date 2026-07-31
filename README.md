@@ -146,7 +146,7 @@ Every option is available as a flag and an environment variable.
 | `--tls-key`           | `TSD_TLS_KEY`            | _(none)_         | TLS private key path; watched for automatic rotation     |
 | `--tls-ca`            | `TSD_TLS_CA`             | _(none)_         | Client CA path for mTLS; watched for automatic rotation  |
 | `--require-pass`      | `TSD_REQUIRE_PASS`       | _(none)_         | Single password required via `AUTH`; empty disables it   |
-| `--rbac-config`       | `TELLSTONE_RBAC_CONFIG`  | _(none)_         | YAML/JSON RBAC policy file (roles, users, default role); hot-reloaded on SIGHUP |
+| `--rbac-config`       | `TSD_RBAC_CONFIG`        | _(none)_         | YAML/JSON RBAC policy file (roles, users, default role); hot-reloaded on SIGHUP |
 | `--shutdown-timeout`  | `TSD_SHUTDOWN_TIMEOUT`  | `10s`            | Max wait for graceful shutdown on SIGINT/SIGTERM         |
 
 Runtime tuning (environment only): `TSD_GC_PERCENT` (default `-1`, GC off for a zero‑GC hot
@@ -184,15 +184,22 @@ Start with `--require-pass` for a single shared password, or `--rbac-config` for
 authentication with role-based access control (supersedes `--require-pass`):
 
 ```yaml
-# policy.yaml — loaded at startup and hot-reloaded on SIGHUP
+# policy.yaml — loaded at startup and hot-reloaded on SIGHUP.
+# Passwords are bcrypt hashes, e.g. of "adminsecret" / "alicepw"; a password
+# is required unless the user is explicitly marked nopass.
 roles:
-  admin:    [ "+@all", "~*" ]
-  readonly: [ "+get", "~*" ]
+  - name: admin
+    rules: ["+@all", "~*"]
+  - name: readonly
+    rules: ["+get", "~*"]
 users:
-  default:  { role: admin }                 # nopass default user (optional)
-  admin:    { role: admin,    password: "adminsecret" }
-  alice:    { role: readonly, password: "alicepw" }
-default_role: admin
+  - name: admin
+    role: admin
+    password: "$2a$10$pcaKkTfRy.KSdNUgKszYYedE7L32P9fSEG3x1phq0EbjeYkn5WpEi"
+  - name: alice
+    role: readonly
+    password: "$2a$10$sslrTYVwaIaA7O1lhokY2OgnojP5bB8YJ/o2MXaFP1v49lG8fqJYK"
+default_role: readonly    # least privilege: fallback for users without an explicit role
 ```
 
 ```bash

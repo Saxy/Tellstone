@@ -626,21 +626,20 @@ func (s *Server) opAuthorized(msg Message, st *connState) bool {
 	if st.session == nil {
 		return false
 	}
-	var cmd uint16
 	switch msg.Op {
+	// ROLE admin ops are keyless: the namespace whitelist must not be
+	// consulted, only the command bit (mirrors RESP's authorizedCmd).
 	case OpRoleCreate, OpRoleSetUser, OpRoleDelUser, OpRoleDelete, OpRoleList, OpRoleGetUser:
-		cmd = rbac.CmdRole
+		return st.session.AllowsCommand(rbac.CmdRole)
 	case OpGet:
-		cmd = rbac.CmdGet
+		return st.session.IsAllowed(rbac.CmdGet, msg.Key)
 	case OpSet:
-		cmd = rbac.CmdSet
+		return st.session.IsAllowed(rbac.CmdSet, msg.Key)
 	case OpDelete:
-		cmd = rbac.CmdDel
+		return st.session.IsAllowed(rbac.CmdDel, msg.Key)
 	default:
 		return false
 	}
-	allowed := st.session.IsAllowed(cmd, msg.Key)
-	return allowed
 }
 
 // parseAuthPayload extracts username and password from the MsgAuth wire format:

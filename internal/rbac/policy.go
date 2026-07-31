@@ -11,7 +11,10 @@ Authors:
 */
 package rbac
 
-import "sync/atomic"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // PolicyStore is an immutable snapshot of the authorization state: role
 // definitions, user records (role + password hash), and the default role for
@@ -79,9 +82,12 @@ func (p *PolicyStore) Clone() *PolicyStore {
 
 // Store publishes the active PolicyStore behind an atomic pointer. Load never
 // blocks and never allocates; Store swaps the whole snapshot in one operation,
-// so readers always observe a complete policy.
+// so readers always observe a complete policy. mu serializes the read-modify-
+// write mutations (CreateRole, SetUser, DelUser, DeleteRole) so two concurrent
+// ROLE commands cannot overwrite each other's changes; Load remains lock-free.
 type Store struct {
 	active atomic.Pointer[PolicyStore]
+	mu     sync.Mutex
 }
 
 // NewStore returns a Store seeded with policy.

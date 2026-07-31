@@ -24,7 +24,7 @@ users:
     nopass: true
     role: reader
   - name: service-a
-    password: "$2a$10$abcdefghijklmnopqrstuv"
+    password: "$2a$10$4gEVZvJMaugLbxib9OnEzOTY2D6a50ja32pnyDktdigdoMGeJk/sm"
     role: writer
 default_role: reader
 `
@@ -77,6 +77,9 @@ func TestParseErrors(t *testing.T) {
 		{"unknown default role", "default_role: ghost"},
 		{"bad rule", "roles: [{name: r, rules: [\"+BOGUS\"]}]"},
 		{"password and nopass", "users: [{name: u, role: r, password: \"x\", nopass: true}]"},
+		{"no password and no nopass", "users: [{name: u, role: r}]"},
+		{"password not a bcrypt hash", "users: [{name: u, role: r, password: \"hunter2\"}]"},
+		{"truncated bcrypt hash", "users: [{name: u, role: r, password: \"$2a$10$abcdefghijklmnopqrstuv\"}]"},
 	}
 	for _, tc := range cases {
 		if _, err := Parse([]byte(tc.doc)); err == nil {

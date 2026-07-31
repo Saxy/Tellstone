@@ -38,6 +38,13 @@ func main() {
 	}
 	fmt.Println("AUTH admin => OK")
 
+	// Seed a value under users:1 so alice's GET below returns it instead of a
+	// storage-level miss, which would be indistinguishable from an RBAC denial.
+	if _, err = c.Set([]byte("users:1"), []byte("alice-in-users"), 0, buf); err != nil {
+		log.Fatalf("SET users:1 failed: %v", err)
+	}
+	fmt.Println("SET users:1 => OK")
+
 	// ROLE CREATE defines a role that may only read keys under the "users:" prefix.
 	if err = c.RoleCreate("user-reader", []string{"+get", "~users:*"}, buf); err != nil {
 		log.Fatalf("ROLE CREATE failed: %v", err)

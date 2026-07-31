@@ -339,3 +339,11 @@ func TestRequirePassEnvVar(t *testing.T) {
 		t.Fatalf("require-pass env mismatch: %q", cfg.GetRequirePass())
 	}
 }
+
+func TestRBACConfigEnvVar(t *testing.T) {
+	t.Setenv("TSD_RBAC_CONFIG", "/env/policy.yaml")
+	cfg := LoadConfig(nil)
+	if cfg.GetRBACConfig() != "/env/policy.yaml" {
+		t.Fatalf("rbac-config env mismatch: %q", cfg.GetRBACConfig())
+	}
+}

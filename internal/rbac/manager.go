@@ -23,6 +23,8 @@ func (s *Store) CreateRole(name string, rules []string) error {
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	p := s.Load()
 	if p != nil {
 		if _, ok := p.Roles[name]; ok {
@@ -41,6 +43,8 @@ func (s *Store) CreateRole(name string, rules []string) error {
 // (nil for nopass). Fails when the role does not exist, so a user can never
 // reference a dangling role name.
 func (s *Store) SetUser(username, roleName string, passHash []byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	p := s.Load()
 	if p != nil {
 		if _, ok := p.Roles[roleName]; !ok {
@@ -58,6 +62,8 @@ func (s *Store) SetUser(username, roleName string, passHash []byte) error {
 // DelUser removes username. Deleting the only "default" nopass user forces
 // future connections to authenticate.
 func (s *Store) DelUser(username string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	p := s.Load()
 	if p == nil {
 		return
@@ -71,6 +77,8 @@ func (s *Store) DelUser(username string) {
 // the default role on their next policy lookup (fail-safe); already-pinned
 // sessions keep the role they authenticated with.
 func (s *Store) DeleteRole(name string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	p := s.Load()
 	if p == nil {
 		return fmt.Errorf("rbac: role %q does not exist", name)

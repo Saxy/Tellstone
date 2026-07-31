@@ -145,7 +145,6 @@ func (s *Server) Run() error {
 	defer stop()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
-	defer signal.Stop(hup)
 	go func() {
 		for range hup {
 			// Hot-reload the RBAC policy on SIGHUP. Atomic swap: a rejected
@@ -166,14 +165,16 @@ func (s *Server) Run() error {
 
 	if err = s.netSrv.ListenAndServe(); err != nil {
 		if errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		if logger.Enabled(log.LevelError) {
+			err = nil
+		} else if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "tcp error", log.String("error", err.Error()))
 		}
-		return err
 	}
-	return nil
+	// Stop the SIGHUP watcher so its goroutine exits with Run instead of
+	// lingering until the process dies.
+	signal.Stop(hup)
+	close(hup)
+	return err
 }
 
 // initRBAC loads the --rbac-config policy file once at startup. No file
@@ -387,18 +388,28 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 	case network.OpDelete:
 		s.router.Dispatch(shard.CmdDel, keyStr, nil, 0)
 		return network.ResponseOK, network.MsgResponse, nil
-	case network.OpRoleCreate:
-		return s.roleCreate(msg)
-	case network.OpRoleSetUser:
-		return s.roleSetUser(msg)
-	case network.OpRoleDelUser:
-		return s.roleDelUser(msg)
-	case network.OpRoleDelete:
-		return s.roleDelete(msg)
-	case network.OpRoleList:
-		return s.roleList(msg)
-	case network.OpRoleGetUser:
-		return s.roleGetUser(msg)
+	case network.OpRoleCreate, network.OpRoleSetUser, network.OpRoleDelUser,
+		network.OpRoleDelete, network.OpRoleList, network.OpRoleGetUser:
+		// RBAC is disabled without --rbac-config; the RESP layer rejects ROLE
+		// with "RBAC is not enabled" and the binary layer must do the same
+		// instead of panicking on a nil policy store.
+		if s.policy == nil {
+			return roleReply(fmt.Errorf("rbac not enabled"))
+		}
+		switch msg.Op {
+		case network.OpRoleCreate:
+			return s.roleCreate(msg)
+		case network.OpRoleSetUser:
+			return s.roleSetUser(msg)
+		case network.OpRoleDelUser:
+			return s.roleDelUser(msg)
+		case network.OpRoleDelete:
+			return s.roleDelete(msg)
+		case network.OpRoleList:
+			return s.roleList(msg)
+		default:
+			return s.roleGetUser(msg)
+		}
 	default:
 		return network.ResponseNotFound, network.MsgResponse, ErrInvalidOpCode
 	}
@@ -430,6 +441,9 @@ func (s *Server) roleSetUser(msg *network.Message) ([]byte, network.MessageType,
 	args, ok := network.DecodeRoleArgs(msg.Value, nil)
 	if !ok || len(args) < 2 {
 		return roleReply(fmt.Errorf("invalid ROLE SETUSER arguments"))
+	}
+	if len(args) == 2 {
+		return roleReply(fmt.Errorf("ROLE SETUSER requires a '>password' or 'nopass' option"))
 	}
 	passHash, err := rbac.PasswordFromOpts(args[2:])
 	if err != nil {
@@ -468,7 +482,11 @@ func (s *Server) roleList(msg *network.Message) ([]byte, network.MessageType, er
 		}
 		entries = append(entries, e)
 	}
-	return network.EncodeRoleListResponse(entries), network.MsgResponse, nil
+	payload, ok := network.EncodeRoleListResponse(entries)
+	if !ok {
+		return roleReply(fmt.Errorf("role rule exceeds the 64 KiB wire limit"))
+	}
+	return payload, network.MsgResponse, nil
 }
 
 func (s *Server) roleGetUser(msg *network.Message) ([]byte, network.MessageType, error) {
