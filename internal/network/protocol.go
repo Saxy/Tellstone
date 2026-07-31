@@ -40,6 +40,18 @@ func (o OpCode) String() string {
 		return "SET"
 	case OpDelete:
 		return "DELETE"
+	case OpRoleCreate:
+		return "ROLE CREATE"
+	case OpRoleSetUser:
+		return "ROLE SETUSER"
+	case OpRoleDelUser:
+		return "ROLE DELUSER"
+	case OpRoleDelete:
+		return "ROLE DELETE"
+	case OpRoleList:
+		return "ROLE LIST"
+	case OpRoleGetUser:
+		return "ROLE GETUSER"
 	default:
 		return "UNKNOWN"
 	}
@@ -49,6 +61,12 @@ const (
 	OpGet OpCode = iota + 1
 	OpSet
 	OpDelete
+	OpRoleCreate
+	OpRoleSetUser
+	OpRoleDelUser
+	OpRoleDelete
+	OpRoleList
+	OpRoleGetUser
 )
 
 // Message is the atomic execution frame of the Tellstone TCP protocol.
@@ -77,6 +95,7 @@ var (
 	ResponseStorageFailure = []byte("ERR STORAGE_FAILURE")
 	ResponseInvalidOpCode  = []byte("ERR INVALID_OPCODE")
 	ResponseAuthErr        = []byte("ERR INVALID_AUTH")
+	ResponseNotAuthorized  = []byte("ERR NOT_AUTHORIZED")
 )
 
 // Marshal encodes the Message into its binary wire format.

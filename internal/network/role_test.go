@@ -1,0 +1,372 @@
+package network
+
+import (
+	"bytes"
+	"context"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/rbac"
+	"golang.org/x/crypto/bcrypt"
+)
+
+// TestRoleCodecRoundTrip verifies EncodeRoleArgs/DecodeRoleArgs recover the
+// original token list, including empty lists and multi-byte UTF-8 tokens.
+func TestRoleCodecRoundTrip(t *testing.T) {
+	cases := [][][]byte{
+		{},
+		{[]byte("admin")},
+		{[]byte("admin"), []byte("+get"), []byte("~*")},
+		{[]byte("bob"), []byte("opérateur")},
+	}
+	for _, args := range cases {
+		payload := EncodeRoleArgs(args)
+		got, ok := DecodeRoleArgs(payload, nil)
+		if !ok {
+			t.Fatalf("DecodeRoleArgs(%q) reported malformed", args)
+		}
+		if len(got) != len(args) {
+			t.Fatalf("arg count: got %d want %d", len(got), len(args))
+		}
+		for i := range args {
+			if !bytes.Equal(got[i], args[i]) {
+				t.Fatalf("arg %d: got %q want %q", i, got[i], args[i])
+			}
+		}
+	}
+}
+
+func TestRoleCodecMalformed(t *testing.T) {
+	if _, ok := DecodeRoleArgs([]byte{0, 2, 0, 5}, nil); ok {
+		t.Fatal("expected truncated payload to be rejected")
+	}
+	if _, ok := DecodeRoleArgs([]byte{0, 1, 0, 2, 'a'}, nil); ok {
+		t.Fatal("expected trailing short token to be rejected")
+	}
+	if _, ok := DecodeRoleArgs([]byte{0, 1, 0, 2, 'a', 'b', 'c'}, nil); ok {
+		t.Fatal("expected trailing garbage to be rejected")
+	}
+}
+
+func TestRoleGetUserCodec(t *testing.T) {
+	for _, u := range []RoleUser{
+		{Role: "admin", HasPass: true},
+		{Role: "", HasPass: false},
+	} {
+		decoded, ok := DecodeRoleGetUserResponse(EncodeRoleGetUserResponse(u))
+		if !ok {
+			t.Fatalf("decode of %+v failed", u)
+		}
+		if decoded != u {
+			t.Fatalf("got %+v want %+v", decoded, u)
+		}
+	}
+	if _, ok := DecodeRoleGetUserResponse([]byte{0, 4, 'a'}); ok {
+		t.Fatal("expected truncated GETUSER response to be rejected")
+	}
+}
+
+func TestRoleListCodec(t *testing.T) {
+	entries := []RoleListEntry{
+		{Name: "admin", Commands: []string{"GET", "SET"}, Namespaces: [][]byte{}},
+		{Name: "operator", Commands: []string{"GET"}, Namespaces: [][]byte{[]byte("users:")}},
+	}
+	decoded, ok := DecodeRoleListResponse(EncodeRoleListResponse(entries))
+	if !ok {
+		t.Fatal("decode of LIST response failed")
+	}
+	if len(decoded) != len(entries) {
+		t.Fatalf("entry count: got %d want %d", len(decoded), len(entries))
+	}
+	for i, e := range decoded {
+		if e.Name != entries[i].Name {
+			t.Fatalf("entry %d name: got %q want %q", i, e.Name, entries[i].Name)
+		}
+		if len(e.Commands) != len(entries[i].Commands) {
+			t.Fatalf("entry %d command count mismatch", i)
+		}
+		if len(e.Namespaces) != len(entries[i].Namespaces) {
+			t.Fatalf("entry %d namespace count mismatch", i)
+		}
+		for j := range e.Commands {
+			if e.Commands[j] != entries[i].Commands[j] {
+				t.Fatalf("entry %d command %d: got %q want %q", i, j, e.Commands[j], entries[i].Commands[j])
+			}
+		}
+	}
+}
+
+// rbacNetworkPolicy builds the policy seeded into the RBAC test server.
+func rbacNetworkPolicy(t *testing.T) *rbac.PolicyStore {
+	t.Helper()
+	admin, err := rbac.ParseRole("admin", "+@all", "~*")
+	if err != nil {
+		t.Fatalf("parse admin role: %v", err)
+	}
+	limited, err := rbac.ParseRole("limited", "+get", "~*")
+	if err != nil {
+		t.Fatalf("parse limited role: %v", err)
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte("sekret"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("hash password: %v", err)
+	}
+	return &rbac.PolicyStore{
+		Roles: map[string]*rbac.Role{"admin": admin, "limited": limited},
+		Users: map[string]*rbac.User{
+			"admin":   {Role: "admin", PasswordHash: hash},
+			"limited": {Role: "limited"},
+		},
+		Default: admin,
+	}
+}
+
+// rbacTestHandler mirrors server.networkHandler for the ROLE ops so the
+// network layer's auth gating and wire codec are exercised end-to-end.
+func rbacTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType, error) {
+	return func(msg *Message) ([]byte, MessageType, error) {
+		switch msg.Op {
+		case OpGet:
+			return ResponseOK, MsgResponse, nil
+		case OpSet, OpDelete:
+			return ResponseOK, MsgResponse, nil
+		case OpRoleCreate:
+			args, ok := DecodeRoleArgs(msg.Value, nil)
+			if !ok || len(args) < 2 {
+				return []byte("ERR invalid ROLE CREATE arguments"), MsgResponse, nil
+			}
+			rules := make([]string, 0, len(args)-1)
+			for _, r := range args[1:] {
+				rules = append(rules, string(r))
+			}
+			if err := store.CreateRole(string(args[0]), rules); err != nil {
+				return []byte("ERR " + err.Error()), MsgResponse, nil
+			}
+			return ResponseOK, MsgResponse, nil
+		case OpRoleSetUser:
+			args, ok := DecodeRoleArgs(msg.Value, nil)
+			if !ok || len(args) < 2 {
+				return []byte("ERR invalid ROLE SETUSER arguments"), MsgResponse, nil
+			}
+			hash, err := rbac.PasswordFromOpts(args[2:])
+			if err != nil {
+				return []byte("ERR " + err.Error()), MsgResponse, nil
+			}
+			if err := store.SetUser(string(args[0]), string(args[1]), hash); err != nil {
+				return []byte("ERR " + err.Error()), MsgResponse, nil
+			}
+			return ResponseOK, MsgResponse, nil
+		case OpRoleDelUser:
+			args, ok := DecodeRoleArgs(msg.Value, nil)
+			if !ok || len(args) != 1 {
+				return []byte("ERR invalid ROLE DELUSER arguments"), MsgResponse, nil
+			}
+			store.DelUser(string(args[0]))
+			return ResponseOK, MsgResponse, nil
+		case OpRoleDelete:
+			args, ok := DecodeRoleArgs(msg.Value, nil)
+			if !ok || len(args) != 1 {
+				return []byte("ERR invalid ROLE DELETE arguments"), MsgResponse, nil
+			}
+			if err := store.DeleteRole(string(args[0])); err != nil {
+				return []byte("ERR " + err.Error()), MsgResponse, nil
+			}
+			return ResponseOK, MsgResponse, nil
+		case OpRoleList:
+			p := store.Load()
+			entries := make([]RoleListEntry, 0, len(p.Roles))
+			for name, r := range p.Roles {
+				e := RoleListEntry{Name: name, Commands: r.GrantedCommands()}
+				for _, ns := range r.Namespaces {
+					e.Namespaces = append(e.Namespaces, append([]byte(nil), ns...))
+				}
+				entries = append(entries, e)
+			}
+			return EncodeRoleListResponse(entries), MsgResponse, nil
+		case OpRoleGetUser:
+			args, ok := DecodeRoleArgs(msg.Value, nil)
+			if !ok || len(args) != 1 {
+				return []byte("ERR invalid ROLE GETUSER arguments"), MsgResponse, nil
+			}
+			p := store.Load()
+			u := p.UserFor(string(args[0]))
+			if u == nil {
+				return []byte("ERR user does not exist"), MsgResponse, nil
+			}
+			return EncodeRoleGetUserResponse(RoleUser{Role: u.Role, HasPass: len(u.PasswordHash) > 0}), MsgResponse, nil
+		default:
+			return ResponseNotFound, MsgResponse, nil
+		}
+	}
+}
+
+func startRBACNetworkServer(t *testing.T) (addr string, store *rbac.Store) {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr = l.Addr().String()
+	_ = l.Close()
+	store = rbac.NewStore(rbacNetworkPolicy(t))
+	srv := NewServer(addr, 0, nil, rbacTestHandler(store), log.NewNoOpLogger(), nil, "", store)
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	if err := waitForServer(addr, 2*time.Second); err != nil {
+		t.Fatalf("server not ready: %v", err)
+	}
+	return addr, store
+}
+
+// TestServerRBACAuthGating verifies the binary protocol denies data ops before
+// AUTH, authenticates per-user, and gates ops on the session's role.
+func TestServerRBACAuthGating(t *testing.T) {
+	addr, _ := startRBACNetworkServer(t)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// GET before auth must be rejected.
+	if resp := sendAndRecv(t, conn, MsgRequest, []byte{byte(OpGet), 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'k'}); resp.Type != MsgAuthErr {
+		t.Fatalf("expected MsgAuthErr for GET before auth, got %v", resp.Type)
+	}
+	// Wrong password.
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("admin", "wrong")); resp.Type != MsgAuthErr {
+		t.Fatalf("expected MsgAuthErr for wrong password, got %v", resp.Type)
+	}
+	// Unknown user.
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("ghost", "x")); resp.Type != MsgAuthErr {
+		t.Fatalf("expected MsgAuthErr for unknown user, got %v", resp.Type)
+	}
+	// Correct credentials.
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("admin", "sekret")); resp.Type != MsgAuthOk {
+		t.Fatalf("expected MsgAuthOk, got %v", resp.Type)
+	}
+	// ROLE CREATE now permitted (admin role).
+	if resp := sendAndRecv(t, conn, MsgRequest, roleRequestPayload(OpRoleCreate, [][]byte{[]byte("operator"), []byte("+get"), []byte("~*")})); !bytes.Equal(resp.Value, ResponseOK) {
+		t.Fatalf("expected ROLE CREATE OK, got %q type %v", resp.Value, resp.Type)
+	}
+}
+
+// TestServerRBACAuthorizationDenial verifies that a limited user (GET only)
+// gets ResponseNotAuthorized for ROLE and SET ops but may GET.
+func TestServerRBACAuthorizationDenial(t *testing.T) {
+	addr, _ := startRBACNetworkServer(t)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("limited", "anything")); resp.Type != MsgAuthOk {
+		t.Fatalf("expected MsgAuthOk for nopass user, got %v", resp.Type)
+	}
+	if resp := sendAndRecv(t, conn, MsgRequest, roleRequestPayload(OpRoleCreate, [][]byte{[]byte("operator"), []byte("+get")})); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
+		t.Fatalf("expected ResponseNotAuthorized for ROLE, got %q", resp.Value)
+	}
+	if resp := sendAndRecv(t, conn, MsgRequest, []byte{byte(OpSet), 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'k', 'v'}); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
+		t.Fatalf("expected ResponseNotAuthorized for SET, got %q", resp.Value)
+	}
+	if resp := sendAndRecv(t, conn, MsgRequest, []byte{byte(OpGet), 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 'k'}); !bytes.Equal(resp.Value, ResponseOK) {
+		t.Fatalf("expected OK for GET, got %q", resp.Value)
+	}
+}
+
+// TestClientRoleMethods exercises the client API against a live RBAC server.
+func TestClientRoleMethods(t *testing.T) {
+	addr, _ := startRBACNetworkServer(t)
+
+	client, err := Dial(addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	scratch := make([]byte, 4096)
+
+	if err := client.AuthUser("admin", "sekret", scratch); err != nil {
+		t.Fatalf("AuthUser: %v", err)
+	}
+	if err := client.RoleCreate("operator", []string{"+get", "~*"}, scratch); err != nil {
+		t.Fatalf("RoleCreate: %v", err)
+	}
+	if err := client.RoleSetUser("bob", "operator", [][]byte{[]byte(">pw")}, scratch); err != nil {
+		t.Fatalf("RoleSetUser: %v", err)
+	}
+	u, err := client.RoleGetUser("bob", scratch)
+	if err != nil {
+		t.Fatalf("RoleGetUser: %v", err)
+	}
+	if u.Role != "operator" || !u.HasPass {
+		t.Fatalf("RoleGetUser: got %+v want operator with password", u)
+	}
+	entries, err := client.RoleList(scratch)
+	if err != nil {
+		t.Fatalf("RoleList: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("RoleList: got %d entries want 3 (admin, limited, operator)", len(entries))
+	}
+	// Bad credentials surface as an error, not a hang.
+	badClient, err := Dial(addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer badClient.Close()
+	if err := badClient.AuthUser("admin", "nope", scratch); err == nil {
+		t.Fatal("expected AuthUser to fail with wrong password")
+	}
+}
+
+// TestClientRoleMethodsGating proves that a user created at runtime and bound
+// to a limited role is gated exactly like a seeded one: GET passes, SET and
+// non-matching namespaces are denied.
+func TestClientRoleMethodsGating(t *testing.T) {
+	addr, _ := startRBACNetworkServer(t)
+
+	admin, err := Dial(addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer admin.Close()
+	scratch := make([]byte, 4096)
+	if err := admin.AuthUser("admin", "sekret", scratch); err != nil {
+		t.Fatalf("AuthUser: %v", err)
+	}
+	if err := admin.RoleCreate("limited2", []string{"+get", "~users:*"}, scratch); err != nil {
+		t.Fatalf("RoleCreate: %v", err)
+	}
+	if err := admin.RoleSetUser("carol", "limited2", nil, scratch); err != nil {
+		t.Fatalf("RoleSetUser: %v", err)
+	}
+
+	carol, err := Dial(addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer carol.Close()
+	if err := carol.AuthUser("carol", "anything", scratch); err != nil {
+		t.Fatalf("AuthUser carol: %v", err)
+	}
+	// GET on a matching key passes through to the handler.
+	if _, err := carol.Get([]byte("users:1"), scratch); err != nil {
+		t.Fatalf("GET users:1 as carol: %v", err)
+	}
+	// SET is not in the role.
+	if _, err := carol.Set([]byte("users:1"), []byte("x"), 0, scratch); err == nil {
+		t.Fatal("expected SET to be denied for carol")
+	}
+	// Key outside the namespace whitelist.
+	if _, err := carol.Get([]byte("accounts:1"), scratch); err == nil {
+		t.Fatal("expected GET accounts:1 to be denied for carol")
+	}
+}

@@ -139,6 +139,13 @@ func AppendInt(dst []byte, n int64) []byte {
 	return append(dst, '\r', '\n')
 }
 
+// AppendArray appends a RESP array header ("*<n>\r\n").
+func AppendArray(dst []byte, n int) []byte {
+	dst = append(dst, '*')
+	dst = strconv.AppendInt(dst, int64(n), 10)
+	return append(dst, '\r', '\n')
+}
+
 // EqualFold reports whether the ASCII command token a equals the upper-case literal b
 // case-insensitively. b must already be upper-case (e.g. "GET").
 func EqualFold(a []byte, b string) bool {

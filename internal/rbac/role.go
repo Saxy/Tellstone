@@ -11,7 +11,10 @@ Authors:
 */
 package rbac
 
-import "bytes"
+import (
+	"bytes"
+	"sort"
+)
 
 // Role is a named permission set. Permissions is a Bitset of granted commands
 // (zero-alloc to check). Namespaces are a key-prefix whitelist: an empty list
@@ -33,4 +36,25 @@ func (r *Role) AllowsKey(key []byte) bool {
 		}
 	}
 	return len(r.Namespaces) == 0
+}
+
+// GrantedCommands returns the sorted names of every registered command with its
+// permission bit set. Used for ROLE LIST output — not on the hot path.
+func (r *Role) GrantedCommands() []string {
+	var names []string
+	for i, w := range r.Permissions {
+		if w == 0 {
+			continue
+		}
+		for bit := 0; bit < 64; bit++ {
+			if w&(uint64(1)<<bit) == 0 {
+				continue
+			}
+			if name := CommandName(uint16(i*64 + bit)); name != "" {
+				names = append(names, name)
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
 }

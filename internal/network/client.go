@@ -11,6 +11,7 @@ Authors:
 package network
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/binary"
@@ -94,6 +95,16 @@ func (c *Client) Close() error {
 	return c.conn.Close()
 }
 
+// errReply converts a server payload into an error when it carries the "ERR "
+// prefix — the binary protocol's error convention (denied ops, missing keys).
+// Arbitrary stored values and OK responses pass through as nil.
+func errReply(value []byte) error {
+	if bytes.HasPrefix(value, []byte("ERR ")) {
+		return fmt.Errorf("server: %s", value)
+	}
+	return nil
+}
+
 // Set stores a binary key-value pair with a millisecond-based TTL inside the remote engine.
 func (c *Client) Set(key, value []byte, ttlMs int64, scratchBuf []byte) ([]byte, error) {
 	payloadLen := 1 + 2 + 8 + len(key) + len(value)
@@ -114,6 +125,9 @@ func (c *Client) Set(key, value []byte, ttlMs int64, scratchBuf []byte) ([]byte,
 	var resp Message
 	// scratchBuf is now exclusively used to catch the incoming wire data safely
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
+		return nil, err
+	}
+	if err := errReply(resp.Value); err != nil {
 		return nil, err
 	}
 	return resp.Value, nil
@@ -138,6 +152,9 @@ func (c *Client) Get(key []byte, scratchBuf []byte) ([]byte, error) {
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
 		return nil, err
 	}
+	if err := errReply(resp.Value); err != nil {
+		return nil, err
+	}
 	return resp.Value, nil
 }
 
@@ -158,6 +175,9 @@ func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
 
 	var resp Message
 	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
+		return nil, err
+	}
+	if err := errReply(resp.Value); err != nil {
 		return nil, err
 	}
 	return resp.Value, nil

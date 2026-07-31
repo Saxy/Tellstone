@@ -57,7 +57,7 @@ func TestCollectorEngineSnapshot(t *testing.T) {
 		t.Fatalf("expected key to exist after Set")
 	}
 	// Create a dummy network server (no handler, no activity).
-	srv := network.NewServer("", 0, nil, nil, log.NewNoOpLogger(), nil, "")
+	srv := network.NewServer("", 0, nil, nil, log.NewNoOpLogger(), nil, "", nil)
 
 	col := NewCollector(eng, srv, log.NewNoOpLogger())
 	snap := col.GetEngineSnapshot()

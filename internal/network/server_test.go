@@ -123,7 +123,7 @@ func TestServerEcho(t *testing.T) {
 		}
 		return nil, 0, nil
 	}
-	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, "")
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, "", nil)
 	go func() { _ = srv.ListenAndServe() }()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -196,7 +196,7 @@ func TestServerTLSConfigRotation(t *testing.T) {
 	}
 	addr := listener.Addr().String()
 	_ = listener.Close()
-	srv := NewServer(addr, 0, nil, pingHandler, log.NewNoOpLogger(), configs, "")
+	srv := NewServer(addr, 0, nil, pingHandler, log.NewNoOpLogger(), configs, "", nil)
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -260,7 +260,7 @@ func startAuthServer(t *testing.T, requirePass string, handler func(msg *Message
 	}
 	addr := l.Addr().String()
 	l.Close()
-	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, requirePass)
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, requirePass, nil)
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

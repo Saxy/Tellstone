@@ -57,13 +57,13 @@ func TestSessionPinnedAcrossPolicySwap(t *testing.T) {
 	}
 	store := NewStore(&PolicyStore{
 		Roles: map[string]*Role{"old": oldRole, "new": newRole},
-		Users: map[string]string{"alice": "old"},
+		Users: map[string]*User{"alice": {Role: "old"}},
 	})
 
 	session := NewSessionContext("alice", store.Load().RoleFor("alice"))
 	store.Store(&PolicyStore{
 		Roles: map[string]*Role{"new": newRole},
-		Users: map[string]string{"alice": "new"},
+		Users: map[string]*User{"alice": {Role: "new"}},
 	})
 
 	if !session.IsAllowed(CmdGet, []byte("k")) {

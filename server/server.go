@@ -28,6 +28,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/metrics"
 	"github.com/Saxy/Tellstone/internal/network"
 	"github.com/Saxy/Tellstone/internal/persistence"
+	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/resp"
 	"github.com/Saxy/Tellstone/internal/router"
 	"github.com/Saxy/Tellstone/internal/shard"
@@ -67,6 +68,10 @@ type Server struct {
 	metricsSrv  *http.Server
 	tlsConfigs  *tlslib.ConfigStore
 	tlsReloader *tlslib.Reloader
+	// policy is the atomic RBAC policy store shared by the binary and RESP
+	// listeners. nil means RBAC is disabled and both servers keep their
+	// legacy zero-overhead paths. SIGHUP swaps a fresh snapshot into it.
+	policy *rbac.Store
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -98,6 +103,9 @@ func (s *Server) Run() error {
 	if err = s.initShards(cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
+	if err = s.initRBAC(); err != nil {
+		return fmt.Errorf("rbac init: %w", err)
+	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
@@ -106,6 +114,7 @@ func (s *Server) Run() error {
 		logger,
 		s.tlsConfigs,
 		cfg.GetRequirePass(),
+		s.policy,
 	)
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(s.netSrv)
@@ -134,6 +143,16 @@ func (s *Server) Run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go func() {
+		for range hup {
+			// Hot-reload the RBAC policy on SIGHUP. Atomic swap: a rejected
+			// file leaves the running policy untouched.
+			s.reloadRBAC()
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		stop()
@@ -155,6 +174,55 @@ func (s *Server) Run() error {
 		return err
 	}
 	return nil
+}
+
+// initRBAC loads the --rbac-config policy file once at startup. No file
+// configured means RBAC is disabled (legacy behavior, zero overhead). A
+// configured-but-unreadable or invalid file aborts startup: a server that
+// silently runs without the operator's ACLs is a security hole.
+func (s *Server) initRBAC() error {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	path := cfg.GetRBACConfig()
+	if path == "" {
+		return nil
+	}
+	policy, err := rbac.LoadFile(path)
+	if err != nil {
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "rbac policy load failed", log.String("error", err.Error()))
+		}
+		return err
+	}
+	s.policy = rbac.NewStore(policy)
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "rbac policy loaded", log.String("path", path))
+	}
+	return nil
+}
+
+// reloadRBAC re-reads the policy file on SIGHUP and swaps it into the store in
+// one atomic operation. A bad file is rejected and the running policy stays in
+// effect; only a fully valid snapshot is ever published.
+func (s *Server) reloadRBAC() {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	path := cfg.GetRBACConfig()
+	if path == "" || s.policy == nil {
+		return
+	}
+	policy, err := rbac.LoadFile(path)
+	if err != nil {
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "rbac policy reload rejected, keeping running policy",
+				log.String("error", err.Error()))
+		}
+		return
+	}
+	s.policy.Store(policy)
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "rbac policy reloaded", log.String("path", path))
+	}
 }
 
 func (s *Server) shutdown(ctx context.Context) {
@@ -280,7 +348,7 @@ func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	store := &RouterStore{router: s.router}
-	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfigs, cfg.GetRequirePass())
+	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfigs, cfg.GetRequirePass(), s.policy)
 	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {
@@ -319,7 +387,102 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 	case network.OpDelete:
 		s.router.Dispatch(shard.CmdDel, keyStr, nil, 0)
 		return network.ResponseOK, network.MsgResponse, nil
+	case network.OpRoleCreate:
+		return s.roleCreate(msg)
+	case network.OpRoleSetUser:
+		return s.roleSetUser(msg)
+	case network.OpRoleDelUser:
+		return s.roleDelUser(msg)
+	case network.OpRoleDelete:
+		return s.roleDelete(msg)
+	case network.OpRoleList:
+		return s.roleList(msg)
+	case network.OpRoleGetUser:
+		return s.roleGetUser(msg)
 	default:
 		return network.ResponseNotFound, network.MsgResponse, ErrInvalidOpCode
 	}
+}
+
+// roleReply wraps a ROLE result: ResponseOK on success, an "ERR <detail>"
+// payload otherwise. The client surfaces the latter as an error without
+// tearing down the connection, so a failed admin op never kicks the client.
+func roleReply(err error) ([]byte, network.MessageType, error) {
+	if err == nil {
+		return network.ResponseOK, network.MsgResponse, nil
+	}
+	return []byte("ERR " + err.Error()), network.MsgResponse, nil
+}
+
+func (s *Server) roleCreate(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) < 3 {
+		return roleReply(fmt.Errorf("invalid ROLE CREATE arguments"))
+	}
+	rules := make([]string, 0, len(args)-1)
+	for _, r := range args[1:] {
+		rules = append(rules, string(r))
+	}
+	return roleReply(s.policy.CreateRole(string(args[0]), rules))
+}
+
+func (s *Server) roleSetUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) < 2 {
+		return roleReply(fmt.Errorf("invalid ROLE SETUSER arguments"))
+	}
+	passHash, err := rbac.PasswordFromOpts(args[2:])
+	if err != nil {
+		return roleReply(err)
+	}
+	return roleReply(s.policy.SetUser(string(args[0]), string(args[1]), passHash))
+}
+
+func (s *Server) roleDelUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) != 1 {
+		return roleReply(fmt.Errorf("invalid ROLE DELUSER arguments"))
+	}
+	s.policy.DelUser(string(args[0]))
+	return network.ResponseOK, network.MsgResponse, nil
+}
+
+func (s *Server) roleDelete(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) != 1 {
+		return roleReply(fmt.Errorf("invalid ROLE DELETE arguments"))
+	}
+	return roleReply(s.policy.DeleteRole(string(args[0])))
+}
+
+func (s *Server) roleList(msg *network.Message) ([]byte, network.MessageType, error) {
+	p := s.policy.Load()
+	if p == nil {
+		return roleReply(fmt.Errorf("rbac policy not loaded"))
+	}
+	entries := make([]network.RoleListEntry, 0, len(p.Roles))
+	for name, r := range p.Roles {
+		e := network.RoleListEntry{Name: name, Commands: r.GrantedCommands()}
+		for _, ns := range r.Namespaces {
+			e.Namespaces = append(e.Namespaces, append([]byte(nil), ns...))
+		}
+		entries = append(entries, e)
+	}
+	return network.EncodeRoleListResponse(entries), network.MsgResponse, nil
+}
+
+func (s *Server) roleGetUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) != 1 {
+		return roleReply(fmt.Errorf("invalid ROLE GETUSER arguments"))
+	}
+	p := s.policy.Load()
+	if p == nil {
+		return roleReply(fmt.Errorf("rbac policy not loaded"))
+	}
+	u := p.UserFor(string(args[0]))
+	if u == nil {
+		return roleReply(fmt.Errorf("user '%s' does not exist", args[0]))
+	}
+	return network.EncodeRoleGetUserResponse(network.RoleUser{Role: u.Role, HasPass: len(u.PasswordHash) > 0}), network.MsgResponse, nil
 }

@@ -145,6 +145,8 @@ Every option is available as a flag and an environment variable.
 | `--tls-cert`          | `TSD_TLS_CERT`           | _(none)_         | TLS certificate path; watched for automatic rotation     |
 | `--tls-key`           | `TSD_TLS_KEY`            | _(none)_         | TLS private key path; watched for automatic rotation     |
 | `--tls-ca`            | `TSD_TLS_CA`             | _(none)_         | Client CA path for mTLS; watched for automatic rotation  |
+| `--require-pass`      | `TSD_REQUIRE_PASS`       | _(none)_         | Single password required via `AUTH`; empty disables it   |
+| `--rbac-config`       | `TELLSTONE_RBAC_CONFIG`  | _(none)_         | YAML/JSON RBAC policy file (roles, users, default role); hot-reloaded on SIGHUP |
 | `--shutdown-timeout`  | `TSD_SHUTDOWN_TIMEOUT`  | `10s`            | Max wait for graceful shutdown on SIGINT/SIGTERM         |
 
 Runtime tuning (environment only): `TSD_GC_PERCENT` (default `-1`, GC off for a zero‑GC hot
@@ -172,8 +174,38 @@ redis-cli -p 6379 SET k v EX 60   # OK (60s TTL)
 redis-cli -p 6379 DEL foo         # (integer) 1
 ```
 
-Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`**. Unknown commands
-return a `-ERR` reply without dropping the connection.
+Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`, `ROLE`
+(`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`)**. Unknown commands return a `-ERR`
+reply without dropping the connection.
+
+#### Authentication & RBAC
+
+Start with `--require-pass` for a single shared password, or `--rbac-config` for per-user
+authentication with role-based access control (supersedes `--require-pass`):
+
+```yaml
+# policy.yaml — loaded at startup and hot-reloaded on SIGHUP
+roles:
+  admin:    [ "+@all", "~*" ]
+  readonly: [ "+get", "~*" ]
+users:
+  default:  { role: admin }                 # nopass default user (optional)
+  admin:    { role: admin,    password: "adminsecret" }
+  alice:    { role: readonly, password: "alicepw" }
+default_role: admin
+```
+
+```bash
+./bin/tellstone --rbac-config policy.yaml --enable-resp
+redis-cli AUTH admin adminsecret                 # +OK
+redis-cli ROLE CREATE operator +get '~users:*'   # +OK (runtime roles)
+redis-cli ROLE SETUSER bob operator '>bobpw'     # +OK
+redis-cli ROLE GETUSER bob                       # bob / operator / 1
+```
+
+Unauthenticated data commands return `-NOAUTH`; commands a user's role does not grant return
+`-NOPERM`. The native binary client offers the same via `client.AuthUser` and `RoleCreate` /
+`RoleSetUser` (see `cmd/example/role`).
 
 ### Native binary protocol (Go client)
 
