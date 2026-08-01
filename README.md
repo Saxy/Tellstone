@@ -211,6 +211,11 @@ users:
 default_role: readonly    # least privilege: fallback for users without an explicit role
 ```
 
+Generate a password hash with `htpasswd -nbBC 10 "" PASSWORD | tr -d ':\n'` or
+`mkpasswd -m bcrypt PASSWORD` (bcrypt, cost 10, `$2a$10$...`). Do **not** use `openssl passwd` —
+it emits SHA-512-crypt, not bcrypt. `ROLE SETUSER` accepts a raw `>password` and bcrypt-hashes it
+server-side, so runtime-created users need no tooling.
+
 ```bash
 ./bin/tellstone --rbac-config policy.yaml --enable-resp
 redis-cli AUTH admin adminsecret                 # +OK
@@ -218,6 +223,23 @@ redis-cli ROLE CREATE operator +get '~users:*'   # +OK (runtime roles)
 redis-cli ROLE SETUSER bob operator '>bobpw'     # +OK
 redis-cli ROLE GETUSER bob                       # bob / operator / 1
 ```
+
+Roles are user-defined; a role's `rules` are Redis-style tokens: `+cmd` / `-cmd` grant or revoke
+one command, `+@cat` / `-@cat` a whole category, and `~prefix` whitelists a key namespace (an
+empty list or `~*` allows every key). `-` rules override `+` rules. The built-in categories:
+
+| Category | Grants |
+|----------|--------|
+| `login` | AUTH, PING, COMMAND |
+| `read` | GET, INFO |
+| `write` | SET, DEL |
+| `readwrite` | read + write + login |
+| `operator` | readwrite + FLUSH |
+| `maintenance` | FLUSH, SHUTDOWN, CONFIG, DEBUG, MONITOR |
+| `admin` | AUTH, ROLE, ACL, USER, GRANT, REVOKE |
+| `all` / `none` | every registered command / nothing |
+
+A ready-to-run policy file ships with the role example at `cmd/example/role/policy.yaml`.
 
 Unauthenticated data commands return `-NOAUTH`; commands a user's role does not grant return
 `-NOPERM`. The native binary client offers the same via `client.AuthUser` and `RoleCreate` /

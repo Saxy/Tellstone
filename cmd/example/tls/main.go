@@ -6,6 +6,7 @@ Description: Example TLS/mTLS client that connects to a Tellstone server with tr
 Demonstrates three modes: plaintext, one-way TLS, and mutual TLS (mTLS).
 
 Usage:
+
 	# 1. Start server with TLS:
 	go run ./cmd/tellstone --tls-cert cmd/example/tls/certs/server.crt --tls-key cmd/example/tls/certs/server.key
 
@@ -21,12 +22,11 @@ package main
 
 import (
 	"flag"
-	"fmt"
-	"log"
 	"os"
 	"time"
 
 	"github.com/Saxy/Tellstone/client"
+	"github.com/Saxy/Tellstone/logger"
 )
 
 func main() {
@@ -35,6 +35,8 @@ func main() {
 	certDir := flag.String("certs", "cmd/example/tls/certs", "Directory containing TLS certificates")
 	flag.Parse()
 
+	slog := logger.NewSlogLogger(logger.LevelInfo)
+
 	var (
 		c   *client.Client
 		err error
@@ -42,70 +44,78 @@ func main() {
 
 	switch *mode {
 	case "plaintext":
-		fmt.Println("[*] Connecting in PLAINTEXT mode...")
-		c, err = client.Dial(*addr, 5*time.Second)
+		slog.Log(logger.LevelInfo, "connecting in plaintext mode")
+		c, err = client.DialWithLogger(*addr, 5*time.Second, slog)
 
 	case "tls":
-		fmt.Println("[*] Connecting in TLS mode (one-way)...")
-		c, err = client.DialTLS(*addr,
+		slog.Log(logger.LevelInfo, "connecting in tls mode")
+		c, err = client.DialTLSWithLogger(*addr,
 			"", "",
 			*certDir+"/ca.crt",
 			5*time.Second,
+			slog,
 		)
 
 	case "mtls":
-		fmt.Println("[*] Connecting in mTLS mode (mutual TLS)...")
-		c, err = client.DialTLS(*addr,
+		slog.Log(logger.LevelInfo, "connecting in mtls mode")
+		c, err = client.DialTLSWithLogger(*addr,
 			*certDir+"/client.crt",
 			*certDir+"/client.key",
 			*certDir+"/ca.crt",
 			5*time.Second,
+			slog,
 		)
 
 	default:
-		fmt.Fprintf(os.Stderr, "unknown mode: %s (use plaintext, tls, or mtls)\n", *mode)
+		slog.Log(logger.LevelFatal, "unknown mode", logger.String("mode", *mode))
 		os.Exit(1)
 	}
 
 	if err != nil {
-		log.Fatalf("[-] Connection failed: %v", err)
+		fatal(slog, "connection failed", err)
 	}
 	defer c.Close()
-	fmt.Printf("[+] Connected to %s via %s\n", *addr, *mode)
+	slog.Log(logger.LevelInfo, "connected", logger.String("addr", *addr), logger.String("mode", *mode))
 
 	buf := make([]byte, 4*1024)
 
 	// SET
-	fmt.Println("\n--- SET ---")
 	res, err := c.Set([]byte("tls-demo-key"), []byte("hello from TLS client"), 0, buf)
 	if err != nil {
-		log.Fatalf("SET failed: %v", err)
+		fatal(slog, "SET failed", err)
 	}
-	fmt.Printf("SET => %s\n", string(res))
+	slog.Log(logger.LevelInfo, "SET", logger.String("result", string(res)))
 
 	// GET
-	fmt.Println("\n--- GET ---")
 	res, err = c.Get([]byte("tls-demo-key"), buf)
 	if err != nil {
-		log.Fatalf("GET failed: %v", err)
+		fatal(slog, "GET failed", err)
 	}
-	fmt.Printf("GET => %s\n", string(res))
+	slog.Log(logger.LevelInfo, "GET", logger.String("result", string(res)))
 
 	// DELETE
-	fmt.Println("\n--- DELETE ---")
 	res, err = c.Delete([]byte("tls-demo-key"), buf)
 	if err != nil {
-		log.Fatalf("DELETE failed: %v", err)
+		fatal(slog, "DELETE failed", err)
 	}
-	fmt.Printf("DEL => %s\n", string(res))
+	slog.Log(logger.LevelInfo, "DELETE", logger.String("result", string(res)))
 
 	// GET after DELETE (should return NOT_FOUND)
-	fmt.Println("\n--- GET (after delete) ---")
 	res, err = c.Get([]byte("tls-demo-key"), buf)
 	if err != nil {
-		log.Fatalf("GET failed: %v", err)
+		fatal(slog, "GET after delete failed", err)
 	}
-	fmt.Printf("GET => %s\n", string(res))
+	slog.Log(logger.LevelInfo, "GET after delete", logger.String("result", string(res)))
 
-	fmt.Println("\n[+] All operations completed successfully over", *mode)
+	slog.Log(logger.LevelInfo, "all operations completed successfully", logger.String("mode", *mode))
+}
+
+// fatal logs the error and terminates the example process.
+func fatal(l logger.Logger, msg string, err error) {
+	if err != nil {
+		l.Log(logger.LevelFatal, msg, logger.String("error", err.Error()))
+	} else {
+		l.Log(logger.LevelFatal, msg)
+	}
+	os.Exit(1)
 }

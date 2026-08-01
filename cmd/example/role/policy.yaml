@@ -1,0 +1,20 @@
+# Example RBAC policy for cmd/example/role. Run the role example against a
+# server started with this file:
+#
+#   ./bin/tellstone --rbac-config cmd/example/role/policy.yaml --enable-metrics
+#
+# The admin user below is required: the example authenticates as
+# admin/adminsecret before issuing ROLE commands.
+roles:
+  - name: admin
+    rules: ["+@all", "~*"]
+  - name: readonly
+    rules: ["+get", "~*"]
+users:
+  - name: admin
+    role: admin
+    password: "$2a$10$pcaKkTfRy.KSdNUgKszYYedE7L32P9fSEG3x1phq0EbjeYkn5WpEi"
+  - name: alice
+    role: readonly
+    password: "$2a$10$sslrTYVwaIaA7O1lhokY2OgnojP5bB8YJ/o2MXaFP1v49lG8fqJYK"
+default_role: readonly    # least privilege: fallback for users without an explicit role

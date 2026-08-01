@@ -11,32 +11,49 @@ Authors:
 package main
 
 import (
-	"fmt"
-	"log"
+	"os"
 	"time"
 
 	"github.com/Saxy/Tellstone/client"
+	"github.com/Saxy/Tellstone/logger"
 )
 
 func main() {
-	c, err := client.Dial("127.0.0.1:9988", 5*time.Second)
+	slog := logger.NewSlogLogger(logger.LevelInfo)
+	c, err := client.DialWithLogger("127.0.0.1:9988", 5*time.Second, slog)
 	if err != nil {
-		log.Fatalf("failed to dial server: %v", err)
+		fatal(slog, "failed to dial server", err)
 	}
 	defer c.Close()
 
 	// 4KB reusable scratch buffer for both building requests and receiving replies
 	buf := make([]byte, 4*1024)
 
-	// SET
-	res, _ := c.Set([]byte("mykey"), []byte("myvalue"), 0, buf)
-	fmt.Printf("SET => %s\n", string(res))
+	res, err := c.Set([]byte("mykey"), []byte("myvalue"), 0, buf)
+	if err != nil {
+		fatal(slog, "SET failed", err)
+	}
+	slog.Log(logger.LevelInfo, "SET", logger.String("result", string(res)))
 
-	// GET
-	res, _ = c.Get([]byte("mykey"), buf)
-	fmt.Printf("GET => %s\n", string(res))
+	res, err = c.Get([]byte("mykey"), buf)
+	if err != nil {
+		fatal(slog, "GET failed", err)
+	}
+	slog.Log(logger.LevelInfo, "GET", logger.String("result", string(res)))
 
-	// DELETE
-	res, _ = c.Delete([]byte("mykey"), buf)
-	fmt.Printf("DEL => %s\n", string(res))
+	res, err = c.Delete([]byte("mykey"), buf)
+	if err != nil {
+		fatal(slog, "DELETE failed", err)
+	}
+	slog.Log(logger.LevelInfo, "DELETE", logger.String("result", string(res)))
+}
+
+// fatal logs the error and terminates the example process.
+func fatal(l logger.Logger, msg string, err error) {
+	if err != nil {
+		l.Log(logger.LevelFatal, msg, logger.String("error", err.Error()))
+	} else {
+		l.Log(logger.LevelFatal, msg)
+	}
+	os.Exit(1)
 }

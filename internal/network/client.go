@@ -19,6 +19,8 @@ import (
 	"net"
 	"os"
 	"time"
+
+	"github.com/Saxy/Tellstone/internal/log"
 )
 
 var (
@@ -31,11 +33,20 @@ var (
 
 // Client represents a high-performance synchronous connection to a Tellstone server.
 type Client struct {
-	conn net.Conn
+	conn   net.Conn
+	logger log.Logger
 }
 
 // Dial connects to a Tellstone server pool via the specified TCP address.
 func Dial(addr string, timeout time.Duration) (*Client, error) {
+	return DialWithLogger(addr, timeout, nil)
+}
+
+// DialWithLogger connects like Dial and reports connection lifecycle events to logger.
+func DialWithLogger(addr string, timeout time.Duration, logger log.Logger) (*Client, error) {
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
 	conn, err := net.DialTimeout("tcp", addr, timeout)
 	if err != nil {
 		return nil, err
@@ -43,13 +54,22 @@ func Dial(addr string, timeout time.Duration) (*Client, error) {
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 	}
-	return &Client{conn: conn}, nil
+	logger.Log(log.LevelInfo, "client: connected", log.String("addr", addr))
+	return &Client{conn: conn, logger: logger}, nil
 }
 
 // DialTLS connects to a Tellstone server with TLS 1.3 encryption.
 // certPath/keyPath are the client certificate and key for mTLS (pass empty for one-way TLS).
 // caPath is the CA certificate to verify the server (pass empty to skip verification).
 func DialTLS(addr string, certPath, keyPath, caPath string, timeout time.Duration) (*Client, error) {
+	return DialTLSWithLogger(addr, certPath, keyPath, caPath, timeout, nil)
+}
+
+// DialTLSWithLogger connects like DialTLS and reports connection lifecycle events to logger.
+func DialTLSWithLogger(addr string, certPath, keyPath, caPath string, timeout time.Duration, logger log.Logger) (*Client, error) {
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 		MaxVersion: tls.VersionTLS13,
@@ -86,12 +106,21 @@ func DialTLS(addr string, certPath, keyPath, caPath string, timeout time.Duratio
 	if err != nil {
 		return nil, err
 	}
-	return &Client{conn: conn}, nil
+	logger.Log(log.LevelInfo, "client: connected", log.String("addr", addr))
+	return &Client{conn: conn, logger: logger}, nil
 }
 
 // Close gracefully closes the underlying network connection.
 func (c *Client) Close() error {
-	return c.conn.Close()
+	err := c.conn.Close()
+	if c.logger != nil {
+		if err != nil {
+			c.logger.Log(log.LevelWarn, "client: close failed", log.String("error", err.Error()))
+		} else {
+			c.logger.Log(log.LevelInfo, "client: connection closed")
+		}
+	}
+	return err
 }
 
 // errReply converts a response into an error when it arrives in a MsgError

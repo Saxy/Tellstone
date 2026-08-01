@@ -2,7 +2,7 @@
 Package logger
 Tellstone Cloud-Native In-Memory Database
 File: logger.go
-Description: Adapter that bridges the internal log abstraction to Go's structured slog logger (JSON output).
+Description: Adapter that bridges the logging contract to Go's structured slog logger (JSON output).
 
 Authors:
 
@@ -14,55 +14,54 @@ import (
 	"context"
 	"log/slog"
 	"os"
-
-	"github.com/Saxy/Tellstone/internal/log"
 )
 
 type SlogAdapter struct {
 	slogLogger *slog.Logger
 }
 
-func NewSlogLogger(level log.Level) log.Logger {
-	var handler slog.Handler
+// NewSlogLogger builds a Logger backed by slog's JSON handler on stdout.
+// Logging is disabled by default in every other component; callers opt in.
+func NewSlogLogger(level Level) Logger {
 	opts := &slog.HandlerOptions{
 		Level: translateLevelToSlog(level),
 	}
-	handler = slog.NewJSONHandler(os.Stdout, opts)
+	handler := slog.NewJSONHandler(os.Stdout, opts)
 	return &SlogAdapter{slogLogger: slog.New(handler)}
 }
 
-func (s *SlogAdapter) Enabled(level log.Level) bool {
+func (s *SlogAdapter) Enabled(level Level) bool {
 	return s.slogLogger.Enabled(context.Background(), translateLevelToSlog(level))
 }
 
-func (s *SlogAdapter) Log(level log.Level, msg string, fields ...log.Field) {
+func (s *SlogAdapter) Log(level Level, msg string, fields ...Field) {
 	attrs := make([]any, len(fields))
 	for i, f := range fields {
 		switch f.Type {
-		case log.TypeString:
+		case TypeString:
 			attrs[i] = slog.String(f.Key, f.StrVal)
-		case log.TypeInt:
+		case TypeInt:
 			attrs[i] = slog.Int(f.Key, f.IntVal)
-		case log.TypeBool:
+		case TypeBool:
 			attrs[i] = slog.Bool(f.Key, f.BoolVal)
-		case log.TypeFloat:
+		case TypeFloat:
 			attrs[i] = slog.Float64(f.Key, f.FloatVal)
-		case log.TypeUint:
+		case TypeUint:
 			attrs[i] = slog.Uint64(f.Key, f.UintVal)
 		}
 	}
 	s.slogLogger.Log(context.Background(), translateLevelToSlog(level), msg, attrs...)
 }
 
-func translateLevelToSlog(l log.Level) slog.Level {
+func translateLevelToSlog(l Level) slog.Level {
 	switch l {
-	case log.LevelDebug:
+	case LevelDebug:
 		return slog.LevelDebug
-	case log.LevelInfo:
+	case LevelInfo:
 		return slog.LevelInfo
-	case log.LevelWarn:
+	case LevelWarn:
 		return slog.LevelWarn
-	case log.LevelError:
+	case LevelError:
 		return slog.LevelError
 	default:
 		return slog.LevelError

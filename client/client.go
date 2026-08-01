@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/network"
+	"github.com/Saxy/Tellstone/logger"
 )
 
 // Client is a synchronous connection to a Tellstone server.
@@ -14,7 +15,13 @@ type Client struct {
 
 // Dial connects to a Tellstone server pool via the specified TCP address.
 func Dial(addr string, timeout time.Duration) (*Client, error) {
-	c, err := network.Dial(addr, timeout)
+	return DialWithLogger(addr, timeout, nil)
+}
+
+// DialWithLogger connects like Dial and reports connection lifecycle events to logger.
+// logger may be nil to disable logging.
+func DialWithLogger(addr string, timeout time.Duration, logger logger.Logger) (*Client, error) {
+	c, err := network.DialWithLogger(addr, timeout, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -25,7 +32,13 @@ func Dial(addr string, timeout time.Duration) (*Client, error) {
 // certPath/keyPath are the client certificate and key for mTLS (pass empty for one-way TLS).
 // caPath is the CA certificate to verify the server (pass empty to skip verification).
 func DialTLS(addr string, certPath, keyPath, caPath string, timeout time.Duration) (*Client, error) {
-	c, err := network.DialTLS(addr, certPath, keyPath, caPath, timeout)
+	return DialTLSWithLogger(addr, certPath, keyPath, caPath, timeout, nil)
+}
+
+// DialTLSWithLogger connects like DialTLS and reports connection lifecycle events to logger.
+// logger may be nil to disable logging.
+func DialTLSWithLogger(addr string, certPath, keyPath, caPath string, timeout time.Duration, logger logger.Logger) (*Client, error) {
+	c, err := network.DialTLSWithLogger(addr, certPath, keyPath, caPath, timeout, logger)
 	if err != nil {
 		return nil, err
 	}

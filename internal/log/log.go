@@ -2,17 +2,10 @@
 Package log
 Tellstone Cloud-Native In-Memory Database
 File: log.go
-Description: Lightweight logging abstraction with log levels and a Logger interface.
-
-Authors:
-
-	Maximilian Hagen
-*/
-/*
-Package log
-Tellstone Cloud-Native In-Memory Database
-File: log.go
-Description: Lightweight logging abstraction defining log levels and a Logger interface.
+Description: Re-exports the public logging contract from the logger package so internal
+code keeps using the log.Level / log.Logger / log.Field identifiers it already imports.
+The contract lives in the non-internal logger package so public packages (client) can
+build and accept loggers without importing an internal package.
 
 Authors:
 
@@ -20,81 +13,43 @@ Authors:
 */
 package log
 
-type Level uint8
-
-func (l Level) String() string {
-	switch l {
-	case LevelDebug:
-		return "DEBUG"
-	case LevelInfo:
-		return "INFO"
-	case LevelWarn:
-		return "WARN"
-	case LevelError:
-		return "ERROR"
-	case LevelFatal:
-		return "FATAL"
-	default:
-		return "UNKNOWN"
-	}
-}
-
-const (
-	LevelDebug Level = iota
-	LevelInfo
-	LevelWarn
-	LevelError
-	LevelFatal
+import (
+	"github.com/Saxy/Tellstone/logger"
 )
 
-func ParseLogLevel(lvl string) Level {
-	switch lvl {
-	case "debug", "DEBUG":
-		return LevelDebug
-	case "info", "INFO":
-		return LevelInfo
-	case "warn", "WARN", "warning":
-		return LevelWarn
-	case "error", "ERROR":
-		return LevelError
-	case "fatal", "FATAL":
-		return LevelFatal
-	default:
-		return LevelInfo
-	}
-}
-
-type FieldType uint8
+type Level = logger.Level
+type FieldType = logger.FieldType
+type Field = logger.Field
+type Logger = logger.Logger
 
 const (
-	TypeString FieldType = iota
-	TypeInt
-	TypeBool
-	TypeFloat
-	TypeUint
+	LevelDebug = logger.LevelDebug
+	LevelInfo  = logger.LevelInfo
+	LevelWarn  = logger.LevelWarn
+	LevelError = logger.LevelError
+	LevelFatal = logger.LevelFatal
 )
 
-type Field struct {
-	Key      string
-	StrVal   string
-	IntVal   int
-	UintVal  uint64
-	BoolVal  bool
-	FloatVal float64
-	Type     FieldType
-}
+const (
+	TypeString = logger.TypeString
+	TypeInt    = logger.TypeInt
+	TypeBool   = logger.TypeBool
+	TypeFloat  = logger.TypeFloat
+	TypeUint   = logger.TypeUint
+)
 
-func String(key, val string) Field  { return Field{Key: key, StrVal: val, Type: TypeString} }
-func Int(key string, val int) Field { return Field{Key: key, IntVal: int(int64(val)), Type: TypeInt} }
+// ParseLogLevel maps a string level name to a Level, defaulting to Info.
+func ParseLogLevel(lvl string) Level { return logger.ParseLogLevel(lvl) }
+
+func String(key, val string) Field  { return logger.String(key, val) }
+func Int(key string, val int) Field { return logger.Int(key, val) }
 func Uint(key string, val uint32) Field {
-	return Field{Key: key, UintVal: uint64(val), Type: TypeUint}
+	return logger.Uint(key, val)
 }
-func Uint64(key string, val uint64) Field { return Field{Key: key, UintVal: val, Type: TypeUint} }
-func Int64(key string, val int64) Field   { return Field{Key: key, IntVal: int(val), Type: TypeInt} }
-func Float(key string, val float64) Field { return Field{Key: key, FloatVal: val, Type: TypeFloat} }
-func Bool(key string, val bool) Field     { return Field{Key: key, BoolVal: val, Type: TypeBool} }
+func Uint64(key string, val uint64) Field { return logger.Uint64(key, val) }
+func Int64(key string, val int64) Field   { return logger.Int64(key, val) }
+func Float(key string, val float64) Field { return logger.Float(key, val) }
+func Bool(key string, val bool) Field     { return logger.Bool(key, val) }
 
-type Logger interface {
-	Enabled(level Level) bool
-	Log(level Level, msg string, fields ...Field)
-}
+// NewNoOpLogger returns a Logger that discards every message.
+func NewNoOpLogger() Logger { return logger.NewNoOpLogger() }

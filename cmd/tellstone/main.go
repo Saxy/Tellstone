@@ -20,7 +20,6 @@ import (
 
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
-	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/version"
 	"github.com/Saxy/Tellstone/logger"
 	"github.com/Saxy/Tellstone/server"
@@ -86,8 +85,8 @@ func main() {
 	app.Start(cfg, logpkg)
 	svr := server.NewServer(app)
 	if err := svr.Run(); err != nil {
-		if logpkg.Enabled(log.LevelError) {
-			logpkg.Log(log.LevelError, "server terminated with error", log.String("error", err.Error()))
+		if logpkg.Enabled(logger.LevelError) {
+			logpkg.Log(logger.LevelError, "server terminated with error", logger.String("error", err.Error()))
 		}
 		os.Exit(1)
 	}

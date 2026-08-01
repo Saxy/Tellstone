@@ -7,20 +7,18 @@ import (
 	"log/slog"
 	"os"
 	"testing"
-
-	"github.com/Saxy/Tellstone/internal/log"
 )
 
 func TestTranslateLevelToSlog(t *testing.T) {
 	cases := []struct {
-		lvl      log.Level
+		lvl      Level
 		expected slog.Level
 	}{
-		{log.LevelDebug, slog.LevelDebug},
-		{log.LevelInfo, slog.LevelInfo},
-		{log.LevelWarn, slog.LevelWarn},
-		{log.LevelError, slog.LevelError},
-		{log.LevelFatal, slog.LevelError}, // default fallback maps fatal to error
+		{LevelDebug, slog.LevelDebug},
+		{LevelInfo, slog.LevelInfo},
+		{LevelWarn, slog.LevelWarn},
+		{LevelError, slog.LevelError},
+		{LevelFatal, slog.LevelError}, // default fallback maps fatal to error
 	}
 	for _, c := range cases {
 		got := translateLevelToSlog(c.lvl)
@@ -31,17 +29,17 @@ func TestTranslateLevelToSlog(t *testing.T) {
 }
 
 func TestSlogAdapterEnabled(t *testing.T) {
-	l := NewSlogLogger(log.LevelInfo)
-	if l.Enabled(log.LevelDebug) {
+	l := NewSlogLogger(LevelInfo)
+	if l.Enabled(LevelDebug) {
 		t.Fatalf("logger should not be enabled for Debug level when set to Info")
 	}
-	if !l.Enabled(log.LevelInfo) {
+	if !l.Enabled(LevelInfo) {
 		t.Fatalf("logger should be enabled for Info level")
 	}
-	if !l.Enabled(log.LevelWarn) {
+	if !l.Enabled(LevelWarn) {
 		t.Fatalf("logger should be enabled for Warn level")
 	}
-	if !l.Enabled(log.LevelError) {
+	if !l.Enabled(LevelError) {
 		t.Fatalf("logger should be enabled for Error level")
 	}
 }
@@ -70,9 +68,9 @@ func captureStdout(f func()) (string, error) {
 func TestSlogAdapterLogOutput(t *testing.T) {
 	// Capture stdout while logging
 	out, err := captureStdout(func() {
-		logger := NewSlogLogger(log.LevelDebug)
+		logger := NewSlogLogger(LevelDebug)
 		// Log a message with fields
-		logger.Log(log.LevelInfo, "test message", log.String("key", "value"), log.Int("num", 42))
+		logger.Log(LevelInfo, "test message", String("key", "value"), Int("num", 42))
 	})
 	if err != nil {
 		t.Fatalf("failed to capture stdout: %v", err)
@@ -105,8 +103,8 @@ func TestSlogAdapterLogOutput(t *testing.T) {
 
 func TestSlogAdapterLogSuppressedBelowThreshold(t *testing.T) {
 	out, err := captureStdout(func() {
-		logger := NewSlogLogger(log.LevelInfo) // Info threshold
-		logger.Log(log.LevelDebug, "debug should be suppressed")
+		logger := NewSlogLogger(LevelInfo) // Info threshold
+		logger.Log(LevelDebug, "debug should be suppressed")
 	})
 	if err != nil {
 		t.Fatalf("capture error: %v", err)
