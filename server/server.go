@@ -95,11 +95,11 @@ func (s *Server) Run() error {
 		}()
 		s.tlsConfigs = s.tlsReloader.Configs()
 	}
-	if err = s.initShards(cryptoEngine); err != nil {
-		return fmt.Errorf("shard init: %w", err)
-	}
 	if err = s.initRBAC(); err != nil {
 		return fmt.Errorf("rbac init: %w", err)
+	}
+	if err = s.initShards(cryptoEngine); err != nil {
+		return fmt.Errorf("shard init: %w", err)
 	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
