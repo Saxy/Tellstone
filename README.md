@@ -174,9 +174,9 @@ redis-cli -p 6379 SET k v EX 60   # OK (60s TTL)
 redis-cli -p 6379 DEL foo         # (integer) 1
 ```
 
-Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`, `ROLE`
-(`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`)**. Unknown commands return a `-ERR`
-reply without dropping the connection.
+Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`, `COMMAND`,
+`ROLE` (`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`)**. Unknown commands return a
+`-ERR` reply without dropping the connection.
 
 #### Authentication & RBAC
 

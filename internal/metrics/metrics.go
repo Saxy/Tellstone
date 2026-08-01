@@ -181,9 +181,9 @@ func (ac *AggregateCollector) WritePrometheus(w io.Writer) {
 		_, _ = w.Write(b)
 		_, _ = w.Write([]byte("\n\n"))
 	}
-	writeLabeled := func(name, labelName, labelValue, mType, help string, value uint64) {
-		_, _ = w.Write([]byte("# HELP " + name + " " + help + "\n"))
-		_, _ = w.Write([]byte("# TYPE " + name + " " + mType + "\n"))
+	// writeLabeledSample writes a single labeled sample; the HELP and TYPE lines
+	// are written once by the caller so per-role samples do not repeat metadata.
+	writeLabeledSample := func(name, labelName, labelValue string, value uint64) {
 		_, _ = w.Write([]byte(name + `{` + labelName + `="` + escapeLabelValue(labelValue) + `"} `))
 		b := strconv.AppendUint(buf[:0], value, 10)
 		_, _ = w.Write(b)
@@ -210,8 +210,12 @@ func (ac *AggregateCollector) WritePrometheus(w io.Writer) {
 		}
 		// Map iteration is unordered; sort so identical states render identically.
 		sort.Strings(names)
+		if len(names) > 0 {
+			_, _ = w.Write([]byte("# HELP tellstone_rbac_commands_total Data commands executed per role.\n"))
+			_, _ = w.Write([]byte("# TYPE tellstone_rbac_commands_total counter\n"))
+		}
 		for _, name := range names {
-			writeLabeled("tellstone_rbac_commands_total", "role", name, "counter", "Data commands executed per role.", counts[name])
+			writeLabeledSample("tellstone_rbac_commands_total", "role", name, counts[name])
 		}
 	}
 }

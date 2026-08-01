@@ -46,6 +46,13 @@ func (s *Store) DeniedCommands() uint64 { return atomic.LoadUint64(&s.deniedComm
 // RoleCommandCounts snapshots the executed-command counter of every role in the
 // active policy, keyed by role name. Scrape-time only (the map allocation is
 // fine here); the request path never touches it.
+//
+// The counters live on the immutable Role value a session pins at AUTH time, so
+// a SIGHUP reload that swaps in freshly parsed Role values resets every
+// per-role count: continuity across reloads is not supported because live
+// sessions keep counting against their pinned (pre-reload) role, which is no
+// longer read after the swap. Runtime ROLE CREATE does not reset anything —
+// Clone shares the existing Role values, so their counters carry over.
 func (s *Store) RoleCommandCounts() map[string]uint64 {
 	counts := make(map[string]uint64)
 	if p := s.Load(); p != nil {

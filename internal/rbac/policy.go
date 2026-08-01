@@ -112,3 +112,16 @@ func (s *Store) Load() *PolicyStore {
 func (s *Store) Store(policy *PolicyStore) {
 	s.active.Store(policy)
 }
+
+// Reload publishes a complete replacement snapshot (e.g. from a SIGHUP policy
+// file reload) serialized against concurrent ROLE mutations. Publishing under
+// mu means a reload can never land between a mutation's clone and its
+// republish, which would silently discard the other operation; it either lands
+// before the mutation or after it. mu is acquired here, so the caller must not
+// hold it and must not call the locking mutation helpers (CreateRole, SetUser,
+// DelUser, DeleteRole) while it is held.
+func (s *Store) Reload(policy *PolicyStore) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Store(policy)
+}

@@ -85,6 +85,15 @@ func (a *App) Start(cfg *config.Config, logger log.Logger) {
 			logger.Log(log.LevelInfo, "Telemetry stack configuration", log.String("telemetry", "NoOp Tracer"))
 		}
 	}
+	// --rbac-config and --require-pass are both authentication knobs; when both
+	// are set, per-user RBAC authentication supersedes the single shared
+	// password and require-pass is ignored.
+	if cfg.GetRBACConfig() != "" && cfg.GetRequirePass() != "" {
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "both --rbac-config and --require-pass are set",
+				log.String("auth", "RBAC authentication supersedes require-pass"))
+		}
+	}
 	if cfg.MTLSEnabled() {
 		if logger.Enabled(log.LevelInfo) {
 			logger.Log(log.LevelInfo, "Transport security",

@@ -55,10 +55,37 @@ func TestStoreDelUserAndDeleteRole(t *testing.T) {
 	if _, ok := store.Load().Roles["r"]; ok {
 		t.Fatal("deleted role must be gone")
 	}
+	// alice's only role was deleted and the policy has no Default: her next
+	// lookup must resolve to nil (deny-all), never to a stale role.
+	if r := store.Load().RoleFor("alice"); r != nil {
+		t.Fatalf("user referencing a deleted role must resolve to the nil default, got %q", r.Name)
+	}
 
 	store.DelUser("alice")
 	if store.Load().UserFor("alice") != nil {
 		t.Fatal("deleted user must be gone")
+	}
+}
+
+func TestStoreDeleteRoleClearsDefault(t *testing.T) {
+	role, err := ParseRole("r", "+GET")
+	if err != nil {
+		t.Fatalf("ParseRole: %v", err)
+	}
+	store := NewStore(&PolicyStore{
+		Roles:   map[string]*Role{"r": role},
+		Users:   map[string]*User{"alice": {Role: "r"}},
+		Default: role,
+	})
+	if err := store.DeleteRole("r"); err != nil {
+		t.Fatalf("DeleteRole: %v", err)
+	}
+	p := store.Load()
+	if p.Default != nil {
+		t.Fatalf("Default must be cleared when it refers to the deleted role, got %q", p.Default.Name)
+	}
+	if r := p.RoleFor("alice"); r != nil {
+		t.Fatalf("user with only the deleted role must resolve to nil (deny-all), got %q", r.Name)
 	}
 }
 

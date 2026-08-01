@@ -16,6 +16,7 @@ func BenchmarkIsAllowedAllowed(b *testing.B) {
 	sc := NewSessionContext("alice", role)
 	key := []byte("cache:session:abc")
 	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if !sc.IsAllowed(CmdGet, key) {
 			b.Fatal("expected allowed")
@@ -31,6 +32,7 @@ func BenchmarkIsAllowedDeniedByPrefix(b *testing.B) {
 	sc := NewSessionContext("alice", role)
 	key := []byte("users:123")
 	b.ReportAllocs()
+	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if sc.IsAllowed(CmdSet, key) {
 			b.Fatal("expected denied")

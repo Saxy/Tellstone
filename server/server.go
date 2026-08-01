@@ -36,12 +36,6 @@ import (
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 )
 
-var (
-	ErrEmptyKey       = errors.New("set requires a key")
-	ErrStorageFailure = errors.New("failed to store inside storage engine")
-	ErrInvalidOpCode  = errors.New("unsupported protocol operation")
-)
-
 type RouterStore struct {
 	router *router.Router
 }
@@ -221,7 +215,7 @@ func (s *Server) reloadRBAC() {
 		}
 		return
 	}
-	s.policy.Store(policy)
+	s.policy.Reload(policy)
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "rbac policy reloaded", log.String("path", path))
 	}
@@ -321,7 +315,14 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	if s.tlsReloader != nil {
 		tlsMetrics = s.tlsReloader
 	}
-	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics, s.policy)
+	// A nil *rbac.Store must not be boxed into the RBACMetrics interface: the
+	// scrape path treats a nil interface as "RBAC disabled", but a typed nil
+	// would pass the nil check and then panic on RoleCommandCounts.
+	var rbacMetrics metrics.RBACMetrics
+	if s.policy != nil {
+		rbacMetrics = s.policy
+	}
+	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics, rbacMetrics)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -375,7 +376,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 		return resp.Value, network.MsgResponse, nil
 	case network.OpSet:
 		if len(msg.Key) == 0 {
-			return network.ResponseEmptyKey, network.MsgError, ErrEmptyKey
+			return network.ResponseEmptyKey, network.MsgError, nil
 		}
 		ttlDuration := time.Duration(msg.TTL) * time.Millisecond
 		resp := s.router.Dispatch(shard.CmdSet, keyStr, msg.Value, ttlDuration)
@@ -383,7 +384,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 			if s.app.GetLogger().Enabled(log.LevelError) {
 				s.app.GetLogger().Log(log.LevelError, "failed to store inside storage engine", log.String("error", resp.Err.Error()))
 			}
-			return network.ResponseStorageFailure, network.MsgError, ErrStorageFailure
+			return network.ResponseStorageFailure, network.MsgError, nil
 		}
 		return network.ResponseOK, network.MsgResponse, nil
 	case network.OpDelete:
@@ -412,7 +413,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 			return s.roleGetUser(msg)
 		}
 	default:
-		return network.ResponseNotFound, network.MsgError, ErrInvalidOpCode
+		return network.ResponseInvalidOpCode, network.MsgError, nil
 	}
 }
 

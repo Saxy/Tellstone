@@ -106,7 +106,10 @@ func DecodeRoleGetUserResponse(payload []byte) (RoleUser, bool) {
 		return RoleUser{}, false
 	}
 	n := int(binary.BigEndian.Uint16(payload[:2]))
-	if 2+n+1 > len(payload) {
+	// The response must be exactly [2B roleLen][role][1B haspass]; trailing
+	// bytes mean a mismatched or corrupt frame, so reject them like the other
+	// decoders reject trailing garbage.
+	if 2+n+1 != len(payload) {
 		return RoleUser{}, false
 	}
 	return RoleUser{

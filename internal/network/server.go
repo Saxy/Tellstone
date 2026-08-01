@@ -507,6 +507,12 @@ type authResult struct {
 	dispatched  bool // true when bcrypt was sent to the worker pool
 }
 
+// dummyAuthHash is a fixed bcrypt hash verified against an unknown user's
+// password so a failed AUTH for a nonexistent username takes as long as one for
+// a real user — otherwise response latency leaks which users exist. The worker
+// comparison always fails against it (mirrors the RESP dummyAuthHash).
+var dummyAuthHash = []byte("$2a$10$cwFksVIrb4lyV/GA2fAmWeUFmAkmYlUGwkxVoF9r3Ccaus0H5LdOW")
+
 // handleAuthMessage consolidates the MsgAuth branch shared by the TLS and
 // plaintext OnTraffic paths. It handles the no-password bypass, fast-rejects
 // malformed payloads, validates the username, makes a copy of the password for
@@ -536,13 +542,19 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 		}
 		u := p.UserFor(name)
 		if u == nil {
-			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+			// An unknown username must cost the same bcrypt work as a wrong
+			// password for a real user — otherwise AUTH latency leaks which
+			// usernames exist. Dispatch the job against a fixed dummy hash so
+			// the worker's comparison fails normally (see dummyAuthHash).
+			passHash = dummyAuthHash
+		} else {
+			// Empty hash marks a nopass user that accepts any password (Redis
+			// ACL semantics). The session is built from the same snapshot that
+			// yielded the hash, and the *Role it references is immutable across
+			// hot-swaps.
+			passHash = u.PasswordHash
+			session = rbac.NewSessionContext(name, p.RoleFor(name))
 		}
-		// Empty hash marks a nopass user that accepts any password (Redis ACL
-		// semantics). The session is built from the same snapshot that yielded
-		// the hash, and the *Role it references is immutable across hot-swaps.
-		passHash = u.PasswordHash
-		session = rbac.NewSessionContext(name, p.RoleFor(name))
 	} else {
 		if len(username) > 0 && string(username) != "default" {
 			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}

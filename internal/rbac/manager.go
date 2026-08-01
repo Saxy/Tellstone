@@ -47,12 +47,15 @@ func (s *Store) SetUser(username, roleName string, passHash []byte) error {
 	defer s.mu.Unlock()
 	p := s.Load()
 	if p != nil {
-		if _, ok := p.Roles[roleName]; !ok {
-			return fmt.Errorf("rbac: unknown role %q", roleName)
-		}
 		p = p.Clone()
 	} else {
 		p = &PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}}
+	}
+	// Validate against the initialized snapshot so a fresh store rejects an
+	// unknown role just like an existing policy does — a user must never
+	// reference a dangling role name.
+	if _, ok := p.Roles[roleName]; !ok {
+		return fmt.Errorf("rbac: unknown role %q", roleName)
 	}
 	p.Users[username] = &User{Role: roleName, PasswordHash: passHash}
 	s.Store(p)
@@ -87,6 +90,12 @@ func (s *Store) DeleteRole(name string) error {
 		return fmt.Errorf("rbac: role %q does not exist", name)
 	}
 	p = p.Clone()
+	// If the deleted role is also the default fallback, drop the pointer too:
+	// otherwise RoleFor keeps resolving unassigned users to a role that no
+	// longer exists in p.Roles, silently failing open.
+	if p.Default == p.Roles[name] {
+		p.Default = nil
+	}
 	delete(p.Roles, name)
 	s.Store(p)
 	return nil

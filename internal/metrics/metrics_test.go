@@ -74,6 +74,10 @@ func TestAggregateCollectorRBACMetrics(t *testing.T) {
 			t.Fatalf("missing RBAC metric %q in output:\n%s", want, got)
 		}
 	}
+	// HELP/TYPE metadata must be emitted once, before the per-role samples.
+	if n := strings.Count(got, "# TYPE tellstone_rbac_commands_total counter"); n != 1 {
+		t.Fatalf("tellstone_rbac_commands_total TYPE declared %d times, want 1:\n%s", n, got)
+	}
 	// Sorted role output: admin must be rendered before readonly.
 	adminIdx := strings.Index(got, `role="admin"`)
 	readonlyIdx := strings.Index(got, `role="readonly"`)
