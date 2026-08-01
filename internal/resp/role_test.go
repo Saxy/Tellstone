@@ -43,7 +43,7 @@ func rbacTestPolicy(t *testing.T) *rbac.PolicyStore {
 func startRBACServer(t *testing.T) (addr string) {
 	t.Helper()
 	addr = freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "",
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false,
 		rbac.NewStore(rbacTestPolicy(t)))
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
@@ -188,7 +188,7 @@ func TestRESPServer_RBACNamespacePrefix(t *testing.T) {
 func TestRESPServer_RBACMetrics(t *testing.T) {
 	addr := freeAddr(t)
 	store := rbac.NewStore(rbacTestPolicy(t))
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", store)
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, store)
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

@@ -130,6 +130,7 @@ Every option is available as a flag and an environment variable.
 | `--addr`              | `TSD_ADDR`              | `127.0.0.1:9988` | Binary‑protocol listen address                           |
 | `--enable-resp`       | `TSD_ENABLE_RESP`       | `false`          | Enable the Redis‑compatible RESP listener                |
 | `--resp-addr`         | `TSD_RESP_ADDR`         | `127.0.0.1:6379` | RESP listen address                                      |
+| `--resp-starttls`     | `TSD_RESP_STARTTLS`     | `false`          | Allow RESP plaintext connections to upgrade with TLS     |
 | `--shards`            | `TSD_NUM_SHARDS`        | `0` (auto = CPU) | Number of shared-nothing shards                          |
 | `--max-msg-size`      | `TSD_MAX_MSG_SIZE`      | `16MiB`          | Per‑message size limit                                   |
 | `--max-mem-bytes`     | `TSD_MAX_MEM_BYTES`     | `0` (unlimited)  | Total engine memory ceiling                              |
@@ -154,9 +155,16 @@ path), `TSD_MEM_LIMIT_BYTES` (soft heap ceiling), `TSD_ENABLE_PROFILING` (serves
 `127.0.0.1:6060`).
 
 When TLS is enabled, Tellstone watches the parent directories of the certificate, key, and
-optional client CA. Valid replacements are applied to new connections after a 500 ms debounce;
-existing TLS connections continue uninterrupted. Directory watching supports atomic file renames
-and Kubernetes projected Secret updates.
+optional client CA. Valid replacements are applied after a 500 ms debounce; existing TLS
+connections continue uninterrupted. Directory watching supports atomic file renames and Kubernetes
+projected Secret updates.
+
+By default, both listeners require TLS from the first byte. Setting `--resp-starttls` keeps only the
+RESP listener plaintext until a client sends `STARTTLS`; Tellstone replies `+OK` in plaintext and
+then requires an immediate TLS 1.3 handshake on the same socket. `STARTTLS` is allowed before
+`AUTH` so credentials need not cross plaintext. The command must not be pipelined with any other
+plaintext bytes. The binary listener always retains implicit TLS, and each RESP upgrade loads the
+latest rotated certificate configuration.
 
 ---
 
@@ -176,7 +184,8 @@ redis-cli -p 6379 DEL foo         # (integer) 1
 
 Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`, `COMMAND`,
 `ROLE` (`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`)**. Unknown commands return a
-`-ERR` reply without dropping the connection.
+`-ERR` reply without dropping the connection. `STARTTLS` is additionally available when
+`--resp-starttls` is enabled.
 
 #### Authentication & RBAC
 

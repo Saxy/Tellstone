@@ -6,8 +6,8 @@ Description: Optional gnet event-loop server speaking RESP2, reusing the shared 
 via a small Store interface. Supports PING, GET, SET (with optional EX/PX), DEL, and AUTH;
 unknown commands return an error without dropping the connection. Exists so Tellstone can be
 driven by standard Redis tooling (redis-benchmark, memtier_benchmark) for cross-system
-comparison. Supports optional TLS 1.3 transport encryption via the internal TLS library.
-When a server password is configured (--require-pass / TSD_REQUIRE_PASS), connections must
+comparison. Supports optional implicit TLS 1.3 or an explicit STARTTLS in-place upgrade via the
+internal TLS library. When a server password is configured (--require-pass / TSD_REQUIRE_PASS), connections must
 authenticate via AUTH before issuing commands other than PING and QUIT.
 
 Authors:
@@ -31,6 +31,8 @@ import (
 	"github.com/panjf2000/gnet/v2"
 	"golang.org/x/crypto/bcrypt"
 )
+
+const tlsHandshakeTimeout = 10 * time.Second
 
 // Store is the subset of the storage engine the RESP server needs. *storage.Engine satisfies
 // it directly, which keeps this package decoupled and easy to test with a fake.
@@ -57,6 +59,9 @@ type connState struct {
 	// closeAfterReply is set by dispatch (QUIT) so the traffic loop flushes the pending
 	// replies and then returns gnet.Close instead of keeping the connection open.
 	closeAfterReply bool
+	// upgradeTLS is set only after a valid STARTTLS command. The plaintext traffic loop
+	// owns the transition so +OK can be flushed before TLS consumes the next inbound byte.
+	upgradeTLS bool
 }
 
 // Server is an edge-triggered RESP2 listener backed by gnet.
@@ -66,6 +71,7 @@ type Server struct {
 	store      Store
 	logger     log.Logger
 	tlsConfigs *tlslib.ConfigStore
+	startTLS   bool
 	// eng and ready let Shutdown reach the running gnet engine: OnBoot fires once the event
 	// loop is accepting connections and hands us the Engine handle we need to stop it; ready
 	// is closed at that point so a concurrent Shutdown call can block until it's safe to stop.
@@ -94,9 +100,10 @@ type Server struct {
 // accepted connection atomically loads the latest immutable TLS configuration.
 // requirePass is optional — if empty, AUTH is a no-op and connections start authenticated;
 // otherwise it is hashed once at startup and clients must AUTH before issuing commands.
+// startTLS keeps the RESP listener plaintext until a client successfully issues STARTTLS.
 // policy is optional — if nil, RBAC is disabled and every authenticated command is allowed;
 // otherwise AUTH resolves per-user credentials and sessions gate data commands.
-func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, policy *rbac.Store) *Server {
+func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, startTLS bool, policy *rbac.Store) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -116,6 +123,7 @@ func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logge
 		shards:          shards,
 		logger:          logger,
 		tlsConfigs:      tlsConfigs,
+		startTLS:        startTLS,
 		requirePassHash: passHash,
 		policy:          policy,
 		ready:           make(chan struct{}),
@@ -183,11 +191,11 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		session:       session,
 		remoteAddr:    c.RemoteAddr().String(),
 	}
-	if tlsCfg := s.tlsConfigs.Load(); tlsCfg != nil {
+	if tlsCfg := s.tlsConfigs.Load(); tlsCfg != nil && !s.startTLS {
 		adapter := tlslib.NewGnetConnAdapter(c)
 		st.tlsConn = tlslib.Server(adapter, tlsCfg)
 		st.readBuf = make([]byte, 0, 4096)
-		st.handshakeDeadline = time.Now().Add(10 * time.Second)
+		st.handshakeDeadline = time.Now().Add(tlsHandshakeTimeout)
 	}
 	c.SetContext(st)
 	return nil, gnet.None
@@ -315,10 +323,38 @@ func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
 	return gnet.None
 }
 
+// hasPipelinedSTARTTLS validates the transition before dispatching any command in the
+// inbound buffer. Checking only when STARTTLS reaches dispatch would allow commands before
+// it in the same buffer to execute even though the connection is then rejected.
+func (s *Server) hasPipelinedSTARTTLS(buf []byte, scratch [][]byte) bool {
+	consumed := 0
+	for consumed < len(buf) {
+		commandStart := consumed
+		args, n, err := Parse(buf[consumed:], scratch)
+		if err != nil {
+			return false
+		}
+		consumed += n
+		if len(args) == 1 && EqualFold(args[0], "STARTTLS") {
+			return commandStart != 0 || consumed != len(buf)
+		}
+	}
+	return false
+}
+
 // onTrafficPlaintext is the original zero-copy plaintext path.
 func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 	buf, err := c.Peek(-1)
 	if err != nil {
+		return gnet.Close
+	}
+	if s.startTLS && s.hasPipelinedSTARTTLS(buf, st.args) {
+		atomic.AddUint64(&s.protocolErrors, 1)
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "resp: pipelined STARTTLS rejected",
+				log.String("remote_addr", st.remoteAddr),
+			)
+		}
 		return gnet.Close
 	}
 	st.out = st.out[:0]
@@ -340,6 +376,9 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 		st.args = args[:0]
 		consumed += n
 		st.out = s.dispatch(st, args, st.out)
+		if st.upgradeTLS {
+			return s.upgradeToTLS(c, st, consumed)
+		}
 		if st.closeAfterReply {
 			// QUIT: stop parsing pipelined commands; flush replies, then close below.
 			break
@@ -372,6 +411,41 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 	return gnet.None
 }
 
+// upgradeToTLS flushes the plaintext acceptance reply before installing TLS state. The
+// configuration is loaded at upgrade time, not accept time, so an idle plaintext connection
+// observes the latest atomically rotated certificate when it eventually upgrades.
+func (s *Server) upgradeToTLS(c gnet.Conn, st *connState, consumed int) gnet.Action {
+	tlsCfg := s.tlsConfigs.Load()
+	if tlsCfg == nil {
+		return gnet.Close
+	}
+	if _, err := c.Write(st.out); err != nil {
+		return gnet.Close
+	}
+	if err := c.Flush(); err != nil {
+		return gnet.Close
+	}
+	if _, err := c.Discard(consumed); err != nil {
+		return gnet.Close
+	}
+
+	written := uint64(len(st.out))
+	atomic.AddUint64(&s.bytesWritten, written)
+	read := uint64(consumed)
+	atomic.AddUint64(&s.bytesRead, read)
+	if st.shardID >= 0 && st.shardID < len(s.shards) {
+		s.shards[st.shardID].AddBytesWritten(written)
+		s.shards[st.shardID].AddBytesRead(read)
+	}
+
+	adapter := tlslib.NewGnetConnAdapter(c)
+	st.tlsConn = tlslib.Server(adapter, tlsCfg)
+	st.readBuf = make([]byte, 0, 4096)
+	st.handshakeDeadline = time.Now().Add(tlsHandshakeTimeout)
+	st.upgradeTLS = false
+	return gnet.None
+}
+
 // dispatch executes a single command and appends its RESP reply to out.
 //
 // Lookup keys use a zero-copy unsafe string over the argument bytes (which alias the gnet read
@@ -385,9 +459,17 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 	if EqualFold(cmd, shard.CmdAuth) {
 		return s.auth(st, args, out)
 	}
-	// Unauthenticated connections may only issue AUTH, PING, and QUIT (Redis semantics).
-	if !st.authenticated && !EqualFold(cmd, shard.CmdPing) && !EqualFold(cmd, "QUIT") {
-		return AppendError(out, "NOAUTH Authentication required")
+	// STARTTLS precedes the authentication gate so credentials can remain encrypted.
+	// Its authenticated check stays in the default case below to avoid adding the
+	// optional feature branch to successful GET, SET, DEL, PING, and COMMAND dispatch.
+	if !st.authenticated {
+		if s.startTLS && EqualFold(cmd, "STARTTLS") {
+			return s.dispatchSTARTTLS(st, args, out)
+		}
+		// Unauthenticated connections may only issue AUTH, PING, and QUIT (Redis semantics).
+		if !EqualFold(cmd, shard.CmdPing) && !EqualFold(cmd, "QUIT") {
+			return AppendError(out, "NOAUTH Authentication required")
+		}
 	}
 	switch {
 	case EqualFold(cmd, shard.CmdGet):
@@ -470,6 +552,9 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 		return append(out, respOK...)
 
 	default:
+		if s.startTLS && EqualFold(cmd, "STARTTLS") {
+			return s.dispatchSTARTTLS(st, args, out)
+		}
 		return AppendError(out, "ERR unknown command '"+string(cmd)+"'")
 	}
 }
@@ -508,6 +593,20 @@ func (s *Server) countDenied() {
 	if s.policy != nil {
 		s.policy.IncDenied()
 	}
+}
+
+func (s *Server) dispatchSTARTTLS(st *connState, args [][]byte, out []byte) []byte {
+	if len(args) != 1 {
+		return AppendError(out, "ERR wrong number of arguments for 'starttls' command")
+	}
+	if st.tlsConn != nil {
+		return AppendError(out, "ERR connection is already encrypted")
+	}
+	if s.tlsConfigs.Load() == nil {
+		return AppendError(out, "ERR TLS not configured")
+	}
+	st.upgradeTLS = true
+	return append(out, respOK...)
 }
 
 // auth handles the AUTH command in both single-password (AUTH <password>) and ACL

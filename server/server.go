@@ -2,7 +2,7 @@
 Package server
 Tellstone Cloud-Native In-Memory Database
 File: server.go
-Description: Top-level server orchestration: initializes the shared-nothing shards, router, binary-protocol listener, optional RESP listener, and metrics server. Handles graceful shutdown on SIGINT/SIGTERM.
+Description: Top-level server orchestration: initializes the shared-nothing shards, router, binary-protocol listener, optional RESP/TLS listener, and metrics server. Handles graceful shutdown on SIGINT/SIGTERM.
 
 Authors:
 
@@ -351,7 +351,16 @@ func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	store := &RouterStore{router: s.router}
-	respSrv := resp.NewServer(cfg.GetRESPAddr(), store, s.shards, logger, s.tlsConfigs, cfg.GetRequirePass(), s.policy)
+	respSrv := resp.NewServer(
+		cfg.GetRESPAddr(),
+		store,
+		s.shards,
+		logger,
+		s.tlsConfigs,
+		cfg.GetRequirePass(),
+		cfg.RESPStartTLSEnabled(),
+		s.policy,
+	)
 	s.respSrv = respSrv
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {

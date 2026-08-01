@@ -111,6 +111,7 @@ Tellstone is a shared-nothing, in-memory key/value store with two protocol front
    - `SET key val [EX s|PX ms]` → `store.Set(key, val, ttl)`
    - `DEL key [key ...]` → `store.Delete(key)` per key
    - `COMMAND` → empty array (Redis tooling compatibility)
+   - `STARTTLS` → plaintext `+OK`, then TLS 1.3 on the same socket (opt-in)
 5. `server.RouterStore` wraps `router.Dispatch()` to satisfy the `Store` interface.
 6. Same shard path as binary protocol.
 
@@ -145,6 +146,7 @@ Every optional feature is disabled by default and has zero overhead when off:
 | RESP protocol | `--enable-resp` | off |
 | TLS / mTLS | `--tls-cert`, `--tls-key`, `--tls-ca` | off |
 | RBAC | `--rbac-config` | off |
+| RESP STARTTLS | `--resp-starttls` | off |
 | Encryption | `--enable-encryption` | off |
 | Metrics | `--enable-metrics` | off |
 | Persistence | `--enable-persistence` | off |
@@ -201,14 +203,20 @@ Both protocol servers use **gnet** (edge-triggered epoll), not `net.Conn` per-go
 This gives Linux-level performance with multi-reactor multicore support
 (`gnet.WithMulticore(true)`).
 
-### TLS Certificate Rotation
+### TLS Transport and Certificate Rotation
 
 When TLS is configured, one filesystem watcher monitors the distinct parent directories of the
 certificate, private key, and optional client CA. A complete replacement config is validated and
-published through a shared atomic pointer after a 500 ms debounce. Binary and RESP listeners load
-the pointer only when accepting a connection, so established connections retain their original
-TLS state while new connections use the rotated material. Parent-directory watching detects direct
-writes, atomic renames, and Kubernetes projected Secret `..data` symlink swaps.
+published through a shared atomic pointer after a 500 ms debounce. Binary and implicit-TLS RESP
+listeners load the pointer when accepting a connection. With `--resp-starttls`, the RESP listener
+instead loads it when processing the upgrade, before writing plaintext `+OK` and before reading the
+client's TLS handshake. Established TLS connections retain their original state while later accepts
+or upgrades use the rotated material. Parent-directory watching detects direct writes, atomic
+renames, and Kubernetes projected Secret `..data` symlink swaps.
+
+STARTTLS is accepted before authentication so credentials can be sent only after encryption. The
+server rejects a transition sharing an inbound buffer with any other plaintext command or bytes;
+otherwise those bytes could cross the transport-security boundary without TLS integrity.
 
 ### Persistence (WAL)
 

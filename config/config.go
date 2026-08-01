@@ -34,6 +34,7 @@ type Config struct {
 	maxMemBytes       uint64
 	enableRESP        bool
 	respAddr          string
+	respStartTLS      bool
 	shutdownTimeout   time.Duration
 	numShards         int
 	enablePersistence bool
@@ -109,6 +110,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_MAX_MEM_BYTES   – optional engine memory ceiling (e.g. "512MiB"; 0 = unlimited)
 //		TSD_ENABLE_RESP     – boolean to enable the Redis-compatible RESP listener (default: false)
 //		TSD_RESP_ADDR       – RESP listener address (default 127.0.0.1:6379)
+//		TSD_RESP_STARTTLS   – allow RESP clients to upgrade plaintext connections to TLS
 //		TSD_ENABLE_METRICS  – boolean to activate the Prometheus exporter (default: false)
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
 //		TSD_SHUTDOWN_TIMEOUT – max wait for graceful shutdown on SIGINT/SIGTERM (default: 10s)
@@ -227,6 +229,12 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_RESP_ADDR", "127.0.0.1:6379"),
 		"RESP listener address (default: 127.0.0.1:6379)",
 	)
+	fs.BoolVar(
+		&cfg.respStartTLS,
+		"resp-starttls",
+		getEnv("TSD_RESP_STARTTLS", false),
+		"Allow RESP clients to upgrade plaintext connections with STARTTLS (default: false)",
+	)
 	// Maximum time graceful shutdown waits for in-flight connections to drain after
 	// SIGINT/SIGTERM before forcing termination.
 	fs.DurationVar(
@@ -315,6 +323,9 @@ func LoadConfig(args []string) *Config {
 	if cfg.tlsCA != "" && cfg.tlsCert == "" {
 		panic("tellstone: --tls-ca requires --tls-cert and --tls-key")
 	}
+	if cfg.respStartTLS && cfg.tlsCert == "" {
+		panic("tellstone: --resp-starttls requires --tls-cert and --tls-key")
+	}
 	return cfg
 }
 
@@ -331,6 +342,7 @@ func (cfg *Config) GetMaxMsgSize() uint64             { return cfg.maxMsgSize }
 func (cfg *Config) GetMaxMemBytes() uint64            { return cfg.maxMemBytes }
 func (cfg *Config) RESPEnabled() bool                 { return cfg.enableRESP }
 func (cfg *Config) GetRESPAddr() string               { return cfg.respAddr }
+func (cfg *Config) RESPStartTLSEnabled() bool         { return cfg.respStartTLS }
 func (cfg *Config) GetShutdownTimeout() time.Duration { return cfg.shutdownTimeout }
 func (cfg *Config) GetNumShards() int                 { return cfg.numShards }
 func (cfg *Config) PersistenceEnabled() bool          { return cfg.enablePersistence }

@@ -318,6 +318,44 @@ func TestTLSFlagsOverrideEnvVars(t *testing.T) {
 	}
 }
 
+func TestRESPStartTLSDefaultsDisabled(t *testing.T) {
+	t.Setenv("TSD_RESP_STARTTLS", "")
+	cfg := LoadConfig(nil)
+	if cfg.RESPStartTLSEnabled() {
+		t.Fatal("RESP STARTTLS should be disabled by default")
+	}
+}
+
+func TestRESPStartTLSFlagAndEnv(t *testing.T) {
+	cfg := LoadConfig([]string{
+		"--tls-cert", "/path/to/cert.pem",
+		"--tls-key", "/path/to/key.pem",
+		"--resp-starttls",
+	})
+	if !cfg.RESPStartTLSEnabled() {
+		t.Fatal("RESP STARTTLS should be enabled by flag")
+	}
+
+	t.Setenv("TSD_TLS_CERT", "/env/cert.pem")
+	t.Setenv("TSD_TLS_KEY", "/env/key.pem")
+	t.Setenv("TSD_RESP_STARTTLS", "true")
+	cfg = LoadConfig(nil)
+	if !cfg.RESPStartTLSEnabled() {
+		t.Fatal("RESP STARTTLS should be enabled by environment")
+	}
+}
+
+func TestRESPStartTLSPanicWithoutTLS(t *testing.T) {
+	t.Setenv("TSD_TLS_CERT", "")
+	t.Setenv("TSD_TLS_KEY", "")
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when RESP STARTTLS is enabled without TLS material")
+		}
+	}()
+	LoadConfig([]string{"--resp-starttls"})
+}
+
 func TestRequirePassDefaultEmpty(t *testing.T) {
 	cfg := LoadConfig(nil)
 	if cfg.GetRequirePass() != "" {
