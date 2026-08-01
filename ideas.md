@@ -9,7 +9,7 @@
 - RESP server — all 5 counters tracked (`resp/server.go:606-610`) but the server is never passed to metrics, so RESP `protocolErrors` are invisible
 
 **Wiring bugs:**
-- Production uses only shard collectors (`server/server.go:324`); `AggregateCollector.WritePrometheus` never renders its stored `networkServer` (`metrics.go:169-217`), so plain `tellstone_network_*` never appears — only `tellstone_shard_N_*`. `NewCollector` (network-only) is test-only.
+- Production uses only shard collectors (`startMetricsServer` in `server/server.go`); `AggregateCollector.WritePrometheus` never renders its stored `networkServer`, so plain `tellstone_network_*` never appears — only `tellstone_shard_N_*`. `NewCollector` (network-only) is test-only.
 - Shard counters are incremented by BOTH binary and RESP listeners, conflating both.
 
 **Not tracked at all:** router (no latency/command stats), SIGHUP/RBAC reload (TLS has `ReloadTotal`/`ReloadErrorsTotal`; RBAC has nothing), startup/shutdown, persistence (WAL records counted then discarded), crypto package, protocol parser.
