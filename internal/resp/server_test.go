@@ -149,6 +149,27 @@ func TestRESPServer_AuthRequired(t *testing.T) {
 		"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n", "-NOAUTH Authentication required\r\n")
 }
 
+func TestRESPServer_AuthPipeline(t *testing.T) {
+	addr := startServer(t, "sekret")
+
+	// AUTH is verified off the event loop by the worker pool. A GET pipelined
+	// behind it in the same write must not run unauthenticated: its reply
+	// arrives only after the async AUTH completes.
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+	expectReply(t, conn, "pipelined AUTH + GET",
+		"*2\r\n$4\r\nAUTH\r\n$6\r\nsekret\r\n*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
+		"+OK\r\n$-1\r\n")
+
+	// A pipelined SET after a failed AUTH must still be denied on a
+	// connection that never authenticated.
+	conn2 := dialWithRetry(t, addr)
+	defer conn2.Close()
+	expectReply(t, conn2, "pipelined failed AUTH + SET",
+		"*2\r\n$4\r\nAUTH\r\n$5\r\nwrong\r\n*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+		"-ERR invalid password\r\n-NOAUTH Authentication required\r\n")
+}
+
 func TestRESPServer_QuitPreAuth(t *testing.T) {
 	addr := startServer(t, "sekret")
 

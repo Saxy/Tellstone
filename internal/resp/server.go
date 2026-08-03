@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -34,12 +35,38 @@ import (
 
 const tlsHandshakeTimeout = 10 * time.Second
 
+// maxAuthFails closes the connection after this many failed AUTH attempts,
+// throttling bcrypt-fuelled credential stuffing (mirrors the binary listener).
+const maxAuthFails = 3
+
+// numAuthWorkers and authQueueCap bound the bcrypt worker pool. bcrypt at cost
+// 10 takes ~50-80ms, so a flood of AUTH commands must not block the gnet event
+// loop: workers run the compare off-loop and dispatchAuth fails fast when the
+// queue is saturated instead of stalling the connection.
+const (
+	numAuthWorkers = 4
+	authQueueCap   = 256
+)
+
 // Store is the subset of the storage engine the RESP server needs. *storage.Engine satisfies
 // it directly, which keeps this package decoupled and easy to test with a fake.
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte, ttl time.Duration) error
 	Delete(key string)
+}
+
+// authJob carries one AUTH verification request from the event loop to the
+// bcrypt worker pool. password is a private copy: the worker must not read the
+// gnet buffer after the event loop has moved on. passHash nil marks a nopass
+// user that accepts any password (Redis ACL semantics).
+type authJob struct {
+	c        gnet.Conn
+	password []byte
+	passHash []byte
+	username string
+	reason   string
+	session  *rbac.SessionContext
 }
 
 // connState holds per-connection scratch buffers reused across OnTraffic calls so the hot
@@ -62,6 +89,12 @@ type connState struct {
 	// upgradeTLS is set only after a valid STARTTLS command. The plaintext traffic loop
 	// owns the transition so +OK can be flushed before TLS consumes the next inbound byte.
 	upgradeTLS bool
+	// authPending is set while an AUTH verification is in flight in the worker
+	// pool. While set, the traffic loops return gnet.None so pipelined commands
+	// cannot run unauthenticated; the worker's Wake clears it and re-triggers
+	// processing. authFails counts failed AUTH attempts against maxAuthFails.
+	authPending bool
+	authFails   int
 }
 
 // Server is an edge-triggered RESP2 listener backed by gnet.
@@ -92,6 +125,12 @@ type Server struct {
 	// authorization checks run (zero-overhead no-op path). When set, AUTH resolves
 	// per-user bcrypt hashes and every data command is gated by the session.
 	policy *rbac.Store
+
+	// authJobs and workerWg back the bcrypt worker pool, created only when a
+	// password or a policy is configured (see NewServer). authWorker goroutines
+	// consume authJobs off the event loop; workerWg lets Shutdown drain them.
+	authJobs chan authJob
+	workerWg sync.WaitGroup
 }
 
 // NewServer creates a RESP server bound to addr that dispatches commands to store.
@@ -117,7 +156,7 @@ func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logge
 			panic("resp: invalid --require-pass value: " + err.Error())
 		}
 	}
-	return &Server{
+	s := &Server{
 		addr:            addr,
 		store:           store,
 		shards:          shards,
@@ -128,6 +167,16 @@ func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logge
 		policy:          policy,
 		ready:           make(chan struct{}),
 	}
+	// The worker pool exists only when authentication is actually required, so
+	// the zero-overhead no-password path spawns no goroutines.
+	if passHash != nil || policy != nil {
+		s.authJobs = make(chan authJob, authQueueCap)
+		for i := 0; i < numAuthWorkers; i++ {
+			s.workerWg.Add(1)
+			go s.authWorker()
+		}
+	}
+	return s
 }
 
 // ListenAndServe starts the multi-reactor epoll event loop (blocking).
@@ -145,9 +194,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-s.ready:
 	case <-ctx.Done():
+		if s.authJobs != nil {
+			close(s.authJobs)
+		}
+		s.workerWg.Wait()
 		return ctx.Err()
 	}
-	return s.eng.Stop(ctx)
+	// Stop the engine first: this synchronously shuts down all event-loop
+	// goroutines, so no more concurrent sends to s.authJobs can occur.
+	err := s.eng.Stop(ctx)
+	if s.authJobs != nil {
+		close(s.authJobs)
+	}
+	s.workerWg.Wait()
+	return err
 }
 
 // connectionAuth resolves the starting authentication state for a new connection.
@@ -294,7 +354,14 @@ func (s *Server) processBuffer(st *connState, c gnet.Conn, src []byte) (consumed
 		}
 		st.args = args[:0]
 		consumed += n
-		st.out = s.dispatch(st, args, st.out)
+		var async bool
+		st.out, async = s.dispatch(st, c, args, st.out)
+		if async {
+			// AUTH was dispatched to the bcrypt worker pool. Stop parsing
+			// pipelined commands so they cannot run unauthenticated; the
+			// worker's Wake writes the reply and re-triggers processing.
+			break
+		}
 		if st.upgradeTLS {
 			if s.upgradeToTLS(c, st, consumed) == gnet.Close {
 				return consumed, false, true
@@ -313,6 +380,11 @@ func (s *Server) processBuffer(st *connState, c gnet.Conn, src []byte) (consumed
 // writes encrypted responses through the TLS connection. It returns gnet.Close
 // on protocol or write errors so the caller propagates the close.
 func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
+	if st.authPending {
+		// An AUTH verification is in flight; the worker's Wake writes the
+		// reply and triggers this path again once it completes.
+		return gnet.None
+	}
 	consumed, _, bad := s.processBuffer(st, c, st.readBuf)
 	if bad {
 		return gnet.Close
@@ -364,6 +436,11 @@ func (s *Server) hasPipelinedSTARTTLS(buf []byte, scratch [][]byte) bool {
 
 // onTrafficPlaintext is the original zero-copy plaintext path.
 func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
+	if st.authPending {
+		// An AUTH verification is in flight; the worker's Wake writes the
+		// reply and triggers this path again once it completes.
+		return gnet.None
+	}
 	buf, err := c.Peek(-1)
 	if err != nil {
 		return gnet.Close
@@ -448,75 +525,78 @@ func (s *Server) upgradeToTLS(c gnet.Conn, st *connState, consumed int) gnet.Act
 	return gnet.None
 }
 
-// dispatch executes a single command and appends its RESP reply to out.
+// dispatch executes a single command and appends its RESP reply to out. The
+// second return is true when an AUTH was dispatched to the bcrypt worker pool,
+// in which case no reply was appended and the caller must stop processing the
+// current buffer until the worker's Wake delivers it.
 //
 // Lookup keys use a zero-copy unsafe string over the argument bytes (which alias the gnet read
 // buffer): this is safe because Get does not retain the key, and Set clones the key and copies
 // the value before storing them.
-func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
+func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte) ([]byte, bool) {
 	if len(args) == 0 {
-		return AppendError(out, "ERR empty command")
+		return AppendError(out, "ERR empty command"), false
 	}
 	cmd := args[0]
 	if EqualFold(cmd, shard.CmdAuth) {
-		return s.auth(st, args, out)
+		return s.auth(st, c, args, out)
 	}
 	// STARTTLS precedes the authentication gate so credentials can remain encrypted.
 	// Its authenticated check stays in the default case below to avoid adding the
 	// optional feature branch to successful GET, SET, DEL, PING, and COMMAND dispatch.
 	if !st.authenticated {
 		if s.startTLS && EqualFold(cmd, "STARTTLS") {
-			return s.dispatchSTARTTLS(st, args, out)
+			return s.dispatchSTARTTLS(st, args, out), false
 		}
 		// Unauthenticated connections may only issue AUTH, PING, and QUIT (Redis semantics).
 		if !EqualFold(cmd, shard.CmdPing) && !EqualFold(cmd, "QUIT") {
-			return AppendError(out, "NOAUTH Authentication required")
+			return AppendError(out, "NOAUTH Authentication required"), false
 		}
 	}
 	switch {
 	case EqualFold(cmd, shard.CmdGet):
 		if len(args) != 2 {
-			return AppendError(out, "ERR wrong number of arguments for 'get' command")
+			return AppendError(out, "ERR wrong number of arguments for 'get' command"), false
 		}
 		if !s.authorized(st, rbac.CmdGet, args[1]) {
 			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'get' command on this key")
+			return AppendError(out, "NOPERM no permission for 'get' command on this key"), false
 		}
 		s.countCommand(st)
 		key := *(*string)(unsafe.Pointer(&args[1]))
 		val, ok := s.store.Get(key)
 		if !ok {
-			return AppendNullBulk(out)
+			return AppendNullBulk(out), false
 		}
-		return AppendBulk(out, val)
+		return AppendBulk(out, val), false
 
 	case EqualFold(cmd, shard.CmdSet):
 		if len(args) != 3 && len(args) != 5 {
-			return AppendError(out, "ERR wrong number of arguments for 'set' command")
+			return AppendError(out, "ERR wrong number of arguments for 'set' command"), false
 		}
 		if !s.authorized(st, rbac.CmdSet, args[1]) {
 			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'set' command on this key")
+			return AppendError(out, "NOPERM no permission for 'set' command on this key"), false
 		}
 		s.countCommand(st)
 		key := *(*string)(unsafe.Pointer(&args[1]))
 		ttl, ok := parseSetTTL(args)
 		if !ok {
-			return AppendError(out, "ERR syntax error")
+			return AppendError(out, "ERR syntax error"), false
 		}
 		if err := s.store.Set(key, args[2], ttl); err != nil {
-			return AppendError(out, "ERR "+err.Error())
+			return AppendError(out, "ERR "+err.Error()), false
 		}
-		return append(out, respOK...)
+		return append(out, respOK...), false
 
 	case EqualFold(cmd, shard.CmdDel):
 		if len(args) < 2 {
-			return AppendError(out, "ERR wrong number of arguments for 'del' command")
+			return AppendError(out, "ERR wrong number of arguments for 'del' command"), false
 		}
 		for _, k := range args[1:] {
 			if !s.authorized(st, rbac.CmdDel, k) {
 				s.countDenied()
-				return AppendError(out, "NOPERM no permission for 'del' command on this key")
+				return AppendError(out, "NOPERM no permission for 'del' command on this key"), false
 			}
 		}
 		s.countCommand(st)
@@ -528,44 +608,44 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 				n++
 			}
 		}
-		return AppendInt(out, n)
+		return AppendInt(out, n), false
 
 	case EqualFold(cmd, shard.CmdPing):
 		if len(args) >= 2 {
-			return AppendBulk(out, args[1])
+			return AppendBulk(out, args[1]), false
 		}
-		return append(out, respPong...)
+		return append(out, respPong...), false
 
 	case EqualFold(cmd, shard.CmdCommand):
 		// redis-cli / some tools probe COMMAND DOCS|COUNT at startup; an empty array keeps
 		// the session alive without implementing the introspection surface.
-		return append(out, "*0\r\n"...)
+		return append(out, "*0\r\n"...), false
 
 	case EqualFold(cmd, shard.CmdRole):
 		if !s.authorizedCmd(st, rbac.CmdRole) {
 			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'role' command")
+			return AppendError(out, "NOPERM no permission for 'role' command"), false
 		}
 		s.countCommand(st)
-		return s.role(st, args, out)
+		return s.role(st, args, out), false
 
 	case EqualFold(cmd, shard.CmdACL):
 		if !s.authorizedCmd(st, rbac.CmdACL) {
 			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'acl' command")
+			return AppendError(out, "NOPERM no permission for 'acl' command"), false
 		}
 		s.countCommand(st)
-		return s.acl(st, args, out)
+		return s.acl(st, args, out), false
 
 	case EqualFold(cmd, "QUIT"):
 		st.closeAfterReply = true
-		return append(out, respOK...)
+		return append(out, respOK...), false
 
 	default:
 		if s.startTLS && EqualFold(cmd, "STARTTLS") {
-			return s.dispatchSTARTTLS(st, args, out)
+			return s.dispatchSTARTTLS(st, args, out), false
 		}
-		return AppendError(out, "ERR unknown command '"+string(cmd)+"'")
+		return AppendError(out, "ERR unknown command '"+string(cmd)+"'"), false
 	}
 }
 
@@ -623,16 +703,18 @@ func (s *Server) dispatchSTARTTLS(st *connState, args [][]byte, out []byte) []by
 // (AUTH <username> <password>) forms. When RBAC is enabled, per-user bcrypt hashes
 // from the policy store are verified instead of the single --require-pass password;
 // otherwise, when no password is configured, AUTH is a backward-compatible no-op
-// that replies +OK. bcrypt comparison happens only here, never on the hot path.
-func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
+// that replies +OK. The second return is true when the verification was dispatched
+// to the bcrypt worker pool: the reply arrives later via the worker's Wake, so the
+// caller must not append or flush anything for this command.
+func (s *Server) auth(st *connState, c gnet.Conn, args [][]byte, out []byte) ([]byte, bool) {
 	if len(args) != 2 && len(args) != 3 {
-		return AppendError(out, "ERR wrong number of arguments for 'auth' command")
+		return AppendError(out, "ERR wrong number of arguments for 'auth' command"), false
 	}
 	if s.policy != nil {
-		return s.authRBAC(st, args, out)
+		return s.authRBAC(st, c, args, out)
 	}
 	if s.requirePassHash == nil {
-		return append(out, respOK...)
+		return append(out, respOK...), false
 	}
 	// Single-password mode knows only the implicit "default" user; per-user
 	// identities and the ACL command family live in the RBAC/ACL path above.
@@ -643,53 +725,138 @@ func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
 		username = string(args[1])
 	}
 	if username != "default" {
-		return s.authFailed(st, username, "unknown user", out)
+		return s.authFailed(st, username, "unknown user", out), false
 	}
-	if bcrypt.CompareHashAndPassword(s.requirePassHash, args[len(args)-1]) != nil {
-		return s.authFailed(st, username, "invalid password", out)
+	password := make([]byte, len(args[len(args)-1]))
+	copy(password, args[len(args)-1])
+	if !s.dispatchAuth(c, username, "invalid password", password, s.requirePassHash, nil) {
+		return AppendError(out, "ERR invalid password"), false
 	}
-	st.authenticated = true
-	return append(out, respOK...)
+	st.authPending = true
+	return out, true
 }
 
 // authRBAC authenticates against the policy store's per-user bcrypt hashes.
-// A nopass user accepts any password (Redis semantics). On success the
-// resolved role is pinned to the connection as a SessionContext; a user
-// without an assignable role gets a deny-all session (fail-closed).
-func (s *Server) authRBAC(st *connState, args [][]byte, out []byte) []byte {
+// A nopass user accepts any password (Redis semantics); users with a hash are
+// verified off the event loop by the worker pool. On success the resolved role
+// is pinned to the connection as a SessionContext; a user without an assignable
+// role gets a deny-all session (fail-closed).
+func (s *Server) authRBAC(st *connState, c gnet.Conn, args [][]byte, out []byte) ([]byte, bool) {
 	username := "default"
 	if len(args) == 3 {
 		username = string(args[1])
 	}
 	p := s.policy.Load()
 	if p == nil {
-		return s.authFailed(st, username, "policy not loaded", out)
+		return s.authFailed(st, username, "policy not loaded", out), false
 	}
 	u := p.UserFor(username)
 	if u == nil {
-		return s.authFailed(st, username, "unknown user", out)
+		return s.authFailed(st, username, "unknown user", out), false
 	}
-	if len(u.PasswordHash) > 0 && bcrypt.CompareHashAndPassword(u.PasswordHash, args[len(args)-1]) != nil {
-		return s.authFailed(st, username, "invalid password", out)
+	if len(u.PasswordHash) == 0 {
+		// nopass user: authentication succeeds without any hashing.
+		st.authenticated = true
+		st.session = rbac.NewSessionContext(username, p.RoleFor(username))
+		return append(out, respOK...), false
 	}
-	st.authenticated = true
-	st.session = rbac.NewSessionContext(username, p.RoleFor(username))
-	return append(out, respOK...)
+	// The session is built from the same snapshot that yielded the hash; the
+	// *Role and the hash it references are immutable across hot-swaps, so the
+	// worker may use them after the event loop has moved on.
+	password := make([]byte, len(args[len(args)-1]))
+	copy(password, args[len(args)-1])
+	if !s.dispatchAuth(c, username, "invalid password", password, u.PasswordHash, rbac.NewSessionContext(username, p.RoleFor(username))) {
+		return AppendError(out, "ERR invalid password"), false
+	}
+	st.authPending = true
+	return out, true
 }
 
 // authFailed records a rejected AUTH attempt — bumping the store-wide counter
-// and appending to the ACL LOG buffer when RBAC is enabled — logs it, and
-// appends the RESP error reply.
+// and appending to the ACL LOG buffer when RBAC is enabled — counts it against
+// the per-connection maxAuthFails limit (closing the connection when reached),
+// logs it, and appends the RESP error reply.
 func (s *Server) authFailed(st *connState, username, reason string, out []byte) []byte {
 	if s.policy != nil {
 		s.policy.LogAuthFailure(username, st.remoteAddr, reason)
 	}
+	st.authFails++
 	if s.logger.Enabled(log.LevelWarn) {
 		s.logger.Log(log.LevelWarn, "resp: failed AUTH attempt",
 			log.String("remote_addr", st.remoteAddr),
+			log.Int("attempts", st.authFails),
 		)
 	}
+	if st.authFails >= maxAuthFails {
+		st.closeAfterReply = true
+	}
 	return AppendError(out, "ERR invalid password")
+}
+
+// dispatchAuth submits an AUTH verification job to the bounded worker pool.
+// Returns false when the pool is saturated so the caller fails the AUTH
+// synchronously instead of stalling the connection.
+func (s *Server) dispatchAuth(c gnet.Conn, username, reason string, password, passHash []byte, session *rbac.SessionContext) bool {
+	select {
+	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session, username: username, reason: reason}:
+		return true
+	default:
+		return false
+	}
+}
+
+// authWorker is a background goroutine that runs bcrypt verification off the
+// gnet event loop. On completion it wakes the connection to deliver the result
+// and write the response, so the loop never blocks on a compare.
+func (s *Server) authWorker() {
+	defer s.workerWg.Done()
+	for job := range s.authJobs {
+		// A nil passHash marks a nopass user that accepts any password
+		// (Redis ACL semantics). In single-password mode passHash is never
+		// nil because the workers only run when a hash or a policy exists.
+		success := job.passHash == nil || bcrypt.CompareHashAndPassword(job.passHash, job.password) == nil
+		_ = job.c.Wake(func(c gnet.Conn, _ error) error {
+			st, _ := c.Context().(*connState)
+			if st == nil {
+				return nil
+			}
+			st.authPending = false
+			var reply []byte
+			if success {
+				st.authenticated = true
+				st.session = job.session
+				reply = append(reply, respOK...)
+			} else {
+				reply = s.authFailed(st, job.username, job.reason, nil)
+			}
+			var writeErr error
+			if st.tlsConn != nil {
+				_, writeErr = st.tlsConn.Write(reply)
+			} else {
+				_, writeErr = c.Write(reply)
+			}
+			if writeErr != nil {
+				if s.logger.Enabled(log.LevelError) {
+					s.logger.Log(log.LevelError, "resp: auth reply write failed",
+						log.String("error", writeErr.Error()),
+					)
+				}
+				_ = c.Close()
+				return nil
+			}
+			n := uint64(len(reply))
+			atomic.AddUint64(&s.bytesWritten, n)
+			if st.shardID >= 0 && st.shardID < len(s.shards) {
+				s.shards[st.shardID].AddBytesWritten(n)
+			}
+			if st.closeAfterReply {
+				_ = c.Close()
+				return nil
+			}
+			_ = c.Wake(nil)
+			return nil
+		})
+	}
 }
 
 // parseSetTTL extracts the TTL from a SET command. Returns (0, true) for a plain 3-arg SET,

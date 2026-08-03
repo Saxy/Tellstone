@@ -69,7 +69,7 @@ func BenchmarkDispatchGetHit(b *testing.B) {
 	out := make([]byte, 0, 128)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		out = srv.dispatch(st, args, out[:0])
+		out, _ = srv.dispatch(st, nil, args, out[:0])
 	}
 }
 
@@ -82,7 +82,7 @@ func BenchmarkDispatchSet(b *testing.B) {
 	out := make([]byte, 0, 128)
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		out = srv.dispatch(st, args, out[:0])
+		out, _ = srv.dispatch(st, nil, args, out[:0])
 	}
 }
 
@@ -97,7 +97,7 @@ func BenchmarkDispatchSetParallel(b *testing.B) {
 		args := [][]byte{[]byte("SET"), []byte("k"), []byte("benchmark_value")}
 		out := make([]byte, 0, 128)
 		for pb.Next() {
-			out = srv.dispatch(st, args, out[:0])
+			out, _ = srv.dispatch(st, nil, args, out[:0])
 		}
 	})
 }
