@@ -652,11 +652,6 @@ func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
 	return append(out, respOK...)
 }
 
-// dummyAuthHash is a fixed bcrypt hash compared against an unknown user's
-// password so that a failed AUTH for a nonexistent username takes as long as
-// one for a real user — otherwise response latency leaks which users exist.
-var dummyAuthHash = []byte("$2a$10$cwFksVIrb4lyV/GA2fAmWeUFmAkmYlUGwkxVoF9r3Ccaus0H5LdOW")
-
 // authRBAC authenticates against the policy store's per-user bcrypt hashes.
 // A nopass user accepts any password (Redis semantics). On success the
 // resolved role is pinned to the connection as a SessionContext; a user
@@ -672,9 +667,6 @@ func (s *Server) authRBAC(st *connState, args [][]byte, out []byte) []byte {
 	}
 	u := p.UserFor(username)
 	if u == nil {
-		// Burn one bcrypt comparison so the failure latency matches an
-		// existing user with a wrong password (see dummyAuthHash).
-		_ = bcrypt.CompareHashAndPassword(dummyAuthHash, args[len(args)-1])
 		return s.authFailed(st, username, "unknown user", out)
 	}
 	if len(u.PasswordHash) > 0 && bcrypt.CompareHashAndPassword(u.PasswordHash, args[len(args)-1]) != nil {

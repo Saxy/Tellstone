@@ -480,18 +480,13 @@ type authResult struct {
 	dispatched  bool // true when bcrypt was sent to the worker pool
 }
 
-// dummyAuthHash is a fixed bcrypt hash verified against an unknown user's
-// password so a failed AUTH for a nonexistent username takes as long as one for
-// a real user — otherwise response latency leaks which users exist. The worker
-// comparison always fails against it (mirrors the RESP dummyAuthHash).
-var dummyAuthHash = []byte("$2a$10$cwFksVIrb4lyV/GA2fAmWeUFmAkmYlUGwkxVoF9r3Ccaus0H5LdOW")
-
 // handleAuthMessage consolidates the MsgAuth branch shared by the TLS and
 // plaintext OnTraffic paths. It handles the no-password bypass, fast-rejects
-// malformed payloads, validates the username, makes a copy of the password for
-// the worker, and submits the job via dispatchAuth. It returns an authResult:
-// dispatched == true means the caller must consume the current frame and skip
-// response writing; otherwise respPayload/respType hold the synchronous result.
+// malformed payloads and unknown usernames, validates the username, makes a
+// copy of the password for the worker, and submits the job via dispatchAuth. It
+// returns an authResult: dispatched == true means the caller must consume the
+// current frame and skip response writing; otherwise respPayload/respType hold
+// the synchronous result.
 func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) authResult {
 	if s.requirePassHash == nil && s.policy == nil {
 		return authResult{respPayload: ResponseOK, respType: MsgAuthOk}
@@ -523,21 +518,18 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 		}
 		u := p.UserFor(name)
 		if u == nil {
-			// An unknown username must cost the same bcrypt work as a wrong
-			// password for a real user — otherwise AUTH latency leaks which
-			// usernames exist. Dispatch the job against a fixed dummy hash so
-			// the worker's comparison fails normally (see dummyAuthHash).
-			passHash = dummyAuthHash
-			reason = "unknown user"
-		} else {
-			// Empty hash marks a nopass user that accepts any password (Redis
-			// ACL semantics). The session is built from the same snapshot that
-			// yielded the hash, and the *Role it references is immutable across
-			// hot-swaps.
-			passHash = u.PasswordHash
-			session = rbac.NewSessionContext(name, p.RoleFor(name))
-			reason = "invalid password"
+			// Unknown usernames fail synchronously; the worker only records
+			// failures for real users, so log the attempt here for ACL LOG.
+			s.policy.LogAuthFailure(name, st.remoteAddr, "unknown user")
+			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
 		}
+		// Empty hash marks a nopass user that accepts any password (Redis
+		// ACL semantics). The session is built from the same snapshot that
+		// yielded the hash, and the *Role it references is immutable across
+		// hot-swaps.
+		passHash = u.PasswordHash
+		session = rbac.NewSessionContext(name, p.RoleFor(name))
+		reason = "invalid password"
 	} else {
 		if len(username) > 0 && string(username) != "default" {
 			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
