@@ -269,14 +269,17 @@ func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 	}
 }
 
-// handleDecryptedResp parses RESP commands from decrypted plaintext and
-// writes encrypted responses through the TLS connection. It returns gnet.Close
-// on protocol or write errors so the caller propagates the close.
-func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
+// processBuffer parses and dispatches every complete command in src, appending
+// replies to st.out. It is the shared core of the plaintext and TLS traffic
+// paths, whose only differences are the buffer ownership and the STARTTLS
+// upgrade. A STARTTLS upgrade flushes the replies and installs TLS state
+// before returning. The results tell the caller what to flush: bad means the
+// connection must close (malformed frame or failed upgrade), upgraded means
+// the replies were already written and the caller must not flush again.
+func (s *Server) processBuffer(st *connState, c gnet.Conn, src []byte) (consumed int, upgraded bool, bad bool) {
 	st.out = st.out[:0]
-	consumed := 0
-	for consumed < len(st.readBuf) {
-		args, n, perr := Parse(st.readBuf[consumed:], st.args)
+	for consumed < len(src) {
+		args, n, perr := Parse(src[consumed:], st.args)
 		if perr != nil {
 			if errors.Is(perr, errIncomplete) {
 				break
@@ -287,15 +290,32 @@ func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
 					log.String("remote_addr", c.RemoteAddr().String()),
 				)
 			}
-			return gnet.Close
+			return consumed, false, true
 		}
 		st.args = args[:0]
 		consumed += n
 		st.out = s.dispatch(st, args, st.out)
+		if st.upgradeTLS {
+			if s.upgradeToTLS(c, st, consumed) == gnet.Close {
+				return consumed, false, true
+			}
+			return consumed, true, false
+		}
 		if st.closeAfterReply {
 			// QUIT: stop parsing pipelined commands; flush replies, then close below.
 			break
 		}
+	}
+	return consumed, false, false
+}
+
+// handleDecryptedResp parses RESP commands from decrypted plaintext and
+// writes encrypted responses through the TLS connection. It returns gnet.Close
+// on protocol or write errors so the caller propagates the close.
+func (s *Server) handleDecryptedResp(st *connState, c gnet.Conn) gnet.Action {
+	consumed, _, bad := s.processBuffer(st, c, st.readBuf)
+	if bad {
+		return gnet.Close
 	}
 	if consumed == 0 {
 		return gnet.None
@@ -357,32 +377,14 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 		}
 		return gnet.Close
 	}
-	st.out = st.out[:0]
-	consumed := 0
-	for consumed < len(buf) {
-		args, n, perr := Parse(buf[consumed:], st.args)
-		if perr != nil {
-			if errors.Is(perr, errIncomplete) {
-				break
-			}
-			atomic.AddUint64(&s.protocolErrors, 1)
-			if s.logger.Enabled(log.LevelWarn) {
-				s.logger.Log(log.LevelWarn, "resp: malformed frame; closing connection",
-					log.String("remote_addr", c.RemoteAddr().String()),
-				)
-			}
-			return gnet.Close
-		}
-		st.args = args[:0]
-		consumed += n
-		st.out = s.dispatch(st, args, st.out)
-		if st.upgradeTLS {
-			return s.upgradeToTLS(c, st, consumed)
-		}
-		if st.closeAfterReply {
-			// QUIT: stop parsing pipelined commands; flush replies, then close below.
-			break
-		}
+	consumed, upgraded, bad := s.processBuffer(st, c, buf)
+	if bad {
+		return gnet.Close
+	}
+	if upgraded {
+		// upgradeToTLS already flushed the replies, discarded the consumed bytes,
+		// and installed TLS state; the TLS path takes over from here.
+		return gnet.None
 	}
 	if consumed == 0 {
 		return gnet.None
@@ -634,14 +636,16 @@ func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
 	}
 	// Single-password mode knows only the implicit "default" user; per-user
 	// identities and the ACL command family live in the RBAC/ACL path above.
-	if len(args) == 3 && string(args[1]) != "default" {
-		return s.authFailed(st, string(args[1]), "unknown user", out)
+	// Derive the username once so the unknown-user and invalid-password
+	// branches report the same identity.
+	username := "default"
+	if len(args) == 3 {
+		username = string(args[1])
+	}
+	if username != "default" {
+		return s.authFailed(st, username, "unknown user", out)
 	}
 	if bcrypt.CompareHashAndPassword(s.requirePassHash, args[len(args)-1]) != nil {
-		username := "default"
-		if len(args) == 3 {
-			username = string(args[1])
-		}
 		return s.authFailed(st, username, "invalid password", out)
 	}
 	st.authenticated = true

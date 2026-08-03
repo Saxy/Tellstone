@@ -76,6 +76,14 @@ func (s *Server) roleSetUser(args [][]byte, out []byte) []byte {
 	if len(args) == 4 {
 		return AppendError(out, "ERR role|setuser requires a '>password' or 'nopass' option")
 	}
+	return s.setUser(args, out)
+}
+
+// setUser applies the SETUSER tail shared by ROLE SETUSER and ACL SETUSER:
+// parse the password options and bind the user to the named role, replying OK
+// on success or an error otherwise. The arg-count checks stay in the callers so
+// each family reports its own command name in the error message.
+func (s *Server) setUser(args [][]byte, out []byte) []byte {
 	passHash, err := rbac.PasswordFromOpts(args[4:])
 	if err != nil {
 		return AppendError(out, "ERR "+err.Error())

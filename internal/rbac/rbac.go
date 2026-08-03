@@ -27,24 +27,27 @@ func (b *Bitset) Set(id uint16) {
 	(*b)[word] |= bit
 }
 
-// Has reports whether id is granted. Out-of-range IDs are denied. A value
-// receiver keeps the read callable on non-addressable Bitset expressions.
-func (b Bitset) Has(id uint16) bool {
+// Has reports whether id is granted. Out-of-range IDs are denied. The
+// authorization hot path is a single dereference plus bit test with zero
+// allocations.
+func (b *Bitset) Has(id uint16) bool {
 	word := id / 64
-	if int(word) >= len(b) {
+	if int(word) >= len(*b) {
 		return false
 	}
-	return b[word]&(uint64(1)<<(id%64)) != 0
+	v := *b
+	return v[word]&(uint64(1)<<(id%64)) != 0
 }
 
-// Clear revokes id. Out-of-range IDs are a no-op. A value receiver is safe: it
-// only mutates existing slice contents, which share the backing array.
-func (b Bitset) Clear(id uint16) {
+// Clear revokes id. Out-of-range IDs are a no-op. It mutates the existing
+// backing array in place, so it never reallocates or grows the slice.
+func (b *Bitset) Clear(id uint16) {
 	word := id / 64
-	if int(word) >= len(b) {
+	if int(word) >= len(*b) {
 		return
 	}
-	b[word] &^= uint64(1) << (id % 64)
+	v := *b
+	v[word] &^= uint64(1) << (id % 64)
 }
 
 // NewBitset returns a bitset pre-sized for commands with every listed ID granted.

@@ -528,7 +528,13 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	}
 	username, password, malformed := parseAuthPayload(value)
 	if malformed {
-		return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
+		// A truncated frame is still a rejected AUTH: record it like any other
+		// failure so ACL LOG shows attempted-but-undeliverable credentials. The
+		// username is unknown, so the entry carries an empty name.
+		if s.policy != nil {
+			s.policy.LogAuthFailure("", st.remoteAddr, "malformed request")
+		}
+		return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
 	}
 	var (
 		passHash []byte

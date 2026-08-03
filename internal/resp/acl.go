@@ -56,14 +56,7 @@ func (s *Server) aclSetUser(args [][]byte, out []byte) []byte {
 	if len(args) == 4 {
 		return AppendError(out, "ERR acl|setuser requires a '>password' or 'nopass' option")
 	}
-	passHash, err := rbac.PasswordFromOpts(args[4:])
-	if err != nil {
-		return AppendError(out, "ERR "+err.Error())
-	}
-	if err := s.policy.SetUser(string(args[2]), string(args[3]), passHash); err != nil {
-		return AppendError(out, "ERR "+err.Error())
-	}
-	return append(out, respOK...)
+	return s.setUser(args, out)
 }
 
 // aclDelUser implements ACL DELUSER <username>. Deleting the only "default"
@@ -96,20 +89,22 @@ func (s *Server) aclList(args [][]byte, out []byte) []byte {
 	out = AppendArray(out, len(names))
 	for _, name := range names {
 		u := p.Users[name]
-		var r *rbac.Role
-		if u.Role != "" {
-			r = p.Roles[u.Role]
-		}
+		// Effective permissions come from the resolved role — the explicit
+		// assignment or the Default role for unassigned users and for users
+		// whose role was deleted — so LIST never shows empty grants for a user
+		// the default role covers. The role identity field stays u.Role (null
+		// for the default-role case) so the assignment is visible.
+		r := p.RoleFor(name)
 		hasPass := 0
 		if len(u.PasswordHash) > 0 {
 			hasPass = 1
 		}
 		out = AppendArray(out, 5)
 		out = AppendBulk(out, []byte(name))
-		if r == nil {
+		if u.Role == "" {
 			out = AppendNullBulk(out)
 		} else {
-			out = AppendBulk(out, []byte(r.Name))
+			out = AppendBulk(out, []byte(u.Role))
 		}
 		out = AppendInt(out, int64(hasPass))
 		out = appendACLCommands(out, r)

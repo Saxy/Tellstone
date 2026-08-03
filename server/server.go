@@ -570,7 +570,10 @@ func (s *Server) aclList(msg *network.Message) ([]byte, network.MessageType, err
 	users := make([]network.ACLUser, 0, len(p.Users))
 	for name, u := range p.Users {
 		e := network.ACLUser{Username: name, Role: u.Role, HasPass: len(u.PasswordHash) > 0}
-		if r, ok := p.Roles[u.Role]; ok {
+		// Effective permissions come from RoleFor: the explicit assignment or
+		// the Default role for unassigned / role-deleted users, matching the
+		// RESP ACL LIST handler.
+		if r := p.RoleFor(name); r != nil {
 			e.Commands = r.GrantedCommands()
 			for _, ns := range r.Namespaces {
 				e.Namespaces = append(e.Namespaces, append([]byte(nil), ns...))

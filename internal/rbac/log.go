@@ -18,8 +18,8 @@ import (
 	"time"
 )
 
-// DefaultAuthLogCap is the default capacity of the ACL LOG circular buffer,
-// matching Redis's default max ACL log length.
+// DefaultAuthLogCap is the capacity of the ACL LOG circular buffer: 100 recent
+// rejected AUTH attempts, oldest evicted once full.
 const DefaultAuthLogCap = 100
 
 // AuthLogEntry is one rejected AUTH attempt. Timestamp is wall-clock time at

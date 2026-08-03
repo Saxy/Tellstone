@@ -74,6 +74,12 @@ func TestACLListCodecMalformed(t *testing.T) {
 	if _, ok := DecodeACLListResponse(enc[:len(enc)-2]); ok {
 		t.Fatal("expected truncated user payload to be rejected")
 	}
+	// A valid payload with a trailing byte must be rejected: the decoder is
+	// required to consume the payload exactly, not just the prefix it knows.
+	trailing := append(append([]byte(nil), enc...), 0xFF)
+	if _, ok := DecodeACLListResponse(trailing); ok {
+		t.Fatal("expected trailing-garbage payload to be rejected")
+	}
 }
 
 // TestACLLogCodec verifies EncodeACLLogResponse/DecodeACLLogResponse recover
@@ -111,6 +117,10 @@ func TestACLLogCodecMalformed(t *testing.T) {
 	enc, _ := EncodeACLLogResponse([]AuthLogEntry{{Timestamp: "t", Username: "u"}})
 	if _, ok := DecodeACLLogResponse(enc[:len(enc)-2]); ok {
 		t.Fatal("expected truncated entry payload to be rejected")
+	}
+	trailing := append(append([]byte(nil), enc...), 0xFF)
+	if _, ok := DecodeACLLogResponse(trailing); ok {
+		t.Fatal("expected trailing-garbage payload to be rejected")
 	}
 }
 
@@ -164,7 +174,7 @@ func aclTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType, 
 			users := make([]ACLUser, 0, len(p.Users))
 			for name, u := range p.Users {
 				e := ACLUser{Username: name, Role: u.Role, HasPass: len(u.PasswordHash) > 0}
-				if r, ok := p.Roles[u.Role]; ok {
+				if r := p.RoleFor(name); r != nil {
 					e.Commands = r.GrantedCommands()
 					for _, ns := range r.Namespaces {
 						e.Namespaces = append(e.Namespaces, append([]byte(nil), ns...))
