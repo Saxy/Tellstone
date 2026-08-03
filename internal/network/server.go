@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"sync"
 	"sync/atomic"
 
@@ -296,61 +297,13 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 			s.shards[st.shardID].AddBytesRead(uint64(totalPacketLen))
 		}
 		if s.handler != nil {
-			var (
-				respType    MessageType
-				respPayload []byte
-				skipHandler bool
-			)
-			if msg.Type == MsgAuth {
-				result := s.handleAuthMessage(c, st, msg.Value)
-				if result.dispatched {
-					offset += totalPacketLen
-					break
-				}
-				respPayload, respType = result.respPayload, result.respType
-				skipHandler = true
-			} else if !st.authenticated && msg.Type != MsgPing {
-				respPayload, respType = ResponseAuthErr, MsgAuthErr
-				skipHandler = true
-			} else if s.policy != nil && !s.opAuthorized(msg, st) {
-				s.policy.IncDenied()
-				respPayload, respType = ResponseNotAuthorized, MsgError
-				skipHandler = true
+			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, &msg)
+			if dispatched {
+				offset += totalPacketLen
+				break
 			}
-			if !skipHandler {
-				// PING is not gated by RBAC and never counted as a role command,
-				// keeping per-role counts symmetric with the RESP data commands.
-				if s.policy != nil && st.session != nil && msg.Type != MsgPing {
-					st.session.CountCommand()
-				}
-				respPayload, respType, err = s.handler(&msg)
-			}
-			if err != nil {
-				atomic.AddUint64(&s.handlerErrors, 1)
-				if s.logger.Enabled(log.LevelWarn) {
-					s.logger.Log(log.LevelWarn, "application handler returned execution error",
-						log.String("error", err.Error()),
-					)
-				}
-				return gnet.Close
-			}
-			if respPayload != nil {
-				if err = Write(st.tlsConn, respType, respPayload); err != nil {
-					if s.logger.Enabled(log.LevelError) {
-						s.logger.Log(log.LevelError, "failed to write tls response frame",
-							log.String("error", err.Error()),
-						)
-					}
-					return gnet.Close
-				}
-				n := uint64(5 + len(respPayload))
-				atomic.AddUint64(&s.bytesWritten, n)
-				if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
-					s.shards[st.shardID].AddBytesWritten(n)
-				}
-			}
-			if st.closeAfterReply {
-				return gnet.Close
+			if action := s.runHandler(st.tlsConn, st, &msg, respType, respPayload, skipHandler, "failed to write tls response frame"); action != gnet.None {
+				return action
 			}
 		}
 		offset += totalPacketLen
@@ -403,72 +356,22 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 			}
 		}
 		if s.handler != nil {
-			var (
-				respType    MessageType
-				respPayload []byte
-				skipHandler bool
-			)
-			if msg.Type == MsgAuth {
-				result := s.handleAuthMessage(c, st, msg.Value)
-				if result.dispatched {
-					_, err = c.Discard(totalPacketLen)
-					if err != nil {
-						atomic.AddUint64(&s.protocolErrors, 1)
-						if s.logger.Enabled(log.LevelWarn) {
-							s.logger.Log(log.LevelWarn, "discarding packages not possible",
-								log.Int("total packet length", totalPacketLen),
-								log.String("error", err.Error()),
-							)
-						}
-					}
-					return gnet.None
-				}
-				respPayload, respType = result.respPayload, result.respType
-				skipHandler = true
-			} else if !st.authenticated && msg.Type != MsgPing {
-				respPayload, respType = ResponseAuthErr, MsgAuthErr
-				skipHandler = true
-			} else if s.policy != nil && !s.opAuthorized(msg, st) {
-				s.policy.IncDenied()
-				respPayload, respType = ResponseNotAuthorized, MsgError
-				skipHandler = true
-			}
-			if !skipHandler {
-				// PING is not gated by RBAC and never counted as a role command,
-				// keeping per-role counts symmetric with the RESP data commands.
-				if s.policy != nil && st.session != nil && msg.Type != MsgPing {
-					st.session.CountCommand()
-				}
-				respPayload, respType, err = s.handler(&msg)
-			}
-			if err != nil {
-				atomic.AddUint64(&s.handlerErrors, 1)
-				if s.logger.Enabled(log.LevelWarn) {
-					s.logger.Log(log.LevelWarn, "application handler returned execution error",
-						log.String("error", err.Error()),
-					)
-				}
-				return gnet.Close
-			}
-			if respPayload != nil {
-				if err = Write(c, respType, respPayload); err != nil {
-					if s.logger.Enabled(log.LevelError) {
-						s.logger.Log(log.LevelError, "failed to write network response frame",
+			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, &msg)
+			if dispatched {
+				_, err = c.Discard(totalPacketLen)
+				if err != nil {
+					atomic.AddUint64(&s.protocolErrors, 1)
+					if s.logger.Enabled(log.LevelWarn) {
+						s.logger.Log(log.LevelWarn, "discarding packages not possible",
+							log.Int("total packet length", totalPacketLen),
 							log.String("error", err.Error()),
 						)
 					}
-					return gnet.Close
 				}
-				n := uint64(5 + len(respPayload))
-				atomic.AddUint64(&s.bytesWritten, n)
-				if len(s.shards) > 0 {
-					if int(st.shardID) < len(s.shards) {
-						s.shards[st.shardID].AddBytesWritten(n)
-					}
-				}
+				return gnet.None
 			}
-			if st.closeAfterReply {
-				return gnet.Close
+			if action := s.runHandler(c, st, &msg, respType, respPayload, skipHandler, "failed to write network response frame"); action != gnet.None {
+				return action
 			}
 		}
 		_, err = c.Discard(totalPacketLen)
@@ -481,6 +384,75 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 				)
 			}
 		}
+	}
+	return gnet.None
+}
+
+// gateMessage authorizes one decoded frame against the connection state: it runs
+// the AUTH path (dispatching bcrypt to the worker pool when needed) and applies
+// the authentication and RBAC gates. skipHandler reports that respType and
+// respPayload already hold the reply and the handler must not run; dispatched
+// reports that the AUTH job was sent to the worker pool, so the caller must
+// consume the frame without writing a response.
+func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType MessageType, respPayload []byte, skipHandler, dispatched bool) {
+	if msg.Type == MsgAuth {
+		result := s.handleAuthMessage(c, st, msg.Value)
+		if result.dispatched {
+			return 0, nil, false, true
+		}
+		return result.respType, result.respPayload, true, false
+	}
+	if !st.authenticated && msg.Type != MsgPing {
+		return MsgAuthErr, ResponseAuthErr, true, false
+	}
+	if s.policy != nil && !s.opAuthorized(*msg, st) {
+		s.policy.IncDenied()
+		return MsgError, ResponseNotAuthorized, true, false
+	}
+	return 0, nil, false, false
+}
+
+// runHandler executes the application handler for one frame unless the gate
+// supplied a reply, then writes the response and accounts the bytes against the
+// connection and its shard. writeError names the failing path for the log. It
+// returns gnet.Close on handler or write errors and when the connection is
+// marked to close after the reply.
+func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType MessageType, respPayload []byte, skipHandler bool, writeError string) gnet.Action {
+	if !skipHandler {
+		// PING is not gated by RBAC and never counted as a role command, keeping
+		// per-role counts symmetric with the RESP data commands.
+		if s.policy != nil && st.session != nil && msg.Type != MsgPing {
+			st.session.CountCommand()
+		}
+		var err error
+		respPayload, respType, err = s.handler(msg)
+		if err != nil {
+			atomic.AddUint64(&s.handlerErrors, 1)
+			if s.logger.Enabled(log.LevelWarn) {
+				s.logger.Log(log.LevelWarn, "application handler returned execution error",
+					log.String("error", err.Error()),
+				)
+			}
+			return gnet.Close
+		}
+	}
+	if respPayload != nil {
+		if err := Write(w, respType, respPayload); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, writeError,
+					log.String("error", err.Error()),
+				)
+			}
+			return gnet.Close
+		}
+		n := uint64(5 + len(respPayload))
+		atomic.AddUint64(&s.bytesWritten, n)
+		if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
+			s.shards[st.shardID].AddBytesWritten(n)
+		}
+	}
+	if st.closeAfterReply {
+		return gnet.Close
 	}
 	return gnet.None
 }

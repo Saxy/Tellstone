@@ -55,27 +55,12 @@ func EncodeACLListResponse(users []ACLUser) ([]byte, bool) {
 		} else {
 			buf = append(buf, 0)
 		}
-		if len(u.Commands) > math.MaxUint16 {
+		var ok bool
+		if buf, ok = encodeStringList(buf, u.Commands); !ok {
 			return nil, false
 		}
-		buf = binary.BigEndian.AppendUint16(buf, uint16(len(u.Commands)))
-		for _, cmd := range u.Commands {
-			if len(cmd) > math.MaxUint16 {
-				return nil, false
-			}
-			buf = binary.BigEndian.AppendUint16(buf, uint16(len(cmd)))
-			buf = append(buf, cmd...)
-		}
-		if len(u.Namespaces) > math.MaxUint16 {
+		if buf, ok = encodeByteList(buf, u.Namespaces); !ok {
 			return nil, false
-		}
-		buf = binary.BigEndian.AppendUint16(buf, uint16(len(u.Namespaces)))
-		for _, ns := range u.Namespaces {
-			if len(ns) > math.MaxUint16 {
-				return nil, false
-			}
-			buf = binary.BigEndian.AppendUint16(buf, uint16(len(ns)))
-			buf = append(buf, ns...)
 		}
 	}
 	return buf, true
@@ -92,64 +77,23 @@ func DecodeACLListResponse(payload []byte) ([]ACLUser, bool) {
 	users := make([]ACLUser, 0, count)
 	for i := 0; i < count; i++ {
 		var u ACLUser
-		if pos+2 > len(payload) {
+		var ok bool
+		if u.Username, pos, ok = decodeU16String(payload, pos); !ok {
 			return nil, false
 		}
-		n := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-		pos += 2
-		if pos+n > len(payload) {
+		if u.Role, pos, ok = decodeU16String(payload, pos); !ok {
 			return nil, false
 		}
-		u.Username = string(payload[pos : pos+n])
-		pos += n
-		if pos+2 > len(payload) {
-			return nil, false
-		}
-		n = int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-		pos += 2
-		if pos+n > len(payload) {
-			return nil, false
-		}
-		u.Role = string(payload[pos : pos+n])
-		pos += n
 		if pos >= len(payload) {
 			return nil, false
 		}
 		u.HasPass = payload[pos] == 1
 		pos++
-		if pos+2 > len(payload) {
+		if u.Commands, pos, ok = decodeStringList(payload, pos, u.Commands); !ok {
 			return nil, false
 		}
-		cmdCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-		pos += 2
-		for j := 0; j < cmdCount; j++ {
-			if pos+2 > len(payload) {
-				return nil, false
-			}
-			clen := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-			pos += 2
-			if pos+clen > len(payload) {
-				return nil, false
-			}
-			u.Commands = append(u.Commands, string(payload[pos:pos+clen]))
-			pos += clen
-		}
-		if pos+2 > len(payload) {
+		if u.Namespaces, pos, ok = decodeByteList(payload, pos, u.Namespaces); !ok {
 			return nil, false
-		}
-		nsCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-		pos += 2
-		for j := 0; j < nsCount; j++ {
-			if pos+2 > len(payload) {
-				return nil, false
-			}
-			nsl := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-			pos += 2
-			if pos+nsl > len(payload) {
-				return nil, false
-			}
-			u.Namespaces = append(u.Namespaces, append([]byte(nil), payload[pos:pos+nsl]...))
-			pos += nsl
 		}
 		users = append(users, u)
 	}

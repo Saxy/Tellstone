@@ -163,8 +163,9 @@ func (c *Client) Set(key, value []byte, ttlMs int64, scratchBuf []byte) ([]byte,
 	return resp.Value, nil
 }
 
-// Get retrieves a binary value from the remote engine using its key identifier.
-func (c *Client) Get(key []byte, scratchBuf []byte) ([]byte, error) {
+// callKeyOp issues a keyed request (GET or DEL) and returns the response
+// value. scratchBuf must be large enough to hold the server response.
+func (c *Client) callKeyOp(op OpCode, key []byte, scratchBuf []byte) ([]byte, error) {
 	payloadLen := 1 + 2 + 8 + len(key)
 
 	var reqBuf [512]byte
@@ -172,7 +173,7 @@ func (c *Client) Get(key []byte, scratchBuf []byte) ([]byte, error) {
 		return nil, ErrRequestTooLarge
 	}
 
-	reqBuf[0] = byte(OpGet)
+	reqBuf[0] = byte(op)
 	binary.BigEndian.PutUint16(reqBuf[1:3], uint16(len(key)))
 	binary.BigEndian.PutUint64(reqBuf[3:11], 0)
 
@@ -188,29 +189,14 @@ func (c *Client) Get(key []byte, scratchBuf []byte) ([]byte, error) {
 	return resp.Value, nil
 }
 
+// Get retrieves a binary value from the remote engine using its key identifier.
+func (c *Client) Get(key []byte, scratchBuf []byte) ([]byte, error) {
+	return c.callKeyOp(OpGet, key, scratchBuf)
+}
+
 // Delete removes a key-value entity permanently from the remote cluster space.
 func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
-	payloadLen := 1 + 2 + 8 + len(key)
-
-	var reqBuf [512]byte
-	if payloadLen > len(reqBuf) {
-		return nil, ErrRequestTooLarge
-	}
-
-	reqBuf[0] = byte(OpDelete)
-	binary.BigEndian.PutUint16(reqBuf[1:3], uint16(len(key)))
-	binary.BigEndian.PutUint64(reqBuf[3:11], 0)
-
-	copy(reqBuf[11:11+len(key)], key)
-
-	var resp Message
-	if err := c.Call(MsgRequest, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
-		return nil, err
-	}
-	if err := errReply(resp); err != nil {
-		return nil, err
-	}
-	return resp.Value, nil
+	return c.callKeyOp(OpDelete, key, scratchBuf)
 }
 
 // Auth authenticates the client with a password (single-password mode, username empty).

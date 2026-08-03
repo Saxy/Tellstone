@@ -118,6 +118,98 @@ func DecodeRoleGetUserResponse(payload []byte) (RoleUser, bool) {
 	}, true
 }
 
+// encodeStringList appends a [2B count]{[2B len][str]} list to buf. ok is
+// false when the count or any element exceeds the 64 KiB length-prefix limit.
+func encodeStringList(buf []byte, items []string) ([]byte, bool) {
+	if len(items) > math.MaxUint16 {
+		return nil, false
+	}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(items)))
+	for _, s := range items {
+		if len(s) > math.MaxUint16 {
+			return nil, false
+		}
+		buf = binary.BigEndian.AppendUint16(buf, uint16(len(s)))
+		buf = append(buf, s...)
+	}
+	return buf, true
+}
+
+// encodeByteList appends a [2B count]{[2B len][bytes]} list to buf. ok is
+// false when the count or any element exceeds the 64 KiB length-prefix limit.
+func encodeByteList(buf []byte, items [][]byte) ([]byte, bool) {
+	if len(items) > math.MaxUint16 {
+		return nil, false
+	}
+	buf = binary.BigEndian.AppendUint16(buf, uint16(len(items)))
+	for _, b := range items {
+		if len(b) > math.MaxUint16 {
+			return nil, false
+		}
+		buf = binary.BigEndian.AppendUint16(buf, uint16(len(b)))
+		buf = append(buf, b...)
+	}
+	return buf, true
+}
+
+// decodeU16String reads one [2B len][bytes] token from payload at pos and
+// returns it as a string with the position after the token; ok is false when
+// the length or the token overruns the buffer.
+func decodeU16String(payload []byte, pos int) (string, int, bool) {
+	if pos+2 > len(payload) {
+		return "", 0, false
+	}
+	n := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
+	pos += 2
+	if pos+n > len(payload) {
+		return "", 0, false
+	}
+	return string(payload[pos : pos+n]), pos + n, true
+}
+
+// decodeStringList reads a [2B count]{[2B len][str]} list into dst; ok is
+// false when any token overruns the buffer.
+func decodeStringList(payload []byte, pos int, dst []string) ([]string, int, bool) {
+	if pos+2 > len(payload) {
+		return nil, 0, false
+	}
+	count := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
+	pos += 2
+	for i := 0; i < count; i++ {
+		s, next, ok := decodeU16String(payload, pos)
+		if !ok {
+			return nil, 0, false
+		}
+		dst = append(dst, s)
+		pos = next
+	}
+	return dst, pos, true
+}
+
+// decodeByteList reads a [2B count]{[2B len][bytes]} list into dst, deep-copying
+// each element so the slices outlive the payload buffer they alias; ok is false
+// when any token overruns the buffer.
+func decodeByteList(payload []byte, pos int, dst [][]byte) ([][]byte, int, bool) {
+	if pos+2 > len(payload) {
+		return nil, 0, false
+	}
+	count := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
+	pos += 2
+	for i := 0; i < count; i++ {
+		if pos+2 > len(payload) {
+			return nil, 0, false
+		}
+		n := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
+		pos += 2
+		if pos+n > len(payload) {
+			return nil, 0, false
+		}
+		dst = append(dst, append([]byte(nil), payload[pos:pos+n]...))
+		pos += n
+	}
+	return dst, pos, true
+}
+
 // LIST response: [2B roleCount] then per role
 // [2B nameLen][name][2B cmdCount]{[2B len][cmd]}[2B nsCount]{[2B len][ns]}.
 
@@ -136,27 +228,12 @@ func EncodeRoleListResponse(entries []RoleListEntry) ([]byte, bool) {
 		}
 		buf = binary.BigEndian.AppendUint16(buf, uint16(len(e.Name)))
 		buf = append(buf, e.Name...)
-		if len(e.Commands) > math.MaxUint16 {
+		var ok bool
+		if buf, ok = encodeStringList(buf, e.Commands); !ok {
 			return nil, false
 		}
-		buf = binary.BigEndian.AppendUint16(buf, uint16(len(e.Commands)))
-		for _, cmd := range e.Commands {
-			if len(cmd) > math.MaxUint16 {
-				return nil, false
-			}
-			buf = binary.BigEndian.AppendUint16(buf, uint16(len(cmd)))
-			buf = append(buf, cmd...)
-		}
-		if len(e.Namespaces) > math.MaxUint16 {
+		if buf, ok = encodeByteList(buf, e.Namespaces); !ok {
 			return nil, false
-		}
-		buf = binary.BigEndian.AppendUint16(buf, uint16(len(e.Namespaces)))
-		for _, ns := range e.Namespaces {
-			if len(ns) > math.MaxUint16 {
-				return nil, false
-			}
-			buf = binary.BigEndian.AppendUint16(buf, uint16(len(ns)))
-			buf = append(buf, ns...)
 		}
 	}
 	return buf, true
@@ -173,49 +250,15 @@ func DecodeRoleListResponse(payload []byte) ([]RoleListEntry, bool) {
 	entries := make([]RoleListEntry, 0, count)
 	for i := 0; i < count; i++ {
 		var e RoleListEntry
-		if pos+2 > len(payload) {
+		var ok bool
+		if e.Name, pos, ok = decodeU16String(payload, pos); !ok {
 			return nil, false
 		}
-		n := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-		pos += 2
-		if pos+n > len(payload) {
+		if e.Commands, pos, ok = decodeStringList(payload, pos, e.Commands); !ok {
 			return nil, false
 		}
-		e.Name = string(payload[pos : pos+n])
-		pos += n
-		if pos+2 > len(payload) {
+		if e.Namespaces, pos, ok = decodeByteList(payload, pos, e.Namespaces); !ok {
 			return nil, false
-		}
-		cmdCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-		pos += 2
-		for j := 0; j < cmdCount; j++ {
-			if pos+2 > len(payload) {
-				return nil, false
-			}
-			clen := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-			pos += 2
-			if pos+clen > len(payload) {
-				return nil, false
-			}
-			e.Commands = append(e.Commands, string(payload[pos:pos+clen]))
-			pos += clen
-		}
-		if pos+2 > len(payload) {
-			return nil, false
-		}
-		nsCount := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-		pos += 2
-		for j := 0; j < nsCount; j++ {
-			if pos+2 > len(payload) {
-				return nil, false
-			}
-			nsl := int(binary.BigEndian.Uint16(payload[pos : pos+2]))
-			pos += 2
-			if pos+nsl > len(payload) {
-				return nil, false
-			}
-			e.Namespaces = append(e.Namespaces, append([]byte(nil), payload[pos:pos+nsl]...))
-			pos += nsl
 		}
 		entries = append(entries, e)
 	}
