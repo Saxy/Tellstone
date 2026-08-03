@@ -94,6 +94,13 @@ type Store struct {
 	// (fail-closed deny-all). The request path only bumps them atomically.
 	authFailures   uint64
 	deniedCommands uint64
+	// logMu serializes the ACL auth-failure log. The log is mutable state that
+	// lives for the Store's lifetime and survives policy Reload swaps; entries
+	// are recorded off the hot path at failed AUTH time.
+	logMu   sync.Mutex
+	log     []AuthLogEntry // circular buffer, oldest at (logHead-logLen) mod cap
+	logHead int            // next write slot
+	logLen  int            // number of valid entries
 }
 
 // NewStore returns a Store seeded with policy.

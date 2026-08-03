@@ -55,6 +55,14 @@ func (o OpCode) String() string {
 		return "ROLE LIST"
 	case OpRoleGetUser:
 		return "ROLE GETUSER"
+	case OpACLSetUser:
+		return "ACL SETUSER"
+	case OpACLDelUser:
+		return "ACL DELUSER"
+	case OpACLList:
+		return "ACL LIST"
+	case OpACLLog:
+		return "ACL LOG"
 	default:
 		return "UNKNOWN"
 	}
@@ -70,6 +78,10 @@ const (
 	OpRoleDelete
 	OpRoleList
 	OpRoleGetUser
+	OpACLSetUser
+	OpACLDelUser
+	OpACLList
+	OpACLLog
 )
 
 // Message is the atomic execution frame of the Tellstone TCP protocol.

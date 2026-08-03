@@ -547,6 +547,14 @@ func (s *Server) dispatch(st *connState, args [][]byte, out []byte) []byte {
 		s.countCommand(st)
 		return s.role(st, args, out)
 
+	case EqualFold(cmd, shard.CmdACL):
+		if !s.authorizedCmd(st, rbac.CmdACL) {
+			s.countDenied()
+			return AppendError(out, "NOPERM no permission for 'acl' command")
+		}
+		s.countCommand(st)
+		return s.acl(st, args, out)
+
 	case EqualFold(cmd, "QUIT"):
 		st.closeAfterReply = true
 		return append(out, respOK...)
@@ -624,12 +632,17 @@ func (s *Server) auth(st *connState, args [][]byte, out []byte) []byte {
 	if s.requirePassHash == nil {
 		return append(out, respOK...)
 	}
-	// Only the implicit "default" user exists until an ACL system lands (issue #9).
+	// Single-password mode knows only the implicit "default" user; per-user
+	// identities and the ACL command family live in the RBAC/ACL path above.
 	if len(args) == 3 && string(args[1]) != "default" {
-		return s.authFailed(st, out)
+		return s.authFailed(st, string(args[1]), "unknown user", out)
 	}
 	if bcrypt.CompareHashAndPassword(s.requirePassHash, args[len(args)-1]) != nil {
-		return s.authFailed(st, out)
+		username := "default"
+		if len(args) == 3 {
+			username = string(args[1])
+		}
+		return s.authFailed(st, username, "invalid password", out)
 	}
 	st.authenticated = true
 	return append(out, respOK...)
@@ -651,27 +664,29 @@ func (s *Server) authRBAC(st *connState, args [][]byte, out []byte) []byte {
 	}
 	p := s.policy.Load()
 	if p == nil {
-		return s.authFailed(st, out)
+		return s.authFailed(st, username, "policy not loaded", out)
 	}
 	u := p.UserFor(username)
 	if u == nil {
 		// Burn one bcrypt comparison so the failure latency matches an
 		// existing user with a wrong password (see dummyAuthHash).
 		_ = bcrypt.CompareHashAndPassword(dummyAuthHash, args[len(args)-1])
-		return s.authFailed(st, out)
+		return s.authFailed(st, username, "unknown user", out)
 	}
 	if len(u.PasswordHash) > 0 && bcrypt.CompareHashAndPassword(u.PasswordHash, args[len(args)-1]) != nil {
-		return s.authFailed(st, out)
+		return s.authFailed(st, username, "invalid password", out)
 	}
 	st.authenticated = true
 	st.session = rbac.NewSessionContext(username, p.RoleFor(username))
 	return append(out, respOK...)
 }
 
-// authFailed logs a rejected AUTH attempt and appends the RESP error reply.
-func (s *Server) authFailed(st *connState, out []byte) []byte {
+// authFailed records a rejected AUTH attempt — bumping the store-wide counter
+// and appending to the ACL LOG buffer when RBAC is enabled — logs it, and
+// appends the RESP error reply.
+func (s *Server) authFailed(st *connState, username, reason string, out []byte) []byte {
 	if s.policy != nil {
-		s.policy.IncAuthFailure()
+		s.policy.LogAuthFailure(username, st.remoteAddr, reason)
 	}
 	if s.logger.Enabled(log.LevelWarn) {
 		s.logger.Log(log.LevelWarn, "resp: failed AUTH attempt",

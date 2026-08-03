@@ -21,9 +21,9 @@ runs plaintext TCP with no access control — a non-starter for any real deploym
 - [x] `AUTH` command for RESP protocol (password-based, `AUTH <user> <password>`)
 - [x] `AUTH` handshake for binary protocol (challenge-response or token-based)
 - [x] RBAC – with policy store ROLE commands, per-user auth, namespace whitelists
-- [ ] API key system — per-key ACLs with configurable command/namespace restrictions
+- [x] API key system — per-key ACLs with configurable command/namespace restrictions
 - [ ] OIDC / OAuth2 integration for SSO (optional, pluggable provider interface)
-- [ ] `ACL SETUSER` / `ACL DELUSER` / `ACL LIST` for managing access rules at runtime
+- [x] `ACL SETUSER` / `ACL DELUSER` / `ACL LIST` for managing access rules at runtime
 - [ ] Audit logging — who issued what command, when, from which connection
 
 ### 2c — Encryption Key Management

@@ -421,6 +421,20 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 		default:
 			return s.roleGetUser(msg)
 		}
+	case network.OpACLSetUser, network.OpACLDelUser, network.OpACLList, network.OpACLLog:
+		if s.policy == nil {
+			return roleReply(fmt.Errorf("rbac not enabled"))
+		}
+		switch msg.Op {
+		case network.OpACLSetUser:
+			return s.aclSetUser(msg)
+		case network.OpACLDelUser:
+			return s.aclDelUser(msg)
+		case network.OpACLList:
+			return s.aclList(msg)
+		default:
+			return s.aclLog(msg)
+		}
 	default:
 		return network.ResponseInvalidOpCode, network.MsgError, nil
 	}
@@ -518,4 +532,80 @@ func (s *Server) roleGetUser(msg *network.Message) ([]byte, network.MessageType,
 		return roleReply(fmt.Errorf("user '%s' does not exist", args[0]))
 	}
 	return network.EncodeRoleGetUserResponse(network.RoleUser{Role: u.Role, HasPass: len(u.PasswordHash) > 0}), network.MsgResponse, nil
+}
+
+// aclSetUser handles OpACLSetUser, the binary ACL alias of ROLE SETUSER.
+func (s *Server) aclSetUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) < 2 {
+		return roleReply(fmt.Errorf("invalid ACL SETUSER arguments"))
+	}
+	if len(args) == 2 {
+		return roleReply(fmt.Errorf("ACL SETUSER requires a '>password' or 'nopass' option"))
+	}
+	passHash, err := rbac.PasswordFromOpts(args[2:])
+	if err != nil {
+		return roleReply(err)
+	}
+	return roleReply(s.policy.SetUser(string(args[0]), string(args[1]), passHash))
+}
+
+func (s *Server) aclDelUser(msg *network.Message) ([]byte, network.MessageType, error) {
+	args, ok := network.DecodeRoleArgs(msg.Value, nil)
+	if !ok || len(args) != 1 {
+		return roleReply(fmt.Errorf("invalid ACL DELUSER arguments"))
+	}
+	s.policy.DelUser(string(args[0]))
+	return network.ResponseOK, network.MsgResponse, nil
+}
+
+// aclList handles OpACLList, returning one entry per user with the username,
+// bound role, password presence, and the role's commands and namespace
+// whitelist — never a password hash (mirrors the RESP ACL LIST handler).
+func (s *Server) aclList(msg *network.Message) ([]byte, network.MessageType, error) {
+	p := s.policy.Load()
+	if p == nil {
+		return roleReply(fmt.Errorf("rbac policy not loaded"))
+	}
+	users := make([]network.ACLUser, 0, len(p.Users))
+	for name, u := range p.Users {
+		e := network.ACLUser{Username: name, Role: u.Role, HasPass: len(u.PasswordHash) > 0}
+		if r, ok := p.Roles[u.Role]; ok {
+			e.Commands = r.GrantedCommands()
+			for _, ns := range r.Namespaces {
+				e.Namespaces = append(e.Namespaces, append([]byte(nil), ns...))
+			}
+		}
+		users = append(users, e)
+	}
+	// Map iteration is unordered; sort by username so identical policies
+	// produce a stable, name-ordered response (mirrors the RESP LIST handler).
+	sort.Slice(users, func(i, j int) bool { return users[i].Username < users[j].Username })
+	payload, ok := network.EncodeACLListResponse(users)
+	if !ok {
+		return roleReply(fmt.Errorf("acl rule exceeds the 64 KiB wire limit"))
+	}
+	return payload, network.MsgResponse, nil
+}
+
+// aclLog handles OpACLLog, returning the recent auth-failure buffer in
+// chronological order with timestamp, username, remote address, and reason —
+// the binary twin of the RESP ACL LOG handler. Entries are already ordered by
+// the store, so no sort is needed.
+func (s *Server) aclLog(msg *network.Message) ([]byte, network.MessageType, error) {
+	src := s.policy.AuthLog()
+	entries := make([]network.AuthLogEntry, 0, len(src))
+	for _, e := range src {
+		entries = append(entries, network.AuthLogEntry{
+			Timestamp:  e.Timestamp.Format(time.RFC3339),
+			Username:   e.Username,
+			RemoteAddr: e.RemoteAddr,
+			Reason:     e.Reason,
+		})
+	}
+	payload, ok := network.EncodeACLLogResponse(entries)
+	if !ok {
+		return roleReply(fmt.Errorf("acl log exceeds the 64 KiB wire limit"))
+	}
+	return payload, network.MsgResponse, nil
 }

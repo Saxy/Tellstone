@@ -31,6 +31,7 @@ const (
 	CmdCommand string = "COMMAND"
 	CmdAuth    string = "AUTH"
 	CmdRole    string = "ROLE"
+	CmdACL     string = "ACL"
 )
 
 type Shard struct {

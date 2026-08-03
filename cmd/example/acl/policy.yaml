@@ -1,0 +1,18 @@
+# Example RBAC policy for cmd/example/acl. Run the ACL example against a
+# server started with this file:
+#
+#   ./bin/tellstone --rbac-config cmd/example/acl/policy.yaml --enable-resp
+#
+# The admin user below is required: the example authenticates as
+# admin/adminsecret before issuing ACL commands. There is no "default" user,
+# so every connection must AUTH.
+roles:
+  - name: admin
+    rules: ["+@all", "~*"]
+  - name: readonly
+    rules: ["+get", "~*"]
+users:
+  - name: admin
+    role: admin
+    password: "$2a$10$pcaKkTfRy.KSdNUgKszYYedE7L32P9fSEG3x1phq0EbjeYkn5WpEi"
+default_role: readonly    # least privilege: fallback for users without an explicit role

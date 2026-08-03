@@ -37,6 +37,10 @@ type authJob struct {
 	// session is the RBAC context pinned on success. nil when RBAC is disabled
 	// (single-password mode).
 	session *rbac.SessionContext
+	// username and reason identify the attempt for the ACL LOG entry recorded
+	// when verification fails; username is empty in single-password mode.
+	username string
+	reason   string
 }
 
 // connState holds per-connection state. When TLS is enabled, tlsConn wraps the
@@ -483,10 +487,9 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 
 // authFailed logs a rejected AUTH attempt, increments the per-connection fail
 // counter, and marks the connection for closure when the rate limit is exceeded.
+// The store-wide ACL counter and log entry are recorded by the caller via
+// LogAuthFailure, which carries the username and reason.
 func (s *Server) authFailed(st *connState) []byte {
-	if s.policy != nil {
-		s.policy.IncAuthFailure()
-	}
 	st.authFails++
 	if s.logger.Enabled(log.LevelWarn) {
 		s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",
@@ -530,13 +533,15 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	var (
 		passHash []byte
 		session  *rbac.SessionContext
+		name     string
+		reason   string
 	)
 	if s.policy != nil {
 		p := s.policy.Load()
 		if p == nil {
 			return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
 		}
-		name := "default"
+		name = "default"
 		if len(username) > 0 {
 			name = string(username)
 		}
@@ -547,6 +552,7 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 			// usernames exist. Dispatch the job against a fixed dummy hash so
 			// the worker's comparison fails normally (see dummyAuthHash).
 			passHash = dummyAuthHash
+			reason = "unknown user"
 		} else {
 			// Empty hash marks a nopass user that accepts any password (Redis
 			// ACL semantics). The session is built from the same snapshot that
@@ -554,6 +560,7 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 			// hot-swaps.
 			passHash = u.PasswordHash
 			session = rbac.NewSessionContext(name, p.RoleFor(name))
+			reason = "invalid password"
 		}
 	} else {
 		if len(username) > 0 && string(username) != "default" {
@@ -563,7 +570,7 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	}
 	passwordCopy := make([]byte, len(password))
 	copy(passwordCopy, password)
-	if s.dispatchAuth(c, passwordCopy, passHash, session) {
+	if s.dispatchAuth(c, name, reason, passwordCopy, passHash, session) {
 		st.authPending = true
 		return authResult{dispatched: true}
 	}
@@ -598,6 +605,11 @@ func (s *Server) authWorker() {
 					)
 				}
 			} else {
+				// Record the store-wide failure counter and ACL LOG entry with
+				// the attempted username before the per-connection handling.
+				if s.policy != nil {
+					s.policy.LogAuthFailure(job.username, st.remoteAddr, job.reason)
+				}
 				respPayload, respType = s.authFailed(st), MsgAuthErr
 			}
 			var writeErr error
@@ -632,9 +644,9 @@ func (s *Server) authWorker() {
 
 // dispatchAuth submits an auth verification job to the bounded worker pool.
 // Returns true if the job was accepted, false if the pool is saturated.
-func (s *Server) dispatchAuth(c gnet.Conn, password, passHash []byte, session *rbac.SessionContext) bool {
+func (s *Server) dispatchAuth(c gnet.Conn, username, reason string, password, passHash []byte, session *rbac.SessionContext) bool {
 	select {
-	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session}:
+	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session, username: username, reason: reason}:
 		return true
 	default:
 		return false
@@ -658,6 +670,10 @@ func (s *Server) opAuthorized(msg Message, st *connState) bool {
 	// consulted, only the command bit (mirrors RESP's authorizedCmd).
 	case OpRoleCreate, OpRoleSetUser, OpRoleDelUser, OpRoleDelete, OpRoleList, OpRoleGetUser:
 		return st.session.AllowsCommand(rbac.CmdRole)
+	// ACL admin ops gate on the ACL command bit, a sibling of ROLE: a role
+	// granted only +role cannot manage ACL users and vice versa.
+	case OpACLSetUser, OpACLDelUser, OpACLList, OpACLLog:
+		return st.session.AllowsCommand(rbac.CmdACL)
 	case OpGet:
 		return st.session.IsAllowed(rbac.CmdGet, msg.Key)
 	case OpSet:
