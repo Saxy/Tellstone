@@ -483,8 +483,7 @@ func (s *Server) roleDelUser(msg *network.Message) ([]byte, network.MessageType,
 	if !ok || len(args) != 1 {
 		return roleReply(fmt.Errorf("invalid ROLE DELUSER arguments"))
 	}
-	s.policy.DelUser(string(args[0]))
-	return network.ResponseOK, network.MsgResponse, nil
+	return roleReply(s.policy.DelUser(string(args[0])))
 }
 
 func (s *Server) roleDelete(msg *network.Message) ([]byte, network.MessageType, error) {
@@ -555,8 +554,7 @@ func (s *Server) aclDelUser(msg *network.Message) ([]byte, network.MessageType, 
 	if !ok || len(args) != 1 {
 		return roleReply(fmt.Errorf("invalid ACL DELUSER arguments"))
 	}
-	s.policy.DelUser(string(args[0]))
-	return network.ResponseOK, network.MsgResponse, nil
+	return roleReply(s.policy.DelUser(string(args[0])))
 }
 
 // aclList handles OpACLList, returning one entry per user with the username,

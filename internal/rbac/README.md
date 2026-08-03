@@ -99,7 +99,7 @@ func (s *Store) Store(policy *PolicyStore)
 func (s *Store) Reload(policy *PolicyStore)            // SIGHUP path, serialized vs. mutations
 func (s *Store) CreateRole(name string, rules []string) error
 func (s *Store) SetUser(username, roleName string, passHash []byte) error
-func (s *Store) DelUser(username string)
+func (s *Store) DelUser(username string) error // rejects deleting the last ACL-management user
 func (s *Store) DeleteRole(name string) error
 
 // Per-connection authorization state — pinned at handshake

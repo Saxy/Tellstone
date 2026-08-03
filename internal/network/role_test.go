@@ -205,7 +205,9 @@ func rbacTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType,
 			if !ok || len(args) != 1 {
 				return []byte("invalid ROLE DELUSER arguments"), MsgError, nil
 			}
-			store.DelUser(string(args[0]))
+			if err := store.DelUser(string(args[0])); err != nil {
+				return []byte(err.Error()), MsgError, nil
+			}
 			return ResponseOK, MsgResponse, nil
 		case OpRoleDelete:
 			args, ok := DecodeRoleArgs(msg.Value, nil)

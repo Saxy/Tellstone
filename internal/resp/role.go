@@ -99,7 +99,9 @@ func (s *Server) roleDelUser(args [][]byte, out []byte) []byte {
 	if len(args) != 3 {
 		return AppendError(out, "ERR wrong number of arguments for 'role|deluser' command")
 	}
-	s.policy.DelUser(string(args[2]))
+	if err := s.policy.DelUser(string(args[2])); err != nil {
+		return AppendError(out, "ERR "+err.Error())
+	}
 	return append(out, respOK...)
 }
 

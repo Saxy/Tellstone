@@ -63,17 +63,42 @@ func (s *Store) SetUser(username, roleName string, passHash []byte) error {
 }
 
 // DelUser removes username. Deleting the only "default" nopass user forces
-// future connections to authenticate.
-func (s *Store) DelUser(username string) {
+// future connections to authenticate. It rejects deleting the last user whose
+// effective role grants the ACL command bit: runtime ACL changes are never
+// written back to the policy file, so losing the final administrator would
+// lock every client out of ACL management until a restart or SIGHUP reload
+// restores one. Pinned sessions keep working either way; this only closes the
+// re-administration path.
+func (s *Store) DelUser(username string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	p := s.Load()
 	if p == nil {
-		return
+		return nil
+	}
+	if _, ok := p.Users[username]; ok {
+		if r := p.RoleFor(username); r != nil && r.Permissions.Has(CmdACL) && !p.hasOtherAdmin(username) {
+			return fmt.Errorf("rbac: cannot delete %q: last user with ACL management rights", username)
+		}
 	}
 	p = p.Clone()
 	delete(p.Users, username)
 	s.Store(p)
+	return nil
+}
+
+// hasOtherAdmin reports whether any user other than username has an effective
+// role — explicit or the Default fallback — granting the ACL command bit.
+func (p *PolicyStore) hasOtherAdmin(username string) bool {
+	for name := range p.Users {
+		if name == username {
+			continue
+		}
+		if r := p.RoleFor(name); r != nil && r.Permissions.Has(CmdACL) {
+			return true
+		}
+	}
+	return false
 }
 
 // DeleteRole removes a role. Users referencing the removed role fall back to

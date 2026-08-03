@@ -65,7 +65,9 @@ func (s *Server) aclDelUser(args [][]byte, out []byte) []byte {
 	if len(args) != 3 {
 		return AppendError(out, "ERR wrong number of arguments for 'acl|deluser' command")
 	}
-	s.policy.DelUser(string(args[2]))
+	if err := s.policy.DelUser(string(args[2])); err != nil {
+		return AppendError(out, "ERR "+err.Error())
+	}
 	return append(out, respOK...)
 }
 

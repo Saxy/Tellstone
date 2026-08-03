@@ -61,9 +61,55 @@ func TestStoreDelUserAndDeleteRole(t *testing.T) {
 		t.Fatalf("user referencing a deleted role must resolve to the nil default, got %q", r.Name)
 	}
 
-	store.DelUser("alice")
+	if err := store.DelUser("alice"); err != nil {
+		t.Fatalf("DelUser: %v", err)
+	}
 	if store.Load().UserFor("alice") != nil {
 		t.Fatal("deleted user must be gone")
+	}
+}
+
+func TestStoreDelUserLastAdminGuard(t *testing.T) {
+	admin, err := ParseRole("admin", "+@admin", "~*")
+	if err != nil {
+		t.Fatalf("parse admin role: %v", err)
+	}
+	limited, err := ParseRole("limited", "+get", "~*")
+	if err != nil {
+		t.Fatalf("parse limited role: %v", err)
+	}
+	store := NewStore(&PolicyStore{
+		Roles: map[string]*Role{"admin": admin, "limited": limited},
+		Users: map[string]*User{
+			"admin":   {Role: "admin"},
+			"alice":   {Role: "limited"},
+			"limited": {Role: "limited"},
+		},
+		Default: limited,
+	})
+
+	// Deleting the last user whose effective role grants CmdACL is rejected.
+	if err := store.DelUser("admin"); err == nil {
+		t.Fatal("deleting the last admin user must be rejected")
+	}
+	if store.Load().UserFor("admin") == nil {
+		t.Fatal("rejected deletion must not mutate the store")
+	}
+
+	// A non-admin user, even the last one, may always be deleted.
+	if err := store.DelUser("alice"); err != nil {
+		t.Fatalf("deleting a non-admin user: %v", err)
+	}
+	// With a second admin present, deleting one is allowed.
+	if err := store.SetUser("nopass", "admin", nil); err != nil {
+		t.Fatalf("SetUser: %v", err)
+	}
+	if err := store.DelUser("admin"); err != nil {
+		t.Fatalf("deleting one of two admins: %v", err)
+	}
+	// Deleting an unknown user stays a no-op success.
+	if err := store.DelUser("ghost"); err != nil {
+		t.Fatalf("deleting an unknown user: %v", err)
 	}
 }
 
