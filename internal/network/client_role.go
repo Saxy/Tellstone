@@ -57,6 +57,24 @@ func (c *Client) roleMutate(op OpCode, args [][]byte, scratchBuf []byte) error {
 	return nil
 }
 
+// roleListValue issues a typed-list admin request (ROLE LIST, ACL LIST, ACL LOG)
+// and returns the raw MsgResponse value after validating the reply frame. The
+// caller decodes the value into its concrete entry type.
+func (c *Client) roleListValue(op OpCode, scratchBuf []byte) ([]byte, error) {
+	payload, err := roleRequestPayload(op, nil)
+	if err != nil {
+		return nil, err
+	}
+	var resp Message
+	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
+		return nil, err
+	}
+	if resp.Type != MsgResponse {
+		return nil, errRBACReply(resp.Value)
+	}
+	return resp.Value, nil
+}
+
 // RoleCreate issues ROLE CREATE <name> <rule>... .
 func (c *Client) RoleCreate(role string, rules []string, scratchBuf []byte) error {
 	args := make([][]byte, 0, 1+len(rules))
@@ -87,18 +105,11 @@ func (c *Client) RoleDelete(role string, scratchBuf []byte) error {
 
 // RoleList issues ROLE LIST and decodes the typed response.
 func (c *Client) RoleList(scratchBuf []byte) ([]RoleListEntry, error) {
-	payload, err := roleRequestPayload(OpRoleList, nil)
+	value, err := c.roleListValue(OpRoleList, scratchBuf)
 	if err != nil {
 		return nil, err
 	}
-	var resp Message
-	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Type != MsgResponse {
-		return nil, errRBACReply(resp.Value)
-	}
-	entries, ok := DecodeRoleListResponse(resp.Value)
+	entries, ok := DecodeRoleListResponse(value)
 	if !ok {
 		return nil, fmt.Errorf("server: malformed ROLE LIST response")
 	}

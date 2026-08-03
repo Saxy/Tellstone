@@ -358,32 +358,14 @@ func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 		if s.handler != nil {
 			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, &msg)
 			if dispatched {
-				_, err = c.Discard(totalPacketLen)
-				if err != nil {
-					atomic.AddUint64(&s.protocolErrors, 1)
-					if s.logger.Enabled(log.LevelWarn) {
-						s.logger.Log(log.LevelWarn, "discarding packages not possible",
-							log.Int("total packet length", totalPacketLen),
-							log.String("error", err.Error()),
-						)
-					}
-				}
+				s.discardFrame(c, totalPacketLen)
 				return gnet.None
 			}
 			if action := s.runHandler(c, st, &msg, respType, respPayload, skipHandler, "failed to write network response frame"); action != gnet.None {
 				return action
 			}
 		}
-		_, err = c.Discard(totalPacketLen)
-		if err != nil {
-			atomic.AddUint64(&s.protocolErrors, 1)
-			if s.logger.Enabled(log.LevelWarn) {
-				s.logger.Log(log.LevelWarn, "discarding packages not possible",
-					log.Int("total packet length", totalPacketLen),
-					log.String("error", err.Error()),
-				)
-			}
-		}
+		s.discardFrame(c, totalPacketLen)
 	}
 	return gnet.None
 }
@@ -455,6 +437,22 @@ func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType M
 		return gnet.Close
 	}
 	return gnet.None
+}
+
+// discardFrame consumes one decoded frame from the gnet ring buffer and, when
+// that fails, counts a protocol error and logs a warning. totalPacketLen is the
+// full on-wire size including the 5-byte header.
+func (s *Server) discardFrame(c gnet.Conn, totalPacketLen int) {
+	_, err := c.Discard(totalPacketLen)
+	if err != nil {
+		atomic.AddUint64(&s.protocolErrors, 1)
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "discarding packages not possible",
+				log.Int("total packet length", totalPacketLen),
+				log.String("error", err.Error()),
+			)
+		}
+	}
 }
 
 // authFailed logs a rejected AUTH attempt, increments the per-connection fail

@@ -34,18 +34,11 @@ func (c *Client) AclDelUser(username string, scratchBuf []byte) error {
 // with username, bound role, password presence, and the role's granted
 // commands and namespace whitelist.
 func (c *Client) AclList(scratchBuf []byte) ([]ACLUser, error) {
-	payload, err := roleRequestPayload(OpACLList, nil)
+	value, err := c.roleListValue(OpACLList, scratchBuf)
 	if err != nil {
 		return nil, err
 	}
-	var resp Message
-	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Type != MsgResponse {
-		return nil, errRBACReply(resp.Value)
-	}
-	users, ok := DecodeACLListResponse(resp.Value)
+	users, ok := DecodeACLListResponse(value)
 	if !ok {
 		return nil, fmt.Errorf("server: malformed ACL LIST response")
 	}
@@ -56,18 +49,11 @@ func (c *Client) AclList(scratchBuf []byte) ([]ACLUser, error) {
 // buffer in chronological order, each entry carrying timestamp, username,
 // remote address, and reason.
 func (c *Client) AclLog(scratchBuf []byte) ([]AuthLogEntry, error) {
-	payload, err := roleRequestPayload(OpACLLog, nil)
+	value, err := c.roleListValue(OpACLLog, scratchBuf)
 	if err != nil {
 		return nil, err
 	}
-	var resp Message
-	if err := c.Call(MsgRequest, payload, scratchBuf, &resp); err != nil {
-		return nil, err
-	}
-	if resp.Type != MsgResponse {
-		return nil, errRBACReply(resp.Value)
-	}
-	entries, ok := DecodeACLLogResponse(resp.Value)
+	entries, ok := DecodeACLLogResponse(value)
 	if !ok {
 		return nil, fmt.Errorf("server: malformed ACL LOG response")
 	}
