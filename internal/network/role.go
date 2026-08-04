@@ -118,26 +118,9 @@ func DecodeRoleGetUserResponse(payload []byte) (RoleUser, bool) {
 	}, true
 }
 
-// encodeStringList appends a [2B count]{[2B len][str]} list to buf. ok is
-// false when the count or any element exceeds the 64 KiB length-prefix limit.
-func encodeStringList(buf []byte, items []string) ([]byte, bool) {
-	if len(items) > math.MaxUint16 {
-		return nil, false
-	}
-	buf = binary.BigEndian.AppendUint16(buf, uint16(len(items)))
-	for _, s := range items {
-		if len(s) > math.MaxUint16 {
-			return nil, false
-		}
-		buf = binary.BigEndian.AppendUint16(buf, uint16(len(s)))
-		buf = append(buf, s...)
-	}
-	return buf, true
-}
-
 // encodeByteList appends a [2B count]{[2B len][bytes]} list to buf. ok is
 // false when the count or any element exceeds the 64 KiB length-prefix limit.
-func encodeByteList(buf []byte, items [][]byte) ([]byte, bool) {
+func encodeList[T []byte | string](buf []byte, items []T) ([]byte, bool) {
 	if len(items) > math.MaxUint16 {
 		return nil, false
 	}
@@ -229,10 +212,10 @@ func EncodeRoleListResponse(entries []RoleListEntry) ([]byte, bool) {
 		buf = binary.BigEndian.AppendUint16(buf, uint16(len(e.Name)))
 		buf = append(buf, e.Name...)
 		var ok bool
-		if buf, ok = encodeStringList(buf, e.Commands); !ok {
+		if buf, ok = encodeList(buf, e.Commands); !ok {
 			return nil, false
 		}
-		if buf, ok = encodeByteList(buf, e.Namespaces); !ok {
+		if buf, ok = encodeList(buf, e.Namespaces); !ok {
 			return nil, false
 		}
 	}
