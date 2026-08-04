@@ -111,6 +111,13 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	if e.maxBytes > 0 {
 		totalEntrySize := uint64(len(key) + neededSize)
 		if atomic.LoadUint64(&e.allocatedBytes)+totalEntrySize > e.maxBytes {
+			if e.logger.Enabled(log.LevelWarn) {
+				e.logger.Log(log.LevelWarn, "storage engine memory ceiling reached, write rejected",
+					log.String("key", key),
+					log.Uint64("allocated_bytes", atomic.LoadUint64(&e.allocatedBytes)),
+					log.Uint64("max_bytes", e.maxBytes),
+				)
+			}
 			return ErrEngineFull
 		}
 	}
@@ -182,10 +189,7 @@ func (e *Engine) Delete(key string) {
 	}
 	delete(e.items, key)
 	e.mu.Unlock()
-	releasedBytes := uint64(len(key) + len(item.Value))
-	atomic.AddUint64(&e.allocatedBytes, ^(releasedBytes - 1))
-	atomic.AddUint64(&e.totalCommands, 1)
-	atomic.AddUint64(&e.keyCount, ^uint64(0))
+	e.releaseKey(key, item)
 	if e.logger.Enabled(log.LevelDebug) {
 		e.logger.Log(log.LevelDebug, "key deleted from engine state",
 			log.String("key", key),
@@ -202,11 +206,17 @@ func (e *Engine) deleteIfExpired(key string) bool {
 	}
 	delete(e.items, key)
 	e.mu.Unlock()
+	e.releaseKey(key, item)
+	return true
+}
+
+// releaseKey adjusts the memory, command, and key counters after a successful
+// in-memory deletion. It must be called with the item that was just removed.
+func (e *Engine) releaseKey(key string, item Item) {
 	releasedBytes := uint64(len(key) + len(item.Value))
 	atomic.AddUint64(&e.allocatedBytes, ^(releasedBytes - 1))
 	atomic.AddUint64(&e.totalCommands, 1)
 	atomic.AddUint64(&e.keyCount, ^uint64(0))
-	return true
 }
 
 func (e *Engine) Get(key string) ([]byte, bool) {

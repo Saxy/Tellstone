@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -53,7 +54,7 @@ type Storage struct {
 }
 
 // NewStorage creates a new persistence Storage. If enabled is false, a pass-through
-// (no-op) instance is returned. If dir is empty, the platform-specific default is used.
+// (no-op) instance is returned. If the dir is empty, the platform-specific default is used.
 // Returns an error if enabled is true and the data directory cannot be created.
 func NewStorage(enabled bool, logger log.Logger, dir string) (*Storage, error) {
 	if logger == nil {
@@ -110,7 +111,7 @@ func (s *Storage) getShard(shardID uint32) *shardHandle {
 	return h
 }
 
-// appendRecord is the shared write path for both SET and tombstone records.
+// appendRecord is the shared writing path for both SET and tombstone records.
 // It acquires the shard mutex, writes the header, key, value, and syncs.
 func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, value []byte, op string) error {
 	h := s.getShard(shardID)
@@ -152,7 +153,7 @@ func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, valu
 
 // Write appends a SET record to the shard's WAL file. The record includes a
 // 16-byte header (key length, value length, TTL), followed by key and value bytes.
-// The write and trailing Sync are serialized under the shard's own mutex.
+// The writing and trailing Sync are serialized under the shard's own mutex.
 // Returns nil immediately when persistence is disabled.
 func (s *Storage) Write(shardID uint32, key string, value []byte, ttl time.Time) error {
 	if !s.enabled {
@@ -245,7 +246,7 @@ func (s *Storage) OpenShard(shardID uint32) error {
 
 // LoadShard replays all records from the shard's WAL file into the given engine,
 // skipping expired keys and applying tombstones as deletions. Truncated records
-// from a crash mid-write are detected and the WAL is truncated to the last valid
+// from a crash mid-write are detected, and the WAL is truncated to the last valid
 // offset so future loads resume from a clean end.
 func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 	h := s.getShard(shardID)
@@ -292,14 +293,14 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		}
 		keyBuf := make([]byte, keyLen)
 		if _, err = io.ReadFull(f, keyBuf); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return fmt.Errorf("persistence: read key: %w", err)
 		}
 		valBuf := make([]byte, valLen)
 		if _, err = io.ReadFull(f, valBuf); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return fmt.Errorf("persistence: read value: %w", err)

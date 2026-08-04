@@ -54,7 +54,9 @@ func DialWithLogger(addr string, timeout time.Duration, logger log.Logger) (*Cli
 	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		_ = tcpConn.SetNoDelay(true)
 	}
-	logger.Log(log.LevelInfo, "client: connected", log.String("addr", addr))
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "client: connected", log.String("addr", addr))
+	}
 	return &Client{conn: conn, logger: logger}, nil
 }
 
@@ -106,7 +108,9 @@ func DialTLSWithLogger(addr string, certPath, keyPath, caPath string, timeout ti
 	if err != nil {
 		return nil, err
 	}
-	logger.Log(log.LevelInfo, "client: connected", log.String("addr", addr))
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "client: connected", log.String("addr", addr))
+	}
 	return &Client{conn: conn, logger: logger}, nil
 }
 
@@ -115,8 +119,10 @@ func (c *Client) Close() error {
 	err := c.conn.Close()
 	if c.logger != nil {
 		if err != nil {
-			c.logger.Log(log.LevelWarn, "client: close failed", log.String("error", err.Error()))
-		} else {
+			if c.logger.Enabled(log.LevelWarn) {
+				c.logger.Log(log.LevelWarn, "client: close failed", log.String("error", err.Error()))
+			}
+		} else if c.logger.Enabled(log.LevelInfo) {
 			c.logger.Log(log.LevelInfo, "client: connection closed")
 		}
 	}

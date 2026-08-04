@@ -5,6 +5,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/Saxy/Tellstone/internal/log"
 )
 
 // itoa is a tiny alias so the eviction test's expected usernames read clearly.
@@ -13,7 +15,7 @@ func itoa(i int) string { return strconv.Itoa(i) }
 // TestACLLogOrder verifies the auth-failure buffer returns entries in
 // chronological order and that overflowing it evicts the oldest entries.
 func TestACLLogOrder(t *testing.T) {
-	s := NewStore(&PolicyStore{})
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
 	for i := 0; i < 5; i++ {
 		s.LogAuthFailure("alice", "1.2.3.4:5", "invalid password")
 	}
@@ -37,7 +39,7 @@ func TestACLLogOrder(t *testing.T) {
 // TestACLLogEviction overflows the default capacity and verifies the oldest
 // entries are dropped while order is preserved and capacity stays bounded.
 func TestACLLogEviction(t *testing.T) {
-	s := NewStore(&PolicyStore{})
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
 	total := DefaultAuthLogCap + 7
 	for i := 0; i < total; i++ {
 		s.LogAuthFailure("u"+itoa(i), "addr", "reason")
@@ -61,7 +63,7 @@ func TestACLLogEviction(t *testing.T) {
 
 // TestACLLogEmpty verifies an untouched store reports no entries.
 func TestACLLogEmpty(t *testing.T) {
-	s := NewStore(&PolicyStore{})
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
 	if entries := s.AuthLog(); entries != nil {
 		t.Fatalf("AuthLog = %v, want nil", entries)
 	}
@@ -70,7 +72,7 @@ func TestACLLogEmpty(t *testing.T) {
 // TestACLLogConcurrent exercises the mutex-protected buffer from many
 // goroutines; run with -race to prove no data race on append/read.
 func TestACLLogConcurrent(t *testing.T) {
-	s := NewStore(&PolicyStore{})
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
 	var wg sync.WaitGroup
 	for g := 0; g < 8; g++ {
 		wg.Add(1)

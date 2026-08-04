@@ -14,6 +14,8 @@ package rbac
 import (
 	"sync"
 	"sync/atomic"
+
+	"github.com/Saxy/Tellstone/internal/log"
 )
 
 // PolicyStore is an immutable snapshot of the authorization state: role
@@ -88,6 +90,10 @@ func (p *PolicyStore) Clone() *PolicyStore {
 type Store struct {
 	active atomic.Pointer[PolicyStore]
 	mu     sync.Mutex
+	// logger reports policy mutations (CreateRole, SetUser, DelUser, DeleteRole)
+	// so operators see admin changes in the server log. Set via NewStore; nil
+	// falls back to the no-op logger so RBAC never depends on logging being on.
+	logger log.Logger
 	// authFailures counts rejected AUTH attempts, deniedCommands counts
 	// authorization-denied command attempts. Unlike the per-role command
 	// counter, both are store-wide: a denial can happen without a pinned role
@@ -103,10 +109,15 @@ type Store struct {
 	logLen  int            // number of valid entries
 }
 
-// NewStore returns a Store seeded with policy.
-func NewStore(policy *PolicyStore) *Store {
+// NewStore returns a Store seeded with policy. A nil logger falls back to the
+// no-op logger, so RBAC keeps working with logging disabled.
+func NewStore(policy *PolicyStore, logger log.Logger) *Store {
 	s := new(Store)
 	s.active.Store(policy)
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
+	s.logger = logger
 	return s
 }
 

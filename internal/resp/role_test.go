@@ -44,7 +44,7 @@ func startRBACServer(t *testing.T) (addr string) {
 	t.Helper()
 	addr = freeAddr(t)
 	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false,
-		rbac.NewStore(rbacTestPolicy(t)))
+		rbac.NewStore(rbacTestPolicy(t), log.NewNoOpLogger()))
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -187,7 +187,7 @@ func TestRESPServer_RBACNamespacePrefix(t *testing.T) {
 // the per-role executed counter.
 func TestRESPServer_RBACMetrics(t *testing.T) {
 	addr := freeAddr(t)
-	store := rbac.NewStore(rbacTestPolicy(t))
+	store := rbac.NewStore(rbacTestPolicy(t), log.NewNoOpLogger())
 	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, store)
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {

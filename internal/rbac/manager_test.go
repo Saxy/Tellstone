@@ -8,10 +8,14 @@ visible to later Load calls while never mutating the previously published snapsh
 */
 package rbac
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Saxy/Tellstone/internal/log"
+)
 
 func TestStoreCreateRole(t *testing.T) {
-	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}})
+	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}}, log.NewNoOpLogger())
 	if err := store.CreateRole("reader", []string{"+@read", "~*"}); err != nil {
 		t.Fatalf("CreateRole: %v", err)
 	}
@@ -27,7 +31,7 @@ func TestStoreCreateRole(t *testing.T) {
 }
 
 func TestStoreSetUserValidatesRole(t *testing.T) {
-	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}})
+	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}}, log.NewNoOpLogger())
 	_ = store.CreateRole("reader", []string{"+@read"})
 	if err := store.SetUser("alice", "reader", []byte("hash")); err != nil {
 		t.Fatalf("SetUser: %v", err)
@@ -42,7 +46,7 @@ func TestStoreSetUserValidatesRole(t *testing.T) {
 }
 
 func TestStoreDelUserAndDeleteRole(t *testing.T) {
-	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}})
+	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}}, log.NewNoOpLogger())
 	_ = store.CreateRole("r", []string{"+GET"})
 	_ = store.SetUser("alice", "r", nil)
 
@@ -86,7 +90,7 @@ func TestStoreDelUserLastAdminGuard(t *testing.T) {
 			"limited": {Role: "limited"},
 		},
 		Default: limited,
-	})
+	}, log.NewNoOpLogger())
 
 	// Deleting the last user whose effective role grants CmdACL is rejected.
 	if err := store.DelUser("admin"); err == nil {
@@ -122,7 +126,7 @@ func TestStoreDeleteRoleClearsDefault(t *testing.T) {
 		Roles:   map[string]*Role{"r": role},
 		Users:   map[string]*User{"alice": {Role: "r"}},
 		Default: role,
-	})
+	}, log.NewNoOpLogger())
 	if err := store.DeleteRole("r"); err != nil {
 		t.Fatalf("DeleteRole: %v", err)
 	}
@@ -136,7 +140,7 @@ func TestStoreDeleteRoleClearsDefault(t *testing.T) {
 }
 
 func TestStoreMutationsDoNotMutatePublishedSnapshot(t *testing.T) {
-	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}})
+	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}}, log.NewNoOpLogger())
 	_ = store.CreateRole("r", []string{"+GET"})
 	snapshot := store.Load()
 	_ = store.CreateRole("s", []string{"+SET"})

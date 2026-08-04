@@ -14,7 +14,7 @@ import (
 func startACLServer(t *testing.T) (addr string, store *rbac.Store) {
 	t.Helper()
 	addr = freeAddr(t)
-	store = rbac.NewStore(rbacTestPolicy(t))
+	store = rbac.NewStore(rbacTestPolicy(t), log.NewNoOpLogger())
 	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, store)
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {

@@ -258,13 +258,27 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		st.handshakeDeadline = time.Now().Add(tlsHandshakeTimeout)
 	}
 	c.SetContext(st)
+	if s.logger.Enabled(log.LevelDebug) {
+		s.logger.Log(log.LevelDebug, "resp: client connected", log.String("remote_addr", st.remoteAddr))
+	}
 	return nil, gnet.None
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, ^uint64(0))
-	if st, ok := c.Context().(*connState); ok && st.shardID >= 0 && st.shardID < len(s.shards) {
-		s.shards[st.shardID].DecConnectedClients()
+	var remoteAddr string
+	if st, ok := c.Context().(*connState); ok {
+		remoteAddr = st.remoteAddr
+		if st.shardID >= 0 && st.shardID < len(s.shards) {
+			s.shards[st.shardID].DecConnectedClients()
+		}
+	}
+	if s.logger.Enabled(log.LevelDebug) {
+		fields := []log.Field{log.String("remote_addr", remoteAddr)}
+		if err != nil {
+			fields = append(fields, log.String("error", err.Error()))
+		}
+		s.logger.Log(log.LevelDebug, "resp: client disconnected", fields...)
 	}
 	return gnet.None
 }
@@ -550,6 +564,12 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 		}
 		// Unauthenticated connections may only issue AUTH, PING, and QUIT (Redis semantics).
 		if !EqualFold(cmd, shard.CmdPing) && !EqualFold(cmd, "QUIT") {
+			if s.logger.Enabled(log.LevelWarn) {
+				s.logger.Log(log.LevelWarn, "resp: command rejected, client not authenticated",
+					log.String("remote_addr", st.remoteAddr),
+					log.String("command", string(cmd)),
+				)
+			}
 			return AppendError(out, "NOAUTH Authentication required"), false
 		}
 	}
@@ -559,8 +579,7 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 			return AppendError(out, "ERR wrong number of arguments for 'get' command"), false
 		}
 		if !s.authorized(st, rbac.CmdGet, args[1]) {
-			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'get' command on this key"), false
+			return s.deniedReply(st, "get", false, out), false
 		}
 		s.countCommand(st)
 		key := *(*string)(unsafe.Pointer(&args[1]))
@@ -575,8 +594,7 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 			return AppendError(out, "ERR wrong number of arguments for 'set' command"), false
 		}
 		if !s.authorized(st, rbac.CmdSet, args[1]) {
-			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'set' command on this key"), false
+			return s.deniedReply(st, "set", false, out), false
 		}
 		s.countCommand(st)
 		key := *(*string)(unsafe.Pointer(&args[1]))
@@ -595,8 +613,7 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 		}
 		for _, k := range args[1:] {
 			if !s.authorized(st, rbac.CmdDel, k) {
-				s.countDenied()
-				return AppendError(out, "NOPERM no permission for 'del' command on this key"), false
+				return s.deniedReply(st, "del", false, out), false
 			}
 		}
 		s.countCommand(st)
@@ -623,16 +640,14 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 
 	case EqualFold(cmd, shard.CmdRole):
 		if !s.authorizedCmd(st, rbac.CmdRole) {
-			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'role' command"), false
+			return s.deniedReply(st, "role", true, out), false
 		}
 		s.countCommand(st)
 		return s.role(st, args, out), false
 
 	case EqualFold(cmd, shard.CmdACL):
 		if !s.authorizedCmd(st, rbac.CmdACL) {
-			s.countDenied()
-			return AppendError(out, "NOPERM no permission for 'acl' command"), false
+			return s.deniedReply(st, "acl", true, out), false
 		}
 		s.countCommand(st)
 		return s.acl(st, args, out), false
@@ -683,6 +698,27 @@ func (s *Server) countDenied() {
 	if s.policy != nil {
 		s.policy.IncDenied()
 	}
+}
+
+// deniedReply records one RBAC denial (NOPERM) and logs the blocked command with
+// the pinned user identity so operators see who was denied. keyless omits the
+// key-scoped suffix from the reply (ROLE/ACL have no key scope).
+func (s *Server) deniedReply(st *connState, cmd string, keyless bool, out []byte) []byte {
+	s.countDenied()
+	if s.logger.Enabled(log.LevelWarn) {
+		fields := []log.Field{
+			log.String("remote_addr", st.remoteAddr),
+			log.String("command", cmd),
+		}
+		if st.session != nil {
+			fields = append(fields, log.String("username", st.session.Username))
+		}
+		s.logger.Log(log.LevelWarn, "resp: command denied by rbac policy", fields...)
+	}
+	if keyless {
+		return AppendError(out, "NOPERM no permission for '"+cmd+"' command")
+	}
+	return AppendError(out, "NOPERM no permission for '"+cmd+"' command on this key")
 }
 
 func (s *Server) dispatchSTARTTLS(st *connState, args [][]byte, out []byte) []byte {
@@ -758,6 +794,12 @@ func (s *Server) authRBAC(st *connState, c gnet.Conn, args [][]byte, out []byte)
 		// nopass user: authentication succeeds without any hashing.
 		st.authenticated = true
 		st.session = rbac.NewSessionContext(username, p.RoleFor(username))
+		if s.logger.Enabled(log.LevelDebug) {
+			s.logger.Log(log.LevelDebug, "resp: client authenticated",
+				log.String("remote_addr", st.remoteAddr),
+				log.String("username", username),
+			)
+		}
 		return append(out, respOK...), false
 	}
 	// The session is built from the same snapshot that yielded the hash; the
@@ -801,6 +843,11 @@ func (s *Server) dispatchAuth(c gnet.Conn, username, reason string, password, pa
 	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session, username: username, reason: reason}:
 		return true
 	default:
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "resp: auth worker pool saturated, rejecting AUTH",
+				log.String("remote_addr", c.RemoteAddr().String()),
+			)
+		}
 		return false
 	}
 }
@@ -825,6 +872,12 @@ func (s *Server) authWorker() {
 			if success {
 				st.authenticated = true
 				st.session = job.session
+				if s.logger.Enabled(log.LevelDebug) {
+					s.logger.Log(log.LevelDebug, "resp: client authenticated",
+						log.String("remote_addr", st.remoteAddr),
+						log.String("username", job.username),
+					)
+				}
 				reply = append(reply, respOK...)
 			} else {
 				reply = s.authFailed(st, job.username, job.reason, nil)

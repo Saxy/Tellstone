@@ -213,13 +213,30 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		st.readBuf = make([]byte, 0, 4096)
 	}
 	c.SetContext(st)
+	if s.logger.Enabled(log.LevelDebug) {
+		s.logger.Log(log.LevelDebug, "network: client connected",
+			log.String("remote_addr", st.remoteAddr),
+			log.Uint64("shard_id", sid),
+		)
+	}
 	return nil, gnet.None
 }
 
 func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	atomic.AddUint64(&s.connectedClients, ^uint64(0))
-	if st, ok := c.Context().(*connState); ok && int(st.shardID) < len(s.shards) {
-		s.shards[st.shardID].DecConnectedClients()
+	var remoteAddr string
+	if st, ok := c.Context().(*connState); ok {
+		remoteAddr = st.remoteAddr
+		if int(st.shardID) < len(s.shards) {
+			s.shards[st.shardID].DecConnectedClients()
+		}
+	}
+	if s.logger.Enabled(log.LevelDebug) {
+		fields := []log.Field{log.String("remote_addr", remoteAddr)}
+		if err != nil {
+			fields = append(fields, log.String("error", err.Error()))
+		}
+		s.logger.Log(log.LevelDebug, "network: client disconnected", fields...)
 	}
 	return gnet.None
 }
@@ -385,10 +402,23 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 		return result.respType, result.respPayload, true, false
 	}
 	if !st.authenticated && msg.Type != MsgPing {
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "network: command rejected, client not authenticated",
+				log.String("remote_addr", st.remoteAddr),
+				log.String("command", msg.Op.String()),
+			)
+		}
 		return MsgAuthErr, ResponseAuthErr, true, false
 	}
 	if s.policy != nil && !s.opAuthorized(*msg, st) {
 		s.policy.IncDenied()
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "network: command denied by rbac policy",
+				log.String("remote_addr", st.remoteAddr),
+				log.String("command", msg.Op.String()),
+				log.String("key", string(msg.Key)),
+			)
+		}
 		return MsgError, ResponseNotAuthorized, true, false
 	}
 	return 0, nil, false, false
@@ -617,6 +647,11 @@ func (s *Server) dispatchAuth(c gnet.Conn, username, reason string, password, pa
 	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session, username: username, reason: reason}:
 		return true
 	default:
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "network: auth worker pool saturated, rejecting AUTH",
+				log.String("remote_addr", c.RemoteAddr().String()),
+			)
+		}
 		return false
 	}
 }
@@ -629,6 +664,8 @@ func (s *Server) opAuthorized(msg Message, st *connState) bool {
 	switch msg.Type {
 	case MsgPing, MsgAuth:
 		return true
+	default:
+		break
 	}
 	if st.session == nil {
 		return false

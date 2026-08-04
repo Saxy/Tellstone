@@ -6,7 +6,11 @@ Description: Verifies user→role resolution (explicit, default, fail-closed) an
 */
 package rbac
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Saxy/Tellstone/internal/log"
+)
 
 func TestPolicyStoreRoleFor(t *testing.T) {
 	readonly, err := ParseRole("readonly", "+@read")
@@ -42,7 +46,7 @@ func TestStoreAtomicSwap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ParseRole v2: %v", err)
 	}
-	store := NewStore(&PolicyStore{Roles: map[string]*Role{"v1": v1}})
+	store := NewStore(&PolicyStore{Roles: map[string]*Role{"v1": v1}}, log.NewNoOpLogger())
 	if got := store.Load().Roles["v1"]; got != v1 {
 		t.Fatal("initial policy must be visible")
 	}

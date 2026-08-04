@@ -119,8 +119,10 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		if err := s.Engine.Set(key, value, ttl); err != nil {
 			if s.Persistence.Enabled() && !keyExisted {
 				if delErr := s.Persistence.Delete(uint32(s.ID), key); delErr != nil {
-					s.Logger.Log(log.LevelError, "persistence: compensation delete failed after engine rejection",
-						log.String("key", key), log.String("error", delErr.Error()))
+					if s.Logger.Enabled(log.LevelError) {
+						s.Logger.Log(log.LevelError, "persistence: compensation delete failed after engine rejection",
+							log.String("key", key), log.String("error", delErr.Error()))
+					}
 				}
 			}
 			return Response{Err: err}
@@ -135,6 +137,12 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		s.Engine.Delete(key)
 		return Response{OK: true}
 	default:
+		if s.Logger.Enabled(log.LevelError) {
+			s.Logger.Log(log.LevelError, "shard: unknown operation",
+				log.String("op", op),
+				log.String("key", key),
+			)
+		}
 		return Response{Err: ErrShardStopped}
 	}
 }

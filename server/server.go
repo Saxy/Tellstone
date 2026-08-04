@@ -156,6 +156,9 @@ func (s *Server) Run() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.GetShutdownTimeout())
 		defer cancel()
 		s.shutdown(shutdownCtx)
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "server shutdown complete")
+		}
 	}()
 
 	if err = s.netSrv.ListenAndServe(); err != nil {
@@ -190,7 +193,7 @@ func (s *Server) initRBAC() error {
 		}
 		return err
 	}
-	s.policy = rbac.NewStore(policy)
+	s.policy = rbac.NewStore(policy, logger)
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "rbac policy loaded", log.String("path", path))
 	}
@@ -300,6 +303,16 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 		s.shards[i] = sh
 	}
 	s.router = router.New(s.shards)
+	if logger.Enabled(log.LevelInfo) {
+		persistence := "disabled"
+		if store != nil {
+			persistence = "enabled"
+		}
+		logger.Log(log.LevelInfo, "shards initialized",
+			log.Int("num_shards", numShards),
+			log.String("persistence", persistence),
+		)
+	}
 	return nil
 }
 

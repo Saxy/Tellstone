@@ -35,7 +35,7 @@ func initProfiling() {
 	}
 }
 
-func initRuntimeSettings() {
+func initRuntimeSettings(l logger.Logger) {
 	// TSD_GC_PERCENT configures the garbage collection trigger percentage.
 	// Setting this to -1 disables the default percentage-based GC entirely.
 	// This creates a "Zero-GC Hot-Path" where execution is never interrupted
@@ -68,6 +68,12 @@ func initRuntimeSettings() {
 		}
 	}
 	debug.SetMemoryLimit(memLimit)
+	if l.Enabled(logger.LevelInfo) {
+		l.Log(logger.LevelInfo, "runtime settings applied",
+			logger.Int("gc_percent", gcPercent),
+			logger.Int64("memory_limit_bytes", memLimit),
+		)
+	}
 }
 
 func main() {
@@ -77,11 +83,11 @@ func main() {
 			return
 		}
 	}
-	initRuntimeSettings()
-	initProfiling()
 	cfg := config.LoadConfig(os.Args[1:])
 	app := new(tellstone.App)
 	logpkg := logger.NewSlogLogger(cfg.GetLogLevel())
+	initRuntimeSettings(logpkg)
+	initProfiling()
 	app.Start(cfg, logpkg)
 	svr := server.NewServer(app)
 	if err := svr.Run(); err != nil {

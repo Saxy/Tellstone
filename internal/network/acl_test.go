@@ -220,7 +220,7 @@ func startACLNetworkServer(t *testing.T) (addr string, store *rbac.Store) {
 	}
 	addr = l.Addr().String()
 	_ = l.Close()
-	store = rbac.NewStore(rbacNetworkPolicy(t))
+	store = rbac.NewStore(rbacNetworkPolicy(t), log.NewNoOpLogger())
 	srv := NewServer(addr, 0, nil, aclTestHandler(store), log.NewNoOpLogger(), nil, "", store)
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {

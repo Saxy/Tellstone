@@ -6,7 +6,11 @@ Description: Verifies the SessionContext hot path: command + namespace checks, f
 */
 package rbac
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/Saxy/Tellstone/internal/log"
+)
 
 func TestSessionContextIsAllowed(t *testing.T) {
 	role, err := ParseRole("readonly", "+@read")
@@ -58,7 +62,7 @@ func TestSessionPinnedAcrossPolicySwap(t *testing.T) {
 	store := NewStore(&PolicyStore{
 		Roles: map[string]*Role{"old": oldRole, "new": newRole},
 		Users: map[string]*User{"alice": {Role: "old"}},
-	})
+	}, log.NewNoOpLogger())
 
 	session := NewSessionContext("alice", store.Load().RoleFor("alice"))
 	store.Store(&PolicyStore{
