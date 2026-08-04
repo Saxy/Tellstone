@@ -56,10 +56,10 @@ func EncodeACLListResponse(users []ACLUser) ([]byte, bool) {
 			buf = append(buf, 0)
 		}
 		var ok bool
-		if buf, ok = encodeStringList(buf, u.Commands); !ok {
+		if buf, ok = encodeList(buf, u.Commands); !ok {
 			return nil, false
 		}
-		if buf, ok = encodeByteList(buf, u.Namespaces); !ok {
+		if buf, ok = encodeList(buf, u.Namespaces); !ok {
 			return nil, false
 		}
 	}
