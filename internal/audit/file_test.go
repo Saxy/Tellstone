@@ -20,6 +20,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -82,14 +83,21 @@ func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 		t.Fatalf("file name %q missing the tsd marker", base)
 	}
 	parts := strings.Split(strings.TrimSuffix(base, "_tsd.log"), "_")
-	if len(parts) != 2 {
-		t.Fatalf("expected <timestamp>_<hash>_tsd.log, got %q", base)
+	if len(parts) != 3 {
+		t.Fatalf("expected <timestamp>_<hash>_<pid>_tsd.log, got %q", base)
 	}
 	if _, err := fmt.Sscanf(parts[0], "%d", new(int64)); err != nil {
 		t.Fatalf("timestamp segment %q is not numeric: %v", parts[0], err)
 	}
 	if len(parts[1]) != 8 {
 		t.Fatalf("hash segment %q should be 8 hex chars", parts[1])
+	}
+	pid, err := strconv.Atoi(parts[2])
+	if err != nil {
+		t.Fatalf("pid segment %q is not numeric: %v", parts[2], err)
+	}
+	if pid != os.Getpid() {
+		t.Fatalf("pid segment %q must match the writing process (%d)", parts[2], os.Getpid())
 	}
 }
 

@@ -4,10 +4,11 @@ Tellstone Cloud-Native In-Memory Database
 File: file.go
 Description: File-backed audit log writer. The on-disk file name is generated,
 never supplied: a unix timestamp, the first 8 hex chars of a SHA-256 of the
-destination directory (a stable per-instance fingerprint), and the "tsd" marker.
-Bytes written are tracked and once the threshold (50 MiB) is crossed the writer
-rotates to a freshly named file in the same directory. When encryption is
-enabled, every record is sealed with the crypto engine before being flushed.
+destination directory (a stable per-instance fingerprint), the writing process's
+PID, and the "tsd" marker. Bytes written are tracked and once the threshold
+(50 MiB) is crossed the writer rotates to a freshly named file in the same
+directory. When encryption is enabled, every record is sealed with the crypto
+engine before being flushed.
 
 Authors:
 
@@ -79,9 +80,11 @@ func open(dir string) (*os.File, string, error) {
 	return osFile, path, nil
 }
 
-// fileName builds a unique audit file name: <unix-nanoseconds>_<hash>_tsd.log.
-// Nanoseconds (rather than seconds) guarantee two rotations in the same second
-// cannot collide; the hash fingerprint separates instances sharing a directory.
+// fileName builds a unique audit file name:
+// <unix-nanoseconds>_<hash>_<pid>_tsd.log. Nanoseconds (rather than seconds)
+// guarantee two rotations in the same second cannot collide; the hash
+// fingerprint separates instances sharing a directory; the PID separates
+// processes writing to the same directory.
 func fileName(dir string) string {
 	h := sha256.Sum256([]byte(dir))
 	return fmt.Sprintf("%d_%x_%d_tsd.log", time.Now().UnixNano(), h[:4], os.Getpid())
