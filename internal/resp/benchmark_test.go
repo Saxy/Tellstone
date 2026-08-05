@@ -63,7 +63,7 @@ func BenchmarkParsePipeline(b *testing.B) {
 func BenchmarkDispatchGetHit(b *testing.B) {
 	store := newFakeStore()
 	_ = store.Set("k", []byte("benchmark_value"), 0)
-	srv := &Server{store: store, logger: log.NewNoOpLogger()}
+	srv := &Server{store: store, logger: log.NewNoOpLogger(), audit: newNoOpAudit()}
 	st := &connState{authenticated: true}
 	args := [][]byte{[]byte("GET"), []byte("k")}
 	out := make([]byte, 0, 128)
@@ -76,7 +76,7 @@ func BenchmarkDispatchGetHit(b *testing.B) {
 // BenchmarkDispatchSet measures Server.dispatch for a plain (no-TTL) SET.
 func BenchmarkDispatchSet(b *testing.B) {
 	store := newFakeStore()
-	srv := &Server{store: store, logger: log.NewNoOpLogger()}
+	srv := &Server{store: store, logger: log.NewNoOpLogger(), audit: newNoOpAudit()}
 	st := &connState{authenticated: true}
 	args := [][]byte{[]byte("SET"), []byte("k"), []byte("benchmark_value")}
 	out := make([]byte, 0, 128)
@@ -90,7 +90,7 @@ func BenchmarkDispatchSet(b *testing.B) {
 // single mutex, mirroring how many gnet event-loop goroutines would hammer a shared store.
 func BenchmarkDispatchSetParallel(b *testing.B) {
 	store := newFakeStore()
-	srv := &Server{store: store, logger: log.NewNoOpLogger()}
+	srv := &Server{store: store, logger: log.NewNoOpLogger(), audit: newNoOpAudit()}
 	b.ReportAllocs()
 	b.RunParallel(func(pb *testing.PB) {
 		st := &connState{authenticated: true}
