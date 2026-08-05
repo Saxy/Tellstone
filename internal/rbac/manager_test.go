@@ -14,6 +14,18 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
+// recordingLogger captures every Log call so tests can assert on the exact set
+// of events emitted (or not emitted) by the Store mutation helpers.
+type recordingLogger struct {
+	msgs []string
+}
+
+func (r *recordingLogger) Enabled(level log.Level) bool { return true }
+
+func (r *recordingLogger) Log(level log.Level, msg string, fields ...log.Field) {
+	r.msgs = append(r.msgs, msg)
+}
+
 func TestStoreCreateRole(t *testing.T) {
 	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}}, log.NewNoOpLogger())
 	if err := store.CreateRole("reader", []string{"+@read", "~*"}); err != nil {
@@ -70,6 +82,52 @@ func TestStoreDelUserAndDeleteRole(t *testing.T) {
 	}
 	if store.Load().UserFor("alice") != nil {
 		t.Fatal("deleted user must be gone")
+	}
+}
+
+func TestStoreDelUserAbsentUserLogsNothing(t *testing.T) {
+	rec := &recordingLogger{}
+	store := NewStore(&PolicyStore{Roles: map[string]*Role{}, Users: map[string]*User{}}, rec)
+	snapshot := store.Load()
+
+	if err := store.DelUser("ghost"); err != nil {
+		t.Fatalf("DelUser on an absent user must succeed as a no-op: %v", err)
+	}
+	// No republish: Load must return the exact snapshot published before the call.
+	if store.Load() != snapshot {
+		t.Fatal("absent-user DelUser must not republish the policy")
+	}
+	for _, msg := range rec.msgs {
+		if msg == "rbac: user deleted" {
+			t.Fatal("absent-user DelUser must not emit a deletion event")
+		}
+	}
+
+	// Contrast: deleting an existing user still republishes and logs, so the
+	// early return above only short-circuits the genuinely absent case.
+	rec2 := &recordingLogger{}
+	role, err := ParseRole("r", "+GET")
+	if err != nil {
+		t.Fatalf("ParseRole: %v", err)
+	}
+	store2 := NewStore(&PolicyStore{
+		Roles: map[string]*Role{"r": role},
+		Users: map[string]*User{"alice": {Role: "r"}},
+	}, rec2)
+	if err := store2.DelUser("alice"); err != nil {
+		t.Fatalf("DelUser on an existing user: %v", err)
+	}
+	if store2.Load().UserFor("alice") != nil {
+		t.Fatal("existing user must be deleted")
+	}
+	seen := false
+	for _, msg := range rec2.msgs {
+		if msg == "rbac: user deleted" {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("deleting an existing user must still emit the deletion event")
 	}
 }
 

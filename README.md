@@ -46,17 +46,17 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 For a detailed description of the package structure, request flow, and design decisions,
 see [ARCHITECTURE.md](ARCHITECTURE.md).
 
-| Layer | Package | Notes |
-|---|---|---|
-| Binary protocol | `internal/network` | `MsgRequest`/`MsgResponse` frames (`GET`/`SET`/`DEL`, TTL, key, value) |
-| RESP2 protocol | `internal/resp` | Redis‑compatible listener reusing the same engine |
-| Request router | `internal/router` | FNV‑1a hash → O(1) shard dispatch |
-| Shard runner | `internal/shard` | Shared‑nothing shard: synchronous `Execute()`, per‑shard `sync.RWMutex` |
-| Storage engine | `internal/storage` | Single‑map engine, TTL eviction via timing wheel |
-| Persistence | `internal/persistence` | Per‑shard append‑only WAL, zero‑alloc write path |
-| Crypto | `internal/crypto` | Optional ChaCha20‑Poly1305 |
-| Audit | `internal/audit` | Structured JSON security events (`connect`, `auth_*`, `acl_deny`, `command`); rotating file writer, optional encryption |
-| Metrics / tracing | `internal/metrics`, `internal/trace` | Prometheus text exporter, OTLP/gRPC tracing |
+| Layer | Package | Notes                                                                                                                                 |
+|---|---|---------------------------------------------------------------------------------------------------------------------------------------|
+| Binary protocol | `internal/network` | `MsgRequest`/`MsgResponse` frames (`GET`/`SET`/`DEL`, TTL, key, value)                                                                |
+| RESP2 protocol | `internal/resp` | Redis‑compatible listener reusing the same engine                                                                                     |
+| Request router | `internal/router` | FNV‑1a hash → O(1) shard dispatch                                                                                                     |
+| Shard runner | `internal/shard` | Shared‑nothing shard: synchronous `Execute()`, per‑shard `sync.RWMutex`                                                               |
+| Storage engine | `internal/storage` | Single‑map engine, TTL eviction via timing wheel                                                                                      |
+| Persistence | `internal/persistence` | Per‑shard append‑only WAL, zero‑alloc write path                                                                                      |
+| Crypto | `internal/crypto` | Optional ChaCha20‑Poly1305                                                                                                            |
+| Audit | `internal/audit` | Structured JSON security events (`connect`, `disconnect`, `auth_*`, `acl_deny`, `command`); rotating file writer, optional encryption |
+| Metrics / tracing | `internal/metrics`, `internal/trace` | Prometheus text exporter, OTLP/gRPC tracing                                                                                           |
 
 ---
 
@@ -254,7 +254,7 @@ end-to-end in `cmd/example/acl`.
 
 ### Audit logging
 
-Opt-in structured audit trail via `--enable-audit`. Every security-relevant operation is written
+Opt-in structured audit trail via `--enable-audit`. Each selected audit event is written
 as one JSON line carrying `"level": "AUDIT"`, so log aggregators can separate it from operational
 INFO/WARN/ERROR output without custom parsing:
 

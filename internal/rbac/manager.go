@@ -89,10 +89,14 @@ func (s *Store) DelUser(username string) error {
 	if p == nil {
 		return nil
 	}
-	if _, ok := p.Users[username]; ok {
-		if r := p.RoleFor(username); r != nil && r.Permissions.Has(CmdACL) && !p.hasOtherAdmin(username) {
-			return fmt.Errorf("rbac: cannot delete %q: last user with ACL management rights", username)
-		}
+	if _, ok := p.Users[username]; !ok {
+		// Unknown user: nothing to delete. Return before cloning, republishing,
+		// or logging so an absent name never fakes a deletion event against an
+		// unchanged policy.
+		return nil
+	}
+	if r := p.RoleFor(username); r != nil && r.Permissions.Has(CmdACL) && !p.hasOtherAdmin(username) {
+		return fmt.Errorf("rbac: cannot delete %q: last user with ACL management rights", username)
 	}
 	p = p.Clone()
 	delete(p.Users, username)
