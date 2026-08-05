@@ -121,17 +121,18 @@ func (f *file) Write(p []byte) (int, error) {
 // the same directory, resetting the byte counter. The previous file is left
 // untouched on disk — rotation never truncates or renames history.
 func (f *file) rotate() error {
-	if err := f.file.Close(); err != nil {
-		return err
-	}
 	osFile, path, err := open(f.dir)
 	if err != nil {
 		if f.logger.Enabled(log.LevelError) {
-			f.logger.Log(log.LevelError, "audit: failed to rotate log file", log.String("filename", f.file.Name()), log.String("error", err.Error()))
+			f.logger.Log(log.LevelError, "audit: failed to rotate log file", log.String("current", f.path), log.String("error", err.Error()))
 		}
 		return err
 	}
 	previous := f.path
+	if err = f.file.Close(); err != nil {
+		_ = osFile.Close()
+		return err
+	}
 	f.file = osFile
 	f.path = path
 	f.bytesWritten = 0
