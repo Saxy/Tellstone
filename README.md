@@ -39,7 +39,7 @@ workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
   O(1); lazy eviction on read backs it up.
 * **Optional At‑Rest Encryption** – ChaCha20‑Poly1305, off by default.
 * **Write-Ahead Log Persistence** – Per-shard append-only WAL for crash recovery. SET and DEL operations are persisted (deletes as tombstones) and replayed on restart. Zero-allocation on the hot path (`Write` = 0 allocs/op). Disabled by default.
-* **Metrics & Tracing** – Built‑in Prometheus exporter and optional OpenTelemetry tracing.
+* **Metrics, Tracing & Audit Logging** – Built‑in Prometheus exporter, optional OpenTelemetry tracing, and an opt-in structured audit trail for security events.
 
 ### Core Architecture
 
@@ -55,6 +55,7 @@ see [ARCHITECTURE.md](ARCHITECTURE.md).
 | Storage engine | `internal/storage` | Single‑map engine, TTL eviction via timing wheel |
 | Persistence | `internal/persistence` | Per‑shard append‑only WAL, zero‑alloc write path |
 | Crypto | `internal/crypto` | Optional ChaCha20‑Poly1305 |
+| Audit | `internal/audit` | Structured JSON security events (`connect`, `auth_*`, `acl_deny`, `command`); rotating file writer, optional encryption |
 | Metrics / tracing | `internal/metrics`, `internal/trace` | Prometheus text exporter, OTLP/gRPC tracing |
 
 ---
@@ -148,6 +149,9 @@ Every option is available as a flag and an environment variable.
 | `--tls-ca`            | `TSD_TLS_CA`             | _(none)_         | Client CA path for mTLS; watched for automatic rotation  |
 | `--require-pass`      | `TSD_REQUIRE_PASS`       | _(none)_         | Single password required via `AUTH`; empty disables it   |
 | `--rbac-config`       | `TSD_RBAC_CONFIG`        | _(none)_         | YAML/JSON RBAC policy file (roles, users, default role); hot-reloaded on SIGHUP |
+| `--enable-audit`      | `TSD_ENABLE_AUDIT`       | `false`          | Enable structured audit logging                          |
+| `--audit-log-path`    | `TSD_AUDIT_LOG_PATH`     | `stdout`         | Audit destination: a directory (rotated `0600` files) or `stdout` |
+| `--audit-events`      | `TSD_AUDIT_EVENTS`       | `auth,acl`       | Comma-separated event types: `auth`, `acl`, `connect`, `disconnect`, `command`, or `all` |
 | `--shutdown-timeout`  | `TSD_SHUTDOWN_TIMEOUT`  | `10s`            | Max wait for graceful shutdown on SIGINT/SIGTERM         |
 
 Runtime tuning (environment only): `TSD_GC_PERCENT` (default `-1`, GC off for a zero‑GC hot
@@ -247,6 +251,37 @@ Unauthenticated data commands return `-NOAUTH`; commands a user's role does not 
 `RoleSetUser` (see `cmd/example/role`). The `ACL` command family (`ACL SETUSER` / `ACL DELUSER` /
 `ACL LIST` / `ACL LOG`) manages the same policy store through a Redis-flavored alias, driven
 end-to-end in `cmd/example/acl`.
+
+### Audit logging
+
+Opt-in structured audit trail via `--enable-audit`. Every security-relevant operation is written
+as one JSON line carrying `"level": "AUDIT"`, so log aggregators can separate it from operational
+INFO/WARN/ERROR output without custom parsing:
+
+```bash
+./bin/tellstone --enable-audit --audit-log-path /var/log/tellstone --audit-events all
+```
+
+`--audit-log-path` is `stdout` (the default) or a directory. In directory mode the server creates
+rotating files named `<unix-timestamp>_<dir-fingerprint>_tsd.log` with `0600` permissions,
+rotating to a fresh file once a file reaches 50 MiB (history is never truncated or renamed). When
+`--enable-encryption` is set, every record is sealed with the crypto engine before it is flushed.
+The engine is a no-op when audit logging is disabled, so the hot path pays nothing.
+
+`--audit-events` selects which event types are logged (default `auth,acl`; `all` enables every
+type). `connect`, `disconnect`, and `command` are high-volume and must be opted into explicitly:
+
+| Event | Fires on | Fields |
+|-------|----------|--------|
+| `connect` / `disconnect` | TCP connection open/close, both protocols | `remote_addr`, `protocol`, `shard_id` |
+| `auth_success` | successful `AUTH` | `user`, `remote_addr`, `protocol` |
+| `auth_failure` | rejected `AUTH` (bad password, unknown user, malformed request) | `user`, `reason`, `remote_addr`, `protocol` |
+| `acl_deny` | command blocked by RBAC (`-NOPERM`) | `user`, `command`, `key`, `remote_addr`, `protocol` |
+| `command` | every dispatched data/admin command | `command`, `key`, `user`, `remote_addr`, `protocol` |
+
+```json
+{"event":"acl_deny","level":"AUDIT","msg":"command denied by rbac policy","protocol":"binary","remote_addr":"127.0.0.1:51642","command":"SET","key":"config:key","user":"reader","time":"2026-08-05T10:40:32.908569649+02:00"}
+```
 
 ### Native binary protocol (Go client)
 
@@ -440,6 +475,8 @@ Run them locally with `task bench:native` or `task bench:resp:precise`.
 ### Observability
 * **Metrics:** `task run:resp` with `--enable-metrics` exposes Prometheus text at
   `http://<metrics-addr>/metrics` (default `:9100`).
+* **Audit logging:** `--enable-audit` writes structured security events (see
+  [Audit logging](#audit-logging)); run with `--audit-events all` to capture every event type.
 
 ### Profiling
 

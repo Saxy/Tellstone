@@ -79,6 +79,7 @@ Tellstone is a shared-nothing, in-memory key/value store with two protocol front
 | `crypto` | `internal/crypto/` | ChaCha20-Poly1305 encryption. `EncryptInPlace` / `DecryptInPlace`. Pass-through mode when disabled (zero overhead). |
 | `tls` | `internal/tls/` | TLS 1.3/mTLS transport, gnet connection adapter, and automatic certificate/key/CA rotation through a shared atomic config store. |
 | `metrics` | `internal/metrics/` | Prometheus exporter. Per-shard `Collector` + `AggregateCollector` (includes Go runtime stats). Hand-written exposition text. |
+| `audit` | `internal/audit/` | Structured audit logging. Event-type filter (`--audit-events`), JSON engine emitting `"level":"AUDIT"` lines, rotating and optionally encrypted file writer. |
 | `trace` | `internal/trace/` | OpenTelemetry wrapper. `Tracer`/`Span` interfaces with `NoOpTracer` (zero-alloc) and `OTelTracer` (OTLP/gRPC). |
 | `version` | `internal/version/` | Build-time version/commit/date via `-ldflags`. |
 
@@ -151,6 +152,7 @@ Every optional feature is disabled by default and has zero overhead when off:
 | Metrics | `--enable-metrics` | off |
 | Persistence | `--enable-persistence` | off |
 | Tracing | `--trace-ratio 0` | off |
+| Audit logging | `--enable-audit` | off |
 
 ### Role-Based Access Control (RBAC)
 
@@ -193,9 +195,38 @@ client sees exactly which permission it lacks. Passwords are bcrypt hashes verif
 `bcrypt.CompareHashAndPassword` (constant-time by construction); hashes are never rendered by
 `ROLE LIST` / `ROLE GETUSER`.
 
-**Integration seams.** `SessionContext` already carries `RoleName` and `Username` for audit
-logging. Planned integrations: API keys intersect role permissions (most restrictive wins), and
-OIDC `groups` claims map to roles through the policy store.
+**Integration seams.** `SessionContext` carries `RoleName` and `Username`, consumed by the audit
+engine for `auth_success`, `auth_failure`, and `acl_deny` events (see Audit Logging). Planned
+integrations: API keys intersect role permissions (most restrictive wins), and OIDC `groups`
+claims map to roles through the policy store.
+
+### Audit Logging
+
+Opt-in via `--enable-audit` / `TSD_ENABLE_AUDIT`. One shared `audit.LogEngine` is built in
+`server` and passed to both the binary and RESP listeners. It is **always non-nil**: without the
+flag it is a disabled no-op whose `Record()` returns on a single bool comparison — no writer, no
+encoder, no allocation — so the listeners call it unconditionally with no `nil` guard on the
+dispatch path.
+
+**Event types.** `connect`, `disconnect`, `auth_success`, `auth_failure`, `acl_deny`, and
+`command`. The filter is parsed once at startup from `--audit-events` (default `auth,acl`;
+`all` enables every event) and consulted per `Record()`. The `command` event is the only one with
+per-command dispatch overhead and is off by default. Each line is one JSON object with
+`"level":"AUDIT"`, distinguishing it from operational INFO/WARN/ERROR logs.
+
+**Concurrency.** `Record()` and `Close()` are serialized by a mutex, so a gnet event loop never
+races file rotation or shutdown. `Close()` runs at the end of `server.shutdown()`, only after both
+listeners are stopped, so no in-flight write can race the file close.
+
+**Zero-copy keys.** Command and key strings alias the gnet buffer via the same `unsafe`
+slice-header pattern used on the dispatch paths, consumed synchronously by the encoder before the
+frame is discarded — no allocation is added to the audit path.
+
+**File writer.** `--audit-log-path` selects `stdout` or a directory. File names are generated
+(`<unix-nanoseconds>_<8-hex-dir-hash>_tsd.log`), created `0600`, and rotated at 50 MiB by closing
+and reopening a fresh file in the same directory — rotation never truncates or renames history.
+When `--enable-encryption` is set, every record is sealed with the crypto engine before it is
+flushed. A failed file open falls back to stdout with an error log.
 
 ### Event-Driven Networking
 
