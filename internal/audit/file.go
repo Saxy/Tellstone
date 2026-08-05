@@ -84,7 +84,7 @@ func open(dir string) (*os.File, string, error) {
 // cannot collide; the hash fingerprint separates instances sharing a directory.
 func fileName(dir string) string {
 	h := sha256.Sum256([]byte(dir))
-	return fmt.Sprintf("%d_%x_tsd.log", time.Now().UnixNano(), h[:4])
+	return fmt.Sprintf("%d_%x_%d_tsd.log", time.Now().UnixNano(), h[:4], os.Getpid())
 }
 
 // Write encrypts the record when enabled, flushes it to the current file, and
