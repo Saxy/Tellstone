@@ -119,7 +119,16 @@ type Server struct {
 // otherwise AUTH resolves per-user credentials and sessions gate data ops.
 // audit is the shared audit engine; it must be non-nil (pass a disabled engine when
 // audit logging is off) and is always called without a nil guard.
-func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, policy *rbac.Store, audit *audit.LogEngine) *Server {
+func NewServer(
+	addr string,
+	maxMsgSize uint64,
+	shards []*shard.Shard,
+	handler func(msg *Message) ([]byte, MessageType, error),
+	logger log.Logger,
+	tlsConfigs *tlslib.ConfigStore,
+	requirePass string,
+	policy *rbac.Store,
+	audit *audit.LogEngine) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -435,11 +444,10 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 		if st.session != nil {
 			user = st.session.Username
 		}
-		keyStr := string(msg.Key)
 		s.audit.Record(audit.EventACLDeny, "command denied by rbac policy",
 			log.String("user", user),
 			log.String("command", msg.Op.String()),
-			log.String("key", keyStr),
+			log.String("key", string(msg.Key)),
 			log.String("remote_addr", st.remoteAddr),
 			log.String("protocol", "binary"),
 		)
@@ -447,7 +455,7 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 			s.logger.Log(log.LevelWarn, "network: command denied by rbac policy",
 				log.String("remote_addr", st.remoteAddr),
 				log.String("command", msg.Op.String()),
-				log.String("key", keyStr),
+				log.String("key", string(msg.Key)),
 			)
 		}
 		return MsgError, ResponseNotAuthorized, true, false
