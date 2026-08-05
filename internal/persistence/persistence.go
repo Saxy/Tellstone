@@ -293,14 +293,14 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		}
 		keyBuf := make([]byte, keyLen)
 		if _, err = io.ReadFull(f, keyBuf); err != nil {
-			if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return fmt.Errorf("persistence: read key: %w", err)
 		}
 		valBuf := make([]byte, valLen)
 		if _, err = io.ReadFull(f, valBuf); err != nil {
-			if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return fmt.Errorf("persistence: read value: %w", err)
@@ -337,7 +337,7 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 	}
 	if validOffset < fileSize {
 		h.mu.Lock()
-		if err := f.Truncate(validOffset); err != nil {
+		if err = f.Truncate(validOffset); err != nil {
 			h.mu.Unlock()
 			if s.logger.Enabled(log.LevelWarn) {
 				s.logger.Log(log.LevelWarn, "persistence: failed to truncate corrupted tail",
