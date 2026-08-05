@@ -15,6 +15,7 @@ import (
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
@@ -44,6 +45,9 @@ type Config struct {
 	tlsCA             string
 	requirePass       string
 	rbacConfig        string
+	enableAuditLog    bool
+	auditLogPath      string
+	auditLogEvents    string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -121,7 +125,10 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_TLS_KEY          – path to TLS private key file (PEM)
 //		TSD_TLS_CA           – path to CA certificate for client verification (enables mTLS)
 //		TSD_REQUIRE_PASS     – server password required by AUTH (empty = no authentication)
-//		TSD_RBAC_CONFIG     – path to a YAML/JSON RBAC policy file (roles, users, default_role)
+//		TSD_RBAC_CONFIG      – path to a YAML/JSON RBAC policy file (roles, users, default_role)
+//		TSD_ENABLE_AUDIT	 - boolean to enable audit logging (default: false)
+// 		TSD_AUDIT_LOG_PATH	 - path where the audit log file(s) will be created (default: stdout)
+//		TSD_AUDIT_EVENTS	 - comma-seperated event types on which audit events should be logged (default: auth,acl)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
@@ -216,7 +223,7 @@ func LoadConfig(args []string) *Config {
 		"max-mem-bytes",
 		"Total engine memory ceiling (e.g. 512MiB, 4GiB, 0 = unlimited)",
 	)
-	// Optional RESP2 (Redis-compatible) listener, for benchmarking against Redis/Dragonfly/etc.
+	// Optional RESP2 (Redis-compatible) listener for benchmarking against Redis/Dragonfly/etc.
 	fs.BoolVar(
 		&cfg.enableRESP,
 		"enable-resp",
@@ -298,6 +305,24 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_RBAC_CONFIG", ""),
 		"Path to YAML/JSON RBAC policy file (roles, users, default_role); empty disables RBAC (default: none)",
 	)
+	fs.BoolVar(
+		&cfg.enableAuditLog,
+		"enable-audit",
+		getEnv("TSD_ENABLE_AUDIT", false),
+		"Enable Audit logging (default: false)",
+	)
+	fs.StringVar(
+		&cfg.auditLogPath,
+		"audit-log-path",
+		getEnv("TSD_AUDIT_LOG_PATH", "stdout"),
+		"Path where Audit logging files should be created (default: stdout)",
+	)
+	fs.StringVar(
+		&cfg.auditLogEvents,
+		"audit-events",
+		getEnv("TSD_AUDIT_EVENTS", "auth,acl"),
+		"Comma-separated event types which should be logged, possible events: auth, acl, connect, disconnect, command, all for all event logging (default: auth,acl)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -353,6 +378,7 @@ func (cfg *Config) GetTLSKey() string                 { return cfg.tlsKey }
 func (cfg *Config) GetTLSCA() string                  { return cfg.tlsCA }
 func (cfg *Config) GetRequirePass() string            { return cfg.requirePass }
 func (cfg *Config) GetRBACConfig() string             { return cfg.rbacConfig }
-func (cfg *Config) MTLSEnabled() bool {
-	return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != ""
-}
+func (cfg *Config) MTLSEnabled() bool                 { return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != "" }
+func (cfg *Config) AuditEnabled() bool                { return cfg.enableAuditLog }
+func (cfg *Config) AuditLogPath() string              { return cfg.auditLogPath }
+func (cfg *Config) AuditLogEvents() []string          { return strings.Split(cfg.auditLogEvents, ",") }
