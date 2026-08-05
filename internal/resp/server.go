@@ -73,13 +73,16 @@ type authJob struct {
 // connState holds per-connection scratch buffers reused across OnTraffic calls so the hot
 // path stays allocation-free, plus the assigned shard index for per-shard metrics.
 type connState struct {
-	out               []byte
-	args              [][]byte
-	shardID           int
-	tlsConn           *tlslib.Conn
-	readBuf           []byte
-	handshakeDeadline time.Time
-	authenticated     bool
+	out     []byte
+	args    [][]byte
+	shardID int
+	tlsConn *tlslib.Conn
+	readBuf []byte
+	// pending is the sweeper entry enforcing this connection's handshake deadline without
+	// inbound traffic. It is non-nil whenever tlsConn is non-nil — both are installed
+	// together, on accept for implicit TLS and in upgradeToTLS for STARTTLS.
+	pending       *pendingHandshake
+	authenticated bool
 	// session is the RBAC context pinned at AUTH time. nil when RBAC is
 	// disabled (the zero-overhead no-op path) or before authentication.
 	session    *rbac.SessionContext
@@ -137,6 +140,12 @@ type Server struct {
 	// it is a disabled no-op whose Record() costs one bool comparison, so the
 	// hooks below call it without a nil guard.
 	audit *audit.LogEngine
+
+	// handshakes enforces handshakeTimeout on connections that stop sending after being handed
+	// to the TLS state machine (see handshake.go). handshakeTimeout is tlsHandshakeTimeout;
+	// tests shrink it to keep the sweep observable without waiting out the production deadline.
+	handshakes       handshakeSweeper
+	handshakeTimeout time.Duration
 }
 
 // NewServer creates a RESP server bound to addr that dispatches commands to store.
@@ -175,6 +184,8 @@ func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logge
 		policy:          policy,
 		ready:           make(chan struct{}),
 		audit:           audit,
+
+		handshakeTimeout: tlsHandshakeTimeout,
 	}
 	// The worker pool exists only when authentication is actually required, so
 	// the zero-overhead no-password path spawns no goroutines.
@@ -193,7 +204,13 @@ func (s *Server) ListenAndServe() error {
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "resp: event-driven engine initializing", log.String("address", s.addr))
 	}
-	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true), gnet.WithLogger(log.NewGnetAdapter(s.logger)))
+	opts := []gnet.Option{gnet.WithMulticore(true), gnet.WithLogger(log.NewGnetAdapter(s.logger))}
+	if s.tlsConfigs.Load() != nil {
+		// The ticker exists only to enforce the TLS handshake deadline, so a plaintext listener
+		// keeps the original configuration: no ticker goroutine, no timer, no OnTick calls.
+		opts = append(opts, gnet.WithTicker(true))
+	}
+	return gnet.Run(s, "tcp://"+s.addr, opts...)
 }
 
 // Shutdown gracefully stops the event loop, waiting for in-flight connections to drain or
@@ -264,7 +281,7 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		adapter := tlslib.NewGnetConnAdapter(c)
 		st.tlsConn = tlslib.Server(adapter, tlsCfg)
 		st.readBuf = make([]byte, 0, 4096)
-		st.handshakeDeadline = time.Now().Add(tlsHandshakeTimeout)
+		st.pending = s.handshakes.track(c, st.tlsConn, time.Now().Add(s.handshakeTimeout))
 	}
 	c.SetContext(st)
 	s.audit.Record(audit.EventConnect, "client connected",
@@ -283,6 +300,12 @@ func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 	var remoteAddr string
 	if st, ok := c.Context().(*connState); ok {
 		remoteAddr = st.remoteAddr
+		if st.pending != nil {
+			// Let the sweeper forget this connection instead of reporting it as a handshake
+			// timeout once the deadline passes: a client is free to hang up mid-handshake,
+			// and TCP health probes do it on every check.
+			st.pending.done.Store(true)
+		}
 		if st.shardID >= 0 && st.shardID < len(s.shards) {
 			s.shards[st.shardID].DecConnectedClients()
 		}
@@ -319,7 +342,9 @@ func (s *Server) OnTraffic(c gnet.Conn) gnet.Action {
 	}
 
 	if st.tlsConn != nil {
-		if !st.tlsConn.HandshakeCompleted() && time.Now().After(st.handshakeDeadline) {
+		// The sweeper enforces the same deadline without traffic; this keeps closing a
+		// stalled handshake on the spot when the client does send something.
+		if !st.tlsConn.HandshakeCompleted() && time.Now().After(st.pending.deadline) {
 			return gnet.Close
 		}
 		return s.onTrafficTLS(c, st)
@@ -552,7 +577,7 @@ func (s *Server) upgradeToTLS(c gnet.Conn, st *connState, consumed int) gnet.Act
 	adapter := tlslib.NewGnetConnAdapter(c)
 	st.tlsConn = tlslib.Server(adapter, tlsCfg)
 	st.readBuf = make([]byte, 0, 4096)
-	st.handshakeDeadline = time.Now().Add(tlsHandshakeTimeout)
+	st.pending = s.handshakes.track(c, st.tlsConn, time.Now().Add(s.handshakeTimeout))
 	st.upgradeTLS = false
 	return gnet.None
 }

@@ -168,7 +168,10 @@ RESP listener plaintext until a client sends `STARTTLS`; Tellstone replies `+OK`
 then requires an immediate TLS 1.3 handshake on the same socket. `STARTTLS` is allowed before
 `AUTH` so credentials need not cross plaintext. The command must not be pipelined with any other
 plaintext bytes. The binary listener always retains implicit TLS, and each RESP upgrade loads the
-latest rotated certificate configuration.
+latest rotated certificate configuration. Once a RESP connection is handed to the TLS state machine
+— on accept for implicit TLS, or after a `STARTTLS` acceptance — it must complete the handshake
+within 10 seconds; the listener closes it at the deadline even if the client sends nothing further,
+so stalled connections cannot pile up.
 
 ---
 
