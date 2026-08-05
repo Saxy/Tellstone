@@ -42,6 +42,10 @@ type LogEngine struct {
 	enc     *json.Encoder
 	closeFn func() error
 	mu      sync.Mutex
+	// firstErr is the first failed Encode, retained so Close can report it.
+	// Once set, later records are dropped instead of overwriting the original
+	// cause, which would hide the root failure from the operator.
+	firstErr error
 }
 
 // NewLogEngine creates an audit engine. When enabled is false, the engine is
@@ -80,13 +84,20 @@ func NewLogEngine(enabled bool, filter *eventSet, auditLogPath string, logger lo
 // Record writes one audit event. When the engine is not enabled, this is a
 // single bool comparison — zero overhead. When enabled, the event is checked
 // against the filter; filtered-out events return immediately. Passing events
-// write one JSON line with "level": "AUDIT".
+// write one JSON line with "level": "AUDIT". A failing write is retained as
+// the engine's first error and reported by Close; subsequent records are
+// dropped rather than masking it.
 func (e *LogEngine) Record(event EventType, msg string, fields ...log.Field) {
 	if !e.enabled || !e.filter.has(event) {
 		return
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	// A broken sink keeps failing; stop attempting writes once the first
+	// failure is recorded so Close reports the original error, not the last one.
+	if e.firstErr != nil {
+		return
+	}
 	entry := map[string]any{
 		"time":  time.Now().Format(time.RFC3339Nano),
 		"level": auditLevel,
@@ -107,18 +118,30 @@ func (e *LogEngine) Record(event EventType, msg string, fields ...log.Field) {
 			entry[f.Key] = f.UintVal
 		}
 	}
-	_ = e.enc.Encode(entry)
+	if err := e.enc.Encode(entry); err != nil && e.firstErr == nil {
+		e.firstErr = err
+	}
 }
 
-// Close closes the file backing a non-stdout audit log. Returns nil when the
-// engine is not enabled or the destination is stdout — os.Stdout is never
-// closed, it is owned by the process. The mutex serializes Close against any
-// in-flight Record, so the underlying file is never closed mid-write.
+// Close closes the file backing a non-stdout audit log and reports the first
+// write failure, if any. Returns nil when the engine is not enabled — the
+// disabled engine never records, so it can have no write error. The first
+// failed write outranks a close error: it happened first and is the root
+// cause the operator needs. os.Stdout is never closed — it is owned by the
+// process. The mutex serializes Close against any in-flight Record, so the
+// underlying file is never closed mid-write.
 func (e *LogEngine) Close() error {
-	if !e.enabled || e.closeFn == nil {
+	if !e.enabled {
 		return nil
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.closeFn()
+	var closeErr error
+	if e.closeFn != nil {
+		closeErr = e.closeFn()
+	}
+	if e.firstErr != nil {
+		return e.firstErr
+	}
+	return closeErr
 }

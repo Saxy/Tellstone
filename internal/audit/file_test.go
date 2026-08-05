@@ -15,6 +15,7 @@ package audit
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -185,23 +186,34 @@ func TestFileAuditLoggingEncrypted(t *testing.T) {
 		{EventAuthFailure, "bad password"},
 	}
 
-	// Each record is sealed as one contiguous blob. Track the file growth so
-	// every blob is sliced out individually and decrypted back to its JSON line.
-	var before []byte
-	for i, r := range records {
+	// Every record is written up front; the completed file is decoded only
+	// afterwards, walking the length prefixes sequentially with no reads
+	// between Record calls.
+	for _, r := range records {
 		e.Record(r.event, r.msg, log.String("user", "alice"))
-		after, err := os.ReadFile(singleAuditFile(t, dir))
-		if err != nil {
-			t.Fatal(err)
+	}
+	if err := e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	data, err := os.ReadFile(singleAuditFile(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "AUDIT") {
+		t.Fatal("encrypted audit file contains plaintext AUDIT marker")
+	}
+
+	for i, r := range records {
+		if len(data) < 4 {
+			t.Fatalf("record %d: truncated length prefix (%d bytes left)", i, len(data))
 		}
-		if len(after) <= len(before) {
-			t.Fatalf("record %d did not grow the audit file", i)
+		blobLen := int(binary.BigEndian.Uint32(data[:4]))
+		data = data[4:]
+		if blobLen == 0 || blobLen > len(data) {
+			t.Fatalf("record %d: invalid blob length %d (remaining %d)", i, blobLen, len(data))
 		}
-		sealed := after[len(before):]
-		if strings.Contains(string(sealed), r.msg) || strings.Contains(string(sealed), "AUDIT") {
-			t.Fatalf("record %d is stored as plaintext: %q", i, sealed)
-		}
-		plain, err := ce.DecryptInPlace(sealed)
+		plain, err := ce.DecryptInPlace(data[:blobLen])
 		if err != nil {
 			t.Fatalf("record %d failed to decrypt: %v", i, err)
 		}
@@ -212,18 +224,10 @@ func TestFileAuditLoggingEncrypted(t *testing.T) {
 		if m["level"] != "AUDIT" || m["event"] != string(r.event) || m["msg"] != r.msg {
 			t.Fatalf("record %d does not survive the encrypted round trip: %v", i, m)
 		}
-		before = after
+		data = data[blobLen:]
 	}
-
-	if err := e.Close(); err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(singleAuditFile(t, dir))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(data), "AUDIT") {
-		t.Fatal("encrypted audit file contains plaintext AUDIT marker")
+	if len(data) != 0 {
+		t.Fatalf("file holds %d trailing bytes beyond the last record", len(data))
 	}
 }
 

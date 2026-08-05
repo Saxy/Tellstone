@@ -18,6 +18,7 @@ package audit
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -103,6 +104,17 @@ func (f *file) Write(p []byte) (int, error) {
 			return 0, err
 		}
 		f.buf = out
+		// Prepend a 4-byte big-endian length prefix counting the sealed bytes
+		// (nonce + ciphertext + tag) so every blob is self-delimiting: a
+		// completed file decodes sequentially without knowing plaintext lengths
+		// or reading between records. The prefix is plaintext metadata, never
+		// part of the record itself.
+		var prefix [4]byte
+		binary.BigEndian.PutUint32(prefix[:], uint32(len(out)))
+		if _, err := f.file.Write(prefix[:]); err != nil {
+			return 0, err
+		}
+		f.bytesWritten += 4
 	}
 	n, err := f.file.Write(out)
 	if err != nil {

@@ -95,6 +95,10 @@ func (s *eventSet) has(eventType EventType) bool {
 // An empty string yields a set containing only defaultEventTypes.
 func ParseEventTypes(raw string) *eventSet {
 	s := &eventSet{}
+	// Trim before the emptiness check so a whitespace-only value (e.g.
+	// --audit-events "  ") applies the defaults instead of silently yielding
+	// a filter that disables every event.
+	raw = strings.TrimSpace(raw)
 	tokens := strings.Split(raw, ",")
 	if len(tokens) == 1 && tokens[0] == "" {
 		// Empty flag value — apply defaults.

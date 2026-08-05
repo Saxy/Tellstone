@@ -13,6 +13,8 @@ package audit
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,6 +93,20 @@ func TestParseEventTypesWhitespace(t *testing.T) {
 	s := ParseEventTypes(" auth_success , acl_deny ")
 	if !s.has(EventAuthSuccess) || !s.has(EventACLDeny) {
 		t.Fatal("whitespace around tokens should be trimmed")
+	}
+}
+
+func TestParseEventTypesWhitespaceOnlyAppliesDefaults(t *testing.T) {
+	for _, raw := range []string{"   ", "\t\n", " \t "} {
+		s := ParseEventTypes(raw)
+		if s.count == 0 {
+			t.Fatalf("whitespace-only filter %q must apply defaults, got an empty set", raw)
+		}
+		for _, d := range defaultEventTypes {
+			if !s.has(d) {
+				t.Fatalf("whitespace-only filter %q must enable default event %q", raw, d)
+			}
+		}
 	}
 }
 
@@ -243,5 +259,48 @@ func TestCloseWithCloser(t *testing.T) {
 	e := newTestEngine(t, true, filter, t.TempDir())
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close on a file-backed engine should not error: %v", err)
+	}
+}
+
+// failingWriter rejects every write with a per-write error, so a test can tell
+// which attempt produced the failure.
+type failingWriter struct {
+	writes int
+}
+
+var errAuditWrite = errors.New("audit: write failed")
+
+func (f *failingWriter) Write(p []byte) (int, error) {
+	f.writes++
+	return 0, fmt.Errorf("%w: attempt %d", errAuditWrite, f.writes)
+}
+
+func TestRecordRetainsFirstWriteError(t *testing.T) {
+	fw := &failingWriter{}
+	e := &LogEngine{
+		enabled: true,
+		filter:  ParseEventTypes("all"),
+		writer:  fw,
+		enc:     json.NewEncoder(fw),
+	}
+
+	e.Record(EventAuthSuccess, "first")
+	e.Record(EventAuthSuccess, "second")
+	e.Record(EventACLDeny, "third")
+
+	err := e.Close()
+	if err == nil {
+		t.Fatal("Close must report the retained write error")
+	}
+	if !errors.Is(err, errAuditWrite) {
+		t.Fatalf("Close error must wrap the write failure, got %v", err)
+	}
+	// Attempt 1 failed first; the later attempts must not replace it, so the
+	// reported error is the original one, not the last write's.
+	if !strings.Contains(err.Error(), "attempt 1") {
+		t.Fatalf("Close must report the first write failure, got %v", err)
+	}
+	if fw.writes != 1 {
+		t.Fatalf("expected one write attempt before the sink was marked broken, got %d", fw.writes)
 	}
 }
