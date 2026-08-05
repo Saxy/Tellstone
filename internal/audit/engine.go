@@ -19,8 +19,11 @@ package audit
 import (
 	"encoding/json"
 	"io"
+	"os"
+	"sync"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
@@ -37,25 +40,40 @@ type LogEngine struct {
 	filter  *eventSet
 	writer  io.Writer
 	enc     *json.Encoder
+	closeFn func() error
+	mu      sync.Mutex
 }
 
 // NewLogEngine creates an audit engine. When enabled is false, the engine is
 // a lightweight no-op: no writer opened, no encoder created, Record() is a
-// single bool check. When enabled is true, structured JSON is written to
-// a writer. Pass nil for the writer to discard output (useful for tests).
-func NewLogEngine(enabled bool, filter *eventSet, writer io.Writer) *LogEngine {
+// single bool check. When enabled, the destination is chosen from the audit
+// log path: "stdout" writes JSON to os.Stdout, any other value is treated as
+// a directory whose audit files are created and rotated automatically. The
+// path is only inspected when enabled, so a disabled engine pays nothing.
+func NewLogEngine(enabled bool, filter *eventSet, auditLogPath string, logger log.Logger, engine crypto.Engine) *LogEngine {
 	if !enabled {
 		return &LogEngine{enabled: false}
 	}
-	var enc *json.Encoder
-	if writer != nil {
-		enc = json.NewEncoder(writer)
+	writer := io.Writer(os.Stdout)
+	var closeFn func() error
+	if auditLogPath != "" && auditLogPath != "stdout" {
+		f, err := newFile(auditLogPath, engine, logger)
+		if err != nil {
+			// fallback to stdout in case of error with a file
+			if logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "audit: initial file creation failed -- activate fallback to stdout", log.String("error", err.Error()))
+			}
+		} else {
+			writer = f
+			closeFn = f.Close
+		}
 	}
 	return &LogEngine{
 		enabled: true,
 		filter:  filter,
 		writer:  writer,
-		enc:     enc,
+		enc:     json.NewEncoder(writer),
+		closeFn: closeFn,
 	}
 }
 
@@ -67,6 +85,8 @@ func (e *LogEngine) Record(event EventType, msg string, fields ...log.Field) {
 	if !e.enabled || !e.filter.has(event) {
 		return
 	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
 	entry := map[string]any{
 		"time":  time.Now().Format(time.RFC3339Nano),
 		"level": auditLevel,
@@ -90,15 +110,15 @@ func (e *LogEngine) Record(event EventType, msg string, fields ...log.Field) {
 	_ = e.enc.Encode(entry)
 }
 
-// Close closes the underlying writer if it implements io.Closer.
-// Returns nil when the engine is not enabled or the writer does not
-// implement io.Closer (e.g. os.Stdout).
+// Close closes the file backing a non-stdout audit log. Returns nil when the
+// engine is not enabled or the destination is stdout — os.Stdout is never
+// closed, it is owned by the process. The mutex serializes Close against any
+// in-flight Record, so the underlying file is never closed mid-write.
 func (e *LogEngine) Close() error {
-	if !e.enabled {
+	if !e.enabled || e.closeFn == nil {
 		return nil
 	}
-	if closer, ok := e.writer.(io.Closer); ok {
-		return closer.Close()
-	}
-	return nil
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.closeFn()
 }

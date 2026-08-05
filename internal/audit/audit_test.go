@@ -12,11 +12,13 @@ Authors:
 package audit
 
 import (
-	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
@@ -119,23 +121,45 @@ func TestDefaultEventTypesExist(t *testing.T) {
 
 // --- Engine tests ---
 
-func TestDisabledEngineNoop(t *testing.T) {
-	var buf bytes.Buffer
-	filter := parseEventTypes("all")
-	e := NewLogEngine(false, filter, &buf)
-	e.Record(EventAuthSuccess, "should not appear")
-	if buf.Len() != 0 {
-		t.Fatalf("disabled engine produced output: %s", buf.String())
+// newTestEngine wires a disabled-crypto engine and a no-op logger, mirroring
+// how the server constructs an audit engine without encryption enabled.
+func newTestEngine(t *testing.T, enabled bool, filter *eventSet, dir string) *LogEngine {
+	t.Helper()
+	return NewLogEngine(enabled, filter, dir, log.NewNoOpLogger(), crypto.Engine{})
+}
+
+// readAuditFiles returns the contents of every *_tsd.log file in dir.
+func readAuditFiles(t *testing.T, dir string) []string {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, "*_tsd.log"))
+	if err != nil {
+		t.Fatal("Glob:", err)
 	}
+	out := make([]string, 0, len(matches))
+	for _, m := range matches {
+		var data []byte
+		data, err = os.ReadFile(m)
+		if err != nil {
+			t.Fatal("ReadFile:", err)
+		}
+		out = append(out, string(data))
+	}
+	return out
+}
+
+func TestDisabledEngineNoop(t *testing.T) {
+	filter := parseEventTypes("all")
+	e := newTestEngine(t, false, filter, "stdout")
+	e.Record(EventAuthSuccess, "should not appear")
 	if err := e.Close(); err != nil {
 		t.Fatal("disabled engine Close should return nil")
 	}
 }
 
 func TestRecordWritesJSON(t *testing.T) {
-	var buf bytes.Buffer
+	dir := t.TempDir()
 	filter := parseEventTypes("auth_success")
-	e := NewLogEngine(true, filter, &buf)
+	e := newTestEngine(t, true, filter, dir)
 
 	e.Record(EventAuthSuccess, "user logged in",
 		log.String("user", "alice"),
@@ -143,7 +167,15 @@ func TestRecordWritesJSON(t *testing.T) {
 		log.String("protocol", "resp"),
 	)
 
-	line := strings.TrimSpace(buf.String())
+	if err := e.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	files := readAuditFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("expected one audit file, got %d", len(files))
+	}
+
+	line := strings.TrimSpace(files[0])
 	if line == "" {
 		t.Fatal("expected JSON output, got empty")
 	}
@@ -170,36 +202,46 @@ func TestRecordWritesJSON(t *testing.T) {
 }
 
 func TestRecordFiltersOutDisabledEvents(t *testing.T) {
-	var buf bytes.Buffer
+	dir := t.TempDir()
 	filter := parseEventTypes("auth_success")
-	e := NewLogEngine(true, filter, &buf)
+	e := newTestEngine(t, true, filter, dir)
 
 	e.Record(EventACLDeny, "should be filtered")
-	if buf.Len() != 0 {
-		t.Fatalf("filtered event produced output: %s", buf.String())
+	if err := e.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	files := readAuditFiles(t, dir)
+	if len(files) != 1 || len(files[0]) != 0 {
+		t.Fatalf("filtered event produced output: %v", files)
 	}
 }
 
 func TestRecordMultipleEvents(t *testing.T) {
-	var buf bytes.Buffer
+	dir := t.TempDir()
 	filter := parseEventTypes("auth_success,acl_deny")
-	e := NewLogEngine(true, filter, &buf)
+	e := newTestEngine(t, true, filter, dir)
 
 	e.Record(EventAuthSuccess, "login", log.String("user", "alice"))
 	e.Record(EventACLDeny, "denied", log.String("user", "bob"))
 	e.Record(EventConnect, "should be filtered")
 
-	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if err := e.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+	files := readAuditFiles(t, dir)
+	if len(files) != 1 {
+		t.Fatalf("expected one audit file, got %d", len(files))
+	}
+	lines := strings.Split(strings.TrimSpace(files[0]), "\n")
 	if len(lines) != 2 {
-		t.Fatalf("expected 2 lines, got %d: %s", len(lines), buf.String())
+		t.Fatalf("expected 2 lines, got %d: %s", len(lines), files[0])
 	}
 }
 
 func TestCloseWithCloser(t *testing.T) {
 	filter := parseEventTypes("all")
-	var buf bytes.Buffer
-	e := NewLogEngine(true, filter, &buf)
+	e := newTestEngine(t, true, filter, t.TempDir())
 	if err := e.Close(); err != nil {
-		t.Fatalf("Close on bytes.Buffer should not error: %v", err)
+		t.Fatalf("Close on a file-backed engine should not error: %v", err)
 	}
 }
