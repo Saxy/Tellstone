@@ -2,7 +2,7 @@
 Package audit
 Tellstone Cloud-Native In-Memory Database
 File: audit_test.go
-Description: Verifies EventType definitions, eventSet filtering, parseEventTypes
+Description: Verifies EventType definitions, eventSet filtering, ParseEventTypes
 semantics, and the LogEngine record/close lifecycle.
 
 Authors:
@@ -30,7 +30,7 @@ func TestEventSetNilReceiver(t *testing.T) {
 }
 
 func TestParseEventTypesEmpty(t *testing.T) {
-	s := parseEventTypes("")
+	s := ParseEventTypes("")
 	if !s.has(EventAuthSuccess) || !s.has(EventAuthFailure) || !s.has(EventACLDeny) {
 		t.Fatal("empty flag should yield default event set (auth_success, auth_failure, acl_deny)")
 	}
@@ -40,7 +40,7 @@ func TestParseEventTypesEmpty(t *testing.T) {
 }
 
 func TestParseEventTypesAuthShorthand(t *testing.T) {
-	s := parseEventTypes("auth")
+	s := ParseEventTypes("auth")
 	if !s.has(EventAuthSuccess) || !s.has(EventAuthFailure) {
 		t.Fatal("'auth' shorthand should enable both auth_success and auth_failure")
 	}
@@ -50,7 +50,7 @@ func TestParseEventTypesAuthShorthand(t *testing.T) {
 }
 
 func TestParseEventTypesACLShorthand(t *testing.T) {
-	s := parseEventTypes("acl")
+	s := ParseEventTypes("acl")
 	if !s.has(EventACLDeny) {
 		t.Fatal("'acl' shorthand should enable acl_deny")
 	}
@@ -60,7 +60,7 @@ func TestParseEventTypesACLShorthand(t *testing.T) {
 }
 
 func TestParseEventTypesAll(t *testing.T) {
-	s := parseEventTypes("all")
+	s := ParseEventTypes("all")
 	for _, et := range allEvents {
 		if !s.has(et) {
 			t.Fatalf("'all' should enable every event type, missing %s", et)
@@ -69,7 +69,7 @@ func TestParseEventTypesAll(t *testing.T) {
 }
 
 func TestParseEventTypesExactTokens(t *testing.T) {
-	s := parseEventTypes("auth_success,auth_failure,acl_deny,connect,disconnect,command")
+	s := ParseEventTypes("auth_success,auth_failure,acl_deny,connect,disconnect,command")
 	for _, et := range allEvents {
 		if !s.has(et) {
 			t.Fatalf("explicit token list should enable %s", et)
@@ -78,7 +78,7 @@ func TestParseEventTypesExactTokens(t *testing.T) {
 }
 
 func TestParseEventTypesUnknownIgnored(t *testing.T) {
-	s := parseEventTypes("auth_success,bogus,acl_deny")
+	s := ParseEventTypes("auth_success,bogus,acl_deny")
 	if !s.has(EventAuthSuccess) || !s.has(EventACLDeny) {
 		t.Fatal("known tokens should still be enabled when unknowns are present")
 	}
@@ -88,7 +88,7 @@ func TestParseEventTypesUnknownIgnored(t *testing.T) {
 }
 
 func TestParseEventTypesWhitespace(t *testing.T) {
-	s := parseEventTypes(" auth_success , acl_deny ")
+	s := ParseEventTypes(" auth_success , acl_deny ")
 	if !s.has(EventAuthSuccess) || !s.has(EventACLDeny) {
 		t.Fatal("whitespace around tokens should be trimmed")
 	}
@@ -148,7 +148,7 @@ func readAuditFiles(t *testing.T, dir string) []string {
 }
 
 func TestDisabledEngineNoop(t *testing.T) {
-	filter := parseEventTypes("all")
+	filter := ParseEventTypes("all")
 	e := newTestEngine(t, false, filter, "stdout")
 	e.Record(EventAuthSuccess, "should not appear")
 	if err := e.Close(); err != nil {
@@ -158,7 +158,7 @@ func TestDisabledEngineNoop(t *testing.T) {
 
 func TestRecordWritesJSON(t *testing.T) {
 	dir := t.TempDir()
-	filter := parseEventTypes("auth_success")
+	filter := ParseEventTypes("auth_success")
 	e := newTestEngine(t, true, filter, dir)
 
 	e.Record(EventAuthSuccess, "user logged in",
@@ -203,7 +203,7 @@ func TestRecordWritesJSON(t *testing.T) {
 
 func TestRecordFiltersOutDisabledEvents(t *testing.T) {
 	dir := t.TempDir()
-	filter := parseEventTypes("auth_success")
+	filter := ParseEventTypes("auth_success")
 	e := newTestEngine(t, true, filter, dir)
 
 	e.Record(EventACLDeny, "should be filtered")
@@ -218,7 +218,7 @@ func TestRecordFiltersOutDisabledEvents(t *testing.T) {
 
 func TestRecordMultipleEvents(t *testing.T) {
 	dir := t.TempDir()
-	filter := parseEventTypes("auth_success,acl_deny")
+	filter := ParseEventTypes("auth_success,acl_deny")
 	e := newTestEngine(t, true, filter, dir)
 
 	e.Record(EventAuthSuccess, "login", log.String("user", "alice"))
@@ -239,7 +239,7 @@ func TestRecordMultipleEvents(t *testing.T) {
 }
 
 func TestCloseWithCloser(t *testing.T) {
-	filter := parseEventTypes("all")
+	filter := ParseEventTypes("all")
 	e := newTestEngine(t, true, filter, t.TempDir())
 	if err := e.Close(); err != nil {
 		t.Fatalf("Close on a file-backed engine should not error: %v", err)

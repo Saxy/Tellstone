@@ -13,9 +13,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 )
+
+// newNoOpAudit returns a disabled audit engine so listener tests exercise the
+// unguarded Record() hooks with zero audit output.
+func newNoOpAudit() *audit.LogEngine {
+	return audit.NewLogEngine(false, nil, "stdout", log.NewNoOpLogger(), crypto.Engine{})
+}
 
 // fakeStore is a minimal in-memory key-value store for testing binary protocol handlers.
 type fakeStore struct {
@@ -123,7 +131,7 @@ func TestServerEcho(t *testing.T) {
 		}
 		return nil, 0, nil
 	}
-	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, "", nil)
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, "", nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -196,7 +204,7 @@ func TestServerTLSConfigRotation(t *testing.T) {
 	}
 	addr := listener.Addr().String()
 	_ = listener.Close()
-	srv := NewServer(addr, 0, nil, pingHandler, log.NewNoOpLogger(), configs, "", nil)
+	srv := NewServer(addr, 0, nil, pingHandler, log.NewNoOpLogger(), configs, "", nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -260,7 +268,7 @@ func startAuthServer(t *testing.T, requirePass string, handler func(msg *Message
 	}
 	addr := l.Addr().String()
 	l.Close()
-	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, requirePass, nil)
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, requirePass, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

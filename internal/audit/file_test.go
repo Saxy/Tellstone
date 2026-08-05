@@ -139,7 +139,7 @@ func TestFileRotation(t *testing.T) {
 
 func TestFileAuditLoggingPlaintext(t *testing.T) {
 	dir := t.TempDir()
-	e := newTestEngine(t, true, parseEventTypes("all"), dir)
+	e := newTestEngine(t, true, ParseEventTypes("all"), dir)
 
 	e.Record(EventAuthSuccess, "user logged in", log.String("user", "alice"))
 	e.Record(EventACLDeny, "command denied", log.String("user", "bob"))
@@ -166,7 +166,7 @@ func TestFileAuditLoggingEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := NewLogEngine(true, parseEventTypes("all"), dir, log.NewNoOpLogger(), *ce)
+	e := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), *ce)
 
 	records := []struct {
 		event EventType
@@ -221,7 +221,7 @@ func TestFileAuditLoggingEncrypted(t *testing.T) {
 
 func TestFileRotationThroughEngine(t *testing.T) {
 	dir := t.TempDir()
-	e := newTestEngine(t, true, parseEventTypes("all"), dir)
+	e := newTestEngine(t, true, ParseEventTypes("all"), dir)
 	e.writer.(*file).maxSize = 1 // rotate after every record
 
 	const n = 10
@@ -254,7 +254,7 @@ func TestFileRotationThroughEngine(t *testing.T) {
 
 func TestEngineConcurrentRecords(t *testing.T) {
 	dir := t.TempDir()
-	e := newTestEngine(t, true, parseEventTypes("all"), dir)
+	e := newTestEngine(t, true, ParseEventTypes("all"), dir)
 
 	// The gnet listeners and bcrypt workers record from many goroutines at
 	// once; run under -race this proves Record and Close are serialized.

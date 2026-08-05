@@ -8,9 +8,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/panjf2000/gnet/v2"
 )
+
+// newNoOpAudit returns a disabled audit engine so listener tests exercise the
+// unguarded Record() hooks with zero audit output.
+func newNoOpAudit() *audit.LogEngine {
+	return audit.NewLogEngine(false, nil, "stdout", log.NewNoOpLogger(), crypto.Engine{})
+}
 
 // fakeStore is a minimal in-memory Store. Like the real engine, it must COPY the key and
 // value because the arguments handed to Set alias the server's network read buffer.
@@ -54,7 +62,7 @@ func freeAddr(t *testing.T) string {
 
 func TestRESPServer_GetSetPingPipeline(t *testing.T) {
 	addr := freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, nil)
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -109,7 +117,7 @@ func expectReply(t *testing.T, conn net.Conn, name, send, want string) {
 func startServer(t *testing.T, requirePass string) (addr string) {
 	t.Helper()
 	addr = freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, requirePass, false, nil)
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, requirePass, false, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

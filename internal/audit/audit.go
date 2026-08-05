@@ -50,7 +50,7 @@ const (
 )
 
 // allEvents is the complete set of recognized event types. Used by
-// parseEventTypes to validate user input and by the default set builder.
+// ParseEventTypes to validate user input and by the default set builder.
 var allEvents = [6]EventType{
 	EventConnect,
 	EventDisconnect,
@@ -89,11 +89,11 @@ func (s *eventSet) has(eventType EventType) bool {
 	return false
 }
 
-// parseEventTypes builds an eventSet from a comma-separated flag value
+// ParseEventTypes builds an eventSet from a comma-separated flag value
 // (e.g. "auth_success,auth_failure,acl_deny" or "auth,acl,command").
 // Unrecognized tokens are silently ignored, so the flag stays forward-compatible.
 // An empty string yields a set containing only defaultEventTypes.
-func parseEventTypes(raw string) *eventSet {
+func ParseEventTypes(raw string) *eventSet {
 	s := &eventSet{}
 	tokens := strings.Split(raw, ",")
 	if len(tokens) == 1 && tokens[0] == "" {

@@ -19,11 +19,13 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
+	"github.com/Saxy/Tellstone/internal/audit"
 	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/metrics"
@@ -67,6 +69,10 @@ type Server struct {
 	// listeners. nil means RBAC is disabled and both servers keep their
 	// legacy zero-overhead paths. SIGHUP swaps a fresh snapshot into it.
 	policy *rbac.Store
+	// audit is the shared audit engine. It is always non-nil: when
+	// --enable-audit is not set it is a disabled no-op whose Record() costs a
+	// single bool comparison, so listeners never guard the call.
+	audit *audit.LogEngine
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -101,6 +107,7 @@ func (s *Server) Run() error {
 	if err = s.initShards(cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
+	s.initAudit(cryptoEngine)
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
@@ -110,6 +117,7 @@ func (s *Server) Run() error {
 		s.tlsConfigs,
 		cfg.GetRequirePass(),
 		s.policy,
+		s.audit,
 	)
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(s.netSrv)
@@ -255,6 +263,11 @@ func (s *Server) shutdown(ctx context.Context) {
 			}
 		}
 	}
+	// Both listeners are stopped above, so no Record() call can race the
+	// file close. A disabled engine's Close() is a no-op returning nil.
+	if err := s.audit.Close(); err != nil && logger.Enabled(log.LevelError) {
+		logger.Log(log.LevelError, "audit log close error", log.String("error", err.Error()))
+	}
 }
 
 func (s *Server) initCrypto() (*crypto.Engine, error) {
@@ -271,6 +284,27 @@ func (s *Server) initCrypto() (*crypto.Engine, error) {
 		return nil, fmt.Errorf("crypto engine initialization: %w", err)
 	}
 	return cryptoEngine, nil
+}
+
+// initAudit constructs the shared audit engine from the --enable-audit,
+// --audit-log-path, and --audit-events flags. The engine is always non-nil: a
+// disabled --enable-audit yields the no-op engine, so every listener hook can
+// call Record() unconditionally. cryptoEngine is nil when encryption is off;
+// the zero-value crypto.Engine keeps the file writer's encryption path inert.
+func (s *Server) initAudit(cryptoEngine *crypto.Engine) {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	var engine crypto.Engine
+	if cryptoEngine != nil {
+		engine = *cryptoEngine
+	}
+	s.audit = audit.NewLogEngine(
+		cfg.AuditEnabled(),
+		audit.ParseEventTypes(strings.Join(cfg.AuditLogEvents(), ",")),
+		cfg.AuditLogPath(),
+		logger,
+		engine,
+	)
 }
 
 func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
@@ -304,13 +338,13 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 	}
 	s.router = router.New(s.shards)
 	if logger.Enabled(log.LevelInfo) {
-		persistence := "disabled"
+		p := "disabled"
 		if store != nil {
-			persistence = "enabled"
+			p = "enabled"
 		}
 		logger.Log(log.LevelInfo, "shards initialized",
 			log.Int("num_shards", numShards),
-			log.String("persistence", persistence),
+			log.String("persistence", p),
 		)
 	}
 	return nil
@@ -373,6 +407,7 @@ func (s *Server) startRESPServer() {
 		cfg.GetRequirePass(),
 		cfg.RESPStartTLSEnabled(),
 		s.policy,
+		s.audit,
 	)
 	s.respSrv = respSrv
 	go func() {

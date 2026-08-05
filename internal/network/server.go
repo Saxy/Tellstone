@@ -17,7 +17,9 @@ import (
 	"io"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
+	"github.com/Saxy/Tellstone/internal/audit"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/shard"
@@ -97,6 +99,11 @@ type Server struct {
 	// per-user bcrypt hashes and every data op is gated by the session.
 	policy *rbac.Store
 
+	// audit is the shared audit engine. Always non-nil: without --enable-audit
+	// it is a disabled no-op whose Record() costs one bool comparison, so the
+	// hooks below call it without a nil guard.
+	audit *audit.LogEngine
+
 	authJobs chan authJob
 	workerWg sync.WaitGroup
 }
@@ -110,7 +117,9 @@ type Server struct {
 // otherwise it is hashed at startup and clients must AUTH before issuing data commands.
 // policy is optional — if nil, RBAC is disabled and every authenticated op is allowed;
 // otherwise AUTH resolves per-user credentials and sessions gate data ops.
-func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, policy *rbac.Store) *Server {
+// audit is the shared audit engine; it must be non-nil (pass a disabled engine when
+// audit logging is off) and is always called without a nil guard.
+func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler func(msg *Message) ([]byte, MessageType, error), logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, policy *rbac.Store, audit *audit.LogEngine) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -141,6 +150,7 @@ func NewServer(addr string, maxMsgSize uint64, shards []*shard.Shard, handler fu
 		shards:          shards,
 		requirePassHash: passHash,
 		policy:          policy,
+		audit:           audit,
 	}
 	if passHash != nil || policy != nil {
 		s.authJobs = make(chan authJob, 256)
@@ -213,6 +223,11 @@ func (s *Server) OnOpen(c gnet.Conn) (out []byte, action gnet.Action) {
 		st.readBuf = make([]byte, 0, 4096)
 	}
 	c.SetContext(st)
+	s.audit.Record(audit.EventConnect, "client connected",
+		log.String("remote_addr", st.remoteAddr),
+		log.String("protocol", "binary"),
+		log.Uint64("shard_id", sid),
+	)
 	if s.logger.Enabled(log.LevelDebug) {
 		s.logger.Log(log.LevelDebug, "network: client connected",
 			log.String("remote_addr", st.remoteAddr),
@@ -231,6 +246,10 @@ func (s *Server) OnClose(c gnet.Conn, err error) (action gnet.Action) {
 			s.shards[st.shardID].DecConnectedClients()
 		}
 	}
+	s.audit.Record(audit.EventDisconnect, "client disconnected",
+		log.String("remote_addr", remoteAddr),
+		log.String("protocol", "binary"),
+	)
 	if s.logger.Enabled(log.LevelDebug) {
 		fields := []log.Field{log.String("remote_addr", remoteAddr)}
 		if err != nil {
@@ -412,11 +431,23 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 	}
 	if s.policy != nil && !s.opAuthorized(*msg, st) {
 		s.policy.IncDenied()
+		user := ""
+		if st.session != nil {
+			user = st.session.Username
+		}
+		keyStr := string(msg.Key)
+		s.audit.Record(audit.EventACLDeny, "command denied by rbac policy",
+			log.String("user", user),
+			log.String("command", msg.Op.String()),
+			log.String("key", keyStr),
+			log.String("remote_addr", st.remoteAddr),
+			log.String("protocol", "binary"),
+		)
 		if s.logger.Enabled(log.LevelWarn) {
 			s.logger.Log(log.LevelWarn, "network: command denied by rbac policy",
 				log.String("remote_addr", st.remoteAddr),
 				log.String("command", msg.Op.String()),
-				log.String("key", string(msg.Key)),
+				log.String("key", keyStr),
 			)
 		}
 		return MsgError, ResponseNotAuthorized, true, false
@@ -436,6 +467,22 @@ func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType M
 		if s.policy != nil && st.session != nil && msg.Type != MsgPing {
 			st.session.CountCommand()
 		}
+		// The key is converted zero-copy (aliasing the gnet buffer) and consumed
+		// synchronously by the encoder, mirroring the dispatch path in server.go.
+		// The unsafe string holds a slice header over the buffer that stays valid
+		// until the frame is discarded below.
+		keyStr := *(*string)(unsafe.Pointer(&msg.Key))
+		user := "default"
+		if st.session != nil {
+			user = st.session.Username
+		}
+		s.audit.Record(audit.EventCommand, "command dispatched",
+			log.String("command", msg.Op.String()),
+			log.String("key", keyStr),
+			log.String("user", user),
+			log.String("remote_addr", st.remoteAddr),
+			log.String("protocol", "binary"),
+		)
 		var err error
 		respPayload, respType, err = s.handler(msg)
 		if err != nil {
@@ -485,12 +532,18 @@ func (s *Server) discardFrame(c gnet.Conn, totalPacketLen int) {
 	}
 }
 
-// authFailed logs a rejected AUTH attempt, increments the per-connection fail
-// counter, and marks the connection for closure when the rate limit is exceeded.
-// The store-wide ACL counter and log entry are recorded by the caller via
-// LogAuthFailure, which carries the username and reason.
-func (s *Server) authFailed(st *connState) []byte {
+// authFailed logs a rejected AUTH attempt to the audit trail, increments the
+// per-connection fail counter, and marks the connection for closure when the
+// rate limit is exceeded. The store-wide ACL counter and log entry are recorded
+// by the caller via LogAuthFailure, which carries the username and reason.
+func (s *Server) authFailed(st *connState, username, reason string) []byte {
 	st.authFails++
+	s.audit.Record(audit.EventAuthFailure, "authentication failed",
+		log.String("user", username),
+		log.String("remote_addr", st.remoteAddr),
+		log.String("reason", reason),
+		log.String("protocol", "binary"),
+	)
 	if s.logger.Enabled(log.LevelWarn) {
 		s.logger.Log(log.LevelWarn, "network: failed AUTH attempt",
 			log.String("remote_addr", st.remoteAddr),
@@ -529,7 +582,7 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 		if s.policy != nil {
 			s.policy.LogAuthFailure("", st.remoteAddr, "malformed request")
 		}
-		return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+		return authResult{respPayload: s.authFailed(st, "", "malformed request"), respType: MsgAuthErr}
 	}
 	var (
 		passHash []byte
@@ -551,7 +604,7 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 			// Unknown usernames fail synchronously; the worker only records
 			// failures for real users, so log the attempt here for ACL LOG.
 			s.policy.LogAuthFailure(name, st.remoteAddr, "unknown user")
-			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+			return authResult{respPayload: s.authFailed(st, name, "unknown user"), respType: MsgAuthErr}
 		}
 		// Empty hash marks a nopass user that accepts any password (Redis
 		// ACL semantics). The session is built from the same snapshot that
@@ -562,7 +615,7 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 		reason = "invalid password"
 	} else {
 		if len(username) > 0 && string(username) != "default" {
-			return authResult{respPayload: s.authFailed(st), respType: MsgAuthErr}
+			return authResult{respPayload: s.authFailed(st, string(username), "unknown user"), respType: MsgAuthErr}
 		}
 		passHash = s.requirePassHash
 	}
@@ -596,6 +649,17 @@ func (s *Server) authWorker() {
 			if success {
 				st.authenticated = true
 				st.session = job.session
+				// Single-password mode never sets job.username; the implicit
+				// identity there is "default", mirroring the AUTH payload rule.
+				user := job.username
+				if user == "" {
+					user = "default"
+				}
+				s.audit.Record(audit.EventAuthSuccess, "client authenticated",
+					log.String("user", user),
+					log.String("remote_addr", st.remoteAddr),
+					log.String("protocol", "binary"),
+				)
 				respPayload, respType = ResponseOK, MsgAuthOk
 				if s.logger.Enabled(log.LevelDebug) {
 					s.logger.Log(log.LevelDebug, "network: client authenticated",
@@ -608,7 +672,7 @@ func (s *Server) authWorker() {
 				if s.policy != nil {
 					s.policy.LogAuthFailure(job.username, st.remoteAddr, job.reason)
 				}
-				respPayload, respType = s.authFailed(st), MsgAuthErr
+				respPayload, respType = s.authFailed(st, job.username, job.reason), MsgAuthErr
 			}
 			var writeErr error
 			if st.tlsConn != nil {
