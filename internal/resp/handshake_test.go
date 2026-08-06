@@ -37,18 +37,21 @@ func TestRESPServer_StalledSTARTTLSTimesOut(t *testing.T) {
 	raw := dialWithRetry(t, addr)
 	defer raw.Close()
 
+	// Timed from before the upgrade request: the server starts its deadline inside
+	// upgradeToTLS, which cannot happen before this point, so a correct close can never look
+	// early. Timing from after the +OK arrives would leave the assertion racing the round trip.
+	start := time.Now()
 	expectReply(t, raw, "STARTTLS", startTLSRequest, "+OK\r\n")
 	// The upgrade is accepted and then the client goes silent: no ClientHello, no further
 	// bytes, so nothing will ever call OnTraffic for this connection again.
-	start := time.Now()
-	assertClosedByServer(t, raw, "connection stalled after STARTTLS")
-	if elapsed := time.Since(start); elapsed < sweepTestTimeout {
-		t.Fatalf("closed after %v, before the %v deadline", elapsed, sweepTestTimeout)
-	}
+	assertClosedAfterDeadline(t, raw, "connection stalled after STARTTLS", start)
 }
 
 func TestRESPServer_StalledClientHelloTimesOut(t *testing.T) {
 	addr, _ := startHandshakeServer(t, false)
+	// Implicit TLS is tracked in OnOpen, so the deadline starts at accept — time from before
+	// the dial.
+	start := time.Now()
 	raw := dialWithRetry(t, addr)
 	defer raw.Close()
 
@@ -58,17 +61,18 @@ func TestRESPServer_StalledClientHelloTimesOut(t *testing.T) {
 	if _, err := raw.Write(partialHello); err != nil {
 		t.Fatalf("write partial ClientHello: %v", err)
 	}
-	assertClosedByServer(t, raw, "connection stalled mid-ClientHello")
+	assertClosedAfterDeadline(t, raw, "connection stalled mid-ClientHello", start)
 }
 
 func TestRESPServer_SilentImplicitTLSTimesOut(t *testing.T) {
 	addr, _ := startHandshakeServer(t, false)
+	start := time.Now()
 	raw := dialWithRetry(t, addr)
 	defer raw.Close()
 
 	// Not a single byte is sent, so the deadline set at accept time is the only thing that can
 	// release the socket and its 4 KiB TLS read buffer.
-	assertClosedByServer(t, raw, "silent implicit-TLS connection")
+	assertClosedAfterDeadline(t, raw, "silent implicit-TLS connection", start)
 }
 
 func TestRESPServer_EstablishedConnectionSurvivesDeadline(t *testing.T) {
@@ -190,6 +194,19 @@ func startHandshakeServer(t *testing.T, startTLS bool) (string, []byte) {
 	probe := dialWithRetry(t, addr)
 	_ = probe.Close()
 	return addr, certPEM
+}
+
+// assertClosedAfterDeadline fails unless the server closed conn on its own and waited out the
+// deadline first. start must be taken before whatever begins handshake tracking, so that the
+// server's clock starts at or after it — otherwise a correct close can appear early and the test
+// flakes. Without the lower bound, a regression that closed every TLS connection on accept would
+// still pass.
+func assertClosedAfterDeadline(t *testing.T, conn net.Conn, name string, start time.Time) {
+	t.Helper()
+	assertClosedByServer(t, conn, name)
+	if elapsed := time.Since(start); elapsed < sweepTestTimeout {
+		t.Fatalf("%s: closed after %v, before the %v deadline", name, elapsed, sweepTestTimeout)
+	}
 }
 
 // assertClosedByServer fails unless the server closes conn on its own. The read deadline allows
