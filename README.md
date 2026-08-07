@@ -172,7 +172,9 @@ Kubernetes Secret or a vault-agent-rendered file. Every byte of the file is sign
 be exactly 32 bytes with no trailing newline:
 
 ```bash
-head -c 32 /dev/urandom > /etc/tellstone/key
+# umask 077 in a subshell so the file is created 0600; a later chmod would leave
+# the key world-readable in between.
+(umask 077; head -c 32 /dev/urandom > /etc/tellstone/key)
 tellstone --enable-encryption --encryption-key-file /etc/tellstone/key
 ```
 
@@ -181,7 +183,7 @@ source is refused at startup rather than silently falling back to plaintext.
 
 > **Upgrading:** `--encryption-key` was previously used as raw text, so a literal 32-character
 > value such as `0123456789abcdef0123456789abcdef` worked. It is now base64-decoded, and such a
-> value will fail with a key-length error. Re-encode an existing key with `base64 -w0 <keyfile>`,
+> value will fail with a key-length error. Re-encode an existing key with `base64 < <keyfile>`,
 > or move it to `--encryption-key-file`. Note that generating a key with `openssl rand -hex 16`
 > yielded only 128 bits of entropy despite being 32 characters long; `openssl rand -base64 32`
 > carries the full 256 bits.
