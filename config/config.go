@@ -30,6 +30,7 @@ type Config struct {
 	evictSlots        uint32
 	enableEncryption  bool
 	encryptionKey     string
+	encryptionKeyFile string
 	traceRatio        float64
 	maxMsgSize        uint64
 	maxMemBytes       uint64
@@ -107,7 +108,8 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_LOG_LEVEL       – log verbosity (debug, info, warn, error, fatal)
 //		TSD_EVICT_INTERVAL  – eviction ticker interval (e.g. "500ms", "2s")
 //		TSD_EVICT_SLOTS     – number of slots in the timing‑wheel chronometer
-//		TSD_ENCRYPTION_KEY  – optional base‑64 symmetric key for data encryption
+//		TSD_ENCRYPTION_KEY  – optional base‑64 encoded 32-byte symmetric key for data encryption
+//		TSD_ENCRYPTION_KEY_FILE – path to a file holding the raw 32-byte key; mutually exclusive with TSD_ENCRYPTION_KEY
 //		TSD_TRACE_RATIO     – OpenTelemetry sampling ratio in the range [0.0‑1.0]
 //		TSD_MAX_MSG_SIZE	- optional parameter to define the maximum msg size
 //		TSD_METRICS_ADDR    – Prometheus HTTP exporter address (e.g. ":9100")
@@ -127,7 +129,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_REQUIRE_PASS     – server password required by AUTH (empty = no authentication)
 //		TSD_RBAC_CONFIG      – path to a YAML/JSON RBAC policy file (roles, users, default_role)
 //		TSD_ENABLE_AUDIT	 - boolean to enable audit logging (default: false)
-// 		TSD_AUDIT_LOG_PATH	 - path where the audit log file(s) will be created (default: stdout)
+//		TSD_AUDIT_LOG_PATH	 - path where the audit log file(s) will be created (default: stdout)
 //		TSD_AUDIT_EVENTS	 - comma-seperated event types on which audit events should be logged (default: auth,acl)
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
@@ -190,7 +192,17 @@ func LoadConfig(args []string) *Config {
 		&cfg.encryptionKey,
 		"encryption-key",
 		getEnv("TSD_ENCRYPTION_KEY", ""),
-		"Base‑64 encoded encryption key; empty disables encryption (default: none)",
+		"Base‑64 encoded 32-byte encryption key; empty disables encryption (default: none)",
+	)
+	// Optional file-sourced encryption key, e.g. a mounted Kubernetes Secret or a
+	// vault-agent-sidecar-rendered path. Mutually exclusive with --encryption-key.
+	// The file carries raw bytes rather than base64: a NUL cannot survive a process
+	// argument or environment variable, but a file has no such restriction.
+	fs.StringVar(
+		&cfg.encryptionKeyFile,
+		"encryption-key-file",
+		getEnv("TSD_ENCRYPTION_KEY_FILE", ""),
+		"Path to a file holding the raw (unencoded) 32-byte encryption key; empty disables (default: none)",
 	)
 	// OpenTelemetry trace sampling ratio.
 	fs.Float64Var(
@@ -351,6 +363,17 @@ func LoadConfig(args []string) *Config {
 	if cfg.respStartTLS && cfg.tlsCert == "" {
 		panic("tellstone: --resp-starttls requires --tls-cert and --tls-key")
 	}
+	// The raw key and file-sourced key are alternative KeyProvider backends;
+	// supplying both leaves the intended source ambiguous.
+	if cfg.encryptionKey != "" && cfg.encryptionKeyFile != "" {
+		panic("tellstone: --encryption-key and --encryption-key-file are mutually exclusive")
+	}
+	// Refuse to start rather than silently downgrade: NewEngine treats an empty key as
+	// pass-through, so without this the server would serve plaintext after the operator
+	// explicitly asked for encryption.
+	if cfg.enableEncryption && cfg.encryptionKey == "" && cfg.encryptionKeyFile == "" {
+		panic("tellstone: --enable-encryption requires --encryption-key or --encryption-key-file")
+	}
 	return cfg
 }
 
@@ -362,6 +385,7 @@ func (cfg *Config) GetEvictTicker() time.Duration     { return cfg.evictTicker }
 func (cfg *Config) GetEvictSlots() uint32             { return cfg.evictSlots }
 func (cfg *Config) EncryptionEnabled() bool           { return cfg.enableEncryption }
 func (cfg *Config) GetEncryptionKey() string          { return cfg.encryptionKey }
+func (cfg *Config) GetEncryptionKeyFile() string      { return cfg.encryptionKeyFile }
 func (cfg *Config) GetTraceRatio() float64            { return cfg.traceRatio }
 func (cfg *Config) GetMaxMsgSize() uint64             { return cfg.maxMsgSize }
 func (cfg *Config) GetMaxMemBytes() uint64            { return cfg.maxMemBytes }

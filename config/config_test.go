@@ -277,6 +277,60 @@ func TestTLSPanicCAOnly(t *testing.T) {
 	LoadConfig([]string{"--tls-ca", "/path/to/ca.pem"})
 }
 
+func TestEncryptionKeyFileFlagAndEnv(t *testing.T) {
+	t.Setenv("TSD_ENCRYPTION_KEY", "")
+	cfg := LoadConfig([]string{"--encryption-key-file", "/path/to/key"})
+	if cfg.GetEncryptionKeyFile() != "/path/to/key" {
+		t.Fatalf("EncryptionKeyFile mismatch: %s", cfg.GetEncryptionKeyFile())
+	}
+	if cfg.GetEncryptionKey() != "" {
+		t.Fatalf("EncryptionKey should be empty when only the file flag is set")
+	}
+
+	t.Setenv("TSD_ENCRYPTION_KEY_FILE", "/env/key")
+	cfg = LoadConfig(nil)
+	if cfg.GetEncryptionKeyFile() != "/env/key" {
+		t.Fatalf("EncryptionKeyFile env mismatch: %s", cfg.GetEncryptionKeyFile())
+	}
+}
+
+func TestEncryptionKeyPanicWhenBothSourcesSet(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when both --encryption-key and --encryption-key-file are set")
+		}
+	}()
+	LoadConfig([]string{"--encryption-key", "raw-key-value", "--encryption-key-file", "/path/to/key"})
+}
+
+// An empty key puts the crypto engine in pass-through mode, so accepting this
+// configuration would serve plaintext while the operator believes encryption is on.
+func TestEnableEncryptionPanicWithoutKeySource(t *testing.T) {
+	t.Setenv("TSD_ENCRYPTION_KEY", "")
+	t.Setenv("TSD_ENCRYPTION_KEY_FILE", "")
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when --enable-encryption is set with no key source")
+		}
+	}()
+	LoadConfig([]string{"--enable-encryption"})
+}
+
+func TestEnableEncryptionAcceptsEitherKeySource(t *testing.T) {
+	t.Setenv("TSD_ENCRYPTION_KEY", "")
+	t.Setenv("TSD_ENCRYPTION_KEY_FILE", "")
+
+	cfg := LoadConfig([]string{"--enable-encryption", "--encryption-key", "raw-key-value"})
+	if !cfg.EncryptionEnabled() || cfg.GetEncryptionKey() != "raw-key-value" {
+		t.Fatal("raw key source should be accepted with --enable-encryption")
+	}
+
+	cfg = LoadConfig([]string{"--enable-encryption", "--encryption-key-file", "/path/to/key"})
+	if !cfg.EncryptionEnabled() || cfg.GetEncryptionKeyFile() != "/path/to/key" {
+		t.Fatal("file key source should be accepted with --enable-encryption")
+	}
+}
+
 func TestTLSEnvVars(t *testing.T) {
 	t.Setenv("TSD_TLS_CERT", "/env/cert.pem")
 	t.Setenv("TSD_TLS_KEY", "/env/key.pem")

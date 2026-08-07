@@ -60,13 +60,17 @@ func (a *App) Start(cfg *config.Config, logger log.Logger) {
 		)
 	}
 	if cfg.EncryptionEnabled() {
-		if cfg.GetEncryptionKey() == "" {
-			if logger.Enabled(log.LevelFatal) {
-				logger.Log(log.LevelFatal, "Encryption key must be provided", log.String("error", "encryption key is missing but encryption is enabled"))
-			}
+		// A missing key source is rejected in config.LoadConfig, which runs before
+		// this banner; reaching this branch means a key is present.
+		keySource := "flag/env"
+		if cfg.GetEncryptionKeyFile() != "" {
+			keySource = "file"
 		}
 		if logger.Enabled(log.LevelInfo) {
-			logger.Log(log.LevelInfo, "Engine crypto status", log.String("encryption", "ENABLED (ChaCha20-Poly1305)"))
+			logger.Log(log.LevelInfo, "Engine crypto status",
+				log.String("encryption", "ENABLED (ChaCha20-Poly1305)"),
+				log.String("key_source", keySource),
+			)
 		}
 	} else {
 		if logger.Enabled(log.LevelWarn) {

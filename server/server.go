@@ -270,13 +270,32 @@ func (s *Server) shutdown(ctx context.Context) {
 	}
 }
 
+// initCrypto resolves the encryption key and builds the at-rest cipher engine. The key
+// comes from whichever KeyProvider matches the configured source — a file when
+// --encryption-key-file is set, otherwise the base64 flag value — and is read exactly
+// once here, never from the encrypt/decrypt hot path. It returns a nil engine when
+// encryption is disabled, which leaves callers in pass-through mode.
 func (s *Server) initCrypto() (*crypto.Engine, error) {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	if !cfg.EncryptionEnabled() {
 		return nil, nil
 	}
-	cryptoEngine, err := crypto.NewEngine([]byte(cfg.GetEncryptionKey()), logger)
+	var provider crypto.KeyProvider
+	switch {
+	case cfg.GetEncryptionKeyFile() != "":
+		provider = crypto.NewFileKeyProvider(cfg.GetEncryptionKeyFile())
+	default:
+		provider = crypto.NewBase64KeyProvider(cfg.GetEncryptionKey())
+	}
+	key, err := provider.Key()
+	if err != nil {
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "encryption key resolution failed", log.String("error", err.Error()))
+		}
+		return nil, fmt.Errorf("encryption key resolution: %w", err)
+	}
+	cryptoEngine, err := crypto.NewEngine(key, logger)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "crypto engine setup failed", log.String("error", err.Error()))

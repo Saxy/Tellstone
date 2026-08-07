@@ -41,6 +41,39 @@ func (e *Engine) DecryptInPlaceWithDst(dst, ciphertext []byte) ([]byte, error)
 
 ---
 
+## 🔑 Key Sourcing
+
+`NewEngine` always takes raw key bytes — where those bytes come from is decided once,
+at startup, via a `KeyProvider`:
+
+```go
+// KeyProvider resolves the raw encryption key. Resolution happens once at server
+// startup; implementations are not called from the encrypt/decrypt hot path.
+type KeyProvider interface {
+    Key() ([]byte, error)
+}
+```
+
+Two backends ship in this package:
+
+| Provider | Source | Config |
+|---|---|---|
+| `Base64KeyProvider` | Base64 string decoded to 32 bytes | `--encryption-key` / `TSD_ENCRYPTION_KEY` |
+| `FileKeyProvider` | Raw 32 bytes read from a file (e.g. a mounted Kubernetes Secret or vault-agent-sidecar path) | `--encryption-key-file` / `TSD_ENCRYPTION_KEY_FILE` |
+
+The flag/env source is base64 rather than raw because process arguments and environment
+variables are NUL-terminated: a key containing `0x00` — about 1 in 8 random 32-byte keys —
+cannot pass through them intact. A file has no such restriction, so it carries raw bytes
+and every byte is significant (no trailing-newline trimming).
+
+Both are resolved exactly once, when `server.initCrypto` builds the `Engine` — the key
+is not re-read while the server is running, so rotating a mounted key file requires a
+restart. External Vault/KMS-backed providers can be added by implementing `KeyProvider`
+in a separate, opt-in module without touching `Engine`, `EncryptInPlace`, or
+`DecryptInPlaceWithDst`.
+
+---
+
 ## 📈 Benchmarks
 
 The benchmark suite lives in `internal/crypto/benchmark_test.go` and `internal/storage/benchmark_crypto_test.go`. Below are the most recent results (run on an AMD Ryzen 9 9950X, 16 Cores, Go 1.22).
