@@ -274,7 +274,8 @@ redis-cli AUTH <id_token>              # +OK — claims map to a role via oauth.
 
 Supported presets: `google`, `stackit`; set `--oauth-issuer` for any other OIDC provider. How
 the provider pipeline, claim matching, and fail-closed semantics work is documented in
-[`internal/oauth/README.md`](internal/oauth/README.md).
+[`internal/oauth/README.md`](internal/oauth/README.md). A runnable client example lives in
+`cmd/example/oauth`.
 
 ### Audit logging
 

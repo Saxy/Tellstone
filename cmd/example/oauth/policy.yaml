@@ -1,0 +1,30 @@
+# Example OAuth policy for cmd/example/oauth. Run the example against a server
+# started with this file and an OAuth provider:
+#
+#   ./bin/tellstone --rbac-config cmd/example/oauth/policy.yaml \
+#     --oauth-provider google --oauth-client-id <your-client-id>
+#
+# The example presents an OIDC id_token as its AUTH credential. The token's
+# claims are mapped to a role through the oauth.rules below (first match wins):
+# any id_token whose email ends in @saxy.dev gets the admin role (all commands,
+# every key), while *@tellstone.io gets read-only. A token that verifies but
+# matches no rule is denied — a session without a role is deny-all.
+#
+# The server verifies the token by signature + issuer + audience against the
+# provider's public JWKS; no client secret is needed. Obtain an id_token for a
+# user at one of the domains above (for example via an OAuth2 authorization
+# code flow or a token endpoint) and pass it to the example with -token.
+roles:
+  - name: admin
+    rules: ["+@all", "~*"]
+  - name: readonly
+    rules: ["+get", "~*"]
+users:
+  - name: admin
+    role: admin
+    password: "$2a$10$pcaKkTfRy.KSdNUgKszYYedE7L32P9fSEG3x1phq0EbjeYkn5WpEi"
+oauth:
+  rules:
+    - claim: email
+      match: "*@example.com"
+      role: admin

@@ -103,21 +103,18 @@ func (p *Provider) Verify(ctx context.Context, token []byte) (oauth.Claims, erro
 		Alg string `json:"alg"`
 		Kid string `json:"kid"`
 	}
-	if err := json.Unmarshal(headerB, &hdr); err != nil {
+	if err = json.Unmarshal(headerB, &hdr); err != nil {
 		return nil, oauth.ErrInvalidToken
 	}
 	if !allowedAlgs[hdr.Alg] {
 		return nil, oauth.ErrInvalidToken
 	}
-	// Requiring the kid keeps the key lookup unambiguous; a token without one
-	// is rejected rather than matched against every key.
 	if hdr.Kid == "" {
 		return nil, oauth.ErrInvalidToken
 	}
 	key, ok := p.jwks.lookup(hdr.Kid)
 	if !ok {
-		// Key material may have rotated since startup; refresh once before
-		// giving up so rotation never demands a server restart.
+		// check if key may rotated
 		if err = p.refreshJWKS(ctx); err != nil {
 			return nil, err
 		}
@@ -152,7 +149,7 @@ func (p *Provider) refreshDiscovery(ctx context.Context) error {
 		return err
 	}
 	if doc.JWKSURI == "" {
-		return errors.New("generic: discovery document has no jwks_uri")
+		return errors.New("oauth: discovery document has no jwks_uri")
 	}
 	p.jwksURI = doc.JWKSURI
 	return p.refreshJWKS(ctx)
@@ -172,14 +169,14 @@ func (p *Provider) refreshJWKS(ctx context.Context) error {
 		key, err := parseJWK(k)
 		if err != nil {
 			if p.logger.Enabled(log.LevelWarn) {
-				p.logger.Log(log.LevelWarn, "generic: skipping unusable jwk", log.String("kid", k.Kid), log.String("error", err.Error()))
+				p.logger.Log(log.LevelWarn, "oauth: skipping unusable jwk", log.String("kid", k.Kid), log.String("error", err.Error()))
 			}
 			continue
 		}
 		keys[k.Kid] = key
 	}
 	if len(keys) == 0 {
-		return errors.New("generic: jwks contained no usable keys")
+		return errors.New("oauth: jwks contained no usable keys")
 	}
 	p.jwks.mu.Lock()
 	p.jwks.keys = keys

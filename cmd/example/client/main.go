@@ -2,7 +2,8 @@
 Package main
 Tellstone Cloud-Native In-Memory Database
 File: main.go
-Description: Example client that uses the binary protocol (OpCodes and response codes) to interact with the Tellstone server.
+Description: Example client that uses the binary protocol (OpCodes and response codes)
+to interact with the Tellstone server.
 
 Authors:
 

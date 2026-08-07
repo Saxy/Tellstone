@@ -166,6 +166,10 @@ Startup rules (`server.initOAuth`):
 No `--oauth-client-secret` exists by design. `Verify` needs only the issuer, the audience, and
 the public JWKS.
 
+A runnable example lives at `cmd/example/oauth` (policy + client that presents an id_token and
+proves the pinned role): start a server with `--rbac-config cmd/example/oauth/policy.yaml
+--oauth-provider google --oauth-client-id <id>`, then run the example with a token.
+
 ---
 
 ## Mapping claims to roles
