@@ -48,6 +48,9 @@ type Config struct {
 	enableAuditLog    bool
 	auditLogPath      string
 	auditLogEvents    string
+	oauthProvider     string
+	oauthIssuer       string
+	oauthClientID     string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -127,11 +130,14 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_REQUIRE_PASS     – server password required by AUTH (empty = no authentication)
 //		TSD_RBAC_CONFIG      – path to a YAML/JSON RBAC policy file (roles, users, default_role)
 //		TSD_ENABLE_AUDIT	 - boolean to enable audit logging (default: false)
-// 		TSD_AUDIT_LOG_PATH	 - path where the audit log file(s) will be created (default: stdout)
+//		TSD_AUDIT_LOG_PATH	 - path where the audit log file(s) will be created (default: stdout)
 //		TSD_AUDIT_EVENTS	 - comma-seperated event types on which audit events should be logged (default: auth,acl)
+//		TSD_OAUTH_PROVIDER   - OAuth provider preset (google|stackit|empty for generic OIDC)
+//		TSD_OAUTH_ISSUER	 - OIDC issuer / discovery base URL of the OAuth provider
+//		TSD_OAUTH_CLIENT_ID	 - OAuth2 client ID used as the expected token audience
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
-// environment-only / default configuration. A fresh flag.FlagSet is used so LoadConfig is
+// environment-only / default configuration. A fresh flag.FlagSet is used, so LoadConfig is
 // free of global state and safe to call repeatedly (e.g. from tests).
 func LoadConfig(args []string) *Config {
 	cfg := new(Config)
@@ -323,6 +329,28 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_AUDIT_EVENTS", "auth,acl"),
 		"Comma-separated event types which should be logged, possible events: auth, acl, connect, disconnect, command, all for all event logging (default: auth,acl)",
 	)
+	// Optional OAuth provider for connection-time token authentication. The
+	// provider name selects a preset (google, stackit); empty selects the
+	// generic OIDC verifier driven by --oauth-issuer. Token validation needs no
+	// client secret — issuer and audience suffice — so none is accepted here.
+	fs.StringVar(
+		&cfg.oauthProvider,
+		"oauth-provider",
+		getEnv("TSD_OAUTH_PROVIDER", ""),
+		"OAuth provider preset (google|stackit); empty selects generic OIDC via --oauth-issuer (default: none)",
+	)
+	fs.StringVar(
+		&cfg.oauthIssuer,
+		"oauth-issuer",
+		getEnv("TSD_OAUTH_ISSUER", ""),
+		"OIDC issuer / discovery base URL of the OAuth provider (default: none)",
+	)
+	fs.StringVar(
+		&cfg.oauthClientID,
+		"oauth-client-id",
+		getEnv("TSD_OAUTH_CLIENT_ID", ""),
+		"OAuth2 client ID used as the expected token audience (default: none)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -378,7 +406,12 @@ func (cfg *Config) GetTLSKey() string                 { return cfg.tlsKey }
 func (cfg *Config) GetTLSCA() string                  { return cfg.tlsCA }
 func (cfg *Config) GetRequirePass() string            { return cfg.requirePass }
 func (cfg *Config) GetRBACConfig() string             { return cfg.rbacConfig }
-func (cfg *Config) MTLSEnabled() bool                 { return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != "" }
-func (cfg *Config) AuditEnabled() bool                { return cfg.enableAuditLog }
-func (cfg *Config) AuditLogPath() string              { return cfg.auditLogPath }
-func (cfg *Config) AuditLogEvents() []string          { return strings.Split(cfg.auditLogEvents, ",") }
+func (cfg *Config) MTLSEnabled() bool {
+	return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != ""
+}
+func (cfg *Config) AuditEnabled() bool       { return cfg.enableAuditLog }
+func (cfg *Config) AuditLogPath() string     { return cfg.auditLogPath }
+func (cfg *Config) AuditLogEvents() []string { return strings.Split(cfg.auditLogEvents, ",") }
+func (cfg *Config) GetOAuthProvider() string { return cfg.oauthProvider }
+func (cfg *Config) GetOAuthIssuer() string   { return cfg.oauthIssuer }
+func (cfg *Config) GetOAuthClientID() string { return cfg.oauthClientID }

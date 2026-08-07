@@ -15,7 +15,7 @@ func startACLServer(t *testing.T) (addr string, store *rbac.Store) {
 	t.Helper()
 	addr = freeAddr(t)
 	store = rbac.NewStore(rbacTestPolicy(t), log.NewNoOpLogger())
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, store, newNoOpAudit())
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, store, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -29,7 +29,7 @@ func startACLServer(t *testing.T) (addr string, store *rbac.Store) {
 // when RBAC is disabled, mirroring the ROLE command's guard.
 func TestRESPServer_ACLNotEnabled(t *testing.T) {
 	addr := freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, nil, newNoOpAudit())
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, nil, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

@@ -80,6 +80,7 @@ Tellstone is a shared-nothing, in-memory key/value store with two protocol front
 | `tls` | `internal/tls/` | TLS 1.3/mTLS transport, gnet connection adapter, and automatic certificate/key/CA rotation through a shared atomic config store. |
 | `metrics` | `internal/metrics/` | Prometheus exporter. Per-shard `Collector` + `AggregateCollector` (includes Go runtime stats). Hand-written exposition text. |
 | `audit` | `internal/audit/` | Structured audit logging. Event-type filter (`--audit-events`), JSON engine emitting `"level":"AUDIT"` lines, rotating and optionally encrypted file writer. |
+| `oauth` | `internal/oauth/` | OIDC connection-time token verification. Provider registry, generic OIDC verifier (discovery + cached JWKS, RS256/ES256), `google`/`stackit` presets. See [`internal/oauth/README.md`](internal/oauth/README.md). |
 | `trace` | `internal/trace/` | OpenTelemetry wrapper. `Tracer`/`Span` interfaces with `NoOpTracer` (zero-alloc) and `OTelTracer` (OTLP/gRPC). |
 | `version` | `internal/version/` | Build-time version/commit/date via `-ldflags`. |
 
@@ -196,9 +197,12 @@ client sees exactly which permission it lacks. Passwords are bcrypt hashes verif
 `ROLE LIST` / `ROLE GETUSER`.
 
 **Integration seams.** `SessionContext` carries `RoleName` and `Username`, consumed by the audit
-engine for `auth_success`, `auth_failure`, and `acl_deny` events (see Audit Logging). Planned
-integrations: API keys intersect role permissions (most restrictive wins), and OIDC `groups`
-claims map to roles through the policy store.
+engine for `auth_success`, `auth_failure`, and `acl_deny` events (see Audit Logging). Federated
+identity is wired at the same seam: an OIDC `id_token` presented to `AUTH` is verified by
+`internal/oauth`, its claims resolve to a role through the policy's `oauth.rules` (first match
+wins), and the token's `sub` becomes the session username (see
+[`internal/oauth/README.md`](internal/oauth/README.md)). Planned integration: API keys intersect
+role permissions (most restrictive wins).
 
 ### Audit Logging
 

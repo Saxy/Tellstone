@@ -259,7 +259,7 @@ func startRBACNetworkServer(t *testing.T) (addr string, store *rbac.Store) {
 	addr = l.Addr().String()
 	_ = l.Close()
 	store = rbac.NewStore(rbacNetworkPolicy(t), log.NewNoOpLogger())
-	srv := NewServer(addr, 0, nil, rbacTestHandler(store), log.NewNoOpLogger(), nil, "", store, newNoOpAudit())
+	srv := NewServer(addr, 0, nil, rbacTestHandler(store), log.NewNoOpLogger(), nil, "", store, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)

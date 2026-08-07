@@ -30,6 +30,11 @@ import (
 //	    password: "$2a$10$..."  # bcrypt hash; required unless nopass: true
 //	    role: reader
 //	default_role: reader / optional fallback for users without an explicit role
+//	oauth:
+//	  rules:                    # claim-to-role mapping for OAuth tokens, first match wins
+//	    - claim: groups         # OIDC claim name to match against
+//	      match: "admins"       # exact value, or leading/trailing "*" glob
+//	      role: admin           # target role; must be defined above
 type fileConfig struct {
 	Roles []struct {
 		Name  string   `yaml:"name"`
@@ -42,6 +47,13 @@ type fileConfig struct {
 		Nopass   bool   `yaml:"nopass"`
 	} `yaml:"users"`
 	DefaultRole string `yaml:"default_role"`
+	OAuth       struct {
+		Rules []struct {
+			Claim string `yaml:"claim"`
+			Match string `yaml:"match"`
+			Role  string `yaml:"role"`
+		} `yaml:"rules"`
+	} `yaml:"oauth"`
 }
 
 // LoadFile reads and parses the RBAC policy file at a path. The file may be
@@ -118,6 +130,28 @@ func (fc *fileConfig) build() (*PolicyStore, error) {
 			return nil, fmt.Errorf("rbac: default_role %q is not a defined role", fc.DefaultRole)
 		}
 		p.Default = r
+	}
+	for _, r := range fc.OAuth.Rules {
+		if r.Claim == "" {
+			return nil, fmt.Errorf("rbac: oauth rule without a claim")
+		}
+		if r.Match == "" {
+			return nil, fmt.Errorf("rbac: oauth rule for claim %q without a match pattern", r.Claim)
+		}
+		if r.Role == "" {
+			return nil, fmt.Errorf("rbac: oauth rule for claim %q without a role", r.Claim)
+		}
+		role, ok := p.Roles[r.Role]
+		if !ok {
+			return nil, fmt.Errorf("rbac: oauth rule references unknown role %q", r.Role)
+		}
+		exact, prefix, suffix, err := parseMatch(r.Match)
+		if err != nil {
+			return nil, err
+		}
+		p.OAuthRules = append(p.OAuthRules, oauthRule{
+			claim: r.Claim, exact: exact, prefix: prefix, suffix: suffix, role: role,
+		})
 	}
 	return p, nil
 }

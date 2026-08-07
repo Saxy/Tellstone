@@ -62,7 +62,7 @@ func freeAddr(t *testing.T) string {
 
 func TestRESPServer_GetSetPingPipeline(t *testing.T) {
 	addr := freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, nil, newNoOpAudit())
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, "", false, nil, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	defer func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -117,7 +117,7 @@ func expectReply(t *testing.T, conn net.Conn, name, send, want string) {
 func startServer(t *testing.T, requirePass string) (addr string) {
 	t.Helper()
 	addr = freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, requirePass, false, nil, newNoOpAudit())
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), nil, requirePass, false, nil, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)

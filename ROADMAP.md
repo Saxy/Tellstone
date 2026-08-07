@@ -24,7 +24,7 @@ runs plaintext TCP with no access control — a non-starter for any real deploym
 - [x] API key system — per-key ACLs with configurable command/namespace restrictions
 - [ ] OIDC / OAuth2 integration for SSO (optional, pluggable provider interface)
 - [x] `ACL SETUSER` / `ACL DELUSER` / `ACL LIST` for managing access rules at runtime
-- [ ] Audit logging — who issued what command, when, from which connection
+- [x] Audit logging — who issued what command, when, from which connection
 
 ### 2c — Encryption Key Management
 

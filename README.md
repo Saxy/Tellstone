@@ -149,6 +149,9 @@ Every option is available as a flag and an environment variable.
 | `--tls-ca`            | `TSD_TLS_CA`             | _(none)_         | Client CA path for mTLS; watched for automatic rotation  |
 | `--require-pass`      | `TSD_REQUIRE_PASS`       | _(none)_         | Single password required via `AUTH`; empty disables it   |
 | `--rbac-config`       | `TSD_RBAC_CONFIG`        | _(none)_         | YAML/JSON RBAC policy file (roles, users, default role); hot-reloaded on SIGHUP |
+| `--oauth-provider`    | `TSD_OAUTH_PROVIDER`     | _(none)_         | OAuth preset (`google`\|`stackit`); empty + `--oauth-issuer` → generic OIDC |
+| `--oauth-issuer`      | `TSD_OAUTH_ISSUER`       | _(none)_         | OIDC issuer / discovery base URL of the identity provider |
+| `--oauth-client-id`   | `TSD_OAUTH_CLIENT_ID`    | _(none)_         | OAuth2 client ID used as the expected token audience |
 | `--enable-audit`      | `TSD_ENABLE_AUDIT`       | `false`          | Enable structured audit logging                          |
 | `--audit-log-path`    | `TSD_AUDIT_LOG_PATH`     | `stdout`         | Audit destination: a directory (rotated `0600` files) or `stdout` |
 | `--audit-events`      | `TSD_AUDIT_EVENTS`       | `auth,acl`       | Comma-separated event types: `auth`, `acl`, `connect`, `disconnect`, `command`, or `all` |
@@ -254,6 +257,24 @@ Unauthenticated data commands return `-NOAUTH`; commands a user's role does not 
 `RoleSetUser` (see `cmd/example/role`). The `ACL` command family (`ACL SETUSER` / `ACL DELUSER` /
 `ACL LIST` / `ACL LOG`) manages the same policy store through a Redis-flavored alias, driven
 end-to-end in `cmd/example/acl`.
+
+#### Federated auth (OAuth / OIDC)
+
+Connections can present an OIDC `id_token` (a signed JWT) as their credential instead of a
+password. The token's claims map to a role through the policy file's `oauth.rules` (claims +
+match pattern + role, first match wins), and that role is pinned to the connection like any
+other. Requires `--rbac-config` — a token can only map to a role through the policy. The server
+needs no client secret: verification is signature + issuer + audience against the provider's
+public JWKS.
+
+```bash
+./bin/tellstone --rbac-config policy.yaml --oauth-provider google --oauth-client-id 1234.apps.googleusercontent.com
+redis-cli AUTH <id_token>              # +OK — claims map to a role via oauth.rules
+```
+
+Supported presets: `google`, `stackit`; set `--oauth-issuer` for any other OIDC provider. How
+the provider pipeline, claim matching, and fail-closed semantics work is documented in
+[`internal/oauth/README.md`](internal/oauth/README.md).
 
 ### Audit logging
 

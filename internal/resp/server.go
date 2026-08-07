@@ -27,6 +27,7 @@ import (
 
 	"github.com/Saxy/Tellstone/internal/audit"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/oauth"
 	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/shard"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
@@ -68,6 +69,10 @@ type authJob struct {
 	username string
 	reason   string
 	session  *rbac.SessionContext
+	// oauth marks a bearer-token verification: password holds the raw JWT,
+	// passHash is nil, and the session is built only after claims resolve to a
+	// role via the policy's oauth.rules.
+	oauth bool
 }
 
 // connState holds per-connection scratch buffers reused across OnTraffic calls so the hot
@@ -130,6 +135,13 @@ type Server struct {
 	// per-user bcrypt hashes and every data command is gated by the session.
 	policy *rbac.Store
 
+	// oauth is the token-verification provider for bearer-token AUTH. nil keeps
+	// the password-only paths; when set, a JWT-shaped AUTH secret is verified
+	// here and mapped to a role through the policy store (fail-closed on both
+	// a bad token and a claim set that maps to no role). It is read-only after
+	// construction, so workers may share it without locks.
+	oauth oauth.Provider
+
 	// authJobs and workerWg back the bcrypt worker pool, created only when a
 	// password or a policy is configured (see NewServer). authWorker goroutines
 	// consume authJobs off the event loop; workerWg lets Shutdown drain them.
@@ -159,7 +171,7 @@ type Server struct {
 // otherwise AUTH resolves per-user credentials and sessions gate data commands.
 // audit is the shared audit engine; it must be non-nil (pass a disabled engine when
 // audit logging is off) and is always called without a nil guard.
-func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, startTLS bool, policy *rbac.Store, audit *audit.LogEngine) *Server {
+func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logger, tlsConfigs *tlslib.ConfigStore, requirePass string, startTLS bool, policy *rbac.Store, provider oauth.Provider, audit *audit.LogEngine) *Server {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -182,6 +194,7 @@ func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logge
 		startTLS:        startTLS,
 		requirePassHash: passHash,
 		policy:          policy,
+		oauth:           provider,
 		ready:           make(chan struct{}),
 		audit:           audit,
 
@@ -189,7 +202,7 @@ func NewServer(addr string, store Store, shards []*shard.Shard, logger log.Logge
 	}
 	// The worker pool exists only when authentication is actually required, so
 	// the zero-overhead no-password path spawns no goroutines.
-	if passHash != nil || policy != nil {
+	if passHash != nil || policy != nil || provider != nil {
 		s.authJobs = make(chan authJob, authQueueCap)
 		for i := 0; i < numAuthWorkers; i++ {
 			s.workerWg.Add(1)
@@ -821,6 +834,12 @@ func (s *Server) auth(st *connState, c gnet.Conn, args [][]byte, out []byte) ([]
 		return AppendError(out, "ERR wrong number of arguments for 'auth' command"), false
 	}
 	if s.policy != nil {
+		// A JWT-shaped secret is a bearer token, not a password: route it to
+		// the oauth provider (which maps claims to a role) before any username
+		// lookup. Only the two-argument AUTH form carries a token.
+		if s.oauth != nil && len(args) == 2 && oauth.IsJWT(args[1]) {
+			return s.authOAuth(st, c, args, out)
+		}
 		return s.authRBAC(st, c, args, out)
 	}
 	if s.requirePassHash == nil {
@@ -893,6 +912,37 @@ func (s *Server) authRBAC(st *connState, c gnet.Conn, args [][]byte, out []byte)
 	return out, true
 }
 
+// authOAuth authenticates a bearer JWT against the configured provider. The
+// token's claims resolve to a role via the policy's oauth.rules on the worker
+// pool; a token that fails verification or maps to no rule is rejected
+// (fail-closed). The connection's identity is the token's sub claim.
+func (s *Server) authOAuth(st *connState, c gnet.Conn, args [][]byte, out []byte) ([]byte, bool) {
+	token := make([]byte, len(args[1]))
+	copy(token, args[1])
+	if !s.dispatchOAuth(c, token) {
+		return AppendError(out, "ERR invalid password"), false
+	}
+	st.authPending = true
+	return out, true
+}
+
+// dispatchOAuth submits a bearer-token verification to the worker pool. token
+// is a private copy owned by the job. Returns false when the pool is saturated
+// so the caller fails AUTH synchronously instead of stalling the connection.
+func (s *Server) dispatchOAuth(c gnet.Conn, token []byte) bool {
+	select {
+	case s.authJobs <- authJob{c: c, password: token, oauth: true, reason: "invalid token"}:
+		return true
+	default:
+		if s.logger.Enabled(log.LevelWarn) {
+			s.logger.Log(log.LevelWarn, "resp: auth worker pool saturated, rejecting AUTH",
+				log.String("remote_addr", c.RemoteAddr().String()),
+			)
+		}
+		return false
+	}
+}
+
 // authFailed records a rejected AUTH attempt — bumping the store-wide counter
 // and appending to the ACL LOG buffer when RBAC is enabled — writes it to the
 // audit trail, counts it against the per-connection maxAuthFails limit (closing
@@ -947,6 +997,16 @@ func (s *Server) authWorker() {
 		// (Redis ACL semantics). In single-password mode passHash is never
 		// nil because the workers only run when a hash or a policy exists.
 		success := job.passHash == nil || bcrypt.CompareHashAndPassword(job.passHash, job.password) == nil
+		if job.oauth {
+			// Bearer-token path: the session is unknown until the claims are
+			// verified and mapped to a role, so it is resolved here rather than
+			// pinned at dispatch time. The provider is concurrency-safe; the
+			// store maps claims to a role off a lock-free atomic snapshot.
+			job.session, job.username = s.policy.ResolveOAuthToken(func() (map[string][]string, error) {
+				return s.oauth.Verify(context.Background(), job.password)
+			})
+			success = job.session != nil
+		}
 		_ = job.c.Wake(func(c gnet.Conn, _ error) error {
 			st, _ := c.Context().(*connState)
 			if st == nil {

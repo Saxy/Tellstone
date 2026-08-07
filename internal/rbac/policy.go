@@ -12,6 +12,8 @@ Authors:
 package rbac
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -19,13 +21,65 @@ import (
 )
 
 // PolicyStore is an immutable snapshot of the authorization state: role
-// definitions, user records (role + password hash), and the default role for
-// users without an explicit assignment. It is replaced wholesale via
-// Store.Store, never mutated in place.
+// definitions, user records (role + password hash), the default role for
+// users without an explicit assignment, and the compiled OAuth claim-to-role
+// rules. It is replaced wholesale via Store.Store, never mutated in place.
 type PolicyStore struct {
 	Roles   map[string]*Role // role name → role
 	Users   map[string]*User // username → user
 	Default *Role            // fallback for users without an explicit role
+	// OAuthRules maps token claims to roles, applied in policy-file order.
+	// Compiled at load time (unknown target roles fail the load) so the
+	// resolver on the AUTH path only compares strings.
+	OAuthRules []oauthRule
+}
+
+// oauthRule is one compiled claim-to-role mapping. A rule matches when the
+// named claim is present and any of its values satisfies the match pattern.
+// Exactly one of exact, prefix, or suffix describes the pattern; a bare "*"
+// leaves all three empty, which matches any value.
+type oauthRule struct {
+	claim  string
+	exact  string
+	prefix string
+	suffix string
+	role   *Role
+}
+
+// parseMatch compiles a match pattern. Only exact values and leading or
+// trailing "*" globs are allowed; a middle wildcard is ambiguous and rejected
+// at load time, so a typo surfaces before it silently denies access.
+func parseMatch(match string) (exact, prefix, suffix string, err error) {
+	switch {
+	case strings.Count(match, "*") == 0:
+		return match, "", "", nil
+	case strings.HasPrefix(match, "*"):
+		return "", "", strings.TrimPrefix(match, "*"), nil
+	case strings.HasSuffix(match, "*"):
+		return "", strings.TrimSuffix(match, "*"), "", nil
+	default:
+		return "", "", "", fmt.Errorf("rbac: oauth rule match %q: only a leading or trailing * is allowed", match)
+	}
+}
+
+// matches reports whether any of the claim's values satisfies the pattern.
+// A bare "*" (all three fields empty) matches a claim with any value.
+func (r *oauthRule) matches(values []string) bool {
+	for _, v := range values {
+		if r.exact != "" && v == r.exact {
+			return true
+		}
+		if r.prefix != "" && strings.HasPrefix(v, r.prefix) {
+			return true
+		}
+		if r.suffix != "" && strings.HasSuffix(v, r.suffix) {
+			return true
+		}
+		if r.exact == "" && r.prefix == "" && r.suffix == "" {
+			return true
+		}
+	}
+	return false
 }
 
 // RoleFor resolves the effective role for a username: the user's explicit
@@ -50,6 +104,24 @@ func (p *PolicyStore) UserFor(username string) *User {
 		return nil
 	}
 	return p.Users[username]
+}
+
+// RoleForClaims resolves the effective role for a verified token's claims,
+// applying oauth.rules in policy-file order. The first match wins; a claim set
+// matching no rule returns nil, which callers treat as deny-all. Oauth.Claims
+// is a map[string][]string, so the resolver is written against the plain map,
+// and rbac stays independent of the oauth package.
+func (p *PolicyStore) RoleForClaims(claims map[string][]string) *Role {
+	if p == nil {
+		return nil
+	}
+	for i := range p.OAuthRules {
+		r := &p.OAuthRules[i]
+		if values, ok := claims[r.claim]; ok && r.matches(values) {
+			return r.role
+		}
+	}
+	return nil
 }
 
 // NoPassDefault reports whether the built-in "default" user exists without a
@@ -92,7 +164,7 @@ type Store struct {
 	mu     sync.Mutex
 	// logger reports policy mutations (CreateRole, SetUser, DelUser, DeleteRole)
 	// so operators see admin changes in the server log. Set via NewStore; nil
-	// falls back to the no-op logger so RBAC never depends on logging being on.
+	// falls back to the no-op logger, so RBAC never depends on logging being on.
 	logger log.Logger
 	// authFailures counts rejected AUTH attempts, deniedCommands counts
 	// authorization-denied command attempts. Unlike the per-role command
@@ -142,4 +214,34 @@ func (s *Store) Reload(policy *PolicyStore) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.Store(policy)
+}
+
+// ResolveOAuthToken verifies a bearer token through verify and maps its claims
+// to a role via oauth.rules, returning the pinned session and the subject it
+// was built from. (nil, "") means the token failed verification or matched no
+// rule — the AUTH workers in the RESP and binary listeners treat that as a deny
+// (fail-closed). verify is a closure rather than an oauth.Provider so this
+// store stays independent of the oauth package, matching RoleForClaims's
+// map-based signature.
+func (s *Store) ResolveOAuthToken(verify func() (map[string][]string, error)) (*SessionContext, string) {
+	if s == nil {
+		return nil, ""
+	}
+	claims, err := verify()
+	if err != nil {
+		return nil, ""
+	}
+	p := s.Load()
+	if p == nil {
+		return nil, ""
+	}
+	role := p.RoleForClaims(claims)
+	if role == nil {
+		return nil, ""
+	}
+	subject := "default"
+	if subs, ok := claims["sub"]; ok && len(subs) > 0 && subs[0] != "" {
+		subject = subs[0]
+	}
+	return NewSessionContext(subject, role), subject
 }

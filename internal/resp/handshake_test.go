@@ -183,7 +183,7 @@ func startHandshakeServer(t *testing.T, startTLS bool) (string, []byte) {
 	}
 
 	addr := freeAddr(t)
-	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), configs, "", startTLS, nil, newNoOpAudit())
+	srv := NewServer(addr, newFakeStore(), nil, log.NewNoOpLogger(), configs, "", startTLS, nil, nil, newNoOpAudit())
 	srv.handshakeTimeout = sweepTestTimeout
 	go func() { _ = srv.ListenAndServe() }()
 	t.Cleanup(func() {

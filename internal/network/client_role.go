@@ -143,17 +143,25 @@ func (c *Client) RoleGetUser(username string, scratchBuf []byte) (RoleUser, erro
 // transport as every other message.
 func (c *Client) AuthUser(username, password string, scratchBuf []byte) error {
 	payloadLen := 2 + len(username) + 2 + len(password)
-	var reqBuf [512]byte
-	if payloadLen > len(reqBuf) {
-		return ErrRequestTooLarge
+
+	// Short credentials serialize into the stack buffer, keeping connection
+	// setup allocation-free. OIDC bearer tokens (id_tokens) routinely exceed
+	// 512 bytes, so fall back to a one-time heap buffer when the payload
+	// overflows the stack.
+	var stackBuf [512]byte
+	var payload []byte
+	if payloadLen > len(stackBuf) {
+		payload = make([]byte, payloadLen)
+	} else {
+		payload = stackBuf[:payloadLen]
 	}
-	binary.BigEndian.PutUint16(reqBuf[0:2], uint16(len(username)))
-	copy(reqBuf[2:2+len(username)], username)
-	binary.BigEndian.PutUint16(reqBuf[2+len(username):4+len(username)], uint16(len(password)))
-	copy(reqBuf[4+len(username):payloadLen], password)
+	binary.BigEndian.PutUint16(payload[0:2], uint16(len(username)))
+	copy(payload[2:2+len(username)], username)
+	binary.BigEndian.PutUint16(payload[2+len(username):4+len(username)], uint16(len(password)))
+	copy(payload[4+len(username):payloadLen], password)
 
 	var resp Message
-	if err := c.Call(MsgAuth, reqBuf[:payloadLen], scratchBuf, &resp); err != nil {
+	if err := c.Call(MsgAuth, payload, scratchBuf, &resp); err != nil {
 		return err
 	}
 	if resp.Type != MsgAuthOk {

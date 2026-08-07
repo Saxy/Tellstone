@@ -39,7 +39,7 @@ func startBenchServer(b *testing.B, handler func(msg *Message) ([]byte, MessageT
 	addr := l.Addr().String()
 	l.Close()
 
-	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, "", nil, newNoOpAudit())
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), nil, "", nil, nil, newNoOpAudit())
 	go func() { _ = srv.ListenAndServe() }()
 	if err := waitForServer(addr, 2*time.Second); err != nil {
 		b.Fatalf("server not ready: %v", err)
@@ -92,7 +92,7 @@ func startBenchTLSServer(b *testing.B, handler func(msg *Message) ([]byte, Messa
 	addr := l.Addr().String()
 	l.Close()
 
-	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), tlsConfigs, "", nil, newNoOpAudit())
+	srv := NewServer(addr, 0, nil, handler, log.NewNoOpLogger(), tlsConfigs, "", nil, nil, newNoOpAudit())
 	go func() {
 		_ = srv.ListenAndServe()
 	}()

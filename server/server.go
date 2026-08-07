@@ -30,6 +30,9 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/metrics"
 	"github.com/Saxy/Tellstone/internal/network"
+	"github.com/Saxy/Tellstone/internal/oauth"
+	"github.com/Saxy/Tellstone/internal/oauth/generic"
+	"github.com/Saxy/Tellstone/internal/oauth/presets"
 	"github.com/Saxy/Tellstone/internal/persistence"
 	"github.com/Saxy/Tellstone/internal/rbac"
 	"github.com/Saxy/Tellstone/internal/resp"
@@ -69,6 +72,11 @@ type Server struct {
 	// listeners. nil means RBAC is disabled and both servers keep their
 	// legacy zero-overhead paths. SIGHUP swaps a fresh snapshot into it.
 	policy *rbac.Store
+	// oauth is the configured token-verification provider, built once at
+	// startup from --oauth-provider / --oauth-issuer. nil means token auth is
+	// disabled and both listeners keep their password-only AUTH paths. It is
+	// read-only after init, so it can be shared safely across workers.
+	oauth oauth.Provider
 	// audit is the shared audit engine. It is always non-nil: when
 	// --enable-audit is not set it is a disabled no-op whose Record() costs a
 	// single bool comparison, so listeners never guard the call.
@@ -104,6 +112,9 @@ func (s *Server) Run() error {
 	if err = s.initRBAC(); err != nil {
 		return fmt.Errorf("rbac init: %w", err)
 	}
+	if err = s.initOAuth(); err != nil {
+		return fmt.Errorf("oauth init: %w", err)
+	}
 	if err = s.initShards(cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
@@ -117,6 +128,7 @@ func (s *Server) Run() error {
 		s.tlsConfigs,
 		cfg.GetRequirePass(),
 		s.policy,
+		s.oauth,
 		s.audit,
 	)
 	if cfg.MetricsEnabled() {
@@ -204,6 +216,54 @@ func (s *Server) initRBAC() error {
 	s.policy = rbac.NewStore(policy, logger)
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "rbac policy loaded", log.String("path", path))
+	}
+	return nil
+}
+
+// initOAuth builds the token-verification provider from the --oauth-* flags.
+// No provider configured leaves the provider nil and the password-only AUTH
+// paths intact (zero overhead). A configured-but-invalid provider aborts
+// startup, and so does token auth without --rbac-config: a token can only map
+// to a role through the policy's oauth.rules, so enabling it without a policy
+// would silently deny every connection.
+func (s *Server) initOAuth() error {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	issuer := cfg.GetOAuthIssuer()
+	ocfg := oauth.Config{Issuer: issuer, ClientID: cfg.GetOAuthClientID()}
+	var (
+		p   oauth.Provider
+		err error
+	)
+	switch cfg.GetOAuthProvider() {
+	case "google":
+		p, err = presets.NewGoogle(ocfg, logger)
+	case "stackit":
+		p, err = presets.NewStackit(ocfg, logger)
+	case "":
+		if issuer == "" {
+			return nil
+		}
+		p, err = generic.New(ocfg, logger)
+	default:
+		return fmt.Errorf("unknown --oauth-provider %q (want google, stackit, or empty for generic OIDC)", cfg.GetOAuthProvider())
+	}
+	if err != nil {
+		return err
+	}
+	if s.policy == nil {
+		return errors.New("--oauth-provider requires --rbac-config: tokens map to roles via the policy's oauth.rules")
+	}
+	s.oauth = p
+	if logger.Enabled(log.LevelInfo) {
+		providerName := cfg.GetOAuthProvider()
+		if providerName == "" {
+			providerName = "generic"
+		}
+		logger.Log(log.LevelInfo, "oauth provider initialized",
+			log.String("provider", providerName),
+			log.String("issuer", issuer),
+		)
 	}
 	return nil
 }
@@ -407,6 +467,7 @@ func (s *Server) startRESPServer() {
 		cfg.GetRequirePass(),
 		cfg.RESPStartTLSEnabled(),
 		s.policy,
+		s.oauth,
 		s.audit,
 	)
 	s.respSrv = respSrv
