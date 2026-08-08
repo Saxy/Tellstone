@@ -85,14 +85,14 @@ func main() {
 	}
 	cfg := config.LoadConfig(os.Args[1:])
 	app := new(tellstone.App)
-	logpkg := logger.NewSlogLogger(cfg.GetLogLevel())
-	initRuntimeSettings(logpkg)
+	log := logger.NewSlogLogger(cfg.GetLogLevel())
+	initRuntimeSettings(log)
 	initProfiling()
-	app.Start(cfg, logpkg)
+	app.Start(cfg, log)
 	svr := server.NewServer(app)
 	if err := svr.Run(); err != nil {
-		if logpkg.Enabled(logger.LevelError) {
-			logpkg.Log(logger.LevelError, "server terminated with error", logger.String("error", err.Error()))
+		if log.Enabled(logger.LevelError) {
+			log.Log(logger.LevelError, "server terminated with error", logger.String("error", err.Error()))
 		}
 		os.Exit(1)
 	}
