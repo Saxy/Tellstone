@@ -16,7 +16,14 @@ package oauth
 import (
 	"context"
 	"errors"
+	"time"
 )
+
+// VerifyTimeout bounds a single Provider.Verify call. Verification can reach
+// the identity provider (a JWKS refresh on key rotation), so the AUTH workers
+// in the RESP and binary listeners derive their context from it instead of an
+// unbounded background context.
+const VerifyTimeout = 10 * time.Second
 
 // ErrInvalidToken is returned by a Provider.Verify when the credential cannot be
 // authenticated. Callers translate it into a NOAUTH error and must still find it

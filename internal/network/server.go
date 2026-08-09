@@ -688,7 +688,9 @@ func (s *Server) authWorker() {
 			// pinned at dispatch time. The provider is concurrency-safe; the
 			// store maps claim to a role of a lock-free atomic snapshot.
 			job.session, job.username = s.policy.ResolveOAuthToken(func() (map[string][]string, error) {
-				return s.oauth.Verify(context.Background(), job.password)
+				ctx, cancel := context.WithTimeout(context.Background(), oauth.VerifyTimeout)
+				defer cancel()
+				return s.oauth.Verify(ctx, job.password)
 			})
 			success = job.session != nil
 		}

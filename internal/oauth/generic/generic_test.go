@@ -13,9 +13,11 @@ Authors:
 package generic
 
 import (
+	"context"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
@@ -26,6 +28,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -46,6 +49,8 @@ type idpKey struct {
 type testIDP struct {
 	mu   sync.Mutex
 	keys map[string]idpKey
+	// jwksRequests counts /jwks fetches so tests can assert single-flight.
+	jwksRequests atomic.Int64
 }
 
 func newTestIDP() (*testIDP, *httptest.Server) {
@@ -59,6 +64,7 @@ func newTestIDP() (*testIDP, *httptest.Server) {
 				"jwks_uri": srv.URL + "/jwks",
 			})
 		case "/jwks":
+			idp.jwksRequests.Add(1)
 			idp.mu.Lock()
 			keys := make([]idpKey, 0, len(idp.keys))
 			for _, k := range idp.keys {
@@ -133,6 +139,12 @@ func signJWT(k idpKey, alg string, claims map[string]any) string {
 		sig, err = rsa.SignPKCS1v15(rand.Reader, k.priv.(*rsa.PrivateKey), crypto.SHA256, digest[:])
 	case "ES256":
 		sig, err = k.priv.(*ecdsa.PrivateKey).Sign(rand.Reader, digest[:], crypto.SHA256)
+	case "HS256":
+		mac := hmac.New(sha256.New, []byte("symmetric-secret"))
+		mac.Write([]byte(signed))
+		sig = mac.Sum(nil)
+	default:
+		panic("signJWT: unsupported test algorithm " + alg)
 	}
 	if err != nil {
 		panic(err)
@@ -262,6 +274,61 @@ func TestVerifyRejectsUnknownKidAfterRefresh(t *testing.T) {
 	_, err := p.Verify(t.Context(), []byte(token))
 	if !errors.Is(err, oauth.ErrInvalidToken) {
 		t.Fatalf("Verify() error = %v, want ErrInvalidToken", err)
+	}
+}
+
+func TestVerifyThrottlesUnknownKidRefresh(t *testing.T) {
+	p, idp, srv, _ := newProvider(t)
+	// The first rotation is picked up by a refresh.
+	rotated := rsaKey("key-2")
+	idp.addKey(rotated)
+	token := signJWT(rotated, "RS256", validClaims(srv.URL))
+	if _, err := p.Verify(t.Context(), []byte(token)); err != nil {
+		t.Fatalf("first Verify after rotation error = %v, want nil", err)
+	}
+	// A second, even newer key arrives within the cooldown window: the refresh
+	// is skipped, so its token is rejected rather than fetched.
+	rotated2 := rsaKey("key-3")
+	idp.addKey(rotated2)
+	token2 := signJWT(rotated2, "RS256", validClaims(srv.URL))
+	if _, err := p.Verify(t.Context(), []byte(token2)); !errors.Is(err, oauth.ErrInvalidToken) {
+		t.Fatalf("Verify during cooldown error = %v, want ErrInvalidToken", err)
+	}
+	// A known key still verifies during the cooldown: the throttle only affects
+	// the unknown-key path.
+	known := signJWT(rotated, "RS256", validClaims(srv.URL))
+	if _, err := p.Verify(t.Context(), []byte(known)); err != nil {
+		t.Fatalf("Verify of cached key during cooldown error = %v, want nil", err)
+	}
+}
+
+func TestVerifySingleFlightRefresh(t *testing.T) {
+	p, idp, srv, _ := newProvider(t)
+	before := idp.jwksRequests.Load()
+	rotated := rsaKey("key-2")
+	idp.addKey(rotated)
+	token := signJWT(rotated, "RS256", validClaims(srv.URL))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			claims, err := p.Verify(context.Background(), []byte(token))
+			if err != nil {
+				t.Errorf("Verify() error = %v, want nil", err)
+				return
+			}
+			if claims["sub"][0] != "user-1" {
+				t.Errorf("sub claim = %v, want user-1", claims["sub"])
+			}
+		}()
+	}
+	wg.Wait()
+
+	// All concurrent verifications collapsed onto a single refresh.
+	if got := idp.jwksRequests.Load() - before; got != 1 {
+		t.Fatalf("jwks fetches = %d, want exactly 1 (single-flight)", got)
 	}
 }
 

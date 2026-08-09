@@ -42,7 +42,16 @@ const (
 	// refreshTimeout bounds every outbound call to the identity provider so a
 	// hung IdP cannot stall AUTH indefinitely.
 	refreshTimeout = 10 * time.Second
+	// minRefreshInterval is the minimum time between JWKS refreshes. It bounds
+	// how often a presented token can force a refresh: without it, unknown-kid
+	// tokens would amplify into a refresh storm against the identity provider.
+	minRefreshInterval = 30 * time.Second
 )
+
+// errRefreshCoolingDown is returned when a refresh is skipped because one
+// completed within minRefreshInterval. Callers translate it into
+// oauth.ErrInvalidToken: the key stays unknown, so the token cannot be trusted.
+var errRefreshCoolingDown = errors.New("generic: jwks refresh cooling down")
 
 // allowedAlgs is the signature algorithm allowlist. Everything else — notably
 // the HS* family, which would accept the raw key material as a symmetric
@@ -55,11 +64,23 @@ var allowedAlgs = map[string]bool{"RS256": true, "ES256": true}
 // an RWMutex. Config and jwksURI are written once during New and read-only
 // afterward.
 type Provider struct {
-	cfg     oauth.Config
-	client  *http.Client
-	jwksURI string
-	jwks    *jwksCache
-	logger  log.Logger
+	cfg       oauth.Config
+	client    *http.Client
+	jwksURI   string
+	jwks      *jwksCache
+	logger    log.Logger
+	refreshMu sync.Mutex
+	inFlight  *refreshAttempt
+	refreshAt time.Time
+}
+
+// refreshAttempt tracks one in-flight JWKS refresh so concurrent callers wait
+// for it and reuse its result rather than each hitting the identity provider.
+// done is closed once the outcome is set; err is written before that close, so
+// readers see a stable value after <-done.
+type refreshAttempt struct {
+	done chan struct{}
+	err  error
 }
 
 // New builds a provider and, in the same call, discovers the IdP and fetches
@@ -115,7 +136,14 @@ func (p *Provider) Verify(ctx context.Context, token []byte) (oauth.Claims, erro
 	key, ok := p.jwks.lookup(hdr.Kid)
 	if !ok {
 		// check if key may rotated
-		if err = p.refreshJWKS(ctx); err != nil {
+		if err = p.refreshJWKSThrottled(ctx); err != nil {
+			// A refresh skipped by the cooldown surfaces as a rejection: the
+			// key stays unknown, so the token cannot be trusted. Transient IdP
+			// failures keep their own (unwrapped) error so callers can tell
+			// "bad credential" apart from "identity provider down".
+			if errors.Is(err, errRefreshCoolingDown) {
+				return nil, oauth.ErrInvalidToken
+			}
 			return nil, err
 		}
 		key, ok = p.jwks.lookup(hdr.Kid)
@@ -182,6 +210,38 @@ func (p *Provider) refreshJWKS(ctx context.Context) error {
 	p.jwks.keys = keys
 	p.jwks.mu.Unlock()
 	return nil
+}
+
+// refreshJWKSThrottled re-fetches the key set subject to a minimum interval and
+// single-flight semantics. Concurrent callers collapse into one refresh and
+// share its result; a caller whose refresh would fall within
+// minRefreshInterval of a completed attempt gets errRefreshCoolingDown instead
+// of another fetch. refreshJWKS errors are returned unchanged.
+func (p *Provider) refreshJWKSThrottled(ctx context.Context) error {
+	p.refreshMu.Lock()
+	if a := p.inFlight; a != nil {
+		p.refreshMu.Unlock()
+		select {
+		case <-a.done:
+			return a.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if time.Since(p.refreshAt) < minRefreshInterval {
+		p.refreshMu.Unlock()
+		return errRefreshCoolingDown
+	}
+	a := &refreshAttempt{done: make(chan struct{})}
+	p.inFlight = a
+	p.refreshMu.Unlock()
+	a.err = p.refreshJWKS(ctx)
+	p.refreshMu.Lock()
+	p.refreshAt = time.Now()
+	p.inFlight = nil
+	close(a.done)
+	p.refreshMu.Unlock()
+	return a.err
 }
 
 func (p *Provider) getJSON(ctx context.Context, url string, out any) error {
