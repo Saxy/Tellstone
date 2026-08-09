@@ -148,6 +148,7 @@ Every optional feature is disabled by default and has zero overhead when off:
 | RESP protocol | `--enable-resp` | off |
 | TLS / mTLS | `--tls-cert`, `--tls-key`, `--tls-ca` | off |
 | RBAC | `--rbac-config` | off |
+| OAuth / OIDC | `--oauth-provider`, `--oauth-issuer` | off |
 | RESP STARTTLS | `--resp-starttls` | off |
 | Encryption | `--enable-encryption` | off |
 | Metrics | `--enable-metrics` | off |

@@ -11,6 +11,7 @@ Authors:
 package network
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -588,6 +589,12 @@ type authResult struct {
 	dispatched  bool // true when bcrypt was sent to the worker pool
 }
 
+var tokenPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 4096))
+	},
+}
+
 // handleAuthMessage consolidates the MsgAuth branch shared by the TLS and
 // plaintext OnTraffic paths. It handles the no-password bypass, fast-rejects
 // malformed payloads and unknown usernames, validates the username, makes a
@@ -612,9 +619,10 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	// A JWT-shaped secret is a bearer token, not a password: route it to the
 	// oauth provider (which maps claims to a role) before any username lookup.
 	if s.oauth != nil && len(username) == 0 && oauth.IsJWT(password) {
-		token := make([]byte, len(password))
-		copy(token, password)
-		if s.dispatchOAuth(c, token) {
+		buf := tokenPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		buf.Write(password)
+		if s.dispatchOAuth(c, buf.Bytes()) {
 			st.authPending = true
 			return authResult{dispatched: true}
 		}
@@ -678,7 +686,7 @@ func (s *Server) authWorker() {
 			// Bearer-token path: the session is unknown until the claims are
 			// verified and mapped to a role, so it is resolved here rather than
 			// pinned at dispatch time. The provider is concurrency-safe; the
-			// store maps claims to a role off a lock-free atomic snapshot.
+			// store maps claim to a role of a lock-free atomic snapshot.
 			job.session, job.username = s.policy.ResolveOAuthToken(func() (map[string][]string, error) {
 				return s.oauth.Verify(context.Background(), job.password)
 			})
