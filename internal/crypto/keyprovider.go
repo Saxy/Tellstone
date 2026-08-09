@@ -13,6 +13,9 @@ Authors:
 */
 package crypto
 
+// keySize is the ChaCha20-Poly1305 key length that NewEngine enforces.
+const keySize = 32
+
 // KeyProvider resolves the raw encryption key. Resolution happens once at server
 // startup; implementations are not called from the encrypt/decrypt hot path and may
 // perform I/O.

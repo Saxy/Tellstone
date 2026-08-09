@@ -18,9 +18,9 @@ import (
 )
 
 // keyReadLimit is one byte more than a valid key. The extra byte is what lets an
-// oversized file be rejected: capping the read at 32 would silently accept the first
-// 32 bytes of an arbitrarily long file as a valid key.
-const keyReadLimit = 33
+// oversized file be rejected: capping the read at the key size would silently accept
+// the first 32 bytes of an arbitrarily long file as a valid key.
+const keyReadLimit = keySize + 1
 
 // FileKeyProvider reads the encryption key from a file. The key is resolved once, at
 // startup; picking up a rotated file requires a process restart.

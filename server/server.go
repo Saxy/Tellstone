@@ -286,7 +286,7 @@ func (s *Server) initCrypto() (*crypto.Engine, error) {
 	case cfg.GetEncryptionKeyFile() != "":
 		provider = crypto.NewFileKeyProvider(cfg.GetEncryptionKeyFile())
 	default:
-		provider = crypto.NewBase64KeyProvider(cfg.GetEncryptionKey())
+		provider = crypto.NewBase64KeyProvider(cfg.GetEncryptionKey(), logger)
 	}
 	key, err := provider.Key()
 	if err != nil {

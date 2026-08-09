@@ -10,16 +10,55 @@ import (
 	"time"
 )
 
-func TestBase64KeyProvider(t *testing.T) {
-	key := []byte("0123456789abcdef0123456789abcdef")
-	p := NewBase64KeyProvider(base64.StdEncoding.EncodeToString(key))
-
-	got, err := p.Key()
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+// A 32-byte key is 44 base64 characters padded and 43 unpadded; both are accepted.
+func TestBase64KeyProviderAcceptsPaddedAndUnpadded(t *testing.T) {
+	key := make([]byte, keySize)
+	for i := range key {
+		key[i] = byte(i + 1)
 	}
-	if !bytes.Equal(got, key) {
-		t.Fatalf("key mismatch: got %q want %q", got, key)
+	padded := base64.StdEncoding.EncodeToString(key)
+	unpadded := base64.RawStdEncoding.EncodeToString(key)
+
+	if len(padded) != 44 || len(unpadded) != 43 {
+		t.Fatalf("unexpected encoded lengths: padded %d, unpadded %d", len(padded), len(unpadded))
+	}
+
+	for name, encoded := range map[string]string{"padded": padded, "unpadded": unpadded} {
+		t.Run(name, func(t *testing.T) {
+			got, err := NewBase64KeyProvider(encoded, nil).Key()
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !bytes.Equal(got, key) {
+				t.Fatalf("key mismatch: got %d bytes want %d", len(got), len(key))
+			}
+		})
+	}
+}
+
+// DEPRECATED PATH: remove alongside the raw fallback in v2.
+//
+// The raw form predates the base64 decoding the flag always documented, so v1 keeps
+// accepting it. It cannot collide with base64: 32 characters decode to 24 bytes, never
+// the 32 the base64 branch requires.
+func TestBase64KeyProviderAcceptsDeprecatedRawValue(t *testing.T) {
+	raw := "0123456789abcdef0123456789abcdef"
+	if len(raw) != keySize {
+		t.Fatalf("fixture must be %d characters, got %d", keySize, len(raw))
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(raw); err != nil || len(decoded) == keySize {
+		t.Fatalf("fixture should decode as valid base64 to a length other than %d", keySize)
+	}
+
+	got, err := NewBase64KeyProvider(raw, nil).Key()
+	if err != nil {
+		t.Fatalf("deprecated raw key must still be accepted: %v", err)
+	}
+	if !bytes.Equal(got, []byte(raw)) {
+		t.Fatalf("raw key not passed through verbatim: got %q", got)
+	}
+	if _, err = NewEngine(got, nil); err != nil {
+		t.Fatalf("NewEngine rejected the deprecated raw key: %v", err)
 	}
 }
 
@@ -35,7 +74,7 @@ func TestBase64KeyProviderCarriesNULBytes(t *testing.T) {
 		t.Fatal("encoded form must be NUL-free to survive argv")
 	}
 
-	got, err := NewBase64KeyProvider(encoded).Key()
+	got, err := NewBase64KeyProvider(encoded, nil).Key()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -52,7 +91,7 @@ func TestBase64KeyProviderCarriesNULBytes(t *testing.T) {
 }
 
 func TestBase64KeyProviderEmpty(t *testing.T) {
-	got, err := NewBase64KeyProvider("").Key()
+	got, err := NewBase64KeyProvider("", nil).Key()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -62,7 +101,7 @@ func TestBase64KeyProviderEmpty(t *testing.T) {
 }
 
 func TestBase64KeyProviderRejectsInvalidEncoding(t *testing.T) {
-	_, err := NewBase64KeyProvider("not!valid!base64!").Key()
+	_, err := NewBase64KeyProvider("not!valid!base64!", nil).Key()
 	if err == nil {
 		t.Fatal("expected an error for a malformed base64 key")
 	}

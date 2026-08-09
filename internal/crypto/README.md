@@ -66,6 +66,12 @@ variables are NUL-terminated: a key containing `0x00` — about 1 in 8 random 32
 cannot pass through them intact. A file has no such restriction, so it carries raw bytes
 and every byte is significant (no trailing-newline trimming).
 
+`Base64KeyProvider` accepts the padded and unpadded standard encodings, and falls back to
+a **deprecated** raw 32-character value so deployments predating the decoding keep
+starting; that path logs a warning and is scheduled for removal in the next major release.
+Requiring an exact 32-byte result rules out the raw form before the
+fallback is reached.
+
 Both are resolved exactly once, when `server.initCrypto` builds the `Engine` — the key
 is not re-read while the server is running, so rotating a mounted key file requires a
 restart. External Vault/KMS-backed providers can be added by implementing `KeyProvider`

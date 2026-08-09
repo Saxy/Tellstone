@@ -181,12 +181,12 @@ tellstone --enable-encryption --encryption-key-file /etc/tellstone/key
 The key is read once at startup; rotating it requires a restart. Enabling encryption without either
 source is refused at startup rather than silently falling back to plaintext.
 
-> **Upgrading:** `--encryption-key` was previously used as raw text, so a literal 32-character
-> value such as `0123456789abcdef0123456789abcdef` worked. It is now base64-decoded, and such a
-> value will fail with a key-length error. Re-encode an existing key with `base64 < <keyfile>`,
-> or move it to `--encryption-key-file`. Note that generating a key with `openssl rand -hex 16`
-> yielded only 128 bits of entropy despite being 32 characters long; `openssl rand -base64 32`
-> carries the full 256 bits.
+> **Deprecated:** `--encryption-key` previously used the value as raw text, so a literal
+> 32-character key such as `0123456789abcdef0123456789abcdef` was accepted. That form still
+> works and logs a warning at startup, but it is insecure and will be removed in the next
+> major release. Re-encode an existing key with `base64 < <keyfile>`, or move it to
+> `--encryption-key-file`. The two forms are never ambiguous: a base64 key is 44 characters
+> (43 unpadded), while a 32-character value can only decode to 24 bytes.
 
 When TLS is enabled, Tellstone watches the parent directories of the certificate, key, and
 optional client CA. Valid replacements are applied after a 500 ms debounce; existing TLS
