@@ -611,7 +611,7 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	}
 	// A JWT-shaped secret is a bearer token, not a password: route it to the
 	// oauth provider (which maps claims to a role) before any username lookup.
-	if s.oauth != nil && oauth.IsJWT(password) {
+	if s.oauth != nil && len(username) == 0 && oauth.IsJWT(password) {
 		token := make([]byte, len(password))
 		copy(token, password)
 		if s.dispatchOAuth(c, token) {

@@ -48,10 +48,10 @@ func startTestIDP(t *testing.T) (*httptest.Server, *rsa.PrivateKey) {
 				"jwks_uri": srv.URL + "/jwks",
 			})
 		case "/jwks":
-			e := big.NewInt(int64(priv.PublicKey.E))
+			e := big.NewInt(int64(priv.E))
 			_ = json.NewEncoder(w).Encode(map[string]any{"keys": []map[string]string{{
 				"kty": "RSA", "kid": kid,
-				"n": b64std(priv.PublicKey.N.Bytes()),
+				"n": b64std(priv.N.Bytes()),
 				"e": b64std(e.Bytes()),
 			}}})
 		default:

@@ -17,6 +17,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"math"
 	"net"
 	"strings"
 	"testing"
@@ -161,6 +163,41 @@ func TestClientOAuthLargeToken(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte("large-token-ok")) {
 		t.Fatalf("got %q, want %q", got, "large-token-ok")
+	}
+}
+
+// TestClientOAuthCredentialTooLong verifies the uint16 length-prefix guard:
+// an AUTH credential beyond 65535 bytes must fail with a clear error instead
+// of wrapping the length field and emitting a corrupt frame.
+func TestClientOAuthCredentialTooLong(t *testing.T) {
+	store := newFakeStore()
+	addr := startOAuthServer(t, &stubProvider{
+		token:  "ok",
+		claims: oauth.Claims{"groups": {"admins"}},
+	}, store)
+
+	client, err := Dial(addr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	scratch := make([]byte, 4096)
+
+	tooLong := strings.Repeat("x", math.MaxUint16+1)
+	if err := client.Auth(tooLong, scratch); !errors.Is(err, ErrAuthCredentialsTooLong) {
+		t.Fatalf("Auth: got %v, want ErrAuthCredentialsTooLong", err)
+	}
+	if err := client.AuthUser("alice", tooLong, scratch); !errors.Is(err, ErrAuthCredentialsTooLong) {
+		t.Fatalf("AuthUser with long password: got %v, want ErrAuthCredentialsTooLong", err)
+	}
+	if err := client.AuthUser(tooLong, "pass", scratch); !errors.Is(err, ErrAuthCredentialsTooLong) {
+		t.Fatalf("AuthUser with long username: got %v, want ErrAuthCredentialsTooLong", err)
+	}
+
+	// The boundary itself must still be accepted on the wire.
+	if err := client.Auth(strings.Repeat("y", math.MaxUint16), scratch); err == nil ||
+		errors.Is(err, ErrAuthCredentialsTooLong) {
+		t.Fatalf("Auth at boundary: got %v, want a server reply, not ErrAuthCredentialsTooLong", err)
 	}
 }
 

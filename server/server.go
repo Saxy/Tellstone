@@ -145,7 +145,7 @@ func (s *Server) Run() error {
 		go func() {
 			defer close(reloadDone)
 			if reloadErr := s.tlsReloader.Run(reloadCtx, logger); reloadErr != nil && logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "tls certificate watcher stopped",
+				logger.Log(log.LevelError, "server: tls certificate watcher stopped",
 					log.String("error", reloadErr.Error()),
 				)
 			}
@@ -171,13 +171,13 @@ func (s *Server) Run() error {
 		<-ctx.Done()
 		stop()
 		if logger.Enabled(log.LevelInfo) {
-			logger.Log(log.LevelInfo, "shutdown signal received, draining connections")
+			logger.Log(log.LevelInfo, "server: shutdown signal received, draining connections")
 		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.GetShutdownTimeout())
 		defer cancel()
 		s.shutdown(shutdownCtx)
 		if logger.Enabled(log.LevelInfo) {
-			logger.Log(log.LevelInfo, "server shutdown complete")
+			logger.Log(log.LevelInfo, "server: shutdown complete")
 		}
 	}()
 
@@ -185,7 +185,7 @@ func (s *Server) Run() error {
 		if errors.Is(err, net.ErrClosed) {
 			err = nil
 		} else if logger.Enabled(log.LevelError) {
-			logger.Log(log.LevelError, "tcp error", log.String("error", err.Error()))
+			logger.Log(log.LevelError, "server: tcp error", log.String("error", err.Error()))
 		}
 	}
 	// Stop the SIGHUP watcher so its goroutine exits with Run instead of
@@ -209,13 +209,13 @@ func (s *Server) initRBAC() error {
 	policy, err := rbac.LoadFile(path)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
-			logger.Log(log.LevelError, "rbac policy load failed", log.String("error", err.Error()))
+			logger.Log(log.LevelError, "server: rbac policy load failed", log.String("error", err.Error()))
 		}
 		return err
 	}
 	s.policy = rbac.NewStore(policy, logger)
 	if logger.Enabled(log.LevelInfo) {
-		logger.Log(log.LevelInfo, "rbac policy loaded", log.String("path", path))
+		logger.Log(log.LevelInfo, "server: rbac policy loaded", log.String("path", path))
 	}
 	return nil
 }
@@ -230,7 +230,16 @@ func (s *Server) initOAuth() error {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	issuer := cfg.GetOAuthIssuer()
+	if cfg.GetOAuthProvider() == "" && issuer == "" {
+		return nil
+	}
+	if s.policy == nil {
+		return errors.New("--oauth-provider requires --rbac-config: tokens map to roles via the policy's oauth.rules")
+	}
 	ocfg := oauth.Config{Issuer: issuer, ClientID: cfg.GetOAuthClientID()}
+	if ocfg.ClientID == "" {
+		return errors.New("--oauth-client-id is required: an empty client id disables audience (aud) validation")
+	}
 	var (
 		p   oauth.Provider
 		err error
@@ -241,18 +250,12 @@ func (s *Server) initOAuth() error {
 	case "stackit":
 		p, err = presets.NewStackit(ocfg, logger)
 	case "":
-		if issuer == "" {
-			return nil
-		}
 		p, err = generic.New(ocfg, logger)
 	default:
 		return fmt.Errorf("unknown --oauth-provider %q (want google, stackit, or empty for generic OIDC)", cfg.GetOAuthProvider())
 	}
 	if err != nil {
 		return err
-	}
-	if s.policy == nil {
-		return errors.New("--oauth-provider requires --rbac-config: tokens map to roles via the policy's oauth.rules")
 	}
 	s.oauth = p
 	if logger.Enabled(log.LevelInfo) {
@@ -281,14 +284,14 @@ func (s *Server) reloadRBAC() {
 	policy, err := rbac.LoadFile(path)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
-			logger.Log(log.LevelError, "rbac policy reload rejected, keeping running policy",
+			logger.Log(log.LevelError, "server: rbac policy reload rejected, keeping running policy",
 				log.String("error", err.Error()))
 		}
 		return
 	}
 	s.policy.Reload(policy)
 	if logger.Enabled(log.LevelInfo) {
-		logger.Log(log.LevelInfo, "rbac policy reloaded", log.String("path", path))
+		logger.Log(log.LevelInfo, "server: rbac policy reloaded", log.String("path", path))
 	}
 }
 
@@ -297,26 +300,26 @@ func (s *Server) shutdown(ctx context.Context) {
 	if s.respSrv != nil {
 		if err := s.respSrv.Shutdown(ctx); err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "resp server shutdown error", log.String("error", err.Error()))
+				logger.Log(log.LevelError, "server: resp server shutdown error", log.String("error", err.Error()))
 			}
 		}
 	}
 	if s.metricsSrv != nil {
 		if err := s.metricsSrv.Shutdown(ctx); err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "metrics server shutdown error", log.String("error", err.Error()))
+				logger.Log(log.LevelError, "server: metrics server shutdown error", log.String("error", err.Error()))
 			}
 		}
 	}
 	if err := s.netSrv.Shutdown(ctx); err != nil {
 		if logger.Enabled(log.LevelError) {
-			logger.Log(log.LevelError, "tcp server shutdown error", log.String("error", err.Error()))
+			logger.Log(log.LevelError, "server: tcp server shutdown error", log.String("error", err.Error()))
 		}
 	}
 	for _, sh := range s.shards {
 		if err := sh.Stop(ctx); err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "shard shutdown error",
+				logger.Log(log.LevelError, "server: shard shutdown error",
 					log.Uint64("shard_id", uint64(sh.ID)),
 					log.String("error", err.Error()),
 				)
@@ -326,7 +329,7 @@ func (s *Server) shutdown(ctx context.Context) {
 	// Both listeners are stopped above, so no Record() call can race the
 	// file close. A disabled engine's Close() is a no-op returning nil.
 	if err := s.audit.Close(); err != nil && logger.Enabled(log.LevelError) {
-		logger.Log(log.LevelError, "audit log close error", log.String("error", err.Error()))
+		logger.Log(log.LevelError, "server: audit log close error", log.String("error", err.Error()))
 	}
 }
 
@@ -339,7 +342,7 @@ func (s *Server) initCrypto() (*crypto.Engine, error) {
 	cryptoEngine, err := crypto.NewEngine([]byte(cfg.GetEncryptionKey()), logger)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
-			logger.Log(log.LevelError, "crypto engine setup failed", log.String("error", err.Error()))
+			logger.Log(log.LevelError, "server: crypto engine setup failed", log.String("error", err.Error()))
 		}
 		return nil, fmt.Errorf("crypto engine initialization: %w", err)
 	}
@@ -378,7 +381,7 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 		store, err = persistence.NewStorage(true, logger, cfg.GetPersistenceDir())
 		if err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "persistence initialization failed", log.String("error", err.Error()))
+				logger.Log(log.LevelError, "server: persistence initialization failed", log.String("error", err.Error()))
 			}
 			return fmt.Errorf("persistence initialization: %w", err)
 		}
@@ -389,7 +392,7 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger, store)
 		if err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "shard initialization failed",
+				logger.Log(log.LevelError, "server: shard initialization failed",
 					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", i)))
 			}
 			return fmt.Errorf("shard %d init: %w", i, err)
@@ -402,7 +405,7 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 		if store != nil {
 			p = "enabled"
 		}
-		logger.Log(log.LevelInfo, "shards initialized",
+		logger.Log(log.LevelInfo, "server: shards initialized",
 			log.Int("num_shards", numShards),
 			log.String("persistence", p),
 		)
@@ -444,11 +447,11 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	s.metricsSrv = httpSrv
 	go func() {
 		if logger.Enabled(log.LevelInfo) {
-			logger.Log(log.LevelInfo, "telemetry infrastructure online", log.String("addr", metricsAddr))
+			logger.Log(log.LevelInfo, "server: telemetry infrastructure online", log.String("addr", metricsAddr))
 		}
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "metrics server encountered an error", log.String("error", err.Error()))
+				logger.Log(log.LevelError, "server: metrics server encountered an error", log.String("error", err.Error()))
 			}
 		}
 	}()
@@ -474,7 +477,7 @@ func (s *Server) startRESPServer() {
 	go func() {
 		if err := respSrv.ListenAndServe(); err != nil {
 			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "resp server encountered an error", log.String("error", err.Error()))
+				logger.Log(log.LevelError, "server:resp server encountered an error", log.String("error", err.Error()))
 			}
 		}
 	}()
@@ -500,7 +503,7 @@ func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageTy
 		resp := s.router.Dispatch(shard.CmdSet, keyStr, msg.Value, ttlDuration)
 		if resp.Err != nil {
 			if s.app.GetLogger().Enabled(log.LevelError) {
-				s.app.GetLogger().Log(log.LevelError, "failed to store inside storage engine", log.String("error", resp.Err.Error()))
+				s.app.GetLogger().Log(log.LevelError, "server: failed to store inside storage engine", log.String("error", resp.Err.Error()))
 			}
 			return network.ResponseStorageFailure, network.MsgError, nil
 		}

@@ -16,6 +16,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"time"
@@ -29,6 +30,10 @@ var (
 
 	// ErrRequestTooLarge is returned if the generated request exceeds the local stack buffer boundaries.
 	ErrRequestTooLarge = errors.New("client: key or value size exceeds local client packaging limitations")
+
+	// ErrAuthCredentialsTooLong is returned when an AUTH credential exceeds the
+	// uint16 length prefix of the binary auth frame.
+	ErrAuthCredentialsTooLong = errors.New("client: auth credential exceeds 65535 byte protocol limit")
 )
 
 // Client represents a high-performance synchronous connection to a Tellstone server.
@@ -208,6 +213,12 @@ func (c *Client) Delete(key []byte, scratchBuf []byte) ([]byte, error) {
 // Auth authenticates the client with a password (single-password mode, username empty).
 // scratchBuf must be large enough to hold the server response. Returns nil on success.
 func (c *Client) Auth(password string, scratchBuf []byte) error {
+	// The auth frame's length prefixes are uint16 fields; a longer credential
+	// would wrap them on the wire, so reject it up front instead of sending a
+	// corrupt frame.
+	if len(password) > math.MaxUint16 {
+		return ErrAuthCredentialsTooLong
+	}
 	payloadLen := 2 + 0 + 2 + len(password)
 	// Short passwords serialize into the stack buffer, keeping connection setup
 	// allocation-free. OIDC bearer tokens (id_tokens) routinely exceed 512 bytes,

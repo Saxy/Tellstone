@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 )
 
 // errRBACReply converts a non-success response into an error. The server
@@ -142,6 +143,12 @@ func (c *Client) RoleGetUser(username string, scratchBuf []byte) (RoleUser, erro
 // DialTLS — TLS is an operator opt-in and this payload rides the same
 // transport as every other message.
 func (c *Client) AuthUser(username, password string, scratchBuf []byte) error {
+	// The auth frame's length prefixes are uint16 fields; a longer username or
+	// password would wrap them on the wire, so reject it up front instead of
+	// sending a corrupt frame.
+	if len(username) > math.MaxUint16 || len(password) > math.MaxUint16 {
+		return ErrAuthCredentialsTooLong
+	}
 	payloadLen := 2 + len(username) + 2 + len(password)
 
 	// Short credentials serialize into the stack buffer, keeping connection

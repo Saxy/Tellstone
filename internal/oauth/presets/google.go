@@ -50,7 +50,7 @@ func (g *google) Verify(ctx context.Context, token []byte) (oauth.Claims, error)
 	if err != nil {
 		return nil, err
 	}
-	if hd, ok := claims["hd"]; ok && len(hd) == 1 {
+	if hd, ok := claims["hd"]; ok && len(hd) == 1 && len(claims["groups"]) == 0 {
 		claims["groups"] = []string{hd[0]}
 	}
 	return claims, nil
