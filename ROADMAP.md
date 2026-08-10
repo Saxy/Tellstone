@@ -22,14 +22,14 @@ runs plaintext TCP with no access control — a non-starter for any real deploym
 - [x] `AUTH` handshake for binary protocol (challenge-response or token-based)
 - [x] RBAC – with policy store ROLE commands, per-user auth, namespace whitelists
 - [x] API key system — per-key ACLs with configurable command/namespace restrictions
-- [ ] OIDC / OAuth2 integration for SSO (optional, pluggable provider interface)
+- [x] OIDC / OAuth2 integration for SSO (optional, pluggable provider interface)
 - [x] `ACL SETUSER` / `ACL DELUSER` / `ACL LIST` for managing access rules at runtime
 - [x] Audit logging — who issued what command, when, from which connection
 
 ### 2c — Encryption Key Management
 
 - [ ] Key rotation command — re-encrypt all values in-place with a new key (background, non-blocking)
-- [ ] Key derivation from environment / Vault / KMS integration (bypass raw `--encryption-key`)
+- [x] Key derivation from environment / Vault / KMS integration (bypass raw `--encryption-key`)
 - [ ] Envelope encryption — a master key decrypts per-shard data encryption keys
 
 ---
