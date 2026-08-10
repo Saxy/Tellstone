@@ -263,9 +263,3 @@ func fingerprintBytes(key []byte) [16]byte {
 	copy(fp[:], sum[:16])
 	return fp
 }
-
-// Fingerprint returns the truncated SHA-256 hex of a key — the identifier stored
-// in each envelope header to detect a changed KEK on Load.
-func Fingerprint(key []byte) string {
-	return fmt.Sprintf("%x", fingerprintBytes(key))
-}
