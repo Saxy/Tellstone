@@ -34,7 +34,7 @@ func BenchmarkEncryptInPlace(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if _, err := eng.EncryptInPlace(buf, plain); err != nil {
+				if _, err = eng.EncryptInPlace(buf, plain); err != nil {
 					b.Fatalf("encrypt: %v", err)
 				}
 			}
@@ -60,7 +60,8 @@ func BenchmarkDecryptInPlaceWithDst(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				open, err := eng.DecryptInPlaceWithDst(dst, sealed)
+				var open []byte
+				open, err = eng.DecryptInPlaceWithDst(dst, sealed)
 				if err != nil {
 					b.Fatalf("decrypt: %v", err)
 				}
@@ -88,7 +89,7 @@ func BenchmarkDecryptInPlace(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 			for i := 0; i < b.N; i++ {
-				if _, err := eng.DecryptInPlace(sealed); err != nil {
+				if _, err = eng.DecryptInPlace(sealed); err != nil {
 					b.Fatalf("decrypt: %v", err)
 				}
 			}
