@@ -92,7 +92,7 @@ func NewServer(app *tellstone.App) *Server {
 func (s *Server) Run() error {
 	logger := s.app.GetLogger()
 	cfg := s.app.GetConfig()
-	cryptoEngine, err := s.initCrypto()
+	key, cryptoEngine, err := s.initCrypto()
 	if err != nil {
 		return fmt.Errorf("crypto init: %w", err)
 	}
@@ -115,7 +115,7 @@ func (s *Server) Run() error {
 	if err = s.initOAuth(); err != nil {
 		return fmt.Errorf("oauth init: %w", err)
 	}
-	if err = s.initShards(cryptoEngine); err != nil {
+	if err = s.initShards(key, cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
 	s.initAudit(cryptoEngine)
@@ -333,16 +333,18 @@ func (s *Server) shutdown(ctx context.Context) {
 	}
 }
 
-// initCrypto resolves the encryption key and builds the at-rest cipher engine. The key
-// comes from whichever KeyProvider matches the configured source — a file when
-// --encryption-key-file is set, otherwise the base64 flag value — and is read exactly
-// once here, never from the encrypt/decrypt hot path. It returns a nil engine when
-// encryption is disabled, which leaves callers in pass-through mode.
-func (s *Server) initCrypto() (*crypto.Engine, error) {
+// initCrypto resolves the encryption key and builds the shared at-rest cipher
+// engine. The key comes from whichever KeyProvider matches the configured source —
+// a file when --encryption-key-file is set, otherwise the base64 flag value — and
+// is read exactly once here, never from the encrypt/decrypt hot path. The raw key
+// is returned alongside the engine so envelope mode can hand it to each shard as a
+// KEK. Both are nil when encryption is disabled, leaving callers in pass-through
+// mode.
+func (s *Server) initCrypto() ([]byte, *crypto.Engine, error) {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	if !cfg.EncryptionEnabled() {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var provider crypto.KeyProvider
 	switch {
@@ -356,16 +358,16 @@ func (s *Server) initCrypto() (*crypto.Engine, error) {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "encryption key resolution failed", log.String("error", err.Error()))
 		}
-		return nil, fmt.Errorf("encryption key resolution: %w", err)
+		return nil, nil, fmt.Errorf("encryption key resolution: %w", err)
 	}
 	cryptoEngine, err := crypto.NewEngine(key, logger)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "server: crypto engine setup failed", log.String("error", err.Error()))
 		}
-		return nil, fmt.Errorf("crypto engine initialization: %w", err)
+		return nil, nil, fmt.Errorf("crypto engine initialization: %w", err)
 	}
-	return cryptoEngine, nil
+	return key, cryptoEngine, nil
 }
 
 // initAudit constructs the shared audit engine from the --enable-audit,
@@ -389,7 +391,7 @@ func (s *Server) initAudit(cryptoEngine *crypto.Engine) {
 	)
 }
 
-func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
+func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
 	cfg := s.app.GetConfig()
 	numShards := cfg.GetNumShards()
 	logger := s.app.GetLogger()
@@ -408,7 +410,7 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 
 	s.shards = make([]*shard.Shard, numShards)
 	for i := 0; i < numShards; i++ {
-		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger, store)
+		sh, err := shard.Run(shard.ID(i), cfg, key, cryptoEngine, logger, store)
 		if err != nil {
 			if logger.Enabled(log.LevelError) {
 				logger.Log(log.LevelError, "server: shard initialization failed",
