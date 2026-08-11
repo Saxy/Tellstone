@@ -1,7 +1,9 @@
 package shard
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"testing"
 
 	"github.com/Saxy/Tellstone/config"
@@ -82,5 +84,39 @@ func TestShardStoppedError(t *testing.T) {
 	resp := s.Execute("GET", "x", nil, 0)
 	if resp.Err != nil {
 		t.Fatal("expected no error from stopped shard (engine still accessible)")
+	}
+}
+
+func TestShardEnvelopeStartup(t *testing.T) {
+	kek := bytes.Repeat([]byte{0x2a}, 32)
+	cfg := config.LoadConfig([]string{
+		"-shards=1",
+		"-enable-encryption",
+		"-enable-envelope",
+		"-encryption-key=" + base64.StdEncoding.EncodeToString(kek),
+		"-persistence-dir=" + t.TempDir(),
+	})
+
+	// First boot generates a per-shard DEK and wraps it with the KEK.
+	s1, err := Run(0, cfg, kek, nil, log.NewNoOpLogger(), nil)
+	if err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	s1.Stop(context.Background())
+
+	// A restart with the same KEK unwraps the stored DEK instead of minting
+	// a fresh one, so existing data stays decryptable.
+	s2, err := Run(0, cfg, kek, nil, log.NewNoOpLogger(), nil)
+	if err != nil {
+		t.Fatalf("restart with same KEK: %v", err)
+	}
+	s2.Stop(context.Background())
+
+	// A changed KEK must fail startup (fingerprint mismatch) rather than
+	// silently generating fresh DEKs and bricking the dataset.
+	other := bytes.Repeat([]byte{0x11}, 32)
+	if s3, err := Run(0, cfg, other, nil, log.NewNoOpLogger(), nil); err == nil {
+		s3.Stop(context.Background())
+		t.Fatal("startup with changed KEK should fail")
 	}
 }
