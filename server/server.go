@@ -115,11 +115,11 @@ func (s *Server) Run() error {
 	if err = s.initOAuth(); err != nil {
 		return fmt.Errorf("oauth init: %w", err)
 	}
-	if err = s.initShards(key, cryptoEngine); err != nil {
-		return fmt.Errorf("shard init: %w", err)
-	}
 	if err = s.initAudit(key, cryptoEngine); err != nil {
 		return fmt.Errorf("audit init: %w", err)
+	}
+	if err = s.initShards(key, cryptoEngine); err != nil {
+		return fmt.Errorf("shard init: %w", err)
 	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),

@@ -117,16 +117,7 @@ func NewLogEngine(
 	}
 	f, err := newFile(auditLogPath, engine, logger)
 	if err != nil {
-		// fallback to stdout in case of error with a file
-		if logger.Enabled(log.LevelError) {
-			logger.Log(log.LevelError, "audit: initial file creation failed -- activate fallback to stdout", log.String("error", err.Error()))
-		}
-		return &LogEngine{
-			enabled: true,
-			filter:  filter,
-			writer:  os.Stdout,
-			enc:     json.NewEncoder(os.Stdout),
-		}, nil
+		return nil, err
 	}
 	return &LogEngine{
 		enabled: true,

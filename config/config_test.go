@@ -332,6 +332,9 @@ func TestEnableEncryptionAcceptsEitherKeySource(t *testing.T) {
 }
 
 func TestEnableEnvelopePanicWithoutEncryption(t *testing.T) {
+	t.Setenv("TSD_ENABLE_ENCRYPTION", "false")
+	t.Setenv("TSD_ENCRYPTION_KEY", "")
+	t.Setenv("TSD_ENCRYPTION_KEY_FILE", "")
 	defer func() {
 		if r := recover(); r == nil {
 			t.Fatal("expected panic when --enable-envelope is set without --enable-encryption")

@@ -203,6 +203,19 @@ func (e *Envelope) Store(dir string, shardID uint32) error {
 		}
 		return fmt.Errorf("envelope: finalize envelope file: %w", err)
 	}
+	parent, err := os.Open(dir)
+	if err != nil {
+		return fmt.Errorf("envelope: open envelope directory: %w", err)
+	}
+	if err = parent.Sync(); err != nil {
+		if err = parent.Close(); err != nil {
+			return fmt.Errorf("envelope: close envelope directory: %w", err)
+		}
+		return fmt.Errorf("envelope: sync envelope directory: %w", err)
+	}
+	if err = parent.Close(); err != nil {
+		return fmt.Errorf("envelope: close envelope directory: %w", err)
+	}
 	if e.logger.Enabled(log.LevelDebug) {
 		e.logger.Log(log.LevelDebug, "envelope: stored for shard", log.Uint("shard", shardID))
 	}
