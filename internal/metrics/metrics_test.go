@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/audit"
-	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/network"
 	"github.com/Saxy/Tellstone/internal/storage"
@@ -16,7 +15,8 @@ import (
 // newNoOpAudit returns a disabled audit engine so the listener harness
 // exercises the unguarded Record() hooks with zero audit output.
 func newNoOpAudit() *audit.LogEngine {
-	return audit.NewLogEngine(false, nil, "stdout", log.NewNoOpLogger(), crypto.Engine{})
+	e, _ := audit.NewLogEngine(false, nil, "stdout", log.NewNoOpLogger(), false, nil, nil)
+	return e
 }
 
 // TestCollectorEngineSnapshot verifies that the engine snapshot reflects

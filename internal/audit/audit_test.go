@@ -20,7 +20,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
@@ -141,7 +140,11 @@ func TestDefaultEventTypesExist(t *testing.T) {
 // how the server constructs an audit engine without encryption enabled.
 func newTestEngine(t *testing.T, enabled bool, filter *eventSet, dir string) *LogEngine {
 	t.Helper()
-	return NewLogEngine(enabled, filter, dir, log.NewNoOpLogger(), crypto.Engine{})
+	e, err := NewLogEngine(enabled, filter, dir, log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e
 }
 
 // readAuditFiles returns the contents of every *_tsd.log file in dir.

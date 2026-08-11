@@ -118,7 +118,9 @@ func (s *Server) Run() error {
 	if err = s.initShards(key, cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
-	s.initAudit(cryptoEngine)
+	if err = s.initAudit(key, cryptoEngine); err != nil {
+		return fmt.Errorf("audit init: %w", err)
+	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
@@ -375,20 +377,26 @@ func (s *Server) initCrypto() ([]byte, *crypto.Engine, error) {
 // disabled --enable-audit yields the no-op engine, so every listener hook can
 // call Record() unconditionally. cryptoEngine is nil when encryption is off;
 // the zero-value crypto.Engine keeps the file writer's encryption path inert.
-func (s *Server) initAudit(cryptoEngine *crypto.Engine) {
+// In envelope mode the audit engine derives its own DEK engine, leaving the
+// caller's cryptoEngine untouched for the shards.
+func (s *Server) initAudit(key []byte, cryptoEngine *crypto.Engine) error {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
-	var engine crypto.Engine
+	var engine *crypto.Engine
 	if cryptoEngine != nil {
-		engine = *cryptoEngine
+		engine = cryptoEngine
 	}
-	s.audit = audit.NewLogEngine(
+	var err error
+	s.audit, err = audit.NewLogEngine(
 		cfg.AuditEnabled(),
 		audit.ParseEventTypes(strings.Join(cfg.AuditLogEvents(), ",")),
 		cfg.AuditLogPath(),
 		logger,
+		cfg.EncryptionEnabled() && cfg.EnvelopeEnabled(),
+		key,
 		engine,
 	)
+	return err
 }
 
 func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {

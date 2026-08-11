@@ -18,7 +18,10 @@ package audit
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
+	"math"
 	"os"
 	"sync"
 	"time"
@@ -29,6 +32,14 @@ import (
 
 // auditLevel is the fixed severity label emitted in every JSON audit line.
 const auditLevel = "AUDIT"
+
+// auditEnvelopeID is the envelope identity of the shared audit log. Shard
+// envelopes occupy IDs 0..numShards-1 in the persistence directory, while the
+// audit log owns exactly one envelope of its own, stored beside its records.
+// The sentinel can never collide with a real shard regardless of the configured
+// shard count and stays fixed across restarts — even if numShards changes — so
+// the audit DEK survives and the fingerprint check never fails spuriously.
+const auditEnvelopeID uint32 = math.MaxUint32
 
 // LogEngine is the concrete audit logger. When enabled is false (--enable-audit
 // not set), Record() returns immediately with a single bool comparison — no
@@ -54,31 +65,76 @@ type LogEngine struct {
 // log path: "stdout" writes JSON to os.Stdout, any other value is treated as
 // a directory whose audit files are created and rotated automatically. The
 // path is only inspected when enabled, so a disabled engine pays nothing.
-func NewLogEngine(enabled bool, filter *eventSet, auditLogPath string, logger log.Logger, engine crypto.Engine) *LogEngine {
+//
+// In envelope mode (envelopeEnabled) the audit log uses a DEK of its own —
+// never the operator's KEK, never a shard's DEK — wrapped by the KEK and
+// stored as an envelope file beside the audit records, mirroring how each
+// shard seals its data. A changed KEK is rejected (fail-closed) instead of
+// silently generating a fresh DEK and bricking the audit history. A stdout
+// destination is never persisted, so no envelope is created and records stay
+// plaintext.
+func NewLogEngine(
+	enabled bool,
+	filter *eventSet,
+	auditLogPath string,
+	logger log.Logger,
+	envelopeEnabled bool,
+	key []byte,
+	engine *crypto.Engine) (*LogEngine, error) {
 	if !enabled {
-		return &LogEngine{enabled: false}
+		return &LogEngine{enabled: false}, nil
 	}
-	writer := io.Writer(os.Stdout)
-	var closeFn func() error
-	if auditLogPath != "" && auditLogPath != "stdout" {
-		f, err := newFile(auditLogPath, engine, logger)
+	if auditLogPath == "" || auditLogPath == "stdout" {
+		return &LogEngine{
+			enabled: true,
+			filter:  filter,
+			writer:  os.Stdout,
+			enc:     json.NewEncoder(os.Stdout),
+		}, nil
+	}
+	if envelopeEnabled {
+		env, err := crypto.NewEnvelope(key, logger)
 		if err != nil {
-			// fallback to stdout in case of error with a file
-			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "audit: initial file creation failed -- activate fallback to stdout", log.String("error", err.Error()))
-			}
-		} else {
-			writer = f
-			closeFn = f.Close
+			return nil, fmt.Errorf("audit: envelope init: %w", err)
 		}
+		dek, err := env.Load(auditLogPath, auditEnvelopeID)
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("audit: load envelope: %w", err)
+			}
+			if err = env.GenerateDEK(); err != nil {
+				return nil, fmt.Errorf("audit: generate DEK: %w", err)
+			}
+			if err = env.Store(auditLogPath, auditEnvelopeID); err != nil {
+				return nil, fmt.Errorf("audit: store envelope: %w", err)
+			}
+			dek = env.DEK()
+		}
+		engine, err = crypto.NewEngine(dek, logger)
+		if err != nil {
+			return nil, fmt.Errorf("audit: data engine init: %w", err)
+		}
+	}
+	f, err := newFile(auditLogPath, engine, logger)
+	if err != nil {
+		// fallback to stdout in case of error with a file
+		if logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "audit: initial file creation failed -- activate fallback to stdout", log.String("error", err.Error()))
+		}
+		return &LogEngine{
+			enabled: true,
+			filter:  filter,
+			writer:  os.Stdout,
+			enc:     json.NewEncoder(os.Stdout),
+		}, nil
 	}
 	return &LogEngine{
 		enabled: true,
 		filter:  filter,
-		writer:  writer,
-		enc:     json.NewEncoder(writer),
-		closeFn: closeFn,
-	}
+		writer:  f,
+		enc:     json.NewEncoder(f),
+		closeFn: f.Close,
+	}, nil
 }
 
 // Record writes one audit event. When the engine is not enabled, this is a
