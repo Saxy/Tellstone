@@ -42,7 +42,7 @@ func TestReplayAuthLogPlaintext(t *testing.T) {
 	dir := t.TempDir()
 	writeAuthEvents(t, dir, nil)
 
-	entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger())
 	if len(entries) != 2 {
 		t.Fatalf("ReplayAuthLog len = %d, want 2", len(entries))
 	}
@@ -74,7 +74,7 @@ func TestReplayAuthLogEncrypted(t *testing.T) {
 	}
 	writeAuthEvents(t, dir, ce)
 
-	entries := ReplayAuthLog(dir, *ce, 100, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, ce, 100, log.NewNoOpLogger())
 	if len(entries) != 2 {
 		t.Fatalf("ReplayAuthLog len = %d, want 2", len(entries))
 	}
@@ -102,7 +102,7 @@ func TestReplayAuthLogIgnoresOtherEvents(t *testing.T) {
 		t.Fatal("Close:", err)
 	}
 
-	if entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger()); len(entries) != 0 {
+	if entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger()); len(entries) != 0 {
 		t.Fatalf("ReplayAuthLog = %+v, want no entries", entries)
 	}
 }
@@ -125,7 +125,7 @@ func TestReplayAuthLogCapsAtMaxEntries(t *testing.T) {
 		t.Fatal("Close:", err)
 	}
 
-	entries := ReplayAuthLog(dir, crypto.Engine{}, 3, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, nil, 3, log.NewNoOpLogger())
 	if len(entries) != 3 {
 		t.Fatalf("ReplayAuthLog len = %d, want 3", len(entries))
 	}
@@ -164,7 +164,7 @@ func TestReplayAuthLogAcrossRotatedFiles(t *testing.T) {
 		t.Fatalf("expected rotation to produce several files, got %d", len(paths))
 	}
 
-	entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger())
 	if len(entries) != 4 {
 		t.Fatalf("ReplayAuthLog len = %d, want 4", len(entries))
 	}
@@ -175,7 +175,7 @@ func TestReplayAuthLogAcrossRotatedFiles(t *testing.T) {
 	}
 
 	// The cap must also work across the boundary, keeping the newest records.
-	capped := ReplayAuthLog(dir, crypto.Engine{}, 2, log.NewNoOpLogger())
+	capped := replayAuthLog(dir, nil, 2, log.NewNoOpLogger())
 	if len(capped) != 2 {
 		t.Fatalf("capped len = %d, want 2", len(capped))
 	}
@@ -202,7 +202,7 @@ func TestReplayAuthLogSkipsCorruptLine(t *testing.T) {
 		t.Fatal("WriteFile:", err)
 	}
 
-	entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger())
 	if len(entries) != 2 {
 		t.Fatalf("ReplayAuthLog len = %d, want 2 (corrupt line skipped)", len(entries))
 	}
@@ -227,7 +227,7 @@ func TestReplayAuthLogTruncatedPlaintextTail(t *testing.T) {
 		t.Fatal("WriteFile:", err)
 	}
 
-	entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger())
 	if len(entries) != 2 {
 		t.Fatalf("ReplayAuthLog len = %d, want 2", len(entries))
 	}
@@ -255,7 +255,7 @@ func TestReplayAuthLogTruncatedEncryptedTail(t *testing.T) {
 		if writeErr := os.WriteFile(path, append(data, tail...), 0o600); writeErr != nil {
 			t.Fatal("WriteFile:", writeErr)
 		}
-		entries := ReplayAuthLog(dir, *ce, 100, log.NewNoOpLogger())
+		entries := replayAuthLog(dir, ce, 100, log.NewNoOpLogger())
 		if len(entries) != 2 {
 			t.Fatalf("%s: ReplayAuthLog len = %d, want 2", name, len(entries))
 		}
@@ -284,7 +284,7 @@ func TestReplayAuthLogUndecryptableRecord(t *testing.T) {
 		t.Fatal("WriteFile:", err)
 	}
 
-	entries := ReplayAuthLog(dir, *ce, 100, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, ce, 100, log.NewNoOpLogger())
 	if len(entries) != 1 {
 		t.Fatalf("ReplayAuthLog len = %d, want 1 (first record undecryptable)", len(entries))
 	}
@@ -296,7 +296,7 @@ func TestReplayAuthLogUndecryptableRecord(t *testing.T) {
 // TestReplayAuthLogMissingDirectory covers a first run with no prior history:
 // the audit directory does not exist yet.
 func TestReplayAuthLogMissingDirectory(t *testing.T) {
-	if entries := ReplayAuthLog(t.TempDir()+"/never-created", crypto.Engine{}, 100, log.NewNoOpLogger()); entries != nil {
+	if entries := replayAuthLog(t.TempDir()+"/never-created", nil, 100, log.NewNoOpLogger()); entries != nil {
 		t.Fatalf("ReplayAuthLog = %+v, want nil", entries)
 	}
 }
@@ -304,7 +304,7 @@ func TestReplayAuthLogMissingDirectory(t *testing.T) {
 // TestReplayAuthLogEmptyDirectory covers audit being enabled for the first time
 // against an existing but empty directory.
 func TestReplayAuthLogEmptyDirectory(t *testing.T) {
-	if entries := ReplayAuthLog(t.TempDir(), crypto.Engine{}, 100, log.NewNoOpLogger()); entries != nil {
+	if entries := replayAuthLog(t.TempDir(), nil, 100, log.NewNoOpLogger()); entries != nil {
 		t.Fatalf("ReplayAuthLog = %+v, want nil", entries)
 	}
 }
@@ -314,7 +314,7 @@ func TestReplayAuthLogEmptyDirectory(t *testing.T) {
 func TestReplayAuthLogZeroMaxEntries(t *testing.T) {
 	dir := t.TempDir()
 	writeAuthEvents(t, dir, nil)
-	if entries := ReplayAuthLog(dir, crypto.Engine{}, 0, log.NewNoOpLogger()); entries != nil {
+	if entries := replayAuthLog(dir, nil, 0, log.NewNoOpLogger()); entries != nil {
 		t.Fatalf("ReplayAuthLog = %+v, want nil", entries)
 	}
 }
@@ -323,7 +323,7 @@ func TestReplayAuthLogZeroMaxEntries(t *testing.T) {
 func TestReplayAuthLogNilLogger(t *testing.T) {
 	dir := t.TempDir()
 	writeAuthEvents(t, dir, nil)
-	if entries := ReplayAuthLog(dir, crypto.Engine{}, 100, nil); len(entries) != 2 {
+	if entries := replayAuthLog(dir, nil, 100, nil); len(entries) != 2 {
 		t.Fatalf("ReplayAuthLog len = %d, want 2", len(entries))
 	}
 }
@@ -339,13 +339,13 @@ func TestReplayAuthLogFormatMismatch(t *testing.T) {
 
 	plainDir := t.TempDir()
 	writeAuthEvents(t, plainDir, nil)
-	if entries := ReplayAuthLog(plainDir, *ce, 100, log.NewNoOpLogger()); len(entries) != 0 {
+	if entries := replayAuthLog(plainDir, ce, 100, log.NewNoOpLogger()); len(entries) != 0 {
 		t.Fatalf("plaintext read as encrypted = %+v, want no entries", entries)
 	}
 
 	encDir := t.TempDir()
 	writeAuthEvents(t, encDir, ce)
-	if entries := ReplayAuthLog(encDir, crypto.Engine{}, 100, log.NewNoOpLogger()); len(entries) != 0 {
+	if entries := replayAuthLog(encDir, nil, 100, log.NewNoOpLogger()); len(entries) != 0 {
 		t.Fatalf("encrypted read as plaintext = %+v, want no entries", entries)
 	}
 }
@@ -358,12 +358,99 @@ func TestReplayAuthLogTimestampPreserved(t *testing.T) {
 	writeAuthEvents(t, dir, nil)
 	after := time.Now()
 
-	entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger())
+	entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger())
 	if len(entries) == 0 {
 		t.Fatal("no entries replayed")
 	}
 	ts := entries[0].Timestamp
 	if ts.Before(before.Add(-time.Second)) || ts.After(after.Add(time.Second)) {
 		t.Fatalf("timestamp %v outside the write window %v..%v", ts, before, after)
+	}
+}
+
+// TestLogEngineReplayAuthLogFromFile verifies the method sources the directory
+// and the key from the engine's own writer rather than from its caller.
+func TestLogEngineReplayAuthLogFromFile(t *testing.T) {
+	dir := t.TempDir()
+	writeAuthEvents(t, dir, nil)
+
+	e, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
+	t.Cleanup(func() { _ = e.Close() })
+
+	entries := e.ReplayAuthLog(100)
+	if len(entries) != 2 {
+		t.Fatalf("ReplayAuthLog len = %d, want 2", len(entries))
+	}
+	if entries[0].Username != "alice" || entries[1].Username != "bob" {
+		t.Fatalf("entries = %+v, want alice then bob", entries)
+	}
+}
+
+// TestLogEngineReplayAuthLogEnvelope is the case the method exists for: in
+// envelope mode the records are sealed with the audit log's own DEK, not the
+// shared engine, and a restart with the same KEK must recover them.
+func TestLogEngineReplayAuthLogEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	kek := bytes.Repeat([]byte{0x2a}, 32)
+
+	first, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), true, kek, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
+	first.Record(EventAuthFailure, "authentication failed",
+		log.String("user", "alice"),
+		log.String("remote_addr", "10.0.0.1:5000"),
+		log.String("reason", "invalid password"),
+	)
+	first.Record(EventACLDeny, "command denied by rbac policy",
+		log.String("user", "bob"),
+		log.String("command", "set"),
+		log.String("key", "forbidden"),
+		log.String("remote_addr", "10.0.0.2:5001"),
+	)
+	if err = first.Close(); err != nil {
+		t.Fatal("Close:", err)
+	}
+
+	// The restart reloads the stored DEK, so replay decrypts what the previous
+	// run sealed.
+	second, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), true, kek, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
+	t.Cleanup(func() { _ = second.Close() })
+
+	entries := second.ReplayAuthLog(100)
+	if len(entries) != 2 {
+		t.Fatalf("ReplayAuthLog len = %d, want 2", len(entries))
+	}
+	if entries[0].Reason != "invalid password" {
+		t.Fatalf("entry 0 Reason = %q", entries[0].Reason)
+	}
+	if entries[1].Reason != "NOPERM command=set key=forbidden" {
+		t.Fatalf("entry 1 Reason = %q", entries[1].Reason)
+	}
+}
+
+// TestLogEngineReplayAuthLogNoFileWriter verifies the destinations that hold no
+// recoverable history replay nothing instead of guessing at a directory.
+func TestLogEngineReplayAuthLogNoFileWriter(t *testing.T) {
+	disabled, err := NewLogEngine(false, nil, t.TempDir(), log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
+	if entries := disabled.ReplayAuthLog(100); entries != nil {
+		t.Fatalf("disabled engine replayed %+v, want nil", entries)
+	}
+
+	stdout, err := NewLogEngine(true, ParseEventTypes("all"), "stdout", log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
+	if entries := stdout.ReplayAuthLog(100); entries != nil {
+		t.Fatalf("stdout engine replayed %+v, want nil", entries)
 	}
 }

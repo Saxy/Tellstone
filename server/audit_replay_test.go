@@ -21,6 +21,12 @@ func newReplayServer(t *testing.T, rbacEnabled bool, args ...string) *Server {
 	if rbacEnabled {
 		s.policy = rbac.NewStore(&rbac.PolicyStore{}, log.NewNoOpLogger())
 	}
+	// seedAuditReplay reads the engine's own state, so the engine has to exist
+	// first — the same order Run() uses.
+	if err := s.initAudit(nil, nil); err != nil {
+		t.Fatal("initAudit:", err)
+	}
+	t.Cleanup(func() { _ = s.audit.Close() })
 	return s
 }
 
@@ -55,7 +61,7 @@ func TestSeedAuditReplayRestoresHistory(t *testing.T) {
 	writePriorAuditHistory(t, dir)
 
 	s := newReplayServer(t, true, "-enable-audit", "-audit-log-path", dir)
-	s.seedAuditReplay(nil)
+	s.seedAuditReplay()
 
 	entries := s.policy.AuthLog()
 	if len(entries) != 2 {
@@ -76,7 +82,7 @@ func TestSeedAuditReplayNoopWhenAuditDisabled(t *testing.T) {
 	writePriorAuditHistory(t, dir)
 
 	s := newReplayServer(t, true, "-audit-log-path", dir)
-	s.seedAuditReplay(nil)
+	s.seedAuditReplay()
 
 	if entries := s.policy.AuthLog(); entries != nil {
 		t.Fatalf("AuthLog = %+v, want nil", entries)
@@ -87,7 +93,7 @@ func TestSeedAuditReplayNoopWhenAuditDisabled(t *testing.T) {
 // rather than treated as a directory name.
 func TestSeedAuditReplayNoopWhenStdout(t *testing.T) {
 	s := newReplayServer(t, true, "-enable-audit", "-audit-log-path", "stdout")
-	s.seedAuditReplay(nil)
+	s.seedAuditReplay()
 
 	if entries := s.policy.AuthLog(); entries != nil {
 		t.Fatalf("AuthLog = %+v, want nil", entries)
@@ -101,7 +107,7 @@ func TestSeedAuditReplayNoopWhenRBACDisabled(t *testing.T) {
 	writePriorAuditHistory(t, dir)
 
 	s := newReplayServer(t, false, "-enable-audit", "-audit-log-path", dir)
-	s.seedAuditReplay(nil)
+	s.seedAuditReplay()
 
 	if s.policy != nil {
 		t.Fatal("policy should stay nil when RBAC is disabled")
@@ -112,7 +118,7 @@ func TestSeedAuditReplayNoopWhenRBACDisabled(t *testing.T) {
 // directory restores nothing and does not fail.
 func TestSeedAuditReplayEmptyDirectory(t *testing.T) {
 	s := newReplayServer(t, true, "-enable-audit", "-audit-log-path", t.TempDir())
-	s.seedAuditReplay(nil)
+	s.seedAuditReplay()
 
 	if entries := s.policy.AuthLog(); entries != nil {
 		t.Fatalf("AuthLog = %+v, want nil", entries)

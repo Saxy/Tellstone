@@ -55,15 +55,33 @@ type record struct {
 }
 
 // ReplayAuthLog recovers up to maxEntries of the most recent auth-failure and
-// acl-deny records from the audit files in dir, returned oldest first — the
-// order the ACL LOG buffer expects. engine must be the same crypto.Engine the
-// writer used, since it selects the on-disk format; a mismatch (encryption
-// toggled between runs) recovers nothing rather than failing.
+// acl-deny records this engine's directory already holds, returned oldest first
+// — the order the ACL LOG buffer expects.
+//
+// Everything replay needs is the engine's own state, so a caller cannot pair a
+// directory with the wrong key: the destination and the DEK that seals it are
+// both taken from the file writer. An engine that is disabled or writing to
+// stdout has no file writer and replays nothing, since neither has recoverable
+// history.
+//
+// Records this run has written are included, which is why callers replay before
+// serving traffic; at that point the current file is still empty and costs one
+// read.
+func (e *LogEngine) ReplayAuthLog(maxEntries int) []ReplayEntry {
+	f, ok := e.writer.(*file)
+	if !ok {
+		return nil
+	}
+	return replayAuthLog(f.dir, f.ce, maxEntries, f.logger)
+}
+
+// replayAuthLog walks the audit files in dir. engine is the one that sealed
+// them, or nil when they are plaintext.
 //
 // Every failure mode here is non-fatal and returns whatever was recovered so
 // far: a missing directory, an unreadable file, a corrupt record. History is a
 // convenience, never a reason to refuse to boot.
-func ReplayAuthLog(dir string, engine crypto.Engine, maxEntries int, logger log.Logger) []ReplayEntry {
+func replayAuthLog(dir string, engine *crypto.Engine, maxEntries int, logger log.Logger) []ReplayEntry {
 	if maxEntries <= 0 {
 		return nil
 	}
@@ -105,7 +123,7 @@ func ReplayAuthLog(dir string, engine crypto.Engine, maxEntries int, logger log.
 // readFile decodes one audit file into its replayable entries, oldest first. An
 // unreadable file yields nothing: one damaged file must not cost the history
 // held in its siblings.
-func readFile(path string, engine crypto.Engine, logger log.Logger) []ReplayEntry {
+func readFile(path string, engine *crypto.Engine, logger log.Logger) []ReplayEntry {
 	// Audit files are bounded by rotateAfterBytes, and this runs once at startup
 	// off any serving path, so reading a file whole is simpler than streaming it
 	// and costs one short-lived allocation per file visited.
@@ -119,7 +137,9 @@ func readFile(path string, engine crypto.Engine, logger log.Logger) []ReplayEntr
 		}
 		return nil
 	}
-	if engine.Enabled() {
+	// The same condition newFile applies when deciding to seal records, so the
+	// reader and the writer cannot disagree about the format.
+	if engine != nil && engine.Enabled() {
 		return decodeEncrypted(data, engine, path, logger)
 	}
 	return decodePlaintext(data)
@@ -150,7 +170,7 @@ func decodePlaintext(data []byte) []ReplayEntry {
 // different — the position of the next record becomes unknowable, so decoding
 // stops and keeps what came before. That is exactly the shape of a process
 // killed between writing a prefix and writing its blob.
-func decodeEncrypted(data []byte, engine crypto.Engine, path string, logger log.Logger) []ReplayEntry {
+func decodeEncrypted(data []byte, engine *crypto.Engine, path string, logger log.Logger) []ReplayEntry {
 	var out []ReplayEntry
 	for len(data) >= 4 {
 		blobLen := int(binary.BigEndian.Uint32(data[:4]))

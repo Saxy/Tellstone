@@ -115,10 +115,13 @@ func (s *Server) Run() error {
 	if err = s.initOAuth(); err != nil {
 		return fmt.Errorf("oauth init: %w", err)
 	}
-	s.seedAuditReplay(cryptoEngine)
 	if err = s.initAudit(key, cryptoEngine); err != nil {
 		return fmt.Errorf("audit init: %w", err)
 	}
+	// After initAudit so the engine has resolved the destination and the key
+	// that seals it, and before any listener starts so the restored history is
+	// in place by the time a client can read ACL LOG.
+	s.seedAuditReplay()
 	if err = s.initShards(key, cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
@@ -400,35 +403,20 @@ func (s *Server) initAudit(key []byte, cryptoEngine *crypto.Engine) error {
 	return err
 }
 
-// resolveCryptoEngine turns the nil-when-disabled engine pointer into its value
-// form. Shared by initAudit and seedAuditReplay so the reader and the writer
-// always agree on whether the audit files are encrypted.
-func resolveCryptoEngine(cryptoEngine *crypto.Engine) crypto.Engine {
-	if cryptoEngine == nil {
-		return crypto.Engine{}
-	}
-	return *cryptoEngine
-}
-
 // seedAuditReplay restores the ACL LOG buffer from the audit files a previous
-// run left behind, so ACL LOG survives a restart instead of starting empty. It
-// applies only when RBAC is on and audit records are going to a directory:
-// stdout cannot be read back, and with audit disabled there is nothing to read.
+// run left behind, so ACL LOG survives a restart instead of starting empty.
 //
-// Called before initAudit so the glob cannot pick up the file this process is
-// about to create. Recovery is best-effort and never blocks startup — an
-// unreadable or mismatched log simply leaves the buffer empty.
-func (s *Server) seedAuditReplay(cryptoEngine *crypto.Engine) {
-	cfg := s.app.GetConfig()
+// With RBAC disabled there is no buffer to seed. Every other precondition —
+// audit enabled, records going to a directory rather than stdout, and the key
+// that seals them — belongs to the audit engine, so it decides what is
+// replayable. Recovery is best-effort and never blocks startup: an unreadable
+// or unrecoverable log simply leaves the buffer empty.
+func (s *Server) seedAuditReplay() {
+	if s.policy == nil {
+		return
+	}
 	logger := s.app.GetLogger()
-	if s.policy == nil || !cfg.AuditEnabled() {
-		return
-	}
-	dir := cfg.AuditLogPath()
-	if dir == "" || dir == "stdout" {
-		return
-	}
-	replayed := audit.ReplayAuthLog(dir, resolveCryptoEngine(cryptoEngine), rbac.DefaultAuthLogCap, logger)
+	replayed := s.audit.ReplayAuthLog(rbac.DefaultAuthLogCap)
 	if len(replayed) == 0 {
 		return
 	}
@@ -444,7 +432,7 @@ func (s *Server) seedAuditReplay(cryptoEngine *crypto.Engine) {
 	s.policy.SeedAuthLog(entries)
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "server: restored ACL LOG history from the audit log",
-			log.String("dir", dir),
+			log.String("dir", s.app.GetConfig().AuditLogPath()),
 			log.Int("entries", len(entries)),
 		)
 	}
