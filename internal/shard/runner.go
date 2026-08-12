@@ -60,6 +60,10 @@ func (s *Shard) TotalConnections() uint64 { return atomic.LoadUint64(&s.totalCon
 func (s *Shard) BytesRead() uint64        { return atomic.LoadUint64(&s.bytesRead) }
 func (s *Shard) BytesWritten() uint64     { return atomic.LoadUint64(&s.bytesWritten) }
 
+func envelopeFileName(shardID uint32) string {
+	return fmt.Sprintf("shard-%d.env", shardID)
+}
+
 func Run(id ID, cfg *config.Config, key []byte, cryptoEngine *crypto.Engine, logger log.Logger, store *persistence.Storage) (*Shard, error) {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
@@ -83,7 +87,7 @@ func Run(id ID, cfg *config.Config, key []byte, cryptoEngine *crypto.Engine, log
 			return nil, fmt.Errorf("shard %d: envelope init: %w", id, err)
 		}
 		envDir := envelopeDir(cfg)
-		dek, err := env.Load(envDir, uint32(id))
+		dek, err := env.Load(envDir, envelopeFileName(uint32(id)))
 		if err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("shard %d: load envelope: %w", id, err)
@@ -91,7 +95,7 @@ func Run(id ID, cfg *config.Config, key []byte, cryptoEngine *crypto.Engine, log
 			if err = env.GenerateDEK(); err != nil {
 				return nil, fmt.Errorf("shard %d: generate DEK: %w", id, err)
 			}
-			if err = env.Store(envDir, uint32(id)); err != nil {
+			if err = env.Store(envDir, envelopeFileName(uint32(id))); err != nil {
 				return nil, fmt.Errorf("shard %d: store envelope: %w", id, err)
 			}
 			dek = env.DEK()

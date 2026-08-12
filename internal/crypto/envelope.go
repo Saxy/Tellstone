@@ -147,7 +147,7 @@ func (e *Envelope) decrypt(encryptedDEK []byte) ([]byte, error) {
 
 // Store wraps the DEK with the KEK and persists it to <dir>/shard-<n>.env.
 // On-disk layout: [version:1][KEK fingerprint:16][wrapped DEK: nonce+ct+tag].
-func (e *Envelope) Store(dir string, shardID uint32) error {
+func (e *Envelope) Store(dir string, fileName string) error {
 	if !e.enabled {
 		return nil
 	}
@@ -167,7 +167,7 @@ func (e *Envelope) Store(dir string, shardID uint32) error {
 	fp := fingerprintBytes(e.kek)
 	copy(buf[1:1+envFingerprintLen], fp[:])
 	copy(buf[1+envFingerprintLen:], wrapped)
-	name := filepath.Join(dir, envelopeFileName(shardID))
+	name := filepath.Join(dir, fileName)
 	tmp := name + ".tmp"
 	file, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
@@ -217,37 +217,33 @@ func (e *Envelope) Store(dir string, shardID uint32) error {
 		return fmt.Errorf("envelope: close envelope directory: %w", err)
 	}
 	if e.logger.Enabled(log.LevelDebug) {
-		e.logger.Log(log.LevelDebug, "envelope: stored for shard", log.Uint("shard", shardID))
+		e.logger.Log(log.LevelDebug, "envelope: stored", log.String("file", fileName))
 	}
 	return nil
 }
 
 // Load reads the envelope for shard, rejects a changed KEK via the stored
 // fingerprint, and returns the unwrapped DEK for the caller to build an Engine.
-func (e *Envelope) Load(dir string, shardID uint32) ([]byte, error) {
+func (e *Envelope) Load(dir, fileName string) ([]byte, error) {
 	if !e.enabled {
 		return nil, nil
 	}
-	name := filepath.Join(dir, envelopeFileName(shardID))
+	name := filepath.Join(dir, fileName)
 	raw, err := os.ReadFile(name)
 	if err != nil {
-		return nil, fmt.Errorf("envelope: read envelope for shard %d: %w", shardID, err)
+		return nil, fmt.Errorf("envelope: read envelope %s: %w", fileName, err)
 	}
 	headerLen := 1 + envFingerprintLen
 	if len(raw) < headerLen || raw[0] != envVersion {
-		return nil, fmt.Errorf("envelope: unsupported envelope format for shard %d", shardID)
+		return nil, fmt.Errorf("envelope: unsupported envelope format %s", fileName)
 	}
 	fp := fingerprintBytes(e.kek)
 	if !bytes.Equal(raw[1:headerLen], fp[:]) {
-		return nil,
-			fmt.Errorf(
-				"envelope: KEK fingerprint mismatch for shard %d; data was written with a different key",
-				shardID,
-			)
+		return nil, fmt.Errorf("envelope: KEK fingerprint mismatch for %s; data was written with a different key", fileName)
 	}
 	dek, err := e.decrypt(raw[headerLen:])
 	if err != nil {
-		return nil, fmt.Errorf("envelope: unwrap DEK for shard %d: %w", shardID, err)
+		return nil, fmt.Errorf("envelope: unwrap DEK %s: %w", fileName, err)
 	}
 	e.dek = dek
 	return dek, nil
@@ -255,7 +251,7 @@ func (e *Envelope) Load(dir string, shardID uint32) ([]byte, error) {
 
 // envelopeFileName maps a shard to its envelope file. The shard ID is not part of
 // the on-disk layout; the file name is the identifier.
-func envelopeFileName(shardID uint32) string {
+func EnvelopeFileName(shardID uint32) string {
 	return fmt.Sprintf("shard-%d.env", shardID)
 }
 

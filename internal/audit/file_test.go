@@ -286,7 +286,7 @@ func TestFileAuditLoggingEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dek, err := env.Load(dir, auditEnvelopeID)
+	dek, err := env.Load(dir, envelopeFileName)
 	if err != nil {
 		t.Fatalf("failed to load audit DEK for decoding: %v", err)
 	}

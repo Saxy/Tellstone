@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"sync"
 	"time"
@@ -32,14 +31,6 @@ import (
 
 // auditLevel is the fixed severity label emitted in every JSON audit line.
 const auditLevel = "AUDIT"
-
-// auditEnvelopeID is the envelope identity of the shared audit log. Shard
-// envelopes occupy IDs 0..numShards-1 in the persistence directory, while the
-// audit log owns exactly one envelope of its own, stored beside its records.
-// The sentinel can never collide with a real shard regardless of the configured
-// shard count and stays fixed across restarts — even if numShards changes — so
-// the audit DEK survives and the fingerprint check never fails spuriously.
-const auditEnvelopeID uint32 = math.MaxUint32
 
 // LogEngine is the concrete audit logger. When enabled is false (--enable-audit
 // not set), Record() returns immediately with a single bool comparison — no
@@ -58,6 +49,8 @@ type LogEngine struct {
 	// cause, which would hide the root failure from the operator.
 	firstErr error
 }
+
+var envelopeFileName = "audit.env"
 
 // NewLogEngine creates an audit engine. When enabled is false, the engine is
 // a lightweight no-op: no writer opened, no encoder created, Record() is a
@@ -97,7 +90,7 @@ func NewLogEngine(
 		if err != nil {
 			return nil, fmt.Errorf("audit: envelope init: %w", err)
 		}
-		dek, err := env.Load(auditLogPath, auditEnvelopeID)
+		dek, err := env.Load(auditLogPath, envelopeFileName)
 		if err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return nil, fmt.Errorf("audit: load envelope: %w", err)
@@ -105,7 +98,7 @@ func NewLogEngine(
 			if err = env.GenerateDEK(); err != nil {
 				return nil, fmt.Errorf("audit: generate DEK: %w", err)
 			}
-			if err = env.Store(auditLogPath, auditEnvelopeID); err != nil {
+			if err = env.Store(auditLogPath, envelopeFileName); err != nil {
 				return nil, fmt.Errorf("audit: store envelope: %w", err)
 			}
 			dek = env.DEK()
