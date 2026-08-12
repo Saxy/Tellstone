@@ -16,10 +16,15 @@ import (
 	"bytes"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 )
+
+func envelopeFileName(shardID uint32) string {
+	return fmt.Sprintf("shard-%d.env", shardID)
+}
 
 // wrappedDEKLen is the EncryptInPlace output for a 32-byte key: nonce(12) +
 // ciphertext(32) + Poly1305 tag(16).
@@ -63,10 +68,10 @@ func TestEnvelopePassThroughWhenDisabled(t *testing.T) {
 	if err := env.GenerateDEK(); err != nil {
 		t.Fatalf("GenerateDEK should be a no-op: %v", err)
 	}
-	if err := env.Store(t.TempDir(), EnvelopeFileName(0)); err != nil {
+	if err := env.Store(t.TempDir(), envelopeFileName(0)); err != nil {
 		t.Fatalf("Store should be a no-op: %v", err)
 	}
-	dek, err := env.Load(t.TempDir(), EnvelopeFileName(0))
+	dek, err := env.Load(t.TempDir(), envelopeFileName(0))
 	if err != nil {
 		t.Fatalf("Load should be a no-op: %v", err)
 	}
@@ -111,7 +116,7 @@ func TestEnvelopeStoreLoadRoundTrip(t *testing.T) {
 	if err := env.GenerateDEK(); err != nil {
 		t.Fatalf("generate DEK: %v", err)
 	}
-	if err := env.Store(dir, EnvelopeFileName(7)); err != nil {
+	if err := env.Store(dir, envelopeFileName(7)); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 
@@ -119,7 +124,7 @@ func TestEnvelopeStoreLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload init: %v", err)
 	}
-	got, err := reloaded.Load(dir, EnvelopeFileName(7))
+	got, err := reloaded.Load(dir, envelopeFileName(7))
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -140,11 +145,11 @@ func TestEnvelopeFileLayout(t *testing.T) {
 	if err := env.GenerateDEK(); err != nil {
 		t.Fatalf("generate DEK: %v", err)
 	}
-	if err := env.Store(dir, EnvelopeFileName(1)); err != nil {
+	if err := env.Store(dir, envelopeFileName(1)); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 
-	raw, err := os.ReadFile(filepath.Join(dir, EnvelopeFileName(1)))
+	raw, err := os.ReadFile(filepath.Join(dir, envelopeFileName(1)))
 	if err != nil {
 		t.Fatalf("read envelope file: %v", err)
 	}
@@ -174,7 +179,7 @@ func TestEnvelopeLoadRejectsChangedKEK(t *testing.T) {
 	if err := env.GenerateDEK(); err != nil {
 		t.Fatalf("generate DEK: %v", err)
 	}
-	if err := env.Store(dir, EnvelopeFileName(0)); err != nil {
+	if err := env.Store(dir, envelopeFileName(0)); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 
@@ -182,7 +187,7 @@ func TestEnvelopeLoadRejectsChangedKEK(t *testing.T) {
 	if err != nil {
 		t.Fatalf("envelope init: %v", err)
 	}
-	if _, err := other.Load(dir, EnvelopeFileName(0)); err == nil {
+	if _, err := other.Load(dir, envelopeFileName(0)); err == nil {
 		t.Fatal("expected fingerprint mismatch error for a different KEK")
 	}
 }
@@ -191,7 +196,7 @@ func TestEnvelopeLoadRejectsChangedKEK(t *testing.T) {
 // time, not silently accepted.
 func TestEnvelopeLoadRejectsBadFormat(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, EnvelopeFileName(0))
+	path := filepath.Join(dir, envelopeFileName(0))
 	if err := os.WriteFile(path, []byte{0x99, 0x01}, 0600); err != nil {
 		t.Fatalf("write envelope: %v", err)
 	}
@@ -199,7 +204,7 @@ func TestEnvelopeLoadRejectsBadFormat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("envelope init: %v", err)
 	}
-	if _, err := env.Load(dir, EnvelopeFileName(0)); err == nil {
+	if _, err := env.Load(dir, envelopeFileName(0)); err == nil {
 		t.Fatal("expected format error for garbage envelope")
 	}
 }
@@ -214,12 +219,12 @@ func TestEnvelopeLoadRejectsCorruptEnvelope(t *testing.T) {
 	if err := env.GenerateDEK(); err != nil {
 		t.Fatalf("generate DEK: %v", err)
 	}
-	if err := env.Store(dir, EnvelopeFileName(0)); err != nil {
+	if err := env.Store(dir, envelopeFileName(0)); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 
 	// Flip the last tag byte: the Poly1305 check must fail during unwrap.
-	path := filepath.Join(dir, EnvelopeFileName(0))
+	path := filepath.Join(dir, envelopeFileName(0))
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read envelope: %v", err)
@@ -233,7 +238,7 @@ func TestEnvelopeLoadRejectsCorruptEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("envelope init: %v", err)
 	}
-	if _, err := reloaded.Load(dir, EnvelopeFileName(0)); err == nil {
+	if _, err := reloaded.Load(dir, envelopeFileName(0)); err == nil {
 		t.Fatal("expected unwrap failure on corrupted envelope")
 	}
 }
@@ -245,7 +250,7 @@ func TestEnvelopeLoadMissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("envelope init: %v", err)
 	}
-	if _, err := env.Load(t.TempDir(), EnvelopeFileName(42)); !errors.Is(err, os.ErrNotExist) {
+	if _, err := env.Load(t.TempDir(), envelopeFileName(42)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected os.ErrNotExist, got %v", err)
 	}
 }
@@ -267,7 +272,7 @@ func TestEnvelopePerShardIsolation(t *testing.T) {
 			t.Fatalf("generate DEK %d: %v", i, err)
 		}
 		deks[i] = append([]byte(nil), env.DEK()...)
-		if err := env.Store(dir, EnvelopeFileName(uint32(i))); err != nil {
+		if err := env.Store(dir, envelopeFileName(uint32(i))); err != nil {
 			t.Fatalf("store %d: %v", i, err)
 		}
 	}
@@ -281,7 +286,7 @@ func TestEnvelopePerShardIsolation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("reload %d init: %v", i, err)
 		}
-		got, err := reloaded.Load(dir, EnvelopeFileName(uint32(i)))
+		got, err := reloaded.Load(dir, envelopeFileName(uint32(i)))
 		if err != nil {
 			t.Fatalf("load %d: %v", i, err)
 		}
@@ -303,13 +308,13 @@ func TestEnvelopeFilePermissions(t *testing.T) {
 	if err := env.GenerateDEK(); err != nil {
 		t.Fatalf("generate DEK: %v", err)
 	}
-	if err := env.Store(dir, EnvelopeFileName(0)); err != nil {
+	if err := env.Store(dir, envelopeFileName(0)); err != nil {
 		t.Fatalf("store: %v", err)
 	}
 	if info, err := os.Stat(dir); err != nil || info.Mode().Perm() != 0700 {
 		t.Fatalf("envelope dir mode = %o, want 700 (err=%v)", info.Mode().Perm(), err)
 	}
-	if info, err := os.Stat(filepath.Join(dir, EnvelopeFileName(0))); err != nil || info.Mode().Perm() != 0600 {
+	if info, err := os.Stat(filepath.Join(dir, envelopeFileName(0))); err != nil || info.Mode().Perm() != 0600 {
 		t.Fatalf("envelope file mode = %o, want 600 (err=%v)", info.Mode().Perm(), err)
 	}
 }

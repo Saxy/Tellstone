@@ -249,12 +249,6 @@ func (e *Envelope) Load(dir, fileName string) ([]byte, error) {
 	return dek, nil
 }
 
-// envelopeFileName maps a shard to its envelope file. The shard ID is not part of
-// the on-disk layout; the file name is the identifier.
-func EnvelopeFileName(shardID uint32) string {
-	return fmt.Sprintf("shard-%d.env", shardID)
-}
-
 func rnd() ([]byte, error) {
 	b := make([]byte, keySize)
 	_, err := rand.Read(b)
