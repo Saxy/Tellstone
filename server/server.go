@@ -118,6 +118,7 @@ func (s *Server) Run() error {
 	if err = s.initShards(cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
+	s.seedAuditReplay(cryptoEngine)
 	s.initAudit(cryptoEngine)
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
@@ -376,10 +377,7 @@ func (s *Server) initCrypto() (*crypto.Engine, error) {
 func (s *Server) initAudit(cryptoEngine *crypto.Engine) {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
-	var engine crypto.Engine
-	if cryptoEngine != nil {
-		engine = *cryptoEngine
-	}
+	engine := resolveCryptoEngine(cryptoEngine)
 	s.audit = audit.NewLogEngine(
 		cfg.AuditEnabled(),
 		audit.ParseEventTypes(strings.Join(cfg.AuditLogEvents(), ",")),
@@ -387,6 +385,56 @@ func (s *Server) initAudit(cryptoEngine *crypto.Engine) {
 		logger,
 		engine,
 	)
+}
+
+// resolveCryptoEngine turns the nil-when-disabled engine pointer into its value
+// form. Shared by initAudit and seedAuditReplay so the reader and the writer
+// always agree on whether the audit files are encrypted.
+func resolveCryptoEngine(cryptoEngine *crypto.Engine) crypto.Engine {
+	if cryptoEngine == nil {
+		return crypto.Engine{}
+	}
+	return *cryptoEngine
+}
+
+// seedAuditReplay restores the ACL LOG buffer from the audit files a previous
+// run left behind, so ACL LOG survives a restart instead of starting empty. It
+// applies only when RBAC is on and audit records are going to a directory:
+// stdout cannot be read back, and with audit disabled there is nothing to read.
+//
+// Called before initAudit so the glob cannot pick up the file this process is
+// about to create. Recovery is best-effort and never blocks startup — an
+// unreadable or mismatched log simply leaves the buffer empty.
+func (s *Server) seedAuditReplay(cryptoEngine *crypto.Engine) {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+	if s.policy == nil || !cfg.AuditEnabled() {
+		return
+	}
+	dir := cfg.AuditLogPath()
+	if dir == "" || dir == "stdout" {
+		return
+	}
+	replayed := audit.ReplayAuthLog(dir, resolveCryptoEngine(cryptoEngine), rbac.DefaultAuthLogCap, logger)
+	if len(replayed) == 0 {
+		return
+	}
+	entries := make([]rbac.AuthLogEntry, len(replayed))
+	for i, r := range replayed {
+		entries[i] = rbac.AuthLogEntry{
+			Timestamp:  r.Timestamp,
+			Username:   r.Username,
+			RemoteAddr: r.RemoteAddr,
+			Reason:     r.Reason,
+		}
+	}
+	s.policy.SeedAuthLog(entries)
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "server: restored ACL LOG history from the audit log",
+			log.String("dir", dir),
+			log.Int("entries", len(entries)),
+		)
+	}
 }
 
 func (s *Server) initShards(cryptoEngine *crypto.Engine) error {

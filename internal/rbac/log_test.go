@@ -5,6 +5,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
 )
@@ -188,6 +189,88 @@ func TestACLLogDeniedEviction(t *testing.T) {
 	}
 	if entries[len(entries)-1].Username != "u"+itoa(total-1) {
 		t.Fatalf("newest entry = %q, want u%d", entries[len(entries)-1].Username, total-1)
+	}
+}
+
+// TestSeedAuthLog verifies replayed history is restored verbatim, keeping the
+// timestamps the records carried rather than the time of the restore.
+func TestSeedAuthLog(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	past := time.Date(2026, 8, 12, 10, 0, 0, 0, time.UTC)
+	s.SeedAuthLog([]AuthLogEntry{
+		{Timestamp: past, Username: "alice", RemoteAddr: "10.0.0.1:1", Reason: "invalid password"},
+		{Timestamp: past.Add(time.Minute), Username: "bob", RemoteAddr: "10.0.0.2:2", Reason: "NOPERM command=set key=k"},
+	})
+	entries := s.AuthLog()
+	if len(entries) != 2 {
+		t.Fatalf("AuthLog len = %d, want 2", len(entries))
+	}
+	if !entries[0].Timestamp.Equal(past) {
+		t.Fatalf("entry 0 timestamp = %v, want %v", entries[0].Timestamp, past)
+	}
+	if entries[0].Username != "alice" || entries[1].Username != "bob" {
+		t.Fatalf("entries = %+v, want alice then bob", entries)
+	}
+	if entries[1].Reason != "NOPERM command=set key=k" {
+		t.Fatalf("entry 1 Reason = %q", entries[1].Reason)
+	}
+}
+
+// TestSeedAuthLogEmpty verifies seeding nothing leaves the buffer untouched, the
+// case where no audit history existed to replay.
+func TestSeedAuthLogEmpty(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.SeedAuthLog(nil)
+	if entries := s.AuthLog(); entries != nil {
+		t.Fatalf("AuthLog = %v, want nil", entries)
+	}
+}
+
+// TestSeedAuthLogDoesNotCount verifies restored history does not inflate the
+// counters, which report what this process has seen.
+func TestSeedAuthLogDoesNotCount(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.SeedAuthLog([]AuthLogEntry{
+		{Timestamp: time.Now(), Username: "alice", Reason: "invalid password"},
+	})
+	if got := s.AuthFailures(); got != 0 {
+		t.Fatalf("AuthFailures = %d, want 0", got)
+	}
+}
+
+// TestSeedAuthLogEviction verifies seeded entries obey the buffer's capacity
+// instead of getting an exemption from it.
+func TestSeedAuthLogEviction(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	total := DefaultAuthLogCap + 7
+	seed := make([]AuthLogEntry, 0, total)
+	for i := 0; i < total; i++ {
+		seed = append(seed, AuthLogEntry{Timestamp: time.Now(), Username: "u" + itoa(i), Reason: "invalid password"})
+	}
+	s.SeedAuthLog(seed)
+	entries := s.AuthLog()
+	if len(entries) != DefaultAuthLogCap {
+		t.Fatalf("AuthLog len = %d, want %d", len(entries), DefaultAuthLogCap)
+	}
+	if entries[0].Username != "u7" {
+		t.Fatalf("oldest survivor = %q, want u7", entries[0].Username)
+	}
+}
+
+// TestSeedAuthLogThenLive verifies live events append after restored history
+// rather than replacing it.
+func TestSeedAuthLogThenLive(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.SeedAuthLog([]AuthLogEntry{
+		{Timestamp: time.Now().Add(-time.Hour), Username: "restored", Reason: "invalid password"},
+	})
+	s.LogAuthFailure("live", "10.0.0.9:9", "unknown user")
+	entries := s.AuthLog()
+	if len(entries) != 2 {
+		t.Fatalf("AuthLog len = %d, want 2", len(entries))
+	}
+	if entries[0].Username != "restored" || entries[1].Username != "live" {
+		t.Fatalf("entries = %+v, want restored then live", entries)
 	}
 }
 

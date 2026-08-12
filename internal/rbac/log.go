@@ -84,6 +84,25 @@ func (s *Store) LogDenied(username, remoteAddr, cmd, key string) {
 	})
 }
 
+// SeedAuthLog pre-fills the buffer with entries recovered from a persisted
+// audit log, restoring ACL LOG's history across a restart. entries must be in
+// chronological order, oldest first, and are subject to the usual capacity —
+// seeding more than DefaultAuthLogCap keeps the newest.
+//
+// The failure counters are deliberately left alone: they count what this process
+// has seen, and a restart resetting them is the behavior rate() and increase()
+// already assume. Called once at startup, before any listener runs.
+func (s *Store) SeedAuthLog(entries []AuthLogEntry) {
+	if len(entries) == 0 {
+		return
+	}
+	s.logMu.Lock()
+	defer s.logMu.Unlock()
+	for _, entry := range entries {
+		s.appendLocked(entry)
+	}
+}
+
 // AuthLog returns the buffered auth-failure entries in chronological order,
 // oldest first. It returns a copy, so the caller may hold the result after the
 // buffer advances. Empty when nothing has failed. ACL LOG is the only consumer;
