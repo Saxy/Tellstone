@@ -6,7 +6,6 @@ import (
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
 	"github.com/Saxy/Tellstone/internal/audit"
-	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/rbac"
 )
@@ -29,7 +28,10 @@ func newReplayServer(t *testing.T, rbacEnabled bool, args ...string) *Server {
 // dir through a real engine and closing it.
 func writePriorAuditHistory(t *testing.T, dir string) {
 	t.Helper()
-	e := audit.NewLogEngine(true, audit.ParseEventTypes("all"), dir, log.NewNoOpLogger(), crypto.Engine{})
+	e, err := audit.NewLogEngine(true, audit.ParseEventTypes("all"), dir, log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
 	e.Record(audit.EventAuthFailure, "authentication failed",
 		log.String("user", "alice"),
 		log.String("remote_addr", "10.0.0.1:5000"),

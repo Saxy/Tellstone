@@ -12,9 +12,12 @@ import (
 
 // writeAuthEvents records one auth failure and one denial through a real engine
 // and closes it, leaving a finished audit file for replay to read back.
-func writeAuthEvents(t *testing.T, dir string, engine crypto.Engine) {
+func writeAuthEvents(t *testing.T, dir string, engine *crypto.Engine) {
 	t.Helper()
-	e := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), engine)
+	e, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), false, nil, engine)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
 	e.Record(EventAuthFailure, "authentication failed",
 		log.String("user", "alice"),
 		log.String("remote_addr", "10.0.0.1:5000"),
@@ -37,7 +40,7 @@ func writeAuthEvents(t *testing.T, dir string, engine crypto.Engine) {
 // through an unencrypted audit file with their fields intact.
 func TestReplayAuthLogPlaintext(t *testing.T) {
 	dir := t.TempDir()
-	writeAuthEvents(t, dir, crypto.Engine{})
+	writeAuthEvents(t, dir, nil)
 
 	entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger())
 	if len(entries) != 2 {
@@ -69,7 +72,7 @@ func TestReplayAuthLogEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatal("NewEngine:", err)
 	}
-	writeAuthEvents(t, dir, *ce)
+	writeAuthEvents(t, dir, ce)
 
 	entries := ReplayAuthLog(dir, *ce, 100, log.NewNoOpLogger())
 	if len(entries) != 2 {
@@ -87,7 +90,10 @@ func TestReplayAuthLogEncrypted(t *testing.T) {
 // types never reach ACL LOG.
 func TestReplayAuthLogIgnoresOtherEvents(t *testing.T) {
 	dir := t.TempDir()
-	e := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), crypto.Engine{})
+	e, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
 	e.Record(EventConnect, "client connected", log.String("remote_addr", "10.0.0.1:1"))
 	e.Record(EventAuthSuccess, "client authenticated", log.String("user", "alice"))
 	e.Record(EventCommand, "command dispatched", log.String("command", "get"))
@@ -105,7 +111,10 @@ func TestReplayAuthLogIgnoresOtherEvents(t *testing.T) {
 // and still returns them oldest first.
 func TestReplayAuthLogCapsAtMaxEntries(t *testing.T) {
 	dir := t.TempDir()
-	e := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), crypto.Engine{})
+	e, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
 	for i := 0; i < 10; i++ {
 		e.Record(EventAuthFailure, "authentication failed",
 			log.String("user", "u"+string(rune('0'+i))),
@@ -132,7 +141,10 @@ func TestReplayAuthLogCapsAtMaxEntries(t *testing.T) {
 // across a rotation boundary, since each file is a separate read.
 func TestReplayAuthLogAcrossRotatedFiles(t *testing.T) {
 	dir := t.TempDir()
-	e := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), crypto.Engine{})
+	e, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), false, nil, nil)
+	if err != nil {
+		t.Fatal("NewLogEngine:", err)
+	}
 	f, ok := e.writer.(*file)
 	if !ok {
 		t.Fatalf("engine writer is %T, want *file", e.writer)
@@ -176,7 +188,7 @@ func TestReplayAuthLogAcrossRotatedFiles(t *testing.T) {
 // valid records on both sides of it are still recovered.
 func TestReplayAuthLogSkipsCorruptLine(t *testing.T) {
 	dir := t.TempDir()
-	writeAuthEvents(t, dir, crypto.Engine{})
+	writeAuthEvents(t, dir, nil)
 
 	path := singleAuditFile(t, dir)
 	data, err := os.ReadFile(path)
@@ -203,7 +215,7 @@ func TestReplayAuthLogSkipsCorruptLine(t *testing.T) {
 // the partial trailing line is dropped, the completed records survive.
 func TestReplayAuthLogTruncatedPlaintextTail(t *testing.T) {
 	dir := t.TempDir()
-	writeAuthEvents(t, dir, crypto.Engine{})
+	writeAuthEvents(t, dir, nil)
 
 	path := singleAuditFile(t, dir)
 	data, err := os.ReadFile(path)
@@ -234,7 +246,7 @@ func TestReplayAuthLogTruncatedEncryptedTail(t *testing.T) {
 		"length beyond file":    {0x00, 0x00, 0xFF, 0xFF, 0x01, 0x02},
 	} {
 		dir := t.TempDir()
-		writeAuthEvents(t, dir, *ce)
+		writeAuthEvents(t, dir, ce)
 		path := singleAuditFile(t, dir)
 		data, readErr := os.ReadFile(path)
 		if readErr != nil {
@@ -258,7 +270,7 @@ func TestReplayAuthLogUndecryptableRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal("NewEngine:", err)
 	}
-	writeAuthEvents(t, dir, *ce)
+	writeAuthEvents(t, dir, ce)
 
 	path := singleAuditFile(t, dir)
 	data, err := os.ReadFile(path)
@@ -301,7 +313,7 @@ func TestReplayAuthLogEmptyDirectory(t *testing.T) {
 // all rather than everything.
 func TestReplayAuthLogZeroMaxEntries(t *testing.T) {
 	dir := t.TempDir()
-	writeAuthEvents(t, dir, crypto.Engine{})
+	writeAuthEvents(t, dir, nil)
 	if entries := ReplayAuthLog(dir, crypto.Engine{}, 0, log.NewNoOpLogger()); entries != nil {
 		t.Fatalf("ReplayAuthLog = %+v, want nil", entries)
 	}
@@ -310,7 +322,7 @@ func TestReplayAuthLogZeroMaxEntries(t *testing.T) {
 // TestReplayAuthLogNilLogger verifies the logger is optional, matching newFile.
 func TestReplayAuthLogNilLogger(t *testing.T) {
 	dir := t.TempDir()
-	writeAuthEvents(t, dir, crypto.Engine{})
+	writeAuthEvents(t, dir, nil)
 	if entries := ReplayAuthLog(dir, crypto.Engine{}, 100, nil); len(entries) != 2 {
 		t.Fatalf("ReplayAuthLog len = %d, want 2", len(entries))
 	}
@@ -326,13 +338,13 @@ func TestReplayAuthLogFormatMismatch(t *testing.T) {
 	}
 
 	plainDir := t.TempDir()
-	writeAuthEvents(t, plainDir, crypto.Engine{})
+	writeAuthEvents(t, plainDir, nil)
 	if entries := ReplayAuthLog(plainDir, *ce, 100, log.NewNoOpLogger()); len(entries) != 0 {
 		t.Fatalf("plaintext read as encrypted = %+v, want no entries", entries)
 	}
 
 	encDir := t.TempDir()
-	writeAuthEvents(t, encDir, *ce)
+	writeAuthEvents(t, encDir, ce)
 	if entries := ReplayAuthLog(encDir, crypto.Engine{}, 100, log.NewNoOpLogger()); len(entries) != 0 {
 		t.Fatalf("encrypted read as plaintext = %+v, want no entries", entries)
 	}
@@ -343,7 +355,7 @@ func TestReplayAuthLogFormatMismatch(t *testing.T) {
 func TestReplayAuthLogTimestampPreserved(t *testing.T) {
 	dir := t.TempDir()
 	before := time.Now()
-	writeAuthEvents(t, dir, crypto.Engine{})
+	writeAuthEvents(t, dir, nil)
 	after := time.Now()
 
 	entries := ReplayAuthLog(dir, crypto.Engine{}, 100, log.NewNoOpLogger())

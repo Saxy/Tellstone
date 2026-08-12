@@ -73,7 +73,7 @@ func auditLines(t *testing.T, dir string) []string {
 
 func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 	dir := t.TempDir()
-	f, err := newFile(dir, crypto.Engine{}, log.NewNoOpLogger())
+	f, err := newFile(dir, &crypto.Engine{}, log.NewNoOpLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 	if len(parts) != 3 {
 		t.Fatalf("expected <timestamp>_<hash>_<pid>_tsd.log, got %q", base)
 	}
-	if _, err := fmt.Sscanf(parts[0], "%d", new(int64)); err != nil {
+	if _, err = fmt.Sscanf(parts[0], "%d", new(int64)); err != nil {
 		t.Fatalf("timestamp segment %q is not numeric: %v", parts[0], err)
 	}
 	if len(parts[1]) != 8 {
@@ -104,7 +104,7 @@ func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 
 func TestFileRotation(t *testing.T) {
 	dir := t.TempDir()
-	f, err := newFile(dir, crypto.Engine{}, log.NewNoOpLogger())
+	f, err := newFile(dir, &crypto.Engine{}, log.NewNoOpLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -131,10 +131,10 @@ func TestFileRotation(t *testing.T) {
 		t.Fatalf("previous file holds %q, want both writes", data)
 	}
 
-	if _, err := f.Write([]byte("xyz")); err != nil {
+	if _, err = f.Write([]byte("xyz")); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Close(); err != nil {
+	if err = f.Close(); err != nil {
 		t.Fatal(err)
 	}
 	data, err = os.ReadFile(f.path)
@@ -175,7 +175,10 @@ func TestFileAuditLoggingEncrypted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), *ce)
+	e, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), false, nil, ce)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	records := []struct {
 		event EventType
@@ -228,6 +231,101 @@ func TestFileAuditLoggingEncrypted(t *testing.T) {
 	}
 	if len(data) != 0 {
 		t.Fatalf("file holds %d trailing bytes beyond the last record", len(data))
+	}
+}
+
+func TestFileAuditLoggingEnvelope(t *testing.T) {
+	dir := t.TempDir()
+	kek := bytes.Repeat([]byte{0x2a}, 32)
+
+	e, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), true, kek, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.Record(EventAuthSuccess, "user logged in", log.String("user", "alice"))
+	if err = e.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// The DEK envelope is stored beside the records it protects and the records
+	// themselves carry no plaintext marker.
+	matches, err := filepath.Glob(filepath.Join(dir, "*.env"))
+	if err != nil {
+		t.Fatal("Glob:", err)
+	}
+	if len(matches) != 1 {
+		t.Fatalf("expected exactly one envelope file, got %d: %v", len(matches), matches)
+	}
+	data, err := os.ReadFile(singleAuditFile(t, dir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "AUDIT") {
+		t.Fatal("envelope-encrypted audit file contains plaintext AUDIT marker")
+	}
+
+	// A restart with the same KEK must load the stored DEK (the Load path)
+	// rather than generating a fresh one, and still write decryptable records.
+	e2, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), true, kek, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2.Record(EventACLDeny, "command denied")
+	if err = e2.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A changed KEK must fail the engine closed instead of minting a fresh DEK
+	// that would brick the existing audit history.
+	if e3, err := NewLogEngine(true, ParseEventTypes("all"), dir, log.NewNoOpLogger(), true, bytes.Repeat([]byte{0x11}, 32), nil); err == nil {
+		_ = e3.Close()
+		t.Fatal("changed KEK unexpectedly accepted")
+	}
+
+	env, err := crypto.NewEnvelope(kek, log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dek, err := env.Load(dir, envelopeFileName)
+	if err != nil {
+		t.Fatalf("failed to load audit DEK for decoding: %v", err)
+	}
+	ce, err := crypto.NewEngine(dek, log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Every record across both boots decodes with the restored DEK.
+	var msgs []string
+	for _, p := range auditFilePaths(t, dir) {
+		data, err = os.ReadFile(p)
+		if err != nil {
+			t.Fatal("ReadFile:", err)
+		}
+		for len(data) > 0 {
+			if len(data) < 4 {
+				t.Fatalf("%s: truncated length prefix (%d bytes left)", p, len(data))
+			}
+			blobLen := int(binary.BigEndian.Uint32(data[:4]))
+			data = data[4:]
+			if blobLen == 0 || blobLen > len(data) {
+				t.Fatalf("%s: invalid blob length %d (remaining %d)", p, blobLen, len(data))
+			}
+			var plain []byte
+			plain, err = ce.DecryptInPlace(data[:blobLen])
+			if err != nil {
+				t.Fatalf("%s: failed to decrypt: %v", p, err)
+			}
+			var m map[string]any
+			if err = json.Unmarshal(plain, &m); err != nil {
+				t.Fatalf("%s: not valid JSON after decryption: %v\n%s", p, err, plain)
+			}
+			msgs = append(msgs, fmt.Sprintf("%v", m["msg"]))
+			data = data[blobLen:]
+		}
+	}
+	if got := strings.Join(msgs, "|"); got != "user logged in|command denied" {
+		t.Fatalf("decrypted messages = %v", msgs)
 	}
 }
 

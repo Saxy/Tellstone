@@ -29,6 +29,7 @@ type Config struct {
 	evictTicker       time.Duration
 	evictSlots        uint32
 	enableEncryption  bool
+	enableEnvelope    bool
 	encryptionKey     string
 	encryptionKeyFile string
 	traceRatio        float64
@@ -122,6 +123,7 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_RESP_STARTTLS   – allow RESP clients to upgrade plaintext connections to TLS
 //		TSD_ENABLE_METRICS  – boolean to activate the Prometheus exporter (default: false)
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
+//	 	TSD_ENABLE_ENVELOPE    – boolean to enable envelope encryption (KEK wraps a per-shard DEK; default: false)
 //		TSD_SHUTDOWN_TIMEOUT – max wait for graceful shutdown on SIGINT/SIGTERM (default: 10s)
 //		TSD_NUM_SHARDS      – number of shared-nothing shards (default: GOMAXPROCS)
 //		TSD_ENABLE_PERSISTENCE – boolean to enable WAL persistence (default: false)
@@ -209,6 +211,14 @@ func LoadConfig(args []string) *Config {
 		"encryption-key-file",
 		getEnv("TSD_ENCRYPTION_KEY_FILE", ""),
 		"Path to a file holding the raw (unencoded) 32-byte encryption key; empty disables (default: none)",
+	)
+	// Envelope encryption: the configured key becomes a KEK that wraps a per-shard
+	// random DEK. Opt-in; the legacy single-key mode remains the default.
+	fs.BoolVar(
+		&cfg.enableEnvelope,
+		"enable-envelope",
+		getEnv("TSD_ENABLE_ENVELOPE", false),
+		"Envelope encryption: wrap a per-shard random DEK with the configured key (default: false)",
 	)
 	// OpenTelemetry trace sampling ratio.
 	fs.Float64Var(
@@ -402,6 +412,10 @@ func LoadConfig(args []string) *Config {
 	if cfg.enableEncryption && cfg.encryptionKey == "" && cfg.encryptionKeyFile == "" {
 		panic("tellstone: --enable-encryption requires --encryption-key or --encryption-key-file")
 	}
+	// Envelope encryption is a mode of --enable-encryption, not a substitute for it.
+	if cfg.enableEnvelope && !cfg.enableEncryption {
+		panic("tellstone: --enable-envelope requires --enable-encryption")
+	}
 	return cfg
 }
 
@@ -412,6 +426,7 @@ func (cfg *Config) GetLogLevel() log.Level            { return cfg.logLevel }
 func (cfg *Config) GetEvictTicker() time.Duration     { return cfg.evictTicker }
 func (cfg *Config) GetEvictSlots() uint32             { return cfg.evictSlots }
 func (cfg *Config) EncryptionEnabled() bool           { return cfg.enableEncryption }
+func (cfg *Config) EnvelopeEnabled() bool             { return cfg.enableEnvelope }
 func (cfg *Config) GetEncryptionKey() string          { return cfg.encryptionKey }
 func (cfg *Config) GetEncryptionKeyFile() string      { return cfg.encryptionKeyFile }
 func (cfg *Config) GetTraceRatio() float64            { return cfg.traceRatio }

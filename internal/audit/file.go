@@ -39,7 +39,7 @@ type file struct {
 	dir          string
 	path         string
 	isEncrypted  bool
-	ce           crypto.Engine
+	ce           *crypto.Engine
 	file         *os.File
 	bytesWritten uint64
 	maxSize      uint64
@@ -49,9 +49,9 @@ type file struct {
 
 // newFile opens the first audit file inside dir. When engine.Enabled() is
 // false, records are written as plaintext; otherwise every record is sealed.
-func newFile(dir string, engine crypto.Engine, logger log.Logger) (*file, error) {
+func newFile(dir string, engine *crypto.Engine, logger log.Logger) (*file, error) {
 	f := &file{dir: dir, maxSize: rotateAfterBytes}
-	if engine.Enabled() {
+	if engine != nil && engine.Enabled() {
 		f.isEncrypted = true
 		f.ce = engine
 	}

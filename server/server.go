@@ -92,7 +92,7 @@ func NewServer(app *tellstone.App) *Server {
 func (s *Server) Run() error {
 	logger := s.app.GetLogger()
 	cfg := s.app.GetConfig()
-	cryptoEngine, err := s.initCrypto()
+	key, cryptoEngine, err := s.initCrypto()
 	if err != nil {
 		return fmt.Errorf("crypto init: %w", err)
 	}
@@ -115,11 +115,13 @@ func (s *Server) Run() error {
 	if err = s.initOAuth(); err != nil {
 		return fmt.Errorf("oauth init: %w", err)
 	}
-	if err = s.initShards(cryptoEngine); err != nil {
+	s.seedAuditReplay(cryptoEngine)
+	if err = s.initAudit(key, cryptoEngine); err != nil {
+		return fmt.Errorf("audit init: %w", err)
+	}
+	if err = s.initShards(key, cryptoEngine); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
-	s.seedAuditReplay(cryptoEngine)
-	s.initAudit(cryptoEngine)
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
 		cfg.GetMaxMsgSize(),
@@ -334,16 +336,18 @@ func (s *Server) shutdown(ctx context.Context) {
 	}
 }
 
-// initCrypto resolves the encryption key and builds the at-rest cipher engine. The key
-// comes from whichever KeyProvider matches the configured source — a file when
-// --encryption-key-file is set, otherwise the base64 flag value — and is read exactly
-// once here, never from the encrypt/decrypt hot path. It returns a nil engine when
-// encryption is disabled, which leaves callers in pass-through mode.
-func (s *Server) initCrypto() (*crypto.Engine, error) {
+// initCrypto resolves the encryption key and builds the shared at-rest cipher
+// engine. The key comes from whichever KeyProvider matches the configured source —
+// a file when --encryption-key-file is set, otherwise the base64 flag value — and
+// is read exactly once here, never from the encrypt/decrypt hot path. The raw key
+// is returned alongside the engine so envelope mode can hand it to each shard as a
+// KEK. Both are nil when encryption is disabled, leaving callers in pass-through
+// mode.
+func (s *Server) initCrypto() ([]byte, *crypto.Engine, error) {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
 	if !cfg.EncryptionEnabled() {
-		return nil, nil
+		return nil, nil, nil
 	}
 	var provider crypto.KeyProvider
 	switch {
@@ -357,16 +361,16 @@ func (s *Server) initCrypto() (*crypto.Engine, error) {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "encryption key resolution failed", log.String("error", err.Error()))
 		}
-		return nil, fmt.Errorf("encryption key resolution: %w", err)
+		return nil, nil, fmt.Errorf("encryption key resolution: %w", err)
 	}
 	cryptoEngine, err := crypto.NewEngine(key, logger)
 	if err != nil {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "server: crypto engine setup failed", log.String("error", err.Error()))
 		}
-		return nil, fmt.Errorf("crypto engine initialization: %w", err)
+		return nil, nil, fmt.Errorf("crypto engine initialization: %w", err)
 	}
-	return cryptoEngine, nil
+	return key, cryptoEngine, nil
 }
 
 // initAudit constructs the shared audit engine from the --enable-audit,
@@ -374,17 +378,26 @@ func (s *Server) initCrypto() (*crypto.Engine, error) {
 // disabled --enable-audit yields the no-op engine, so every listener hook can
 // call Record() unconditionally. cryptoEngine is nil when encryption is off;
 // the zero-value crypto.Engine keeps the file writer's encryption path inert.
-func (s *Server) initAudit(cryptoEngine *crypto.Engine) {
+// In envelope mode the audit engine derives its own DEK engine, leaving the
+// caller's cryptoEngine untouched for the shards.
+func (s *Server) initAudit(key []byte, cryptoEngine *crypto.Engine) error {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
-	engine := resolveCryptoEngine(cryptoEngine)
-	s.audit = audit.NewLogEngine(
+	var engine *crypto.Engine
+	if cryptoEngine != nil {
+		engine = cryptoEngine
+	}
+	var err error
+	s.audit, err = audit.NewLogEngine(
 		cfg.AuditEnabled(),
 		audit.ParseEventTypes(strings.Join(cfg.AuditLogEvents(), ",")),
 		cfg.AuditLogPath(),
 		logger,
+		cfg.EncryptionEnabled() && cfg.EnvelopeEnabled(),
+		key,
 		engine,
 	)
+	return err
 }
 
 // resolveCryptoEngine turns the nil-when-disabled engine pointer into its value
@@ -437,7 +450,7 @@ func (s *Server) seedAuditReplay(cryptoEngine *crypto.Engine) {
 	}
 }
 
-func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
+func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
 	cfg := s.app.GetConfig()
 	numShards := cfg.GetNumShards()
 	logger := s.app.GetLogger()
@@ -456,7 +469,7 @@ func (s *Server) initShards(cryptoEngine *crypto.Engine) error {
 
 	s.shards = make([]*shard.Shard, numShards)
 	for i := 0; i < numShards; i++ {
-		sh, err := shard.Run(shard.ID(i), cfg, cryptoEngine, logger, store)
+		sh, err := shard.Run(shard.ID(i), cfg, key, cryptoEngine, logger, store)
 		if err != nil {
 			if logger.Enabled(log.LevelError) {
 				logger.Log(log.LevelError, "server: shard initialization failed",

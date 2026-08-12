@@ -13,8 +13,10 @@ Authors:
 */
 package crypto
 
+import "golang.org/x/crypto/chacha20poly1305"
+
 // keySize is the ChaCha20-Poly1305 key length that NewEngine enforces.
-const keySize = 32
+const keySize = chacha20poly1305.KeySize
 
 // KeyProvider resolves the raw encryption key. Resolution happens once at server
 // startup; implementations are not called from the encrypt/decrypt hot path and may

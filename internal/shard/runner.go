@@ -12,7 +12,11 @@ package shard
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"sync/atomic"
 	"time"
 
@@ -56,7 +60,11 @@ func (s *Shard) TotalConnections() uint64 { return atomic.LoadUint64(&s.totalCon
 func (s *Shard) BytesRead() uint64        { return atomic.LoadUint64(&s.bytesRead) }
 func (s *Shard) BytesWritten() uint64     { return atomic.LoadUint64(&s.bytesWritten) }
 
-func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logger, store *persistence.Storage) (*Shard, error) {
+func envelopeFileName(shardID uint32) string {
+	return fmt.Sprintf("shard-%d.env", shardID)
+}
+
+func Run(id ID, cfg *config.Config, key []byte, cryptoEngine *crypto.Engine, logger log.Logger, store *persistence.Storage) (*Shard, error) {
 	if logger == nil {
 		logger = log.NewNoOpLogger()
 	}
@@ -65,6 +73,38 @@ func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logg
 		maxBytes = maxBytes / uint64(cfg.GetNumShards())
 	}
 	shardLogger := log.NewShardLogger(logger, uint32(id))
+	if store == nil {
+		store, _ = persistence.NewStorage(false, logger, cfg.GetPersistenceDir())
+	}
+	// In envelope mode the configured key is a KEK: each shard owns a random DEK
+	// wrapped by the KEK, so the KEK never touches data and shards share no key
+	// material. The DEK is loaded from the shard's envelope file, or generated and
+	// stored on the first boot. A changed KEK is rejected here (fail-closed) rather
+	// than silently generating fresh DEKs and bricking the dataset.
+	if cfg.EncryptionEnabled() && cfg.EnvelopeEnabled() {
+		env, err := crypto.NewEnvelope(key, shardLogger)
+		if err != nil {
+			return nil, fmt.Errorf("shard %d: envelope init: %w", id, err)
+		}
+		envDir := envelopeDir(cfg)
+		dek, err := env.Load(envDir, envelopeFileName(uint32(id)))
+		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				return nil, fmt.Errorf("shard %d: load envelope: %w", id, err)
+			}
+			if err = env.GenerateDEK(); err != nil {
+				return nil, fmt.Errorf("shard %d: generate DEK: %w", id, err)
+			}
+			if err = env.Store(envDir, envelopeFileName(uint32(id))); err != nil {
+				return nil, fmt.Errorf("shard %d: store envelope: %w", id, err)
+			}
+			dek = env.DEK()
+		}
+		cryptoEngine, err = crypto.NewEngine(dek, shardLogger)
+		if err != nil {
+			return nil, fmt.Errorf("shard %d: data engine init: %w", id, err)
+		}
+	}
 	engine := storage.NewEngine(
 		cfg.GetEvictTicker(),
 		cfg.GetEvictSlots(),
@@ -72,9 +112,6 @@ func Run(id ID, cfg *config.Config, cryptoEngine *crypto.Engine, logger log.Logg
 		shardLogger,
 		cryptoEngine,
 	)
-	if store == nil {
-		store, _ = persistence.NewStorage(false, logger, "")
-	}
 	shard := &Shard{
 		ID:          id,
 		Engine:      engine,
@@ -150,4 +187,31 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 func (s *Shard) Stop(_ context.Context) error {
 	s.Engine.Close()
 	return nil
+}
+
+// envelopeDir returns where per-shard envelope files live: the configured
+// persistence dir, or the platform default data dir when none is set. The envelope
+// must stay durable independently of the WAL, so it is written even when
+// --enable-persistence is disabled.
+func envelopeDir(cfg *config.Config) string {
+	if dir := cfg.GetPersistenceDir(); dir != "" {
+		return dir
+	}
+	return defaultDataDir()
+}
+
+// defaultDataDir mirrors persistence's platform default so envelope files have a
+// durable home when the WAL is disabled. Keep in lockstep with
+// persistence.getDefaultDir.
+func defaultDataDir() string {
+	var baseDir string
+	switch runtime.GOOS {
+	case "windows":
+		baseDir = os.Getenv("APPDATA")
+	case "darwin":
+		baseDir = filepath.Join(os.Getenv("HOME"), "Library", "Application Support")
+	default:
+		baseDir = filepath.Join(os.Getenv("HOME"), ".local", "share")
+	}
+	return filepath.Join(baseDir, "tellstone", "data")
 }

@@ -331,6 +331,38 @@ func TestEnableEncryptionAcceptsEitherKeySource(t *testing.T) {
 	}
 }
 
+func TestEnableEnvelopePanicWithoutEncryption(t *testing.T) {
+	t.Setenv("TSD_ENABLE_ENCRYPTION", "false")
+	t.Setenv("TSD_ENCRYPTION_KEY", "")
+	t.Setenv("TSD_ENCRYPTION_KEY_FILE", "")
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when --enable-envelope is set without --enable-encryption")
+		}
+	}()
+	LoadConfig([]string{"--enable-envelope"})
+}
+
+func TestEnableEnvelopeRequiresKeySource(t *testing.T) {
+	t.Setenv("TSD_ENCRYPTION_KEY", "")
+	t.Setenv("TSD_ENCRYPTION_KEY_FILE", "")
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic when --enable-envelope has no key source")
+		}
+	}()
+	LoadConfig([]string{"--enable-encryption", "--enable-envelope"})
+}
+
+func TestEnableEnvelopeAcceptedWithKey(t *testing.T) {
+	t.Setenv("TSD_ENCRYPTION_KEY", "")
+	t.Setenv("TSD_ENCRYPTION_KEY_FILE", "")
+	cfg := LoadConfig([]string{"--enable-encryption", "--enable-envelope", "--encryption-key", "raw-key-value"})
+	if !cfg.EnvelopeEnabled() {
+		t.Fatal("envelope mode should be enabled")
+	}
+}
+
 func TestTLSEnvVars(t *testing.T) {
 	t.Setenv("TSD_TLS_CERT", "/env/cert.pem")
 	t.Setenv("TSD_TLS_KEY", "/env/key.pem")
