@@ -641,7 +641,11 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	if s.policy != nil {
 		p := s.policy.Load()
 		if p == nil {
-			return authResult{respPayload: ResponseAuthErr, respType: MsgAuthErr}
+			// Recorded like any other rejection rather than returned bare: this
+			// is still a failed AUTH, so it belongs in ACL LOG and the audit
+			// trail and must count against the per-connection limit. The RESP
+			// listener reports it under the same reason.
+			return authResult{respPayload: s.authFailed(st, string(username), "policy not loaded"), respType: MsgAuthErr}
 		}
 		name = "default"
 		if len(username) > 0 {

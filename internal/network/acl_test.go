@@ -536,3 +536,48 @@ func TestClientACLMethods(t *testing.T) {
 		t.Fatalf("log entry missing timestamp or remote address: %+v", last)
 	}
 }
+
+// TestServerACLLogPolicyNotLoaded covers the AUTH rejection that fires when the
+// store holds no policy snapshot. It is still a failed AUTH, so it has to reach
+// ACL LOG and count against the per-connection limit rather than returning bare.
+func TestServerACLLogPolicyNotLoaded(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve port: %v", err)
+	}
+	addr := l.Addr().String()
+	_ = l.Close()
+
+	// A store with no snapshot: Load() returns nil, the condition under test.
+	store := rbac.NewStore(nil, log.NewNoOpLogger())
+	srv := NewServer(addr, 0, nil, aclTestHandler(store), log.NewNoOpLogger(), nil, "", store, nil, newNoOpAudit())
+	go func() { _ = srv.ListenAndServe() }()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	if err = waitForServer(addr, 2*time.Second); err != nil {
+		t.Fatalf("server not ready: %v", err)
+	}
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("alice", "whatever")); resp.Type != MsgAuthErr {
+		t.Fatalf("expected MsgAuthErr, got %v", resp.Type)
+	}
+
+	entries := store.AuthLog()
+	if len(entries) != 1 {
+		t.Fatalf("AuthLog len = %d, want 1", len(entries))
+	}
+	if entries[0].Username != "alice" || entries[0].Reason != "policy not loaded" {
+		t.Fatalf("entry 0 = %+v, want alice/policy not loaded", entries[0])
+	}
+	if got := store.AuthFailures(); got != 1 {
+		t.Fatalf("AuthFailures = %d, want 1", got)
+	}
+}
