@@ -173,13 +173,19 @@ func decodePlaintext(data []byte) []ReplayEntry {
 func decodeEncrypted(data []byte, engine *crypto.Engine, path string, logger log.Logger) []ReplayEntry {
 	var out []ReplayEntry
 	for len(data) >= 4 {
-		blobLen := int(binary.BigEndian.Uint32(data[:4]))
+		// Kept unsigned, the width the prefix is written in, and compared as
+		// uint64 so the check means the same thing on every platform. Converting
+		// to int first would turn a prefix of 0x80000000 or more negative where
+		// int is 32 bits, slipping past the bounds check and panicking on the
+		// slice below. The length comes from disk, so a crash or a tampered file
+		// can put any value here.
+		blobLen := binary.BigEndian.Uint32(data[:4])
 		data = data[4:]
-		if blobLen == 0 || blobLen > len(data) {
+		if blobLen == 0 || uint64(blobLen) > uint64(len(data)) {
 			if logger.Enabled(log.LevelWarn) {
 				logger.Log(log.LevelWarn, "audit: replay stopped at a truncated record",
 					log.String("filename", path),
-					log.Int("record_bytes", blobLen),
+					log.Uint("record_bytes", blobLen),
 					log.Int("remaining_bytes", len(data)),
 				)
 			}

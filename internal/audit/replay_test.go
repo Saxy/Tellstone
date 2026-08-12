@@ -195,13 +195,23 @@ func TestReplayAuthLogSkipsCorruptLine(t *testing.T) {
 	if err != nil {
 		t.Fatal("ReadFile:", err)
 	}
-	// Splice a malformed line between the two valid records.
+	// Splice a malformed line between the two valid records. The pieces are
+	// copied into a buffer of the test's own rather than appended onto one of
+	// them: SplitN returns subslices of data, and appending to one in place
+	// would overwrite the record that follows it.
 	lines := bytes.SplitN(data, []byte{'\n'}, 2)
-	corrupted := append(append(lines[0], []byte("\n{not json at all\n")...), lines[1]...)
+	var corrupted []byte
+	corrupted = append(corrupted, lines[0]...)
+	corrupted = append(corrupted, "\n{not json at all\n"...)
+	corrupted = append(corrupted, lines[1]...)
 	if err = os.WriteFile(path, corrupted, 0o600); err != nil {
 		t.Fatal("WriteFile:", err)
 	}
 
+	// Three lines in, two records out: the middle one is the skipped record.
+	if got := bytes.Count(corrupted, []byte{'\n'}); got != 3 {
+		t.Fatalf("corrupted file has %d lines, want 3", got)
+	}
 	entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger())
 	if len(entries) != 2 {
 		t.Fatalf("ReplayAuthLog len = %d, want 2 (corrupt line skipped)", len(entries))
@@ -452,5 +462,39 @@ func TestLogEngineReplayAuthLogNoFileWriter(t *testing.T) {
 	}
 	if entries := stdout.ReplayAuthLog(100); entries != nil {
 		t.Fatalf("stdout engine replayed %+v, want nil", entries)
+	}
+}
+
+// TestReplayAuthLogHugeFrameLength feeds the length prefixes that a corrupt or
+// tampered file can carry. 0x80000000 is the one that matters: it converts to a
+// negative int where int is 32 bits, which would pass a bounds check written
+// against int and panic on the slice.
+func TestReplayAuthLogHugeFrameLength(t *testing.T) {
+	ce, err := crypto.NewEngine(bytes.Repeat([]byte{0x42}, 32), log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal("NewEngine:", err)
+	}
+
+	for name, prefix := range map[string][]byte{
+		"high bit set": {0x80, 0x00, 0x00, 0x00},
+		"max uint32":   {0xFF, 0xFF, 0xFF, 0xFF},
+	} {
+		dir := t.TempDir()
+		writeAuthEvents(t, dir, ce)
+		path := singleAuditFile(t, dir)
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal("ReadFile:", readErr)
+		}
+		// Append the bogus prefix plus a little payload, so the only thing
+		// stopping the decoder is the length check itself.
+		tail := append(append([]byte(nil), prefix...), 0x01, 0x02, 0x03, 0x04)
+		if writeErr := os.WriteFile(path, append(data, tail...), 0o600); writeErr != nil {
+			t.Fatal("WriteFile:", writeErr)
+		}
+		entries := replayAuthLog(dir, ce, 100, log.NewNoOpLogger())
+		if len(entries) != 2 {
+			t.Fatalf("%s: replayAuthLog len = %d, want 2", name, len(entries))
+		}
 	}
 }
