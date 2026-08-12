@@ -87,7 +87,7 @@ func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 	if len(parts) != 3 {
 		t.Fatalf("expected <timestamp>_<hash>_<pid>_tsd.log, got %q", base)
 	}
-	if _, err := fmt.Sscanf(parts[0], "%d", new(int64)); err != nil {
+	if _, err = fmt.Sscanf(parts[0], "%d", new(int64)); err != nil {
 		t.Fatalf("timestamp segment %q is not numeric: %v", parts[0], err)
 	}
 	if len(parts[1]) != 8 {
@@ -131,10 +131,10 @@ func TestFileRotation(t *testing.T) {
 		t.Fatalf("previous file holds %q, want both writes", data)
 	}
 
-	if _, err := f.Write([]byte("xyz")); err != nil {
+	if _, err = f.Write([]byte("xyz")); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.Close(); err != nil {
+	if err = f.Close(); err != nil {
 		t.Fatal(err)
 	}
 	data, err = os.ReadFile(f.path)
@@ -243,7 +243,7 @@ func TestFileAuditLoggingEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Record(EventAuthSuccess, "user logged in", log.String("user", "alice"))
-	if err := e.Close(); err != nil {
+	if err = e.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -271,7 +271,7 @@ func TestFileAuditLoggingEnvelope(t *testing.T) {
 		t.Fatal(err)
 	}
 	e2.Record(EventACLDeny, "command denied")
-	if err := e2.Close(); err != nil {
+	if err = e2.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -298,7 +298,7 @@ func TestFileAuditLoggingEnvelope(t *testing.T) {
 	// Every record across both boots decodes with the restored DEK.
 	var msgs []string
 	for _, p := range auditFilePaths(t, dir) {
-		data, err := os.ReadFile(p)
+		data, err = os.ReadFile(p)
 		if err != nil {
 			t.Fatal("ReadFile:", err)
 		}
@@ -311,12 +311,13 @@ func TestFileAuditLoggingEnvelope(t *testing.T) {
 			if blobLen == 0 || blobLen > len(data) {
 				t.Fatalf("%s: invalid blob length %d (remaining %d)", p, blobLen, len(data))
 			}
-			plain, err := ce.DecryptInPlace(data[:blobLen])
+			var plain []byte
+			plain, err = ce.DecryptInPlace(data[:blobLen])
 			if err != nil {
 				t.Fatalf("%s: failed to decrypt: %v", p, err)
 			}
 			var m map[string]any
-			if err := json.Unmarshal(plain, &m); err != nil {
+			if err = json.Unmarshal(plain, &m); err != nil {
 				t.Fatalf("%s: not valid JSON after decryption: %v\n%s", p, err, plain)
 			}
 			msgs = append(msgs, fmt.Sprintf("%v", m["msg"]))
