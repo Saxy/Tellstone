@@ -95,3 +95,129 @@ func TestACLLogConcurrent(t *testing.T) {
 		}
 	}
 }
+
+// TestACLLogDenied verifies a denial records the command and key folded into
+// Reason, the format both ACL LOG wire encodings render verbatim.
+func TestACLLogDenied(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.LogDenied("bob", "10.0.0.5:5512", "SET", "forbidden:key")
+	entries := s.AuthLog()
+	if len(entries) != 1 {
+		t.Fatalf("AuthLog len = %d, want 1", len(entries))
+	}
+	e := entries[0]
+	if e.Username != "bob" || e.RemoteAddr != "10.0.0.5:5512" {
+		t.Fatalf("entry = %+v", e)
+	}
+	if want := "NOPERM command=SET key=forbidden:key"; e.Reason != want {
+		t.Fatalf("Reason = %q, want %q", e.Reason, want)
+	}
+	if e.Timestamp.IsZero() {
+		t.Fatal("entry has zero timestamp")
+	}
+}
+
+// TestACLLogDeniedKeyless covers keyless commands (ROLE/ACL have no key scope),
+// which pass an empty key through to the Reason string.
+func TestACLLogDeniedKeyless(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.LogDenied("bob", "10.0.0.5:5512", "ACL", "")
+	entries := s.AuthLog()
+	if len(entries) != 1 {
+		t.Fatalf("AuthLog len = %d, want 1", len(entries))
+	}
+	if want := "NOPERM command=ACL key="; entries[0].Reason != want {
+		t.Fatalf("Reason = %q, want %q", entries[0].Reason, want)
+	}
+}
+
+// TestACLLogMixedAuthAndDenied verifies both event kinds share one buffer and
+// stay in chronological order relative to each other.
+func TestACLLogMixedAuthAndDenied(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	s.LogAuthFailure("alice", "1.2.3.4:5", "invalid password")
+	s.LogDenied("bob", "1.2.3.4:6", "GET", "k1")
+	s.LogAuthFailure("carol", "1.2.3.4:7", "unknown user")
+	entries := s.AuthLog()
+	if len(entries) != 3 {
+		t.Fatalf("AuthLog len = %d, want 3", len(entries))
+	}
+	wantUsers := []string{"alice", "bob", "carol"}
+	for i, want := range wantUsers {
+		if entries[i].Username != want {
+			t.Fatalf("entry %d username = %q, want %q", i, entries[i].Username, want)
+		}
+	}
+	if entries[0].Reason != "invalid password" {
+		t.Fatalf("entry 0 Reason = %q", entries[0].Reason)
+	}
+	if entries[1].Reason != "NOPERM command=GET key=k1" {
+		t.Fatalf("entry 1 Reason = %q", entries[1].Reason)
+	}
+}
+
+// TestACLLogDeniedDoesNotCountAuthFailure guards the counter split: denials are
+// counted by IncDenied at the call sites, never by LogDenied.
+func TestACLLogDeniedDoesNotCountAuthFailure(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	for i := 0; i < 3; i++ {
+		s.LogDenied("bob", "addr", "SET", "k")
+	}
+	if got := s.AuthFailures(); got != 0 {
+		t.Fatalf("AuthFailures = %d, want 0", got)
+	}
+	if got := s.DeniedCommands(); got != 0 {
+		t.Fatalf("DeniedCommands = %d, want 0 (IncDenied owns the counter)", got)
+	}
+}
+
+// TestACLLogDeniedEviction verifies denials share the buffer's bounded capacity
+// with auth failures rather than getting their own.
+func TestACLLogDeniedEviction(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	total := DefaultAuthLogCap + 7
+	for i := 0; i < total; i++ {
+		s.LogDenied("u"+itoa(i), "addr", "GET", "k")
+	}
+	entries := s.AuthLog()
+	if len(entries) != DefaultAuthLogCap {
+		t.Fatalf("AuthLog len = %d, want %d", len(entries), DefaultAuthLogCap)
+	}
+	if entries[0].Username != "u7" {
+		t.Fatalf("oldest survivor = %q, want u7", entries[0].Username)
+	}
+	if entries[len(entries)-1].Username != "u"+itoa(total-1) {
+		t.Fatalf("newest entry = %q, want u%d", entries[len(entries)-1].Username, total-1)
+	}
+}
+
+// TestACLLogDeniedConcurrent exercises interleaved denial and auth-failure
+// writes; run with -race to prove appendLocked stays serialized.
+func TestACLLogDeniedConcurrent(t *testing.T) {
+	s := NewStore(&PolicyStore{}, log.NewNoOpLogger())
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if g%2 == 0 {
+					s.LogDenied("bob", "1.2.3.4:5", "SET", "k")
+				} else {
+					s.LogAuthFailure("alice", "1.2.3.4:5", "invalid password")
+				}
+				_ = s.AuthLog()
+			}
+		}(g)
+	}
+	wg.Wait()
+	entries := s.AuthLog()
+	if len(entries) != DefaultAuthLogCap {
+		t.Fatalf("AuthLog len = %d, want %d", len(entries), DefaultAuthLogCap)
+	}
+	for i, e := range entries {
+		if strings.TrimSpace(e.Username) == "" || e.Reason == "" {
+			t.Fatalf("entry %d has empty fields: %+v", i, e)
+		}
+	}
+}

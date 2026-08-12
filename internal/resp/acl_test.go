@@ -182,3 +182,54 @@ func TestRESPServer_ACLLog(t *testing.T) {
 	expectReply(t, conn, "ACL LOG",
 		"*2\r\n$3\r\nACL\r\n$3\r\nLOG\r\n", string(want))
 }
+
+// TestRESPServer_ACLLogDenials verifies NOPERM denials land in the ACL LOG
+// buffer alongside auth failures, and that folding the command and key into
+// Reason keeps the reply at four fields per entry — the wire shape existing
+// clients decode.
+func TestRESPServer_ACLLogDenials(t *testing.T) {
+	addr, store := startACLServer(t)
+	conn := dialWithRetry(t, addr)
+	defer conn.Close()
+
+	// The limited role grants +get only, so SET (keyed) and ACL (keyless) are
+	// both denied, covering each deniedReply argument shape.
+	expectReply(t, conn, "AUTH limited",
+		"*3\r\n$4\r\nAUTH\r\n$7\r\nlimited\r\n$8\r\nwhatever\r\n", "+OK\r\n")
+	expectReply(t, conn, "SET denied",
+		"*3\r\n$3\r\nSET\r\n$6\r\nsecret\r\n$1\r\nv\r\n",
+		"-NOPERM no permission for 'set' command on this key\r\n")
+	expectReply(t, conn, "ACL LIST denied",
+		"*2\r\n$3\r\nACL\r\n$4\r\nLIST\r\n", "-NOPERM no permission for 'acl' command\r\n")
+
+	entries := store.AuthLog()
+	if len(entries) != 2 {
+		t.Fatalf("AuthLog len = %d, want 2", len(entries))
+	}
+	if entries[0].Username != "limited" || entries[0].Reason != "NOPERM command=set key=secret" {
+		t.Fatalf("entry 0 = %+v, want limited/NOPERM command=set key=secret", entries[0])
+	}
+	if entries[1].Username != "limited" || entries[1].Reason != "NOPERM command=acl key=" {
+		t.Fatalf("entry 1 = %+v, want limited/NOPERM command=acl key=", entries[1])
+	}
+	if entries[0].RemoteAddr == "" {
+		t.Fatal("entry 0 has empty remote address")
+	}
+
+	// Re-AUTH as admin: the limited role cannot run ACL LOG itself.
+	expectReply(t, conn, "AUTH admin",
+		"*3\r\n$4\r\nAUTH\r\n$5\r\nadmin\r\n$6\r\nsekret\r\n", "+OK\r\n")
+
+	entries = store.AuthLog()
+	var want []byte
+	want = AppendArray(want, len(entries))
+	for _, e := range entries {
+		want = AppendArray(want, 4)
+		want = AppendBulk(want, []byte(e.Timestamp.Format(time.RFC3339)))
+		want = AppendBulk(want, []byte(e.Username))
+		want = AppendBulk(want, []byte(e.RemoteAddr))
+		want = AppendBulk(want, []byte(e.Reason))
+	}
+	expectReply(t, conn, "ACL LOG with denials",
+		"*2\r\n$3\r\nACL\r\n$3\r\nLOG\r\n", string(want))
+}

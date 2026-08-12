@@ -720,10 +720,10 @@ func (s *Server) aclList(msg *network.Message) ([]byte, network.MessageType, err
 	return payload, network.MsgResponse, nil
 }
 
-// aclLog handles OpACLLog, returning the recent auth-failure buffer in
-// chronological order with timestamp, username, remote address, and reason —
-// the binary twin of the RESP ACL LOG handler. Entries are already ordered by
-// the store, so no sort is needed.
+// aclLog handles OpACLLog, returning the recent security-event buffer — rejected
+// AUTH attempts and denied commands — in chronological order with timestamp,
+// username, remote address, and reason, the binary twin of the RESP ACL LOG
+// handler. Entries are already ordered by the store, so no sort is needed.
 func (s *Server) aclLog(msg *network.Message) ([]byte, network.MessageType, error) {
 	src := s.policy.AuthLog()
 	entries := make([]network.AuthLogEntry, 0, len(src))

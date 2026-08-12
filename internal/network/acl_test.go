@@ -401,6 +401,69 @@ func TestServerACLLog(t *testing.T) {
 	}
 }
 
+// TestServerACLLogDenials verifies NOPERM denials reach the ACL LOG buffer over
+// the binary protocol and survive the wire round-trip with the command and key
+// folded into Reason, leaving the four-field entry encoding unchanged.
+func TestServerACLLogDenials(t *testing.T) {
+	addr, store := startACLNetworkServer(t)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if resp := sendAndRecv(t, conn, MsgAuth, buildAuthPayloadWithUser("limited", "anything")); resp.Type != MsgAuthOk {
+		t.Fatalf("expected MsgAuthOk for nopass user, got %v", resp.Type)
+	}
+	payload, err := roleRequestPayload(OpACLList, nil)
+	if err != nil {
+		t.Fatalf("roleRequestPayload: %v", err)
+	}
+	if resp := sendAndRecv(t, conn, MsgRequest, payload); !bytes.Equal(resp.Value, ResponseNotAuthorized) {
+		t.Fatalf("expected ResponseNotAuthorized for ACL LIST, got %q", resp.Value)
+	}
+
+	entries := store.AuthLog()
+	if len(entries) != 1 {
+		t.Fatalf("AuthLog len = %d, want 1", len(entries))
+	}
+	if entries[0].Username != "limited" {
+		t.Fatalf("entry 0 username = %q, want limited", entries[0].Username)
+	}
+	// OpACLList carries no key, so the folded Reason ends with an empty key.
+	if want := "NOPERM command=ACL LIST key="; entries[0].Reason != want {
+		t.Fatalf("entry 0 Reason = %q, want %q", entries[0].Reason, want)
+	}
+
+	admin, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer admin.Close()
+	if resp := sendAndRecv(t, admin, MsgAuth, buildAuthPayloadWithUser("admin", "sekret")); resp.Type != MsgAuthOk {
+		t.Fatalf("expected MsgAuthOk, got %v", resp.Type)
+	}
+	payload, err = roleRequestPayload(OpACLLog, nil)
+	if err != nil {
+		t.Fatalf("roleRequestPayload: %v", err)
+	}
+	resp := sendAndRecv(t, admin, MsgRequest, payload)
+	if resp.Type != MsgResponse {
+		t.Fatalf("expected MsgResponse for ACL LOG, got %v", resp.Type)
+	}
+	wireEntries, ok := DecodeACLLogResponse(resp.Value)
+	if !ok {
+		t.Fatal("malformed ACL LOG response")
+	}
+	if len(wireEntries) != 1 {
+		t.Fatalf("wire ACL LOG entry count = %d, want 1", len(wireEntries))
+	}
+	if wireEntries[0].Username != "limited" || wireEntries[0].Reason != entries[0].Reason {
+		t.Fatalf("wire entry 0 = %+v, want it to match the store entry %+v", wireEntries[0], entries[0])
+	}
+}
+
 // TestClientACLMethods exercises the ACL client API against a live server.
 func TestClientACLMethods(t *testing.T) {
 	addr, _ := startACLNetworkServer(t)

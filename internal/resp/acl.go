@@ -115,10 +115,12 @@ func (s *Server) aclList(args [][]byte, out []byte) []byte {
 	return out
 }
 
-// aclLog implements ACL LOG: the recent auth-failure buffer in chronological
+// aclLog implements ACL LOG: the recent security-event buffer in chronological
 // order, each entry a [timestamp, username, remote address, reason] tuple.
-// Unlike Redis's keyed field map the response is a flat array of tuples; the
-// content (who failed, when, from where, why) is the same.
+// Rejected AUTH attempts carry the failure cause in reason; commands denied by
+// the policy carry "NOPERM command=<cmd> key=<key>". Unlike Redis's keyed field
+// map the response is a flat array of tuples; the content (who was rejected,
+// when, from where, why) is the same.
 func (s *Server) aclLog(args [][]byte, out []byte) []byte {
 	if len(args) != 2 {
 		return AppendError(out, "ERR wrong number of arguments for 'acl|log' command")

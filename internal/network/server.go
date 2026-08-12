@@ -462,18 +462,21 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 		if st.session != nil {
 			user = st.session.Username
 		}
+		cmd := msg.Op.String()
+		keyStr := string(msg.Key)
+		s.policy.LogDenied(user, st.remoteAddr, cmd, keyStr)
 		s.audit.Record(audit.EventACLDeny, "command denied by rbac policy",
 			log.String("user", user),
-			log.String("command", msg.Op.String()),
-			log.String("key", string(msg.Key)),
+			log.String("command", cmd),
+			log.String("key", keyStr),
 			log.String("remote_addr", st.remoteAddr),
 			log.String("protocol", "binary"),
 		)
 		if s.logger.Enabled(log.LevelWarn) {
 			s.logger.Log(log.LevelWarn, "network: command denied by rbac policy",
 				log.String("remote_addr", st.remoteAddr),
-				log.String("command", msg.Op.String()),
-				log.String("key", string(msg.Key)),
+				log.String("command", cmd),
+				log.String("key", keyStr),
 			)
 		}
 		return MsgError, ResponseNotAuthorized, true, false

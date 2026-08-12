@@ -773,18 +773,24 @@ func (s *Server) countDenied() {
 	}
 }
 
-// deniedReply records one RBAC denial (NOPERM), writes it to the audit trail,
-// and logs the blocked command with the pinned user identity so operators see
-// who was denied. key holds the offending key for keyed commands and is nil for
-// keyless ones (ROLE/ACL have no key scope); keyless omits the key-scoped
-// suffix from the reply.
+// deniedReply records one RBAC denial (NOPERM) in the ACL LOG buffer and the
+// audit trail, and logs the blocked command with the pinned user identity so
+// operators see who was denied. key holds the offending key for keyed commands
+// and is nil for keyless ones (ROLE/ACL have no key scope); keyless omits the
+// key-scoped suffix from the reply.
 func (s *Server) deniedReply(st *connState, cmd string, key []byte, keyless bool, out []byte) []byte {
 	s.countDenied()
 	user := ""
 	if st.session != nil {
 		user = st.session.Username
 	}
+	// keyStr aliases the read buffer, so it stays valid only for this frame.
+	// LogDenied concatenates it into Reason, which copies, and Record encodes it
+	// synchronously — neither retains the alias past the call.
 	keyStr := *(*string)(unsafe.Pointer(&key))
+	if s.policy != nil {
+		s.policy.LogDenied(user, st.remoteAddr, cmd, keyStr)
+	}
 	s.audit.Record(audit.EventACLDeny, "command denied by rbac policy",
 		log.String("user", user),
 		log.String("command", cmd),
