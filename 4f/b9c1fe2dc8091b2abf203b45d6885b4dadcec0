@@ -1,0 +1,93 @@
+internal/crypto/envelope.go
+  s_0bfbd15b8c3f53::t_2e219a1296830e 225
+internal/shard/shard_test.go
+  s_0bfbd15b8c3f53::t_2e219a1296830e 7-9,14,127-177
+  s_0bfbd15b8c3f53::t_3f6668c5a446ca 178
+internal/network/protocol_test.go
+  s_0bfbd15b8c3f53::t_98cb5cde0b3327 15-16
+  s_0bfbd15b8c3f53::t_4c8a7a128dab59 22
+internal/network/role_test.go
+  s_0bfbd15b8c3f53::t_b5fe3955322e4e 168-169
+  s_0bfbd15b8c3f53::t_367396f47b6b7f 10
+internal/command/handlers.go
+  s_0bfbd15b8c3f53::t_b6d8c3760a99c2 1-96
+server/server.go
+  s_0bfbd15b8c3f53::t_29699538ed998f 484
+  s_0bfbd15b8c3f53::t_60723b732b14e0 583-584
+  s_0bfbd15b8c3f53::t_93cb3e39ac3f83 28
+  s_0bfbd15b8c3f53::t_2ba681c841b4d4 568-574,580-582,589-594,596,602-604
+  s_0bfbd15b8c3f53::t_abdca04ead91de 599-600,605-606
+  s_0bfbd15b8c3f53::t_4a6e7b51d9509f 62-71,76-77
+  s_0bfbd15b8c3f53::t_a3973bbc5dc459 73-75,78
+internal/network/server_test.go
+  s_0bfbd15b8c3f53::t_e4858088ccad05 17
+  s_0bfbd15b8c3f53::t_0bc62138036186 58-59,129,264
+internal/network/acl_test.go
+  s_0bfbd15b8c3f53::t_0ffac4762e080f 130-131
+  s_0bfbd15b8c3f53::t_ca0ae6a698294f 11
+internal/network/benchmark_tls_test.go
+  s_0bfbd15b8c3f53::t_672b93dbfc27ee 112
+  s_0bfbd15b8c3f53::t_86aed3899230a7 22
+  s_0bfbd15b8c3f53::t_3b39cc50625ff8 34,64
+internal/command/command_test.go
+  s_0bfbd15b8c3f53::t_55dd5988e69cd2 194
+  s_0bfbd15b8c3f53::t_27e9b28599fb0b 286
+  s_0bfbd15b8c3f53::t_230a574381fff7 1-193,195-237,239-285,287-327,333,336-340
+  s_0bfbd15b8c3f53::t_a3973bbc5dc459 328-332,334-335
+  s_0bfbd15b8c3f53::t_8255e78adeb61f 238
+internal/network/binaryreply.go
+  s_0bfbd15b8c3f53::t_9d16c763641914 1-41
+internal/network/server.go
+  s_0bfbd15b8c3f53::t_8ac63df46a72c5 79
+  s_0bfbd15b8c3f53::t_d2fdec2ab84f3e 24
+  s_0bfbd15b8c3f53::t_ebdaa84972e8f1 500-509
+  s_0bfbd15b8c3f53::t_374c6fd724712c 117-122
+  s_0bfbd15b8c3f53::t_943c0592f2b651 71-73
+  s_0bfbd15b8c3f53::t_89f643edcf336a 78
+  s_0bfbd15b8c3f53::t_524f0c158ac76b 80-82
+  s_0bfbd15b8c3f53::t_0deaee4b802e3a 510-512
+internal/command/command.go
+  s_0bfbd15b8c3f53::t_76132382e1e25f 90-92
+  s_0bfbd15b8c3f53::t_06e71d03ed8340 98
+  s_0bfbd15b8c3f53::t_525143e32e2f12 1-7,9-16,18,20-33,35-59,62,68-69,71,75-76,78-87,89,93-97,99-109,111-115,118-148,150-151,153-159,161-166,168-172,174-185,187-199,201-217
+  s_0bfbd15b8c3f53::t_ebdf025e03b01a 186
+  s_0bfbd15b8c3f53::t_25eaeb064d2f01 17
+  s_0bfbd15b8c3f53::t_801a2ee8882345 19
+  s_0bfbd15b8c3f53::t_c58223556cd7a9 63-67,72-74
+  s_0bfbd15b8c3f53::t_e30bdf8d3a5992 149,152
+  s_0bfbd15b8c3f53::t_9678003fe5da5f 160,167
+  s_0bfbd15b8c3f53::t_291868ac7951d9 8
+  s_0bfbd15b8c3f53::t_32cef6729cea17 34
+  s_0bfbd15b8c3f53::t_758890d0e561b6 60-61
+  s_0bfbd15b8c3f53::t_a1d51ffdd57626 70
+  s_0bfbd15b8c3f53::t_2171b7f45772e7 77
+  s_0bfbd15b8c3f53::t_08e0757fea7d93 88
+  s_0bfbd15b8c3f53::t_09e3151eb774e8 110
+  s_0bfbd15b8c3f53::t_d27fee251b4f89 116-117
+  s_0bfbd15b8c3f53::t_e38cd12e59b8a8 173
+  s_0bfbd15b8c3f53::t_bfff4f5cfb0ba5 200
+internal/resp/server.go
+  s_0bfbd15b8c3f53::t_4e1b017d231886 83-87
+  s_0bfbd15b8c3f53::t_b37287afe7e845 597-599
+  s_0bfbd15b8c3f53::t_5255ab5ad4484a 28
+  s_0bfbd15b8c3f53::t_daa24e905578b3 80-82
+  s_0bfbd15b8c3f53::t_b1a6f37259f88d 88
+  s_0bfbd15b8c3f53::t_d97528f60735d6 594-596
+  s_0bfbd15b8c3f53::t_e163e523110653 600-602
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "4fb9c1fe2dc8091b2abf203b45d6885b4dadcec0",
+  "prompts": {},
+  "sessions": {
+    "s_0bfbd15b8c3f53": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0065cb2b8ffe5gx5WUzo4s1T39",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
