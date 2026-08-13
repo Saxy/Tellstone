@@ -22,10 +22,10 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
 	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/metrics"
@@ -59,10 +59,23 @@ func (rs *RouterStore) Delete(key string) {
 	rs.router.Dispatch(shard.CmdDel, key, nil, 0)
 }
 
+// binCmdGet, binCmdSet and binCmdDel are the data-command tokens the binary
+// frontend feeds to the shared command layer. They alias the catalog's
+// canonical spellings; appending them and the frame's key/value into the
+// connection's pooled argument scratch keeps the data path allocation-free.
+var (
+	binCmdGet = []byte("GET")
+	binCmdSet = []byte("SET")
+	binCmdDel = []byte("DEL")
+)
+
 type Server struct {
-	app         *tellstone.App
-	router      *router.Router
-	shards      []*shard.Shard
+	app    *tellstone.App
+	router *router.Router
+	shards []*shard.Shard
+	// rs adapts the router to the command layer's Store seam for the binary
+	// frontend. It is populated by initShards, before any connection is served.
+	rs          RouterStore
 	netSrv      *network.Server
 	respSrv     *resp.Server
 	metricsSrv  *http.Server
@@ -468,6 +481,7 @@ func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
 		s.shards[i] = sh
 	}
 	s.router = router.New(s.shards)
+	s.rs = RouterStore{router: s.router}
 	if logger.Enabled(log.LevelInfo) {
 		p := "disabled"
 		if store != nil {
@@ -551,34 +565,45 @@ func (s *Server) startRESPServer() {
 	}()
 }
 
-func (s *Server) networkHandler(msg *network.Message) ([]byte, network.MessageType, error) {
+// networkHandler is the binary frontend's data handler. GET, SET and DEL run
+// through the shared command layer (lookup, validation, execution); the reply
+// is read back from the pooled BinaryReply the network layer attached to the
+// context. The RBAC gate, per-role count and audit for these commands run in
+// the network layer, so the context carries no identity here. PING and the
+// ROLE/ACL admin ops stay transport-specific.
+func (s *Server) networkHandler(msg *network.Message, c *command.Ctx) ([]byte, network.MessageType, error) {
 	if msg.Type == network.MsgPing {
 		return nil, network.MsgPong, nil
 	}
-	keyStr := *(*string)(unsafe.Pointer(&msg.Key))
 	switch msg.Op {
 	case network.OpGet:
-		resp := s.router.Dispatch(shard.CmdGet, keyStr, nil, 0)
-		if !resp.OK {
-			return network.ResponseNotFound, network.MsgError, nil
-		}
-		return resp.Value, network.MsgResponse, nil
+		c.Store = &s.rs
+		c.Args = append(c.Args, binCmdGet, msg.Key)
+		command.Execute(c)
+		payload, mtype := c.Reply.(*network.BinaryReply).Result()
+		return payload, mtype, nil
 	case network.OpSet:
 		if len(msg.Key) == 0 {
 			return network.ResponseEmptyKey, network.MsgError, nil
 		}
-		ttlDuration := time.Duration(msg.TTL) * time.Millisecond
-		resp := s.router.Dispatch(shard.CmdSet, keyStr, msg.Value, ttlDuration)
-		if resp.Err != nil {
+		c.Store = &s.rs
+		c.Args = append(c.Args, binCmdSet, msg.Key, msg.Value)
+		c.TTL = time.Duration(msg.TTL) * time.Millisecond
+		command.Execute(c)
+		br := c.Reply.(*network.BinaryReply)
+		if err := br.Cause(); err != nil {
 			if s.app.GetLogger().Enabled(log.LevelError) {
-				s.app.GetLogger().Log(log.LevelError, "server: failed to store inside storage engine", log.String("error", resp.Err.Error()))
+				s.app.GetLogger().Log(log.LevelError, "server: failed to store inside storage engine", log.String("error", err.Error()))
 			}
-			return network.ResponseStorageFailure, network.MsgError, nil
 		}
-		return network.ResponseOK, network.MsgResponse, nil
+		payload, mtype := br.Result()
+		return payload, mtype, nil
 	case network.OpDelete:
-		s.router.Dispatch(shard.CmdDel, keyStr, nil, 0)
-		return network.ResponseOK, network.MsgResponse, nil
+		c.Store = &s.rs
+		c.Args = append(c.Args, binCmdDel, msg.Key)
+		command.Execute(c)
+		payload, mtype := c.Reply.(*network.BinaryReply).Result()
+		return payload, mtype, nil
 	case network.OpRoleCreate, network.OpRoleSetUser, network.OpRoleDelUser,
 		network.OpRoleDelete, network.OpRoleList, network.OpRoleGetUser:
 		// RBAC is disabled without --rbac-config; the RESP layer rejects ROLE

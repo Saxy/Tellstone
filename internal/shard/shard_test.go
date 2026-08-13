@@ -4,10 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/persistence"
 )
 
 func TestShardIsolation(t *testing.T) {
@@ -118,5 +122,57 @@ func TestShardEnvelopeStartup(t *testing.T) {
 	if s3, err := Run(0, cfg, other, nil, log.NewNoOpLogger(), nil); err == nil {
 		s3.Stop(context.Background())
 		t.Fatal("startup with changed KEK should fail")
+	}
+}
+
+func TestShardEnvelopeMissingRefusesNewDEKForPersistedData(t *testing.T) {
+	kek := bytes.Repeat([]byte{0x2a}, 32)
+	dir := t.TempDir()
+	cfg := config.LoadConfig([]string{
+		"-shards=1",
+		"-enable-encryption",
+		"-enable-envelope",
+		"-encryption-key=" + base64.StdEncoding.EncodeToString(kek),
+		"-persistence-dir=" + dir,
+		"-enable-persistence",
+	})
+	logger := log.NewNoOpLogger()
+	store, err := persistence.NewStorage(true, logger, dir)
+	if err != nil {
+		t.Fatalf("persistence init: %v", err)
+	}
+
+	// First boot mints the envelope; then persist a record so the shard is no
+	// longer a verified empty first boot.
+	s1, err := Run(0, cfg, kek, nil, logger, store)
+	if err != nil {
+		t.Fatalf("first start: %v", err)
+	}
+	if resp := s1.Execute("SET", "k1", []byte("v1"), 0); resp.Err != nil {
+		t.Fatalf("set: %v", resp.Err)
+	}
+	s1.Stop(context.Background())
+	if err := store.CloseShard(0); err != nil {
+		t.Fatalf("close shard: %v", err)
+	}
+
+	envPath := filepath.Join(dir, envelopeFileName(0))
+	if _, err := os.Stat(envPath); err != nil {
+		t.Fatalf("envelope file not written: %v", err)
+	}
+	if err := os.Remove(envPath); err != nil {
+		t.Fatalf("remove envelope: %v", err)
+	}
+
+	// Restart with persisted records but no envelope must fail closed instead
+	// of silently minting a fresh DEK that re-keys the dataset.
+	if s2, err := Run(0, cfg, kek, nil, logger, store); err == nil {
+		s2.Stop(context.Background())
+		t.Fatal("restart with persisted data and missing envelope should fail")
+	}
+
+	// No replacement envelope may be written.
+	if _, err := os.Stat(envPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("replacement envelope must not be written, stat: %v", err)
 	}
 }

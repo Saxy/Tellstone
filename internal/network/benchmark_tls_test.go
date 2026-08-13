@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/log"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 )
@@ -30,7 +31,7 @@ type benchServer struct {
 	ready chan struct{}
 }
 
-func startBenchServer(b *testing.B, handler func(msg *Message) ([]byte, MessageType, error)) *benchServer {
+func startBenchServer(b *testing.B, handler func(msg *Message, c *command.Ctx) ([]byte, MessageType, error)) *benchServer {
 	b.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -60,7 +61,7 @@ type benchTLSServer struct {
 	keyPEM  []byte
 }
 
-func startBenchTLSServer(b *testing.B, handler func(msg *Message) ([]byte, MessageType, error)) *benchTLSServer {
+func startBenchTLSServer(b *testing.B, handler func(msg *Message, c *command.Ctx) ([]byte, MessageType, error)) *benchTLSServer {
 	b.Helper()
 	certPEM, keyPEM, err := generateSelfSignedCert()
 	if err != nil {
@@ -108,7 +109,7 @@ func startBenchTLSServer(b *testing.B, handler func(msg *Message) ([]byte, Messa
 }
 
 // pingHandler echoes back the payload — minimal work to measure transport overhead.
-func pingHandler(msg *Message) ([]byte, MessageType, error) {
+func pingHandler(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
 	if msg.Type == MsgPing {
 		return msg.Payload, MsgPong, nil
 	}

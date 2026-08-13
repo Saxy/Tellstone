@@ -222,7 +222,7 @@ func (e *Envelope) Store(dir string, fileName string) error {
 	return nil
 }
 
-// Load reads the envelope for shard, rejects a changed KEK via the stored
+// Load reads the envelope for fileName, rejects a changed KEK via the stored
 // fingerprint, and returns the unwrapped DEK for the caller to build an Engine.
 func (e *Envelope) Load(dir, fileName string) ([]byte, error) {
 	if !e.enabled {

@@ -12,12 +12,14 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Saxy/Tellstone/internal/command"
 )
 
 const benchAddr = "127.0.0.1:9988"
 
 func TestMain(m *testing.M) {
-	srv := NewServer(benchAddr, 0, nil, func(msg *Message) ([]byte, MessageType, error) {
+	srv := NewServer(benchAddr, 0, nil, func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
 		return msg.Payload, MsgResponse, nil
 	}, nil, nil, "", nil, nil, newNoOpAudit())
 

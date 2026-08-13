@@ -21,6 +21,7 @@ import (
 	"unsafe"
 
 	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/oauth"
 	"github.com/Saxy/Tellstone/internal/rbac"
@@ -58,67 +59,45 @@ type authJob struct {
 // authenticated tracks whether the client has passed AUTH (always true when no
 // server password is configured, so the hot path is branch-predictable).
 type connState struct {
-	shardID       uint64
-	authenticated bool
-	// session is the RBAC context pinned at AUTH time. nil when RBAC is
-	// disabled (the zero-overhead no-op path) or before authentication.
-	session         *rbac.SessionContext
+	shardID         uint64
+	authenticated   bool
+	sessionCtx      *rbac.SessionContext
 	remoteAddr      string
 	authFails       int
 	authPending     bool
 	closeAfterReply bool
 	tlsConn         *tlslib.Conn
 	readBuf         []byte
+	ctxt            command.Ctx
+	cmdArgs         [3][]byte
+	reply           BinaryReply
 }
 
 type Server struct {
 	gnet.BuiltinEventEngine
-	addr       string
-	handler    func(msg *Message) ([]byte, MessageType, error)
-	logger     log.Logger
-	maxMsgSize uint64
-	tlsConfigs *tlslib.ConfigStore
+	addr            string
+	handler         func(msg *Message, c *command.Ctx) ([]byte, MessageType, error)
+	logger          log.Logger
+	maxMsgSize      uint64
+	tlsConfigs      *tlslib.ConfigStore
+	eng             gnet.Engine
+	ready           chan struct{}
+	shards          []*shard.Shard
+	requirePassHash []byte
+	policy          *rbac.Store
+	oauth           oauth.Provider
+	audit           *audit.LogEngine
+	authJobs        chan authJob
+	workerWg        sync.WaitGroup
 
-	// eng and ready let Shutdown reach the running gnet engine: OnBoot fires once the event
-	// loop is accepting connections and hands us the Engine handle we need to stop it; ready
-	// is closed at that point so a concurrent Shutdown call can block until it's safe to stop.
-	eng   gnet.Engine
-	ready chan struct{}
-
+	//need for metrics
+	nextConn         uint64
 	connectedClients uint64
 	totalConnections uint64
 	bytesRead        uint64
 	bytesWritten     uint64
 	protocolErrors   uint64
 	handlerErrors    uint64
-
-	shards   []*shard.Shard
-	nextConn uint64
-
-	// requirePassHash is the bcrypt hash of the server password. nil means AUTH is not
-	// required and every connection starts authenticated (zero-overhead no-op path).
-	// Ignored when a policy store is configured — per-user RBAC supersedes it.
-	requirePassHash []byte
-
-	// policy is the atomic RBAC policy store. nil means RBAC is disabled and no
-	// authorization checks run (zero-overhead no-op path). When set, AUTH resolves
-	// per-user bcrypt hashes and every data op is gated by the session.
-	policy *rbac.Store
-
-	// oauth is the token-verification provider for bearer-token AUTH. nil keeps
-	// the password-only paths; when set, a JWT-shaped AUTH secret is verified
-	// here and mapped to a role through the policy store (fail-closed on both
-	// a bad token and a claim set that maps to no role). It is read-only after
-	// construction, so workers may share it without locks.
-	oauth oauth.Provider
-
-	// audit is the shared audit engine. Always non-nil: without --enable-audit
-	// it is a disabled no-op whose Record() costs one bool comparison, so the
-	// hooks below call it without a nil guard.
-	audit *audit.LogEngine
-
-	authJobs chan authJob
-	workerWg sync.WaitGroup
 }
 
 // NewServer initializes an edge-triggered networking server engine instance.
@@ -135,11 +114,17 @@ type Server struct {
 // roles through the policy store (which must therefore also be set).
 // audit is the shared audit engine; it must be non-nil (pass a disabled engine when
 // audit logging is off) and is always called without a nil guard.
+// handler executes the application handler for one decoded data frame. The
+// handler receives the per-connection command context (pooled on connState)
+// whose Args and Reply it may fill and read; the network layer resets the
+// context and reply before every call. handler runs after the auth and RBAC
+// gates, so the context carries no identity here — the binary frontend keeps
+// its own gate/count/audit in this package.
 func NewServer(
 	addr string,
 	maxMsgSize uint64,
 	shards []*shard.Shard,
-	handler func(msg *Message) ([]byte, MessageType, error),
+	handler func(msg *Message, c *command.Ctx) ([]byte, MessageType, error),
 	logger log.Logger,
 	tlsConfigs *tlslib.ConfigStore,
 	requirePass string,
@@ -459,8 +444,8 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 	if s.policy != nil && !s.opAuthorized(*msg, st) {
 		s.policy.IncDenied()
 		user := ""
-		if st.session != nil {
-			user = st.session.Username
+		if st.sessionCtx != nil {
+			user = st.sessionCtx.Username
 		}
 		cmd := msg.Op.String()
 		keyStr := string(msg.Key)
@@ -493,8 +478,8 @@ func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType M
 	if !skipHandler {
 		// PING is not gated by RBAC and never counted as a role command, keeping
 		// per-role counts symmetric with the RESP data commands.
-		if s.policy != nil && st.session != nil && msg.Type != MsgPing {
-			st.session.CountCommand()
+		if s.policy != nil && st.sessionCtx != nil && msg.Type != MsgPing {
+			st.sessionCtx.CountCommand()
 		}
 		// The key is converted zero-copy (aliasing the gnet buffer) and consumed
 		// synchronously by the encoder, mirroring the dispatch path in server.go.
@@ -502,8 +487,8 @@ func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType M
 		// until the frame is discarded below.
 		keyStr := *(*string)(unsafe.Pointer(&msg.Key))
 		user := "default"
-		if st.session != nil {
-			user = st.session.Username
+		if st.sessionCtx != nil {
+			user = st.sessionCtx.Username
 		}
 		s.audit.Record(audit.EventCommand, "command dispatched",
 			log.String("command", msg.Op.String()),
@@ -512,8 +497,23 @@ func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType M
 			log.String("remote_addr", st.remoteAddr),
 			log.String("protocol", "binary"),
 		)
+		// Reset the pooled command context and reply for this frame. Identity
+		// fields stay nil: the binary frontend gates, counts and audits in this
+		// layer (above), so the shared command layer is a pure
+		// lookup + validate + execute here.
+		st.reply.Reset()
+		st.ctxt.Args = st.cmdArgs[:0]
+		st.ctxt.Reply = &st.reply
+		st.ctxt.Store = nil
+		st.ctxt.Policy = nil
+		st.ctxt.Session = nil
+		st.ctxt.Remote = st.remoteAddr
+		st.ctxt.Protocol = "binary"
+		st.ctxt.Audit = nil
+		st.ctxt.Logger = nil
+		st.ctxt.TTL = 0
 		var err error
-		respPayload, respType, err = s.handler(msg)
+		respPayload, respType, err = s.handler(msg, &st.ctxt)
 		if err != nil {
 			atomic.AddUint64(&s.handlerErrors, 1)
 			if s.logger.Enabled(log.LevelWarn) {
@@ -711,7 +711,7 @@ func (s *Server) authWorker() {
 			var respType MessageType
 			if success {
 				st.authenticated = true
-				st.session = job.session
+				st.sessionCtx = job.session
 				// Single-password mode never sets job.username; the implicit
 				// identity there is "default", mirroring the AUTH payload rule.
 				user := job.username
@@ -806,24 +806,24 @@ func (s *Server) opAuthorized(msg Message, st *connState) bool {
 	default:
 		break
 	}
-	if st.session == nil {
+	if st.sessionCtx == nil {
 		return false
 	}
 	switch msg.Op {
 	// ROLE admin ops are keyless: the namespace whitelist must not be
 	// consulted, only the command bit (mirrors RESP's authorizedCmd).
 	case OpRoleCreate, OpRoleSetUser, OpRoleDelUser, OpRoleDelete, OpRoleList, OpRoleGetUser:
-		return st.session.AllowsCommand(rbac.CmdRole)
+		return st.sessionCtx.AllowsCommand(rbac.CmdRole)
 	// ACL admin ops gate on the ACL command bit, a sibling of ROLE: a role
 	// granted only +role cannot manage ACL users and vice versa.
 	case OpACLSetUser, OpACLDelUser, OpACLList, OpACLLog:
-		return st.session.AllowsCommand(rbac.CmdACL)
+		return st.sessionCtx.AllowsCommand(rbac.CmdACL)
 	case OpGet:
-		return st.session.IsAllowed(rbac.CmdGet, msg.Key)
+		return st.sessionCtx.IsAllowed(rbac.CmdGet, msg.Key)
 	case OpSet:
-		return st.session.IsAllowed(rbac.CmdSet, msg.Key)
+		return st.sessionCtx.IsAllowed(rbac.CmdSet, msg.Key)
 	case OpDelete:
-		return st.session.IsAllowed(rbac.CmdDel, msg.Key)
+		return st.sessionCtx.IsAllowed(rbac.CmdDel, msg.Key)
 	default:
 		return false
 	}

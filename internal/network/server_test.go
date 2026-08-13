@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/log"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
 )
@@ -54,8 +55,8 @@ func (f *fakeStore) delete(key string) {
 
 // storeHandler is a Server handler that dispatches MsgRequest operations against
 // a fakeStore and echoes MsgPing payloads.
-func storeHandler(store *fakeStore) func(msg *Message) ([]byte, MessageType, error) {
-	return func(msg *Message) ([]byte, MessageType, error) {
+func storeHandler(store *fakeStore) func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
+	return func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
 		switch msg.Type {
 		case MsgPing:
 			return msg.Payload, MsgPong, nil
@@ -125,7 +126,7 @@ func TestServerEcho(t *testing.T) {
 	}
 	addr := l.Addr().String()
 	l.Close()
-	handler := func(msg *Message) ([]byte, MessageType, error) {
+	handler := func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
 		if msg.Type == MsgPing {
 			return msg.Payload, MsgPong, nil
 		}
@@ -260,7 +261,7 @@ func clientTLSConfig(t *testing.T, certPEM []byte) *stdtls.Config {
 }
 
 // startAuthServer starts a server with the given requirePass and returns the address.
-func startAuthServer(t *testing.T, requirePass string, handler func(msg *Message) ([]byte, MessageType, error)) string {
+func startAuthServer(t *testing.T, requirePass string, handler func(msg *Message, c *command.Ctx) ([]byte, MessageType, error)) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

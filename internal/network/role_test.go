@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/rbac"
 	"golang.org/x/crypto/bcrypt"
@@ -164,8 +165,8 @@ func rbacNetworkPolicy(t *testing.T) *rbac.PolicyStore {
 
 // rbacTestHandler mirrors server.networkHandler for the ROLE ops so the
 // network layer's auth gating and wire codec are exercised end-to-end.
-func rbacTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType, error) {
-	return func(msg *Message) ([]byte, MessageType, error) {
+func rbacTestHandler(store *rbac.Store) func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
+	return func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
 		switch msg.Op {
 		case OpGet:
 			return ResponseOK, MsgResponse, nil

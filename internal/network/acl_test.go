@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/rbac"
 )
@@ -126,8 +127,8 @@ func TestACLLogCodecMalformed(t *testing.T) {
 
 // aclTestHandler mirrors server.networkHandler for the ACL ops so the network
 // layer's auth gating and wire codec are exercised end-to-end.
-func aclTestHandler(store *rbac.Store) func(msg *Message) ([]byte, MessageType, error) {
-	return func(msg *Message) ([]byte, MessageType, error) {
+func aclTestHandler(store *rbac.Store) func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
+	return func(msg *Message, c *command.Ctx) ([]byte, MessageType, error) {
 		switch msg.Op {
 		case OpGet:
 			return ResponseOK, MsgResponse, nil

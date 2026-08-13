@@ -19,13 +19,13 @@ package resp
 import (
 	"context"
 	"errors"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
 
 	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/oauth"
 	"github.com/Saxy/Tellstone/internal/rbac"
@@ -63,101 +63,62 @@ type Store interface {
 // gnet buffer after the event loop has moved on. passHash nil marks a nopass
 // user that accepts any password (Redis ACL semantics).
 type authJob struct {
-	c        gnet.Conn
-	password []byte
-	passHash []byte
-	username string
-	reason   string
-	session  *rbac.SessionContext
-	// oauth marks a bearer-token verification: password holds the raw JWT,
-	// passHash is nil, and the session is built only after claims resolve to a
-	// role via the policy's oauth.rules.
-	oauth bool
+	c          gnet.Conn
+	password   []byte
+	passHash   []byte
+	username   string
+	reason     string
+	sessionCtx *rbac.SessionContext
+	oauth      bool
 }
 
 // connState holds per-connection scratch buffers reused across OnTraffic calls so the hot
 // path stays allocation-free, plus the assigned shard index for per-shard metrics.
 type connState struct {
-	out     []byte
-	args    [][]byte
-	shardID int
-	tlsConn *tlslib.Conn
-	readBuf []byte
-	// pending is the sweeper entry enforcing this connection's handshake deadline without
-	// inbound traffic. It is non-nil whenever tlsConn is non-nil — both are installed
-	// together, on accept for implicit TLS and in upgradeToTLS for STARTTLS.
-	pending       *pendingHandshake
-	authenticated bool
-	// session is the RBAC context pinned at AUTH time. nil when RBAC is
-	// disabled (the zero-overhead no-op path) or before authentication.
-	session    *rbac.SessionContext
-	remoteAddr string
-	// closeAfterReply is set by dispatch (QUIT) so the traffic loop flushes the pending
-	// replies and then returns gnet.Close instead of keeping the connection open.
+	out             []byte
+	args            [][]byte
+	shardID         int
+	tlsConn         *tlslib.Conn
+	readBuf         []byte
+	reply           respReply
+	ctxt            command.Ctx
+	pending         *pendingHandshake
+	authenticated   bool
+	session         *rbac.SessionContext
+	remoteAddr      string
 	closeAfterReply bool
-	// upgradeTLS is set only after a valid STARTTLS command. The plaintext traffic loop
-	// owns the transition so +OK can be flushed before TLS consumes the next inbound byte.
-	upgradeTLS bool
-	// authPending is set while an AUTH verification is in flight in the worker
-	// pool. While set, the traffic loops return gnet.None so pipelined commands
-	// cannot run unauthenticated; the worker's Wake clears it and re-triggers
-	// processing. authFails counts failed AUTH attempts against maxAuthFails.
-	authPending bool
-	authFails   int
+	upgradeTLS      bool
+	authPending     bool
+	authFails       int
 }
 
 // Server is an edge-triggered RESP2 listener backed by gnet.
 type Server struct {
 	gnet.BuiltinEventEngine
-	addr       string
-	store      Store
-	logger     log.Logger
-	tlsConfigs *tlslib.ConfigStore
-	startTLS   bool
-	// eng and ready let Shutdown reach the running gnet engine: OnBoot fires once the event
-	// loop is accepting connections and hands us the Engine handle we need to stop it; ready
-	// is closed at that point so a concurrent Shutdown call can block until it's safe to stop.
+	addr             string
+	store            Store
+	logger           log.Logger
+	tlsConfigs       *tlslib.ConfigStore
+	startTLS         bool
 	eng              gnet.Engine
 	ready            chan struct{}
+	shards           []*shard.Shard
+	requirePassHash  []byte
+	policy           *rbac.Store
+	oauth            oauth.Provider
+	authJobs         chan authJob
+	workerWg         sync.WaitGroup
+	audit            *audit.LogEngine
+	handshakes       handshakeSweeper
+	handshakeTimeout time.Duration
+
+	// need for metrics
+	nextConn         uint64
 	connectedClients uint64
 	totalConnections uint64
 	bytesRead        uint64
 	bytesWritten     uint64
 	protocolErrors   uint64
-	shards           []*shard.Shard
-	nextConn         uint64
-	// requirePassHash is the bcrypt hash of the server password. nil means AUTH is not
-	// required and every connection starts authenticated (zero-overhead no-op path).
-	// Ignored when a policy store is configured — per-user RBAC supersedes it.
-	requirePassHash []byte
-	// policy is the atomic RBAC policy store. nil means RBAC is disabled and no
-	// authorization checks run (zero-overhead no-op path). When set, AUTH resolves
-	// per-user bcrypt hashes and every data command is gated by the session.
-	policy *rbac.Store
-
-	// oauth is the token-verification provider for bearer-token AUTH. nil keeps
-	// the password-only paths; when set, a JWT-shaped AUTH secret is verified
-	// here and mapped to a role through the policy store (fail-closed on both
-	// a bad token and a claim set that maps to no role). It is read-only after
-	// construction, so workers may share it without locks.
-	oauth oauth.Provider
-
-	// authJobs and workerWg back the bcrypt worker pool, created only when a
-	// password or a policy is configured (see NewServer). authWorker goroutines
-	// consume authJobs off the event loop; workerWg lets Shutdown drain them.
-	authJobs chan authJob
-	workerWg sync.WaitGroup
-
-	// audit is the shared audit engine. Always non-nil: without --enable-audit
-	// it is a disabled no-op whose Record() costs one bool comparison, so the
-	// hooks below call it without a nil guard.
-	audit *audit.LogEngine
-
-	// handshakes enforces handshakeTimeout on connections that stop sending after being handed
-	// to the TLS state machine (see handshake.go). handshakeTimeout is tlsHandshakeTimeout;
-	// tests shrink it to keep the sweep observable without waiting out the production deadline.
-	handshakes       handshakeSweeper
-	handshakeTimeout time.Duration
 }
 
 // NewServer creates a RESP server bound to addr that dispatches commands to store.
@@ -629,6 +590,20 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 			return AppendError(out, "NOAUTH Authentication required"), false
 		}
 	}
+	st.reply.out = out
+	st.ctxt.Store = s.store
+	st.ctxt.Args = args
+	st.ctxt.Reply = &st.reply
+	st.ctxt.Policy = s.policy
+	st.ctxt.Session = st.session
+	st.ctxt.Remote = st.remoteAddr
+	st.ctxt.Protocol = "resp"
+	st.ctxt.Audit = s.audit
+	st.ctxt.Logger = s.logger
+	st.ctxt.TTL = 0
+	if command.Execute(&st.ctxt) {
+		return st.reply.out, false
+	}
 	// The command and key are converted zero-copy over the gnet buffer and
 	// consumed synchronously by the audit encoder before the buffer advances.
 	user := "default"
@@ -647,59 +622,6 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 		log.String("protocol", "resp"),
 	)
 	switch {
-	case EqualFold(cmd, shard.CmdGet):
-		if len(args) != 2 {
-			return AppendError(out, "ERR wrong number of arguments for 'get' command"), false
-		}
-		if !s.authorized(st, rbac.CmdGet, args[1]) {
-			return s.deniedReply(st, "get", args[1], false, out), false
-		}
-		s.countCommand(st)
-		key := *(*string)(unsafe.Pointer(&args[1]))
-		val, ok := s.store.Get(key)
-		if !ok {
-			return AppendNullBulk(out), false
-		}
-		return AppendBulk(out, val), false
-
-	case EqualFold(cmd, shard.CmdSet):
-		if len(args) != 3 && len(args) != 5 {
-			return AppendError(out, "ERR wrong number of arguments for 'set' command"), false
-		}
-		if !s.authorized(st, rbac.CmdSet, args[1]) {
-			return s.deniedReply(st, "set", args[1], false, out), false
-		}
-		s.countCommand(st)
-		key := *(*string)(unsafe.Pointer(&args[1]))
-		ttl, ok := parseSetTTL(args)
-		if !ok {
-			return AppendError(out, "ERR syntax error"), false
-		}
-		if err := s.store.Set(key, args[2], ttl); err != nil {
-			return AppendError(out, "ERR "+err.Error()), false
-		}
-		return append(out, respOK...), false
-
-	case EqualFold(cmd, shard.CmdDel):
-		if len(args) < 2 {
-			return AppendError(out, "ERR wrong number of arguments for 'del' command"), false
-		}
-		for _, k := range args[1:] {
-			if !s.authorized(st, rbac.CmdDel, k) {
-				return s.deniedReply(st, "del", k, false, out), false
-			}
-		}
-		s.countCommand(st)
-		var n int64
-		for _, k := range args[1:] {
-			ks := *(*string)(unsafe.Pointer(&k))
-			if _, ok := s.store.Get(ks); ok {
-				s.store.Delete(ks)
-				n++
-			}
-		}
-		return AppendInt(out, n), false
-
 	case EqualFold(cmd, shard.CmdPing):
 		if len(args) >= 2 {
 			return AppendBulk(out, args[1]), false
@@ -735,16 +657,6 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 		}
 		return AppendError(out, "ERR unknown command '"+string(cmd)+"'"), false
 	}
-}
-
-// authorized reports whether the connection may run the RBAC command cmd on
-// key. When RBAC is disabled (no policy store) every command is allowed and
-// the check is a single pointer comparison — the zero-overhead no-op path.
-func (s *Server) authorized(st *connState, cmd uint16, key []byte) bool {
-	if s.policy == nil {
-		return true
-	}
-	return st.session != nil && st.session.IsAllowed(cmd, key)
 }
 
 // authorizedCmd is authorized for keyless commands: the namespace whitelist is
@@ -981,7 +893,7 @@ func (s *Server) authFailed(st *connState, username, reason string, out []byte) 
 // synchronously instead of stalling the connection.
 func (s *Server) dispatchAuth(c gnet.Conn, username, reason string, password, passHash []byte, session *rbac.SessionContext) bool {
 	select {
-	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, session: session, username: username, reason: reason}:
+	case s.authJobs <- authJob{c: c, password: password, passHash: passHash, sessionCtx: session, username: username, reason: reason}:
 		return true
 	default:
 		if s.logger.Enabled(log.LevelWarn) {
@@ -1008,12 +920,12 @@ func (s *Server) authWorker() {
 			// verified and mapped to a role, so it is resolved here rather than
 			// pinned at dispatch time. The provider is concurrency-safe; the
 			// store maps claims to a role off a lock-free atomic snapshot.
-			job.session, job.username = s.policy.ResolveOAuthToken(func() (map[string][]string, error) {
+			job.sessionCtx, job.username = s.policy.ResolveOAuthToken(func() (map[string][]string, error) {
 				ctx, cancel := context.WithTimeout(context.Background(), oauth.VerifyTimeout)
 				defer cancel()
 				return s.oauth.Verify(ctx, job.password)
 			})
-			success = job.session != nil
+			success = job.sessionCtx != nil
 		}
 		_ = job.c.Wake(func(c gnet.Conn, _ error) error {
 			st, _ := c.Context().(*connState)
@@ -1024,7 +936,7 @@ func (s *Server) authWorker() {
 			var reply []byte
 			if success {
 				st.authenticated = true
-				st.session = job.session
+				st.session = job.sessionCtx
 				s.audit.Record(audit.EventAuthSuccess, "client authenticated",
 					log.String("user", job.username),
 					log.String("remote_addr", st.remoteAddr),
@@ -1067,27 +979,6 @@ func (s *Server) authWorker() {
 			_ = c.Wake(nil)
 			return nil
 		})
-	}
-}
-
-// parseSetTTL extracts the TTL from a SET command. Returns (0, true) for a plain 3-arg SET,
-// the parsed duration for a valid "EX <s>" / "PX <ms>" 5-arg SET, and (_, false) on a syntax
-// error.
-func parseSetTTL(args [][]byte) (time.Duration, bool) {
-	if len(args) == 3 {
-		return 0, true
-	}
-	v, err := strconv.Atoi(unsafe.String(unsafe.SliceData(args[4]), len(args[4])))
-	if err != nil || v < 0 {
-		return 0, false
-	}
-	switch {
-	case EqualFold(args[3], "EX"):
-		return time.Duration(v) * time.Second, true
-	case EqualFold(args[3], "PX"):
-		return time.Duration(v) * time.Millisecond, true
-	default:
-		return 0, false
 	}
 }
 
