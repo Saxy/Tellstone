@@ -147,10 +147,13 @@ func newTestEngine(t *testing.T, enabled bool, filter *eventSet, dir string) *Lo
 	return e
 }
 
-// readAuditFiles returns the contents of every *_tsd.log file in dir.
+// readAuditFiles returns the contents of every audit file in dir. It locates
+// them the way replay does, so a rename of the suffix moves this helper with the
+// code instead of failing it; the name itself is pinned by
+// TestFileNameContainsTimestampHashAndMarker.
 func readAuditFiles(t *testing.T, dir string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, "*_tsd.log"))
+	matches, err := filepath.Glob(filepath.Join(dir, auditFileGlob))
 	if err != nil {
 		t.Fatal("Glob:", err)
 	}

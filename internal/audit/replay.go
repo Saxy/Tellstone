@@ -29,8 +29,12 @@ import (
 )
 
 // auditFileGlob matches the names fileName generates. Audit files carry no
-// index or manifest, so discovery is a directory glob.
-const auditFileGlob = "*_tsd.log"
+// index or manifest, so discovery is a directory glob. Built from the writer's
+// own suffix: a reader that spelled the name out again would stop finding
+// anything the moment the writer's changed, and would do it silently, since a
+// glob that matches nothing is indistinguishable from a directory with no
+// history in it.
+const auditFileGlob = "*" + auditFileSuffix
 
 // ReplayEntry is one recovered security event, shaped for the ACL LOG buffer.
 // The audit package does not import rbac: the caller translates these into

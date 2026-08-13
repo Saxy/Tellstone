@@ -33,6 +33,12 @@ import (
 // while making rotation rare enough not to matter operationally.
 const rotateAfterBytes = 50 << 20
 
+// auditFileSuffix ends every audit file name. Audit files carry no index or
+// manifest, so this suffix is the whole contract between the writer and anyone
+// discovering the files afterwards — replay globs on it. Defined here, beside
+// the fileName that applies it, so the two cannot drift apart.
+const auditFileSuffix = "_tsd.log"
+
 // file is a rotating, optionally encrypted audit log. bytesWritten counts the
 // bytes flushed to the current file; when it reaches maxSize, Write rotates.
 type file struct {
@@ -88,7 +94,7 @@ func open(dir string) (*os.File, string, error) {
 // processes writing to the same directory.
 func fileName(dir string) string {
 	h := sha256.Sum256([]byte(dir))
-	return fmt.Sprintf("%d_%x_%d_tsd.log", time.Now().UnixNano(), h[:4], os.Getpid())
+	return fmt.Sprintf("%d_%x_%d%s", time.Now().UnixNano(), h[:4], os.Getpid(), auditFileSuffix)
 }
 
 // Write encrypts the record when enabled, flushes it to the current file, and

@@ -30,11 +30,13 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
-// auditFilePaths lists every *_tsd.log file in dir. Sorted order equals
-// creation order because the file name embeds its creation timestamp.
+// auditFilePaths lists every audit file in dir. Sorted order equals creation
+// order because the file name embeds its creation timestamp. Discovery only —
+// it locates files the way replay does rather than restating the name, which
+// TestFileNameContainsTimestampHashAndMarker asserts.
 func auditFilePaths(t *testing.T, dir string) []string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(dir, "*_tsd.log"))
+	matches, err := filepath.Glob(filepath.Join(dir, auditFileGlob))
 	if err != nil {
 		t.Fatal("Glob:", err)
 	}
@@ -79,6 +81,10 @@ func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 	}
 	defer f.Close()
 
+	// The suffix is spelled out rather than taken from auditFileSuffix on
+	// purpose. This is the test that pins the on-disk name, and one that built
+	// its expectation from the constant it is checking would pass whatever that
+	// constant said. Changing the suffix is meant to fail here.
 	base := filepath.Base(f.path)
 	if !strings.HasSuffix(base, "_tsd.log") {
 		t.Fatalf("file name %q missing the tsd marker", base)
