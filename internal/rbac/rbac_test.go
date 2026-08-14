@@ -37,6 +37,27 @@ func TestCategoryUnknownReturnsNil(t *testing.T) {
 	}
 }
 
+func TestCategoriesForCommandDerivesFromCatalog(t *testing.T) {
+	read := CategoriesForCommand(CmdGet)
+	if !slices.Contains(read, "read") {
+		t.Errorf("CmdGet missing the read category, got %v", read)
+	}
+	if !slices.Contains(read, "all") {
+		t.Errorf("CmdGet missing the implicit all category, got %v", read)
+	}
+	for i := 1; i < len(read); i++ {
+		if read[i-1] >= read[i] {
+			t.Errorf("categories not sorted: %v", read)
+		}
+	}
+	if got := CategoriesForCommand(CmdGet); !slices.Equal(got, read) {
+		t.Errorf("CategoriesForCommand must be deterministic, got %v", got)
+	}
+	if got := CategoriesForCommand(0); got != nil {
+		t.Errorf("unregistered command id should yield nil, got %v", got)
+	}
+}
+
 func TestBitsetSetHasRoundTrip(t *testing.T) {
 	b := NewBitset(nil)
 	for _, id := range AllCommands {

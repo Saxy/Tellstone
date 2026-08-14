@@ -629,9 +629,15 @@ func (s *Server) dispatch(st *connState, c gnet.Conn, args [][]byte, out []byte)
 		return append(out, respPong...), false
 
 	case EqualFold(cmd, shard.CmdCommand):
-		// redis-cli / some tools probe COMMAND DOCS|COUNT at startup; an empty array keeps
-		// the session alive without implementing the introspection surface.
-		return append(out, "*0\r\n"...), false
+		// redis-cli and cluster-aware clients probe COMMAND INFO|DOCS|COUNT at
+		// startup to learn the server's command surface. The login category
+		// grants the COMMAND bit so sessions can introspect without admin
+		// privileges, mirroring Valkey's @connection classification.
+		if !s.authorizedCmd(st, rbac.CmdCommand) {
+			return s.deniedReply(st, "command", nil, true, out), false
+		}
+		s.countCommand(st)
+		return s.command(st, args, out), false
 
 	case EqualFold(cmd, shard.CmdRole):
 		if !s.authorizedCmd(st, rbac.CmdRole) {

@@ -12,6 +12,7 @@ Authors:
 package rbac
 
 import (
+	"sort"
 	"strings"
 )
 
@@ -100,4 +101,26 @@ var categories = map[string][]uint16{
 // category is unknown. The returned slice must not be mutated.
 func Category(name string) []uint16 {
 	return categories[name]
+}
+
+// CategoriesForCommand returns the names of the built-in categories that grant
+// the command, sorted alphabetically for deterministic output, or nil when id
+// is not registered. The implicit "all" grant is reported; the empty "none"
+// grant never matches. Used by the RESP COMMAND family so introspection stays
+// in step with the authorization model instead of duplicating it.
+func CategoriesForCommand(id uint16) []string {
+	var names []string
+	for name, ids := range categories {
+		if name == "none" {
+			continue
+		}
+		for _, cid := range ids {
+			if cid == id {
+				names = append(names, name)
+				break
+			}
+		}
+	}
+	sort.Strings(names)
+	return names
 }
