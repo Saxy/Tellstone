@@ -26,3 +26,60 @@ func BenchmarkEngineGetNoAlloc(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkEngineGetDeleteHit measures the DEL pattern the command layer used
+// before the Delete seam: Get to test existence, then Delete. The key is
+// re-set each iteration so every iteration sees a hit, the same shape as
+// BenchmarkEngineSetGetParallelNoTTL.
+func BenchmarkEngineGetDeleteHit(b *testing.B) {
+	eng := NewEngine(1*time.Millisecond, 64, 0, nil, nil)
+	defer eng.Close()
+
+	key := "benchmark_key"
+	val := []byte("benchmark_value")
+	eng.Set(key, val, 0)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		eng.Set(key, val, 0)
+		if _, ok := eng.Get(key); ok {
+			eng.Delete(key)
+		}
+	}
+}
+
+// BenchmarkEngineDeleteHit measures the same DEL cycle with the single Delete
+// call that reports existence, i.e. one map lookup instead of two.
+func BenchmarkEngineDeleteHit(b *testing.B) {
+	eng := NewEngine(1*time.Millisecond, 64, 0, nil, nil)
+	defer eng.Close()
+
+	key := "benchmark_key"
+	val := []byte("benchmark_value")
+	eng.Set(key, val, 0)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		eng.Set(key, val, 0)
+		if !eng.Delete(key) {
+			b.Fatalf("Delete reported a miss on a present key")
+		}
+	}
+}
+
+// BenchmarkEngineDeleteMiss measures the cost of DEL on an absent key.
+func BenchmarkEngineDeleteMiss(b *testing.B) {
+	eng := NewEngine(1*time.Millisecond, 64, 0, nil, nil)
+	defer eng.Close()
+
+	key := "benchmark_key"
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if eng.Delete(key) {
+			b.Fatalf("Delete reported a hit on an absent key")
+		}
+	}
+}

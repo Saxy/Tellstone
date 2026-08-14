@@ -56,8 +56,9 @@ func set(c *Ctx) {
 }
 
 // del implements DEL key [key ...], counting the keys that were present.
-// The reply count is a wire detail, not part of the semantics; the binary
-// frontend encodes it as an unconditional OK.
+// Delete reports existence directly, so a DEL costs one map lookup per key
+// instead of Get-then-Delete. The reply count is a wire detail, not part of
+// the semantics; the binary frontend encodes it as an unconditional OK.
 func del(c *Ctx) {
 	if len(c.Args) < 2 {
 		c.Reply.ErrorMsg("ERR wrong number of arguments for 'del' command")
@@ -65,9 +66,7 @@ func del(c *Ctx) {
 	}
 	var n int64
 	for _, k := range c.Args[1:] {
-		ks := alias(k)
-		if _, ok := c.Store.Get(ks); ok {
-			c.Store.Delete(ks)
+		if c.Store.Delete(alias(k)) {
 			n++
 		}
 	}
@@ -82,7 +81,7 @@ func parseSetTTL(args [][]byte) (time.Duration, bool) {
 		return 0, true
 	}
 	v, err := strconv.Atoi(unsafe.String(unsafe.SliceData(args[4]), len(args[4])))
-	if err != nil || v < 0 {
+	if err != nil || v <= 0 {
 		return 0, false
 	}
 	switch {

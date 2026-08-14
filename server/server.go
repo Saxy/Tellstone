@@ -55,8 +55,9 @@ func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
 	return resp.Err
 }
 
-func (rs *RouterStore) Delete(key string) {
-	rs.router.Dispatch(shard.CmdDel, key, nil, 0)
+func (rs *RouterStore) Delete(key string) bool {
+	resp := rs.router.Dispatch(shard.CmdDel, key, nil, 0)
+	return resp.OK
 }
 
 // binCmdGet, binCmdSet and binCmdDel are the data-command tokens the binary

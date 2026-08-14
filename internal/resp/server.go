@@ -55,7 +55,7 @@ const (
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte, ttl time.Duration) error
-	Delete(key string)
+	Delete(key string) bool
 }
 
 // authJob carries one AUTH verification request from the event loop to the

@@ -39,6 +39,35 @@ func TestEngine_SetCopiesAliasedKeyAndValue(t *testing.T) {
 	}
 }
 
+// TestEngine_DeleteReportsExistence verifies Delete reports whether the key was
+// present, and that an expired key is evicted physically but reported as absent
+// (the lazy-eviction semantics Get used to drive the DEL count).
+func TestEngine_DeleteReportsExistence(t *testing.T) {
+	engine := NewEngine(0, 0, 0, nil, nil)
+	defer engine.Close()
+
+	if engine.Delete("missing") {
+		t.Error("Delete(missing) = true, want false")
+	}
+	if err := engine.Set("live", []byte("v"), 0); err != nil {
+		t.Fatalf("set live: %v", err)
+	}
+	if !engine.Delete("live") {
+		t.Error("Delete(live) = false, want true")
+	}
+
+	if err := engine.Set("expired", []byte("v"), 10*time.Millisecond); err != nil {
+		t.Fatalf("set expired: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if engine.Delete("expired") {
+		t.Error("Delete(expired) = true, want false")
+	}
+	if _, found := engine.Get("expired"); found {
+		t.Error("expired key left behind by Delete")
+	}
+}
+
 func TestEngine_TableDriven(t *testing.T) {
 	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
 	defer engine.Close()

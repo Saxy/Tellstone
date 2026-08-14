@@ -1,3 +1,15 @@
+/*
+Package resp
+Tellstone Redis-Compatible Wire Protocol
+File: respreply.go
+Description: Reply encoder that adapts the shared command layer's Reply contract
+to RESP2 output. The encoder appends into the connection's reusable buffer so the
+GET, SET, and DEL path stays allocation-free; only the error paths build strings.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package resp
 
 // respReply is the command-layer Reply encoder for RESP

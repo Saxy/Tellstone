@@ -180,21 +180,30 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	return nil
 }
 
-func (e *Engine) Delete(key string) {
+// Delete removes key and reports whether it was present. An expired key is
+// evicted physically but counts as absent, mirroring Get's lazy eviction, so
+// callers can derive "did the key exist" without a separate Get lookup.
+func (e *Engine) Delete(key string) bool {
 	e.mu.Lock()
 	item, exists := e.items[key]
 	if !exists {
 		e.mu.Unlock()
-		return
+		return false
 	}
+	expired := !item.Expiration.IsZero() && time.Now().After(item.Expiration)
 	delete(e.items, key)
 	e.mu.Unlock()
 	e.releaseKey(key, item)
+	if expired {
+		atomic.AddUint64(&e.expiredCount, 1)
+		return false
+	}
 	if e.logger.Enabled(log.LevelDebug) {
 		e.logger.Log(log.LevelDebug, "key deleted from engine state",
 			log.String("key", key),
 		)
 	}
+	return true
 }
 
 func (e *Engine) deleteIfExpired(key string) bool {

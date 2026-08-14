@@ -73,6 +73,33 @@ func BenchmarkDispatchGetHit(b *testing.B) {
 	}
 }
 
+// BenchmarkDispatchDelHit measures Server.dispatch for a DEL that hits.
+func BenchmarkDispatchDelHit(b *testing.B) {
+	store := newFakeStore()
+	_ = store.Set("k", []byte("benchmark_value"), 0)
+	srv := &Server{store: store, logger: log.NewNoOpLogger(), audit: newNoOpAudit()}
+	st := &connState{authenticated: true}
+	args := [][]byte{[]byte("DEL"), []byte("k")}
+	out := make([]byte, 0, 128)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out, _ = srv.dispatch(st, nil, args, out[:0])
+	}
+}
+
+// BenchmarkDispatchDelMiss measures Server.dispatch for a DEL that misses.
+func BenchmarkDispatchDelMiss(b *testing.B) {
+	store := newFakeStore()
+	srv := &Server{store: store, logger: log.NewNoOpLogger(), audit: newNoOpAudit()}
+	st := &connState{authenticated: true}
+	args := [][]byte{[]byte("DEL"), []byte("k")}
+	out := make([]byte, 0, 128)
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		out, _ = srv.dispatch(st, nil, args, out[:0])
+	}
+}
+
 // BenchmarkDispatchSet measures Server.dispatch for a plain (no-TTL) SET.
 func BenchmarkDispatchSet(b *testing.B) {
 	store := newFakeStore()

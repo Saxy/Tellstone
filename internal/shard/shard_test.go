@@ -66,10 +66,16 @@ func TestShardSetGetDelete(t *testing.T) {
 		t.Fatalf("expected v1, got %q", getResp.Value)
 	}
 
-	s.Execute("DEL", "k1", nil, 0)
+	delResp := s.Execute("DEL", "k1", nil, 0)
+	if !delResp.OK {
+		t.Fatal("expected DEL of an existing key to report a deletion")
+	}
 	getResp = s.Execute("GET", "k1", nil, 0)
 	if getResp.OK {
 		t.Fatal("expected key to be deleted")
+	}
+	if miss := s.Execute("DEL", "k1", nil, 0); miss.OK {
+		t.Fatal("expected DEL of a missing key to report no deletion")
 	}
 }
 

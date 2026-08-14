@@ -27,7 +27,7 @@ import (
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte, ttl time.Duration) error
-	Delete(key string)
+	Delete(key string) bool
 }
 
 // Reply is the transport-specific wire encoder.

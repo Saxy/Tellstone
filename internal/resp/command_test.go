@@ -82,7 +82,7 @@ func parseRESPStatus(b []byte, i int) (respValue, int, error) {
 	if end < 0 {
 		return nil, 0, errIncomplete
 	}
-	if end+2 > len(b) || b[i+end+1] != '\n' {
+	if i+end+2 > len(b) || b[i+end+1] != '\n' {
 		return nil, 0, errIncomplete
 	}
 	return respStatus(b[i+1 : i+end]), i + end + 2, nil
@@ -93,8 +93,7 @@ func parseRESPBulk(b []byte, i int) (respValue, int, error) {
 	if end < 0 {
 		return nil, 0, errIncomplete
 	}
-	hlen := end
-	if hlen+2 > len(b) || b[i+end+1] != '\n' {
+	if i+end+2 > len(b) || b[i+end+1] != '\n' {
 		return nil, 0, errIncomplete
 	}
 	n, err := strconv.ParseInt(string(b[i+1:i+end]), 10, 64)
@@ -117,7 +116,7 @@ func parseRESPArray(b []byte, i int) (respValue, int, error) {
 	if end < 0 {
 		return nil, 0, errIncomplete
 	}
-	if end+2 > len(b) || b[i+end+1] != '\n' {
+	if i+end+2 > len(b) || b[i+end+1] != '\n' {
 		return nil, 0, errIncomplete
 	}
 	n, err := strconv.ParseInt(string(b[i+1:i+end]), 10, 64)

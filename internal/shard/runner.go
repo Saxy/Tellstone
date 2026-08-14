@@ -171,8 +171,9 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 				return Response{Err: err}
 			}
 		}
-		s.Engine.Delete(key)
-		return Response{OK: true}
+		// The engine reports whether the key existed so the command layer can
+		// count DEL hits without a preceding Get.
+		return Response{OK: s.Engine.Delete(key)}
 	default:
 		if s.Logger.Enabled(log.LevelError) {
 			s.Logger.Log(log.LevelError, "shard: unknown operation",
