@@ -1,0 +1,43 @@
+internal/shard/runner.go
+  s_0bfbd15b8c3f53::t_aabf0914b9ce5e 174-176
+internal/resp/server_test.go
+  s_0bfbd15b8c3f53::t_f4e19344b6debf 46,49,51
+internal/resp/server.go
+  s_0bfbd15b8c3f53::t_78d9d2d96fe771 58
+internal/storage/engine.go
+  s_0bfbd15b8c3f53::t_ad287e6ff942b4 183-186,191,193,197-200,206
+internal/command/command.go
+  s_0bfbd15b8c3f53::t_162cc2848ff556 30
+internal/resp/benchmark_test.go
+  s_0bfbd15b8c3f53::t_6426e8f617ec1a 76-102
+internal/storage/engine_test.go
+  s_0bfbd15b8c3f53::t_674c4532ff4588 42-70
+internal/shard/shard_test.go
+  s_0bfbd15b8c3f53::t_8b66f4c82d1059 69-72,77-79
+internal/storage/benchmark_test.go
+  s_0bfbd15b8c3f53::t_52c7cb89612d59 29,35-45,66-71,74-85
+  s_0bfbd15b8c3f53::t_a7aed500f7fdda 30-34,46-65,72-73
+internal/command/command_test.go
+  s_0bfbd15b8c3f53::t_9607c57eae3072 45-49
+internal/command/handlers.go
+  s_0bfbd15b8c3f53::t_8c273a49bfe511 59-61,69
+  s_0bfbd15b8c3f53::t_27c384c9881aad 84
+server/server.go
+  s_0bfbd15b8c3f53::t_cd0e3d339e4d3f 58-60
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "ce7db5044bce8b083b178689f1d8b3d02ea73429",
+  "prompts": {},
+  "sessions": {
+    "s_0bfbd15b8c3f53": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_0065cb2b8ffe5gx5WUzo4s1T39",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
