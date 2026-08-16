@@ -1,0 +1,60 @@
+internal/audit/audit_test.go
+  s_3b20415358534f::t_77645e8ec67159 150-153,168
+internal/crypto/envelope_test.go
+  s_3b20415358534f::t_03b1e6863d1055 162
+internal/audit/replay_test.go
+  s_3b20415358534f::t_ce164f51e4896d 290-293
+internal/crypto/cipher.go
+  s_3b20415358534f::t_8739cfcd50f29d 74-77
+  s_3b20415358534f::t_4402f29ead239f 67-70,78
+  s_3b20415358534f::t_d2741878632f36 25-28
+  s_3b20415358534f::t_7ba5c574167fce 79-80
+internal/audit/file_test.go
+  s_3b20415358534f::t_bb0505246e7bda 226
+  s_3b20415358534f::t_93a3843a47cda9 413-424,426-445,448-470,472-479,482-490,492-499,502-513,515-536,539-553,555-591
+  s_3b20415358534f::t_d3216de7e8b5a4 491,500-501,514,537-538
+  s_3b20415358534f::t_1d17276e9bb84a 323
+  s_3b20415358534f::t_b12ea73dc91965 147-148,161-162
+  s_3b20415358534f::t_0ea2a94ae00a80 47-56
+  s_3b20415358534f::t_a7c93803c98a08 89,124,425,446-447,471,480-481,554
+  s_3b20415358534f::t_ff53ddf3b91f7e 68-69,78
+internal/crypto/envelope.go
+  s_3b20415358534f::t_b0a54967806c6b 167,240
+  s_3b20415358534f::t_368ac531e77e31 261-264
+internal/audit/replay.go
+  s_3b20415358534f::t_b4180affb00f88 144,153-164
+  s_3b20415358534f::t_0e1fe7df8418c6 166-175
+  s_3b20415358534f::t_8a8a13bb273c13 165
+internal/audit/engine.go
+  s_3b20415358534f::t_81ba815ff73c7d 118,120,122
+  s_3b20415358534f::t_117a801bde2759 111-117,123-124,126-127
+  s_3b20415358534f::t_849976c38acdbd 119,121
+  s_3b20415358534f::t_97543b4d5694ef 125
+  s_3b20415358534f::t_231c1f1e8bb6ff 128
+internal/audit/file.go
+  s_3b20415358534f::t_0a39a49242d52f 31-40,44,48-53
+  s_3b20415358534f::t_f6d9a269a9fb96 85-88,97
+  s_3b20415358534f::t_1e1d5cba61c366 66-68,79-80
+  s_3b20415358534f::t_549ab33b22018b 193
+  s_3b20415358534f::t_6e204596689e36 41,43,45,47
+  s_3b20415358534f::t_81bec91e75128e 109-111,117-121,125-135
+  s_3b20415358534f::t_d5597768be460d 42
+  s_3b20415358534f::t_4b752139f3146b 46
+  s_3b20415358534f::t_1f99d728c62e65 136-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "70effe4ab7d28bacfa68bc8b72963e53ae0d0a85",
+  "prompts": {},
+  "sessions": {
+    "s_3b20415358534f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff45061ecffemN1Zv3a9wBkoN5",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
