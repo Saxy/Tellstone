@@ -82,6 +82,14 @@ func main() {
 			version.Print()
 			return
 		}
+		if arg == "-h" || arg == "--help" {
+			config.LoadConfig(os.Args[1:])
+			return
+		}
+	}
+	if len(os.Args) > 1 && os.Args[1] == "audit" {
+		runAudit(os.Args[2:])
+		return
 	}
 	cfg := config.LoadConfig(os.Args[1:])
 	app := new(tellstone.App)
