@@ -339,25 +339,33 @@ func TestReplayAuthLogNilLogger(t *testing.T) {
 	}
 }
 
-// TestReplayAuthLogFormatMismatch documents the encryption-toggle case: files
-// written in one format and read in the other recover nothing, and must not
-// panic or hang.
+// TestReplayAuthLogFormatMismatch documents that the header is the authority:
+// a headed file is decoded according to its keyMode, not the engine the caller
+// provides. A plaintext file with a KeyModeSimple header is decoded as
+// plaintext even when an encrypted engine is supplied (the header wins). An
+// encrypted file whose header fingerprint does not match the engine is skipped
+// (fail-closed). Headerless legacy files still fall back to engine-based
+// inference.
 func TestReplayAuthLogFormatMismatch(t *testing.T) {
 	ce, err := crypto.NewEngine(bytes.Repeat([]byte{0x42}, 32), log.NewNoOpLogger())
 	if err != nil {
 		t.Fatal("NewEngine:", err)
 	}
 
+	// Plaintext file with KeyModeSimple header: decoded as plaintext even when
+	// an encrypted engine is supplied. The header is the authority.
 	plainDir := t.TempDir()
 	writeAuthEvents(t, plainDir, nil)
-	if entries := replayAuthLog(plainDir, ce, 100, log.NewNoOpLogger()); len(entries) != 0 {
-		t.Fatalf("plaintext read as encrypted = %+v, want no entries", entries)
+	if entries := replayAuthLog(plainDir, ce, 100, log.NewNoOpLogger()); len(entries) == 0 {
+		t.Fatal("plaintext file with KeyModeSimple header should be decoded as plaintext")
 	}
 
+	// Encrypted file whose header fingerprint does not match the engine:
+	// fail-closed, zero entries recovered.
 	encDir := t.TempDir()
 	writeAuthEvents(t, encDir, ce)
 	if entries := replayAuthLog(encDir, nil, 100, log.NewNoOpLogger()); len(entries) != 0 {
-		t.Fatalf("encrypted read as plaintext = %+v, want no entries", entries)
+		t.Fatalf("encrypted file with no engine should yield no entries, got %+v", entries)
 	}
 }
 

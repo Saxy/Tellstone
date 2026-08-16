@@ -127,6 +127,17 @@ func replayAuthLog(dir string, engine *crypto.Engine, maxEntries int, logger log
 // readFile decodes one audit file into its replayable entries, oldest first. An
 // unreadable file yields nothing: one damaged file must not cost the history
 // held in its siblings.
+//
+// When the file carries a header the keyMode field decides the format:
+//   - KeyModeSimple (0) → plaintext records, no engine needed.
+//   - KeyModeEnvelope (1) → length-prefixed sealed records; the engine's
+//     fingerprint is validated against the header before any decryption is
+//     attempted, so a wrong key is rejected rather than silently producing
+//     garbage.
+//
+// For headerless legacy files the format is inferred from the engine parameter
+// (nil → plaintext, non-nil → encrypted), preserving backward compatibility
+// without requiring migration.
 func readFile(path string, engine *crypto.Engine, logger log.Logger) []ReplayEntry {
 	// Audit files are bounded by rotateAfterBytes, and this runs once at startup
 	// off any serving path, so reading a file whole is simpler than streaming it
@@ -141,24 +152,62 @@ func readFile(path string, engine *crypto.Engine, logger log.Logger) []ReplayEnt
 		}
 		return nil
 	}
-	data = skipHeader(data, logger, path)
-	// The same condition newFile applies when deciding to seal records, so the
-	// reader and the writer cannot disagree about the format.
-	if engine != nil && engine.Enabled() {
-		return decodeEncrypted(data, engine, path, logger)
+	keyMode, fingerprint, rest, ok := parseHeader(data, logger, path)
+	if !ok {
+		// No valid header — legacy file created before the header feature.
+		// The format cannot be determined from the file itself; infer from
+		// the engine parameter (nil → plaintext, non-nil → encrypted).
+		if logger.Enabled(log.LevelDebug) {
+			logger.Log(log.LevelDebug, "audit: replay reading headerless legacy file",
+				log.String("filename", path),
+			)
+		}
+		if engine != nil && engine.Enabled() {
+			return decodeEncrypted(data, engine, path, logger)
+		}
+		return decodePlaintext(data)
 	}
-	return decodePlaintext(data)
+	// Header present: keyMode is the authority.
+	switch keyMode {
+	case KeyModeSimple:
+		return decodePlaintext(rest)
+	case KeyModeEnvelope:
+		if engine == nil || !engine.Enabled() {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "audit: replay skipping sealed file with no engine",
+					log.String("filename", path),
+				)
+			}
+			return nil
+		}
+		if engine.KeyFingerprint() != fingerprint {
+			if logger.Enabled(log.LevelWarn) {
+				logger.Log(log.LevelWarn, "audit: replay skipping sealed file: fingerprint mismatch",
+					log.String("filename", path),
+				)
+			}
+			return nil
+		}
+		return decodeEncrypted(rest, engine, path, logger)
+	default:
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "audit: replay skipping file with unknown keyMode",
+				log.String("filename", path),
+				log.Uint("keyMode", uint32(keyMode)),
+			)
+		}
+		return nil
+	}
 }
 
-// skipHeader inspects the first bytes of an audit file for the self-describing
-// header ([magic:4][version:1][keyMode:1][fingerprint:16]). When the magic is
-// present the data past the header is returned; for headerless legacy files the
-// original data is returned unchanged. A file shorter than the header or with
-// an unknown version is returned as-is — decoding will either parse it as
-// records or skip the damage gracefully.
-func skipHeader(data []byte, logger log.Logger, path string) []byte {
+// parseHeader inspects the first bytes of an audit file for the self-describing
+// header ([magic:4][version:1][keyMode:1][fingerprint:16]). When valid, it
+// returns the keyMode, the 16-byte fingerprint, the remaining data past the
+// header, and ok=true. For headerless legacy files or files with an unknown
+// version, ok is false and the caller falls back to engine-based inference.
+func parseHeader(data []byte, logger log.Logger, path string) (keyMode byte, fingerprint [16]byte, rest []byte, ok bool) {
 	if len(data) < auditFileHeaderLen || string(data[:4]) != auditFileMagic {
-		return data
+		return 0, [16]byte{}, data, false
 	}
 	version := data[4]
 	if version != auditFileVersion {
@@ -168,9 +217,11 @@ func skipHeader(data []byte, logger log.Logger, path string) []byte {
 				log.Uint("version", uint32(version)),
 			)
 		}
-		return data
+		return 0, [16]byte{}, data, false
 	}
-	return data[auditFileHeaderLen:]
+	keyMode = data[5]
+	copy(fingerprint[:], data[6:6+16])
+	return keyMode, fingerprint, data[auditFileHeaderLen:], true
 }
 
 // decodePlaintext walks newline-delimited JSON, the format the encoder writes
