@@ -1,0 +1,29 @@
+internal/audit/replay.go
+  s_3b20415358534f::t_29fb69c787881b 157-164
+  s_3b20415358534f::t_b4180affb00f88 130-140,167,176,178-199
+  s_3b20415358534f::t_309e53aca6874d 203-208,210,220,222-224
+  s_3b20415358534f::t_c0e6385a7bd501 155-156
+  s_3b20415358534f::t_72ef97c4ee55d0 165-166
+  s_3b20415358534f::t_c3fdd4fc267cf5 168-170,173-175
+  s_3b20415358534f::t_508f5ae553bf85 177
+internal/audit/replay_test.go
+  s_3b20415358534f::t_ae41da8568631d 342-348,355-356,359-360,363-364,368
+internal/audit/engine.go
+  s_3b20415358534f::t_8ee5150a043c90 111-116,120
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "a6cf27f57a6af7b1fe601485b9103cb62d8764e7",
+  "prompts": {},
+  "sessions": {
+    "s_3b20415358534f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff45061ecffemN1Zv3a9wBkoN5",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
