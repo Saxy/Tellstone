@@ -1,0 +1,40 @@
+cmd/tellstone/main.go
+  s_b304c1a7d884ad::t_87ca3b9282ce13 90-92
+  s_03ea68694d1684::t_b04c0dc0444c0b 85-88
+internal/audit/decrypt_test.go
+  s_b304c1a7d884ad::t_b1eb012ff95880 1-415
+internal/audit/decrypt.go
+  s_b304c1a7d884ad::t_aa47b4429479b7 197-200
+  s_b304c1a7d884ad::t_e0313509c2a177 1-101,107-113,122,124-125,127,143-196,201-228
+  s_b304c1a7d884ad::t_f0d3cc9faf3718 102-106
+  s_b304c1a7d884ad::t_d7baf1688e316e 114-121,123
+  s_b304c1a7d884ad::t_b18ce33af61d7a 126
+  s_b304c1a7d884ad::t_8edd3df405adfd 128-134
+  s_b304c1a7d884ad::t_226f8bb1611176 135-142
+cmd/tellstone/audit_decrypt.go
+  s_b304c1a7d884ad::t_0c8dd4f3dcb83e 1-189
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "0b5b04b42bfd25f3624bb41cd5ae83f251f2076f",
+  "prompts": {},
+  "sessions": {
+    "s_03ea68694d1684": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3b15a0cffeN98BX2UzjBFBaM",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    },
+    "s_b304c1a7d884ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3cf694fffe5fNF1krXFw4PB9",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
