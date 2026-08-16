@@ -159,7 +159,7 @@ func TestEnvelopeFileLayout(t *testing.T) {
 	if raw[0] != envVersion {
 		t.Fatalf("version byte = %d, want %d", raw[0], envVersion)
 	}
-	fp := fingerprintBytes(kek)
+	fp := FingerprintBytes(kek)
 	if !bytes.Equal(raw[1:1+envFingerprintLen], fp[:]) {
 		t.Fatal("stored fingerprint does not match the KEK")
 	}

@@ -44,6 +44,16 @@ func auditFilePaths(t *testing.T, dir string) []string {
 	return matches
 }
 
+// stripHeader returns data with the audit file header removed. This mirrors
+// what replay.skipHeader does but lives in the test package so both plaintext
+// and encrypted test helpers can strip the header without importing replay.
+func stripHeader(data []byte) []byte {
+	if len(data) >= auditFileHeaderLen && string(data[:4]) == auditFileMagic {
+		return data[auditFileHeaderLen:]
+	}
+	return data
+}
+
 // a singleAuditFile returns the one and only audit file in dir.
 func singleAuditFile(t *testing.T, dir string) string {
 	t.Helper()
@@ -55,7 +65,8 @@ func singleAuditFile(t *testing.T, dir string) string {
 }
 
 // auditLines returns every non-empty line across all audit files in dir,
-// in creation order.
+// in creation order. The file header is stripped from each file before
+// splitting so callers see only record data.
 func auditLines(t *testing.T, dir string) []string {
 	t.Helper()
 	var lines []string
@@ -64,7 +75,7 @@ func auditLines(t *testing.T, dir string) []string {
 		if err != nil {
 			t.Fatal("ReadFile:", err)
 		}
-		for _, l := range strings.Split(string(data), "\n") {
+		for _, l := range strings.Split(string(stripHeader(data)), "\n") {
 			if l != "" {
 				lines = append(lines, l)
 			}
@@ -75,7 +86,7 @@ func auditLines(t *testing.T, dir string) []string {
 
 func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 	dir := t.TempDir()
-	f, err := newFile(dir, &crypto.Engine{}, log.NewNoOpLogger())
+	f, err := newFile(dir, &crypto.Engine{}, log.NewNoOpLogger(), KeyModeSimple, [16]byte{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +121,7 @@ func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 
 func TestFileRotation(t *testing.T) {
 	dir := t.TempDir()
-	f, err := newFile(dir, &crypto.Engine{}, log.NewNoOpLogger())
+	f, err := newFile(dir, &crypto.Engine{}, log.NewNoOpLogger(), KeyModeSimple, [16]byte{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,8 +144,8 @@ func TestFileRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "0123456789abcdefghij" {
-		t.Fatalf("previous file holds %q, want both writes", data)
+	if got := string(stripHeader(data)); got != "0123456789abcdefghij" {
+		t.Fatalf("previous file holds %q, want both writes", got)
 	}
 
 	if _, err = f.Write([]byte("xyz")); err != nil {
@@ -147,8 +158,8 @@ func TestFileRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "xyz" {
-		t.Fatalf("rotated file holds %q, want xyz", data)
+	if got := string(stripHeader(data)); got != "xyz" {
+		t.Fatalf("rotated file holds %q, want xyz", got)
 	}
 }
 
@@ -212,6 +223,7 @@ func TestFileAuditLoggingEncrypted(t *testing.T) {
 	if strings.Contains(string(data), "AUDIT") {
 		t.Fatal("encrypted audit file contains plaintext AUDIT marker")
 	}
+	data = stripHeader(data)
 
 	for i, r := range records {
 		if len(data) < 4 {
@@ -308,6 +320,7 @@ func TestFileAuditLoggingEnvelope(t *testing.T) {
 		if err != nil {
 			t.Fatal("ReadFile:", err)
 		}
+		data = stripHeader(data)
 		for len(data) > 0 {
 			if len(data) < 4 {
 				t.Fatalf("%s: truncated length prefix (%d bytes left)", p, len(data))
@@ -395,5 +408,184 @@ func TestEngineConcurrentRecords(t *testing.T) {
 	lines := auditLines(t, dir)
 	if len(lines) != workers*perWorker {
 		t.Fatalf("expected %d records, got %d", workers*perWorker, len(lines))
+	}
+}
+
+// --- Audit file header tests ---
+
+func TestAuditFileHeaderLayout(t *testing.T) {
+	dir := t.TempDir()
+	key := bytes.Repeat([]byte{0xAA}, 32)
+	ce, err := crypto.NewEngine(key, log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := crypto.FingerprintBytes(key)
+
+	f, err := newFile(dir, ce, log.NewNoOpLogger(), KeyModeSimple, fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < auditFileHeaderLen {
+		t.Fatalf("file too short for header: %d bytes", len(raw))
+	}
+
+	// [magic:4][version:1][keyMode:1][fingerprint:16]
+	if string(raw[:4]) != auditFileMagic {
+		t.Fatalf("magic = %q, want %q", raw[:4], auditFileMagic)
+	}
+	if raw[4] != auditFileVersion {
+		t.Fatalf("version = %d, want %d", raw[4], auditFileVersion)
+	}
+	if raw[5] != KeyModeSimple {
+		t.Fatalf("keyMode = %d, want %d (KEK)", raw[5], KeyModeSimple)
+	}
+	if !bytes.Equal(raw[6:6+16], fp[:]) {
+		t.Fatal("fingerprint does not match sealing key")
+	}
+}
+
+func TestAuditFileHeaderMagicRejection(t *testing.T) {
+	// A file without the TSDA magic is treated as legacy (headerless).
+	legacy := []byte(`{"event":"auth_success","level":"AUDIT","msg":"test"}` + "\n")
+	if len(legacy) >= 4 && string(legacy[:4]) == auditFileMagic {
+		t.Fatal("test fixture must not start with the audit magic")
+	}
+	// skipHeader must return the data unchanged.
+	got := stripHeader(legacy)
+	if !bytes.Equal(got, legacy) {
+		t.Fatal("skipHeader should return legacy data unchanged")
+	}
+}
+
+func TestAuditFileHeaderKeyMode(t *testing.T) {
+	dir := t.TempDir()
+
+	// Plaintext (no encryption): keyMode should be 0 (KEK).
+	plain, err := newFile(dir, &crypto.Engine{}, log.NewNoOpLogger(), KeyModeSimple, [16]byte{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plain.Close()
+	raw, err := os.ReadFile(plain.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[5] != KeyModeSimple {
+		t.Fatalf("plaintext keyMode = %d, want %d", raw[5], KeyModeSimple)
+	}
+
+	// DEK-sealed (envelope mode): keyMode should be 1.
+	key := bytes.Repeat([]byte{0xBB}, 32)
+	ce, err := crypto.NewEngine(key, log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := crypto.FingerprintBytes(key)
+	fDEK, err := newFile(dir, ce, log.NewNoOpLogger(), KeyModeEnvelope, fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fDEK.Close()
+	raw, err = os.ReadFile(fDEK.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if raw[5] != KeyModeEnvelope {
+		t.Fatalf("DEK keyMode = %d, want %d", raw[5], KeyModeEnvelope)
+	}
+}
+
+func TestAuditFileHeaderOnRotation(t *testing.T) {
+	dir := t.TempDir()
+	key := bytes.Repeat([]byte{0xCC}, 32)
+	ce, err := crypto.NewEngine(key, log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := crypto.FingerprintBytes(key)
+
+	f, err := newFile(dir, ce, log.NewNoOpLogger(), KeyModeEnvelope, fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Force rotation by setting a tiny maxSize.
+	f.maxSize = 5
+	if _, err := f.Write([]byte("0123456789")); err != nil {
+		t.Fatal(err)
+	}
+
+	// The rotated file must also start with the header.
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) < auditFileHeaderLen {
+		t.Fatalf("rotated file too short for header: %d bytes", len(raw))
+	}
+	if string(raw[:4]) != auditFileMagic {
+		t.Fatalf("rotated file magic = %q, want %q", raw[:4], auditFileMagic)
+	}
+	if raw[5] != KeyModeEnvelope {
+		t.Fatalf("rotated file keyMode = %d, want %d", raw[5], KeyModeEnvelope)
+	}
+	if !bytes.Equal(raw[6:6+16], fp[:]) {
+		t.Fatal("rotated file fingerprint does not match sealing key")
+	}
+}
+
+func TestAuditFileHeaderFingerprintMatchesKey(t *testing.T) {
+	dir := t.TempDir()
+	key := bytes.Repeat([]byte{0xDD}, 32)
+	ce, err := crypto.NewEngine(key, log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := crypto.FingerprintBytes(key)
+
+	f, err := newFile(dir, ce, log.NewNoOpLogger(), KeyModeSimple, fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	raw, err := os.ReadFile(f.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := raw[6 : 6+16]
+	if !bytes.Equal(got, fp[:]) {
+		t.Fatalf("header fingerprint %x does not match expected %x", got, fp[:])
+	}
+}
+
+func TestLegacyHeaderlessFileStillReplays(t *testing.T) {
+	// Write a headerless plaintext audit file (legacy format) and verify
+	// replay still recovers the records.
+	dir := t.TempDir()
+	legacy := []byte(`{"time":"2026-08-12T10:00:00Z","level":"AUDIT","event":"auth_failure","user":"alice","reason":"invalid password"}` + "\n" +
+		`{"time":"2026-08-12T10:01:00Z","level":"AUDIT","event":"acl_deny","user":"bob","command":"set","key":"forbidden"}` + "\n")
+	path := filepath.Join(dir, "legacy_0000000000_00000000_0_tsd.log")
+	if err := os.WriteFile(path, legacy, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	entries := replayAuthLog(dir, nil, 100, log.NewNoOpLogger())
+	if len(entries) != 2 {
+		t.Fatalf("ReplayAuthLog len = %d, want 2 for legacy file", len(entries))
+	}
+	if entries[0].Username != "alice" {
+		t.Fatalf("entry 0 username = %q, want alice", entries[0].Username)
+	}
+	if entries[1].Username != "bob" {
+		t.Fatalf("entry 1 username = %q, want bob", entries[1].Username)
 	}
 }

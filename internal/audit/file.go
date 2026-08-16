@@ -28,6 +28,29 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
+const (
+	// auditFileMagic is the 4-byte marker at the start of every audit file
+	// written by the current format. A reader uses it to distinguish headed
+	// files from legacy (headerless) ones without misinterpreting record data.
+	auditFileMagic = "TSDA"
+
+	// auditFileVersion is the format version embedded in the header. Bump it
+	// when the layout changes; the reader dispatches on it.
+	auditFileVersion byte = 1
+
+	// KeyModeSimple signals that every record in the file was sealed directly
+	// with the pass-through mode
+	KeyModeSimple byte = 0
+
+	// KeyModeEnvelope signals envelope mode: every record was sealed with a
+	// per-instance Data Encryption Key wrapped by the a KEK.
+	KeyModeEnvelope byte = 1
+
+	// auditFileHeaderLen is the fixed size of the file header in bytes:
+	// [magic:4][version:1][keyMode:1][fingerprint:16].
+	auditFileHeaderLen = 4 + 1 + 1 + 16
+)
+
 // rotateAfterBytes is the writing volume after which the audit file rotates.
 // 50 MiB keeps a single file small enough to inspect or ingest in one piece
 // while making rotation rare enough not to matter operationally.
@@ -40,7 +63,9 @@ const rotateAfterBytes = 50 << 20
 const auditFileSuffix = "_tsd.log"
 
 // file is a rotating, optionally encrypted audit log. bytesWritten counts the
-// bytes flushed to the current file; when it reaches maxSize, Write rotates.
+// bytes flushed to the current file; when it reaches maxSize, write rotates.
+// Every file starts with a 22-byte self-describing header so a reader can
+// identify the sealing key without consulting a sidecar.
 type file struct {
 	dir          string
 	path         string
@@ -51,12 +76,16 @@ type file struct {
 	maxSize      uint64
 	buf          []byte
 	logger       log.Logger
+	keyMode      byte
+	fingerprint  [16]byte
 }
 
 // newFile opens the first audit file inside dir. When engine.Enabled() is
 // false, records are written as plaintext; otherwise every record is sealed.
-func newFile(dir string, engine *crypto.Engine, logger log.Logger) (*file, error) {
-	f := &file{dir: dir, maxSize: rotateAfterBytes}
+// keyMode and fingerprint are written into the file header so every segment is
+// self-describing — rotation emits the same header automatically.
+func newFile(dir string, engine *crypto.Engine, logger log.Logger, keyMode byte, fingerprint [16]byte) (*file, error) {
+	f := &file{dir: dir, maxSize: rotateAfterBytes, keyMode: keyMode, fingerprint: fingerprint}
 	if engine != nil && engine.Enabled() {
 		f.isEncrypted = true
 		f.ce = engine
@@ -65,7 +94,7 @@ func newFile(dir string, engine *crypto.Engine, logger log.Logger) (*file, error
 		logger = log.NewNoOpLogger()
 	}
 	f.logger = logger
-	osFile, path, err := open(dir)
+	osFile, path, err := open(dir, keyMode, fingerprint)
 	if err != nil {
 		return nil, err
 	}
@@ -77,14 +106,33 @@ func newFile(dir string, engine *crypto.Engine, logger log.Logger) (*file, error
 	return f, nil
 }
 
-// open generates a fresh file name in dir and opens it for append.
-func open(dir string) (*os.File, string, error) {
+// open generates a fresh file name in dir, opens it for append, and writes the
+// self-describing header so every rotated segment carries its own key metadata.
+func open(dir string, keyMode byte, fingerprint [16]byte) (*os.File, string, error) {
 	path := filepath.Join(dir, fileName(dir))
 	osFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
 		return nil, "", err
 	}
+	if err := writeHeader(osFile, keyMode, fingerprint); err != nil {
+		osFile.Close()
+		os.Remove(path)
+		return nil, "", err
+	}
 	return osFile, path, nil
+}
+
+// writeHeader emits the fixed [magic:4][version:1][keyMode:1][fingerprint:16]
+// header to w. The header is written once per file at creation time so every
+// audit segment is self-describing without consulting a sidecar.
+func writeHeader(w *os.File, keyMode byte, fingerprint [16]byte) error {
+	var header [auditFileHeaderLen]byte
+	copy(header[0:4], auditFileMagic)
+	header[4] = auditFileVersion
+	header[5] = keyMode
+	copy(header[6:], fingerprint[:])
+	_, err := w.Write(header[:])
+	return err
 }
 
 // fileName builds a unique audit file name:
@@ -142,7 +190,7 @@ func (f *file) Write(p []byte) (int, error) {
 // the same directory, resetting the byte counter. The previous file is left
 // untouched on disk — rotation never truncates or renames history.
 func (f *file) rotate() error {
-	osFile, path, err := open(f.dir)
+	osFile, path, err := open(f.dir, f.keyMode, f.fingerprint)
 	if err != nil {
 		if f.logger.Enabled(log.LevelError) {
 			f.logger.Log(log.LevelError, "audit: failed to rotate log file", log.String("current", f.path), log.String("error", err.Error()))

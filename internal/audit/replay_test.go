@@ -287,9 +287,10 @@ func TestReplayAuthLogUndecryptableRecord(t *testing.T) {
 	if err != nil {
 		t.Fatal("ReadFile:", err)
 	}
-	// Flip a byte inside the first sealed blob, past its 4-byte length prefix,
-	// so authentication fails for that record alone.
-	data[8] ^= 0xFF
+	// Flip a byte inside the first sealed blob, past the 22-byte file header
+	// and past its 4-byte length prefix, so authentication fails for that
+	// record alone.
+	data[auditFileHeaderLen+4] ^= 0xFF
 	if err = os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal("WriteFile:", err)
 	}

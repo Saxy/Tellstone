@@ -108,7 +108,24 @@ func NewLogEngine(
 			return nil, fmt.Errorf("audit: data engine init: %w", err)
 		}
 	}
-	f, err := newFile(auditLogPath, engine, logger)
+	// Compute the file header metadata. DEK-sealed (envelope) files carry the
+	// DEK's fingerprint so a reader can pick the right key. KEK-sealed and
+	// plaintext files carry the operator key's fingerprint (or zeros when
+	// encryption is entirely off).
+	var keyMode byte
+	var fingerprint [16]byte
+	if engine != nil && engine.Enabled() {
+		if envelopeEnabled {
+			keyMode = KeyModeEnvelope
+		} else {
+			keyMode = KeyModeSimple
+		}
+		fingerprint = engine.KeyFingerprint()
+	} else if len(key) > 0 {
+		keyMode = KeyModeSimple
+		fingerprint = crypto.FingerprintBytes(key)
+	}
+	f, err := newFile(auditLogPath, engine, logger, keyMode, fingerprint)
 	if err != nil {
 		return nil, err
 	}

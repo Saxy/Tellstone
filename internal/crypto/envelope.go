@@ -164,7 +164,7 @@ func (e *Envelope) Store(dir string, fileName string) error {
 	}
 	buf := make([]byte, 1+envFingerprintLen+len(wrapped))
 	buf[0] = envVersion
-	fp := fingerprintBytes(e.kek)
+	fp := FingerprintBytes(e.kek)
 	copy(buf[1:1+envFingerprintLen], fp[:])
 	copy(buf[1+envFingerprintLen:], wrapped)
 	name := filepath.Join(dir, fileName)
@@ -237,7 +237,7 @@ func (e *Envelope) Load(dir, fileName string) ([]byte, error) {
 	if len(raw) < headerLen || raw[0] != envVersion {
 		return nil, fmt.Errorf("envelope: unsupported envelope format %s", fileName)
 	}
-	fp := fingerprintBytes(e.kek)
+	fp := FingerprintBytes(e.kek)
 	if !bytes.Equal(raw[1:headerLen], fp[:]) {
 		return nil, fmt.Errorf("envelope: KEK fingerprint mismatch for %s; data was written with a different key", fileName)
 	}
@@ -258,9 +258,10 @@ func rnd() ([]byte, error) {
 	return b, nil
 }
 
-// fingerprintBytes is the truncated SHA-256 used as the KEK's identifier in the
-// envelope header.
-func fingerprintBytes(key []byte) [16]byte {
+// FingerprintBytes is the truncated SHA-256 used as a key's identifier in
+// envelope and audit file headers. The 16-byte prefix lets a reader pick the
+// right key without trying every candidate.
+func FingerprintBytes(key []byte) [16]byte {
 	var fp [16]byte
 	sum := sha256.Sum256(key)
 	copy(fp[:], sum[:16])

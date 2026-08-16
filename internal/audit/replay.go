@@ -141,12 +141,36 @@ func readFile(path string, engine *crypto.Engine, logger log.Logger) []ReplayEnt
 		}
 		return nil
 	}
+	data = skipHeader(data, logger, path)
 	// The same condition newFile applies when deciding to seal records, so the
 	// reader and the writer cannot disagree about the format.
 	if engine != nil && engine.Enabled() {
 		return decodeEncrypted(data, engine, path, logger)
 	}
 	return decodePlaintext(data)
+}
+
+// skipHeader inspects the first bytes of an audit file for the self-describing
+// header ([magic:4][version:1][keyMode:1][fingerprint:16]). When the magic is
+// present the data past the header is returned; for headerless legacy files the
+// original data is returned unchanged. A file shorter than the header or with
+// an unknown version is returned as-is — decoding will either parse it as
+// records or skip the damage gracefully.
+func skipHeader(data []byte, logger log.Logger, path string) []byte {
+	if len(data) < auditFileHeaderLen || string(data[:4]) != auditFileMagic {
+		return data
+	}
+	version := data[4]
+	if version != auditFileVersion {
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "audit: replay skipping file with unknown header version",
+				log.String("filename", path),
+				log.Uint("version", uint32(version)),
+			)
+		}
+		return data
+	}
+	return data[auditFileHeaderLen:]
 }
 
 // decodePlaintext walks newline-delimited JSON, the format the encoder writes

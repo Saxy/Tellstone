@@ -22,9 +22,10 @@ import (
 var ErrDecryptionFailed = errors.New("cipher: authentication failed during decryption")
 
 type Engine struct {
-	aead    cipher.AEAD
-	enabled bool
-	logger  log.Logger
+	aead           cipher.AEAD
+	keyFingerprint [16]byte
+	enabled        bool
+	logger         log.Logger
 }
 
 // NewEngine initializes the cryptographic state. If key is nil or empty,
@@ -63,10 +64,18 @@ func NewEngine(key []byte, logger log.Logger) (*Engine, error) {
 		logger.Log(log.LevelInfo, "crypto engine successfully initialized with active ChaCha20-Poly1305")
 	}
 	return &Engine{
-		aead:    aead,
-		enabled: true,
-		logger:  logger,
+		aead:           aead,
+		keyFingerprint: FingerprintBytes(key),
+		enabled:        true,
+		logger:         logger,
 	}, nil
+}
+
+// KeyFingerprint returns the truncated SHA-256 of the engine's key. The
+// 16-byte value is used in audit file headers and envelope files so a reader
+// can identify the sealing key without trying every candidate.
+func (e *Engine) KeyFingerprint() [16]byte {
+	return e.keyFingerprint
 }
 
 // Enabled returns the operational state of the cipher engine.
