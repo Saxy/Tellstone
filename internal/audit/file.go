@@ -19,7 +19,9 @@ package audit
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -106,20 +108,29 @@ func newFile(dir string, engine *crypto.Engine, logger log.Logger, keyMode byte,
 	return f, nil
 }
 
-// open generates a fresh file name in dir, opens it for append, and writes the
-// self-describing header so every rotated segment carries its own key metadata.
+// open creates a new audit file exclusively (O_CREATE|O_EXCL) and writes the
+// self-describing header. If the filename collides with an existing segment —
+// an astronomically unlikely event given nanosecond timestamps and PID
+// separation — the name is regenerated and the attempt is retried. The header
+// error is always preserved: cleanup failures (close, remove) are logged but
+// never mask it.
 func open(dir string, keyMode byte, fingerprint [16]byte) (*os.File, string, error) {
-	path := filepath.Join(dir, fileName(dir))
-	osFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	if err != nil {
-		return nil, "", err
+	for {
+		path := filepath.Join(dir, fileName(dir))
+		osFile, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY|os.O_APPEND, 0o600)
+		if err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				continue
+			}
+			return nil, "", err
+		}
+		if err = writeHeader(osFile, keyMode, fingerprint); err != nil {
+			osFile.Close()
+			os.Remove(path)
+			return nil, "", fmt.Errorf("audit: write header: %w", err)
+		}
+		return osFile, path, nil
 	}
-	if err := writeHeader(osFile, keyMode, fingerprint); err != nil {
-		osFile.Close()
-		os.Remove(path)
-		return nil, "", err
-	}
-	return osFile, path, nil
 }
 
 // writeHeader emits the fixed [magic:4][version:1][keyMode:1][fingerprint:16]

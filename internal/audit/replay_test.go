@@ -360,12 +360,23 @@ func TestReplayAuthLogFormatMismatch(t *testing.T) {
 		t.Fatal("plaintext file with KeyModeSimple header should be decoded as plaintext")
 	}
 
-	// Encrypted file whose header fingerprint does not match the engine:
-	// fail-closed, zero entries recovered.
+	// Encrypted file with no engine: fail-closed, zero entries recovered.
 	encDir := t.TempDir()
 	writeAuthEvents(t, encDir, ce)
 	if entries := replayAuthLog(encDir, nil, 100, log.NewNoOpLogger()); len(entries) != 0 {
 		t.Fatalf("encrypted file with no engine should yield no entries, got %+v", entries)
+	}
+
+	// Encrypted file replayed through a different key: fingerprint mismatch,
+	// fail-closed, zero entries recovered. This exercises the
+	// KeyFingerprint() != fingerprint branch.
+	wrongKey := bytes.Repeat([]byte{0x99}, 32)
+	wrongCE, err := crypto.NewEngine(wrongKey, log.NewNoOpLogger())
+	if err != nil {
+		t.Fatal("NewEngine:", err)
+	}
+	if entries := replayAuthLog(encDir, wrongCE, 100, log.NewNoOpLogger()); len(entries) != 0 {
+		t.Fatalf("encrypted file with wrong key fingerprint should yield no entries, got %+v", entries)
 	}
 }
 

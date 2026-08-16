@@ -30,6 +30,18 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
+// closeFile registers a t.Cleanup that closes f and reports any error via
+// t.Errorf, matching the project's convention that test helpers surface cleanup
+// failures through the test handle.
+func closeFile(t *testing.T, f *file) {
+	t.Helper()
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("Close: %v", err)
+		}
+	})
+}
+
 // auditFilePaths lists every audit file in dir. Sorted order equals creation
 // order because the file name embeds its creation timestamp. Discovery only —
 // it locates files the way replay does rather than restating the name, which
@@ -90,7 +102,7 @@ func TestFileNameContainsTimestampHashAndMarker(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	closeFile(t, f)
 
 	// The suffix is spelled out rather than taken from auditFileSuffix on
 	// purpose. This is the test that pins the on-disk name, and one that built
@@ -125,7 +137,7 @@ func TestFileRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	closeFile(t, f)
 
 	first := f.path
 	f.maxSize = 20
@@ -426,7 +438,7 @@ func TestAuditFileHeaderLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	closeFile(t, f)
 
 	raw, err := os.ReadFile(f.path)
 	if err != nil {
@@ -472,7 +484,7 @@ func TestAuditFileHeaderKeyMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer plain.Close()
+	closeFile(t, plain)
 	raw, err := os.ReadFile(plain.path)
 	if err != nil {
 		t.Fatal(err)
@@ -492,7 +504,7 @@ func TestAuditFileHeaderKeyMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer fDEK.Close()
+	closeFile(t, fDEK)
 	raw, err = os.ReadFile(fDEK.path)
 	if err != nil {
 		t.Fatal(err)
@@ -515,7 +527,7 @@ func TestAuditFileHeaderOnRotation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	closeFile(t, f)
 
 	// Force rotation by setting a tiny maxSize.
 	f.maxSize = 5
@@ -555,7 +567,7 @@ func TestAuditFileHeaderFingerprintMatchesKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	closeFile(t, f)
 
 	raw, err := os.ReadFile(f.path)
 	if err != nil {
