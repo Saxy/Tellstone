@@ -187,7 +187,10 @@ func decodeAllRecords(data []byte, engine *crypto.Engine) ([]byte, error) {
 	for len(data) >= 4 {
 		blobLen := binary.BigEndian.Uint32(data[:4])
 		data = data[4:]
-		if blobLen == 0 || uint64(blobLen) > uint64(len(data)) {
+		if blobLen == 0 {
+			return nil, errors.New("audit: malformed frame: zero-length blob")
+		}
+		if uint64(blobLen) > uint64(len(data)) {
 			// Truncated trailing record — process killed mid-write.
 			// Return what we have so far.
 			break
