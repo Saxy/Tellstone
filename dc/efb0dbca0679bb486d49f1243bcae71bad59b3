@@ -1,0 +1,31 @@
+cmd/tellstone/main.go
+  s_b304c1a7d884ad::t_895197d4ffadc7 80-86
+internal/audit/decrypt.go
+  s_b304c1a7d884ad::t_f3c2106c6d827c 132-135
+  s_b304c1a7d884ad::t_aff2f928b9e88c 176-180,198,201
+cmd/tellstone/audit_decrypt.go
+  s_b304c1a7d884ad::t_6fd358aa0eb654 48-55
+  s_b304c1a7d884ad::t_d567d549a38467 133-136,149
+  s_b304c1a7d884ad::t_1a3a966aa3694a 73-81
+  s_b304c1a7d884ad::t_1ce28303f5acec 167-170
+internal/audit/decrypt_test.go
+  s_b304c1a7d884ad::t_e87e6aa3ff989d 83
+  s_b304c1a7d884ad::t_0b8b60585be1c8 130
+  s_b304c1a7d884ad::t_8cfc60fde0bcee 193,234,259,303,340,378,406
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "dcefb0dbca0679bb486d49f1243bcae71bad59b3",
+  "prompts": {},
+  "sessions": {
+    "s_b304c1a7d884ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3cf694fffe5fNF1krXFw4PB9",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
