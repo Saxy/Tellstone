@@ -27,6 +27,10 @@ FROM gcr.io/distroless/static-debian12:nonroot
 
 COPY --from=build /tellstone /tellstone
 
+ENV TSD_ADDR=0.0.0.0:9988
+ENV TSD_ENABLE_RESP=true
+ENV TSD_RESP_ADDR=0.0.0.0:6379
+
 EXPOSE 9988 6379
 
 USER nonroot:nonroot

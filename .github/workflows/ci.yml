@@ -75,6 +75,9 @@ jobs:
         run: |
           podman build \
             --format docker \
+            --build-arg VERSION=development \
+            --build-arg COMMIT=${{ github.sha }} \
+            --build-arg DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
             --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
             --label "org.opencontainers.image.revision=${{ github.sha }}" \
             -t ghcr.io/saxy/tellstone:development-${{ github.sha }} \

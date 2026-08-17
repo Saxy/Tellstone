@@ -12,7 +12,9 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 
 COPY tellstone /tellstone
 
-EXPOSE 9988 6379
+ENV TSD_ADDR=0.0.0.0:9988
+
+EXPOSE 9988
 
 USER nonroot:nonroot
 
