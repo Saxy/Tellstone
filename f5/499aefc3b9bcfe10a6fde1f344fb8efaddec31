@@ -1,0 +1,23 @@
+container/Containerfile
+  s_b304c1a7d884ad::t_bdfe43c7142d64 15-17
+.github/workflows/ci.yml
+  s_b304c1a7d884ad::t_9d336f2f3bceea 78-80
+container/Containerfile.dev
+  s_b304c1a7d884ad::t_082041a5fabe70 30-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "f5499aefc3b9bcfe10a6fde1f344fb8efaddec31",
+  "prompts": {},
+  "sessions": {
+    "s_b304c1a7d884ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3cf694fffe5fNF1krXFw4PB9",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
