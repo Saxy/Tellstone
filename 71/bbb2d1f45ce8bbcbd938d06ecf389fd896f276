@@ -1,0 +1,21 @@
+container/Containerfile
+  s_b304c1a7d884ad::t_07da14b4b7a4a8 13-14
+.goreleaser.yaml
+  s_b304c1a7d884ad::t_e1b6fa28d7f5f0 68-71
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "71bbb2d1f45ce8bbcbd938d06ecf389fd896f276",
+  "prompts": {},
+  "sessions": {
+    "s_b304c1a7d884ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3cf694fffe5fNF1krXFw4PB9",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
