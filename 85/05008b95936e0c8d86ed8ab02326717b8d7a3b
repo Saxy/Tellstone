@@ -1,0 +1,19 @@
+internal/audit/decrypt.go
+  s_b304c1a7d884ad::t_e0cc3adc7c4c43 190-193
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "8505008b95936e0c8d86ed8ab02326717b8d7a3b",
+  "prompts": {},
+  "sessions": {
+    "s_b304c1a7d884ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3cf694fffe5fNF1krXFw4PB9",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
