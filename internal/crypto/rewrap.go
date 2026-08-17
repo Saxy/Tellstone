@@ -21,11 +21,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 )
 
-// envelopeGlob matches all envelope files in a data directory: shard-N.env
-// and audit.env.
-var envelopeGlob = "*.env"
+// findEnvelopeFiles returns shard-*.env and audit.env files in dir, sorted
+// for deterministic processing order. Unrelated .env files are excluded.
+func findEnvelopeFiles(dir string) ([]string, error) {
+	shards, err := filepath.Glob(filepath.Join(dir, "shard-*.env"))
+	if err != nil {
+		return nil, err
+	}
+	var matches []string
+	matches = append(matches, shards...)
+	audit := filepath.Join(dir, "audit.env")
+	if info, err := os.Stat(audit); err == nil && !info.IsDir() {
+		matches = append(matches, audit)
+	}
+	sort.Strings(matches)
+	return matches, nil
+}
 
 // ErrMixedKeys is returned when an envelope carries a KEK fingerprint that
 // matches neither the old nor the new key, indicating a mixed-key dataset
@@ -69,7 +83,7 @@ func RewrapEnvelopes(dir string, oldKEK, newKEK []byte, retainOld bool) (*Rewrap
 	}
 	oldFP := FingerprintBytes(oldKEK)
 	newFP := FingerprintBytes(newKEK)
-	matches, err := filepath.Glob(filepath.Join(dir, envelopeGlob))
+	matches, err := findEnvelopeFiles(dir)
 	if err != nil {
 		return nil, fmt.Errorf("rewrap: glob envelope files: %w", err)
 	}
@@ -111,19 +125,26 @@ func RewrapEnvelopes(dir string, oldKEK, newKEK []byte, retainOld bool) (*Rewrap
 		}
 		entries[i] = e
 	}
-	if unknownCount > 0 {
-		return nil, fmt.Errorf("%w: %d envelope(s) with unrecognized fingerprint", ErrMixedKeys, unknownCount)
-	}
 	if oldCount == 0 && newCount > 0 {
 		return &RewrapResult{Skipped: newCount, Total: len(entries)}, nil
 	}
 	if oldCount == 0 {
 		return nil, ErrOldKeyMismatch
 	}
+	if unknownCount > 0 {
+		return nil, fmt.Errorf("%w: %d envelope(s) with unrecognized fingerprint", ErrMixedKeys, unknownCount)
+	}
 	newEnv, err := NewEnvelope(newKEK, nil)
 	if err != nil {
 		return nil, fmt.Errorf("rewrap: init new KEK envelope: %w", err)
 	}
+
+	// Phase 1: complete all cryptographic processing before touching the filesystem.
+	type prepared struct {
+		entry
+		buf []byte
+	}
+	var toWrite []prepared
 	result := &RewrapResult{Total: len(entries)}
 	for _, e := range entries {
 		if e.status == 'N' {
@@ -149,14 +170,19 @@ func RewrapEnvelopes(dir string, oldKEK, newKEK []byte, retainOld bool) (*Rewrap
 		buf[0] = envVersion
 		copy(buf[1:1+envFingerprintLen], newFP[:])
 		copy(buf[1+envFingerprintLen:], wrapped)
+		toWrite = append(toWrite, prepared{entry: e, buf: buf})
+	}
+
+	// Phase 2: retain-old-keys backups and atomic writes.
+	for _, p := range toWrite {
 		if retainOld {
-			bak := e.path + ".bak"
-			if err = copyFile(e.path, bak); err != nil {
-				return nil, fmt.Errorf("rewrap: backup %s: %w", e.name, err)
+			bak := p.path + ".bak"
+			if err = copyFile(p.path, bak); err != nil {
+				return nil, fmt.Errorf("rewrap: backup %s: %w", p.name, err)
 			}
 		}
-		if err = atomicWrite(e.path, buf); err != nil {
-			return nil, fmt.Errorf("rewrap: write %s: %w", e.name, err)
+		if err = atomicWrite(p.path, p.buf); err != nil {
+			return nil, fmt.Errorf("rewrap: write %s: %w", p.name, err)
 		}
 		result.Rewrapped++
 	}
@@ -210,7 +236,9 @@ func atomicWrite(path string, data []byte) error {
 		return err
 	}
 	if err = d.Sync(); err != nil {
-		d.Close()
+		if closeErr := d.Close(); closeErr != nil {
+			return fmt.Errorf("rewrap: sync directory: %v; close: %w", err, closeErr)
+		}
 		return err
 	}
 	return d.Close()

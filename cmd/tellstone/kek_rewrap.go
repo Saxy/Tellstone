@@ -90,6 +90,11 @@ func runKEKRewrap(args []string) {
 		}
 		os.Exit(1)
 	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "error: unexpected argument %q\n", fs.Arg(0))
+		fs.Usage()
+		os.Exit(1)
+	}
 
 	// Validate required flags.
 	if *dataDir == "" {

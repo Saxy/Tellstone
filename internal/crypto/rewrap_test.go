@@ -62,6 +62,19 @@ func TestRewrapSuccess(t *testing.T) {
 	dek1 := createEnvelope(t, dir, oldKEK, "shard-1.env")
 	dekA := createEnvelope(t, dir, oldKEK, "audit.env")
 
+	// Drop non-envelope fixtures alongside the envelopes. RewrapEnvelopes
+	// must leave them byte-identical.
+	walPath := filepath.Join(dir, "wal-0.data")
+	walFixture := []byte("fake-wal-record-12345")
+	if err := os.WriteFile(walPath, walFixture, 0600); err != nil {
+		t.Fatalf("write WAL fixture: %v", err)
+	}
+	auditRecordPath := filepath.Join(dir, "audit-record.json")
+	auditFixture := []byte(`{"event":"auth_success","level":"AUDIT","user":"admin"}`)
+	if err := os.WriteFile(auditRecordPath, auditFixture, 0600); err != nil {
+		t.Fatalf("write audit fixture: %v", err)
+	}
+
 	result, err := RewrapEnvelopes(dir, oldKEK, newKEK, false)
 	if err != nil {
 		t.Fatalf("rewrap: %v", err)
@@ -99,6 +112,29 @@ func TestRewrapSuccess(t *testing.T) {
 				t.Fatalf("old KEK should fail to load %s after rewrap", name)
 			}
 		}
+	}
+
+	// Verify no .bak files exist when retainOld is false.
+	for _, name := range []string{"shard-0.env.bak", "shard-1.env.bak", "audit.env.bak"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err == nil {
+			t.Fatalf("unexpected backup file %s", name)
+		}
+	}
+
+	// Verify non-envelope files remain byte-identical.
+	gotWal, err := os.ReadFile(walPath)
+	if err != nil {
+		t.Fatalf("read WAL after rewrap: %v", err)
+	}
+	if !bytes.Equal(gotWal, walFixture) {
+		t.Fatal("WAL file changed after rewrap")
+	}
+	gotAudit, err := os.ReadFile(auditRecordPath)
+	if err != nil {
+		t.Fatalf("read audit record after rewrap: %v", err)
+	}
+	if !bytes.Equal(gotAudit, auditFixture) {
+		t.Fatal("audit record file changed after rewrap")
 	}
 }
 
@@ -173,6 +209,9 @@ func TestRewrapWrongOldKey(t *testing.T) {
 	_, err := RewrapEnvelopes(dir, wrongKEK, newKEK, false)
 	if err == nil {
 		t.Fatal("expected error when old KEK does not match")
+	}
+	if !errors.Is(err, ErrOldKeyMismatch) {
+		t.Fatalf("expected ErrOldKeyMismatch, got: %v", err)
 	}
 }
 
