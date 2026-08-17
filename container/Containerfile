@@ -1,0 +1,19 @@
+# Containerfile — production image used by GoReleaser
+#
+# GoReleaser injects the pre-built binary into the build context.
+# For local development: task podman:build (uses Containerfile.dev).
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+LABEL org.opencontainers.image.title="tellstone"
+LABEL org.opencontainers.image.description="High-performance, cloud-native in-memory key/value store"
+LABEL org.opencontainers.image.source="https://github.com/Saxy/Tellstone"
+LABEL org.opencontainers.image.licenses="Apache-2.0"
+
+COPY tellstone /tellstone
+
+EXPOSE 9988 6379
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/tellstone"]

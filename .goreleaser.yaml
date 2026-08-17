@@ -64,6 +64,22 @@ release:
   draft: false
   prerelease: auto
 
+dockers_v2:
+  - images:
+      - "ghcr.io/saxy/tellstone"
+    tags:
+      - "v{{ .Version }}"
+      - "{{ if not .IsNightly }}latest{{ end }}"
+    labels:
+      org.opencontainers.image.title: "tellstone"
+      org.opencontainers.image.description: "High-performance, cloud-native in-memory key/value store"
+      org.opencontainers.image.source: "https://github.com/Saxy/Tellstone"
+      org.opencontainers.image.licenses: "Apache-2.0"
+    dockerfile: container/Containerfile
+    platforms:
+      - linux/amd64
+      - linux/arm64
+
 homebrew_casks:
   - name: tellstone
     directory: Casks

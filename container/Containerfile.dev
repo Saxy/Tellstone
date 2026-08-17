@@ -1,0 +1,34 @@
+# Containerfile.dev — multi-stage build for local development.
+# Used by `task podman:build`.
+
+FROM golang:1.26-alpine AS build
+
+RUN apk add --no-cache git
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ARG VERSION=0.0.0-dev
+ARG COMMIT=unknown
+ARG DATE=unknown
+
+RUN CGO_ENABLED=0 go build \
+    -ldflags "-s -w \
+      -X github.com/Saxy/Tellstone/internal/version.Version=${VERSION} \
+      -X github.com/Saxy/Tellstone/internal/version.Commit=${COMMIT} \
+      -X github.com/Saxy/Tellstone/internal/version.Date=${DATE}" \
+    -o /tellstone ./cmd/tellstone
+
+FROM gcr.io/distroless/static-debian12:nonroot
+
+COPY --from=build /tellstone /tellstone
+
+EXPOSE 9988 6379
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/tellstone"]

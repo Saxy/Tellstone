@@ -343,3 +343,48 @@ tasks:
       - mkdir -p $(dirname {{.OUT}})
       - curl -s "http://{{.PPROF_ADDR}}/debug/pprof/trace?seconds={{.SECONDS}}" -o {{.OUT}}
       - go tool trace {{.OUT}}
+
+  # ---------- podman ----------
+  podman:build:
+    desc: "Build dev container image. Vars: TAG (default: dev)"
+    vars:
+      TAG: '{{.TAG | default "dev"}}'
+    cmds:
+      - >-
+        podman build
+        --format docker
+        --build-arg VERSION={{.VERSION}}
+        --build-arg COMMIT={{.COMMIT}}
+        --build-arg DATE={{.DATE}}
+        -t ghcr.io/saxy/tellstone:{{.TAG}}
+        -f container/Containerfile.dev .
+
+  podman:up:
+    desc: "Run Tellstone container. Vars: TAG (default: dev)"
+    vars:
+      TAG: '{{.TAG | default "dev"}}'
+    cmds:
+      - mkdir -p data
+      - >-
+        podman run -d --name tellstone-dev
+        --rm
+        -p 9988:9988
+        -p 6379:6379
+        -v ./data:/data:Z
+        -e TSD_DATA_DIR=/data
+        ghcr.io/saxy/tellstone:{{.TAG}}
+
+  podman:down:
+    desc: "Stop Tellstone container"
+    cmds:
+      - podman stop tellstone-dev 2>/dev/null || true
+
+  podman:logs:
+    desc: "Tail Tellstone container logs"
+    cmds:
+      - podman logs -f tellstone-dev
+
+  podman:shell:
+    desc: "Exec into running Tellstone container"
+    cmds:
+      - podman exec -it tellstone-dev /bin/sh || podman exec -it tellstone-dev /tellstone -h
