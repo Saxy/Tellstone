@@ -1,0 +1,42 @@
+internal/crypto/rewrap_test.go
+  s_b304c1a7d884ad::t_369e9bf9bcb030 17
+  s_b304c1a7d884ad::t_999e68e042fa69 1-16,18-261
+cmd/tellstone/main.go
+  s_b304c1a7d884ad::t_05b0970a736e30 80-81,86-87
+  s_b304c1a7d884ad::t_3e9e568b4cb8d7 88-89
+internal/crypto/rewrap.go
+  s_b304c1a7d884ad::t_21a4287807f951 1-82,84-88,91-132,136-138,140-143,145-153,155-157,159-176,183-185,192-194,198-200,204-227
+  s_b304c1a7d884ad::t_23a054b025dcd8 89,133-135,139,144,154,158,177-182,186-191,195-197,201-203
+  s_b304c1a7d884ad::t_7e1363d4a4aab4 83
+  s_b304c1a7d884ad::t_9b30bc1fb216cd 90
+internal/log/benchmark_test.go
+  s_b304c1a7d884ad::t_7e1363d4a4aab4 6-9,13-19
+internal/log/log_test.go
+  s_b304c1a7d884ad::t_7e1363d4a4aab4 6-27,31-44
+internal/tls/conn.go
+  s_b304c1a7d884ad::t_7e1363d4a4aab4 44-48
+internal/trace/trace_test.go
+  s_b304c1a7d884ad::t_7e1363d4a4aab4 4-5,9-20,24-44
+internal/resp/protocol_test.go
+  s_b304c1a7d884ad::t_7e1363d4a4aab4 61-62
+config/bytesize_test.go
+  s_b304c1a7d884ad::t_7e1363d4a4aab4 6-21
+cmd/tellstone/kek_rewrap.go
+  s_b304c1a7d884ad::t_e3df8ab261667a 1-140
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "0f46c0cf5fd6cc10d8b671193d5ad7064335fea4",
+  "prompts": {},
+  "sessions": {
+    "s_b304c1a7d884ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3cf694fffe5fNF1krXFw4PB9",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
