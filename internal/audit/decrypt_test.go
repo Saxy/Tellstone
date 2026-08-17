@@ -80,7 +80,7 @@ func TestDecryptFileEnvelopeMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	kekEngine, err := crypto.NewEngine(kek, nil)
 	if err != nil {
@@ -127,7 +127,7 @@ func TestDecryptFileSimpleMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out, err := DecryptFile(f, dir, ce)
 	if err != nil {
@@ -190,7 +190,7 @@ func TestDecryptFileLegacyHeaderless(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	out, err := DecryptFile(f, dir, ce)
 	if err != nil {
@@ -231,7 +231,7 @@ func TestDecryptFileWrongKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	_, err = DecryptFile(f, dir, wrongEngine)
 	if err == nil {
@@ -256,7 +256,7 @@ func TestDecryptFileMissingKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	_, err = DecryptFile(f, dir, nil)
 	if err == nil {
@@ -300,7 +300,7 @@ func TestDecryptFileCorruptedLengthPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Should still decrypt the valid records and stop at the corruption.
 	out, err := DecryptFile(f, dir, ce)
@@ -337,7 +337,7 @@ func TestDecryptFilePlaintext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Supply a matching key (even though it's plaintext, the header has a
 	// fingerprint that must match).
@@ -375,7 +375,7 @@ func TestDecryptFileEmptyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	_, err = DecryptFile(f, dir, nil)
 	if err == nil {
@@ -403,7 +403,7 @@ func TestDecryptFileEnvelopeFingerprintMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	_, err = DecryptFile(f, dir, wrongEngine)
 	if err == nil {

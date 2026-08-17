@@ -28,20 +28,6 @@ import (
 	"github.com/Saxy/Tellstone/internal/crypto"
 )
 
-// ParseHeader inspects the first bytes of raw audit data for the self-describing
-// header ([magic:4][version:1][keyMode:1][fingerprint:16]).
-//
-// Three outcomes:
-//   - ok=true, err=nil: valid header. keyMode, fingerprint, and rest are usable.
-//   - ok=false, err=nil: no magic prefix — legacy headerless file.
-//   - ok=false, err≠magic present but version unknown or data truncated.
-//
-// This is the exported wrapper around the unexported parseHeader so the CLI
-// decrypt tool can inspect files without importing replay internals.
-func ParseHeader(data []byte) (keyMode byte, fingerprint [16]byte, rest []byte, ok bool, err error) {
-	return parseHeader(data, nil, "")
-}
-
 // DecryptFile reads an audit file from r, parses the header, and decrypts every
 // sealed record. dir is the file's parent directory, used to locate audit.env
 // when the header indicates envelope mode.
@@ -87,9 +73,6 @@ func DecryptFile(r io.Reader, dir string, engine *crypto.Engine) ([]byte, error)
 	case KeyModeSimple:
 		return decodeAllRecords(rest, decryptEngine)
 	case KeyModeEnvelope:
-		if decryptEngine == nil || !decryptEngine.Enabled() {
-			return nil, errors.New("audit: envelope-encrypted file requires a key; supply --encryption-key or --encryption-key-file")
-		}
 		return decodeAllRecords(rest, decryptEngine)
 	default:
 		return nil, fmt.Errorf("audit: unsupported keyMode %d", keyMode)
@@ -146,19 +129,11 @@ func resolveEngine(hasHeader bool, keyMode byte, fingerprint [16]byte, dir strin
 	}
 }
 
-// unwrapDEK loads audit.env from dir, verifies the KEK fingerprint, and returns
-// an engine built from the recovered DEK. This mirrors the envelope Load path
-// in audit.NewLogEngine but is standalone for the CLI tool.
+// unwrapDEK reads audit.env from dir, verifies the KEK fingerprint, and returns
+// an engine built from the recovered DEK. The envelope layout is
+// [version:1][KEK fingerprint:16][wrapped DEK]; we verify the fingerprint
+// against the caller-supplied KEK engine, then decrypt the DEK in-place.
 func unwrapDEK(dir string, auditFingerprint [16]byte, kekEngine *crypto.Engine) (*crypto.Engine, error) {
-	// We need the raw KEK bytes to create an Envelope and unwrap the DEK.
-	// The engine doesn't expose the raw key, so we build the envelope from a
-	// key-sourced engine. Since we only have the engine (not the raw key bytes),
-	// we take a different approach: read the envelope file directly and use the
-	// existing envelope logic.
-	//
-	// The envelope file layout is: [version:1][KEK fingerprint:16][wrapped DEK].
-	// We verify the KEK fingerprint, then decrypt the wrapped DEK with the KEK
-	// engine.
 	envPath := filepath.Join(dir, envelopeFileName)
 	raw, err := os.ReadFile(envPath)
 	if err != nil {
@@ -198,6 +173,11 @@ func unwrapDEK(dir string, auditFingerprint [16]byte, kekEngine *crypto.Engine) 
 // Each encrypted blob already contains a trailing newline from the
 // json.Encoder that produced it, so no separator is appended. The plaintext
 // path returns data as-is since it is already newline-delimited.
+//
+// A truncated trailing record (process killed mid-write) stops the walk
+// cleanly and returns what was recovered. Any other decryption failure or
+// malformed record is returned as an error — this is a fail-closed design
+// because partial output from a wrong key is meaningless.
 func decodeAllRecords(data []byte, engine *crypto.Engine) ([]byte, error) {
 	if engine == nil || !engine.Enabled() {
 		// Plaintext — data is newline-delimited JSON.
@@ -215,12 +195,10 @@ func decodeAllRecords(data []byte, engine *crypto.Engine) ([]byte, error) {
 		plain, err := engine.DecryptInPlace(data[:blobLen])
 		data = data[blobLen:]
 		if err != nil {
-			// Undecryptable record — skip it, keep walking.
-			continue
+			return nil, fmt.Errorf("audit: decrypt record: %w", err)
 		}
-		// Validate it's JSON before emitting.
 		if !json.Valid(plain) {
-			continue
+			return nil, errors.New("audit: decrypted record is not valid JSON; wrong key or corrupted data")
 		}
 		buf.Write(plain)
 	}

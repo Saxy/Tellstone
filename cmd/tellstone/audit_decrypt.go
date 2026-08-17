@@ -45,14 +45,14 @@ func runAudit(args []string) {
 }
 
 func printAuditUsage() {
-	println("tellstone audit — audit log utilities")
-	println()
-	println("Usage: tellstone audit <command> [arguments]")
-	println()
-	println("Commands:")
-	println("  decrypt   Decrypt an encrypted audit log file to JSON lines")
-	println()
-	println("Run 'tellstone audit decrypt -h' for details on the decrypt command.")
+	fmt.Fprintln(os.Stdout, "tellstone audit — audit log utilities")
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintln(os.Stdout, "Usage: tellstone audit <command> [arguments]")
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintln(os.Stdout, "Commands:")
+	fmt.Fprintln(os.Stdout, "  decrypt   Decrypt an encrypted audit log file to JSON lines")
+	fmt.Fprintln(os.Stdout)
+	fmt.Fprintln(os.Stdout, "Run 'tellstone audit decrypt -h' for details on the decrypt command.")
 }
 
 // runAuditDecrypt parses flags and decrypts a single audit log file.
@@ -70,15 +70,15 @@ func runAuditDecrypt(args []string) {
 		"Write decrypted output to this file instead of stdout")
 
 	fs.Usage = func() {
-		println("Decrypt an encrypted audit log file to plaintext JSON lines.")
-		println()
-		println("Usage: tellstone audit decrypt <file|-|> [flags]")
-		println()
-		println("Arguments:")
-		println("  <file>   Path to the audit log file to decrypt")
-		println("  -        Read from stdin (envelope-encrypted files require a file path)")
-		println()
-		println("Flags:")
+		fmt.Fprintln(os.Stderr, "Decrypt an encrypted audit log file to plaintext JSON lines.")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Usage: tellstone audit decrypt <file|-|> [flags]")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Arguments:")
+		fmt.Fprintln(os.Stderr, "  <file>   Path to the audit log file to decrypt")
+		fmt.Fprintln(os.Stderr, "  -        Read from stdin (envelope-encrypted files require a file path)")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Flags:")
 		fs.PrintDefaults()
 	}
 
@@ -130,9 +130,10 @@ func runAuditDecrypt(args []string) {
 	var dir string
 	if fileArg == "-" {
 		r = os.Stdin
-		// For stdin we cannot derive the directory for audit.env lookup.
-		// Set dir to "." — envelope mode will fail with a clear error if
-		// audit.env is not found.
+		// Envelope mode requires audit.env on disk — cannot resolve from stdin.
+		// The header will be parsed before this matters; if the file turns out
+		// to be envelope-encrypted, DecryptFile returns a clear error about the
+		// missing envelope file.
 		dir = "."
 	} else {
 		absPath, err := filepath.Abs(fileArg)
@@ -145,7 +146,7 @@ func runAuditDecrypt(args []string) {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
 		}
-		defer r.Close()
+		defer func() { _ = r.Close() }()
 		dir = filepath.Dir(absPath)
 	}
 
@@ -163,7 +164,10 @@ func runAuditDecrypt(args []string) {
 			os.Exit(1)
 		}
 	} else {
-		os.Stdout.Write(out)
+		if _, err := os.Stdout.Write(out); err != nil {
+			fmt.Fprintf(os.Stderr, "error: write stdout: %v\n", err)
+			os.Exit(1)
+		}
 	}
 }
 

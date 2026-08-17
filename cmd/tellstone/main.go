@@ -77,6 +77,13 @@ func initRuntimeSettings(l logger.Logger) {
 }
 
 func main() {
+	// Subcommand dispatch — "audit" is not a server flag, so detect it
+	// before config/flag parsing so "audit -h" and "audit decrypt -h"
+	// route to the CLI tool, not the server.
+	if len(os.Args) > 1 && os.Args[1] == "audit" {
+		runAudit(os.Args[2:])
+		return
+	}
 	for _, arg := range os.Args[1:] {
 		if arg == "-version" || arg == "--version" {
 			version.Print()
@@ -86,10 +93,6 @@ func main() {
 			config.LoadConfig(os.Args[1:])
 			return
 		}
-	}
-	if len(os.Args) > 1 && os.Args[1] == "audit" {
-		runAudit(os.Args[2:])
-		return
 	}
 	cfg := config.LoadConfig(os.Args[1:])
 	app := new(tellstone.App)
