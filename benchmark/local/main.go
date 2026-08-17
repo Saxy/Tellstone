@@ -301,5 +301,3 @@ func makeLatencyComparisonBarChart(title string, cpuCounts []int, allData []Benc
 
 	return bar
 }
-
-

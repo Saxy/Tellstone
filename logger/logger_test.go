@@ -100,7 +100,6 @@ func TestSlogAdapterLogOutput(t *testing.T) {
 	}
 }
 
-
 func TestSlogAdapterLogSuppressedBelowThreshold(t *testing.T) {
 	out, err := captureStdout(func() {
 		logger := NewSlogLogger(LevelInfo) // Info threshold

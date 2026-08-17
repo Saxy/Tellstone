@@ -58,8 +58,8 @@ func TestParsePipelined(t *testing.T) {
 
 func TestParseMalformed(t *testing.T) {
 	cases := map[string][]byte{
-		"not a multibulk":      []byte("+OK\r\n"),
-		"arg not a bulk":       []byte("*1\r\n+notbulk\r\n"),
+		"not a multibulk":       []byte("+OK\r\n"),
+		"arg not a bulk":        []byte("*1\r\n+notbulk\r\n"),
 		"wrong body terminator": []byte("*1\r\n$2\r\nabXX"),
 	}
 	for name, c := range cases {

@@ -41,11 +41,11 @@ type Conn struct {
 	//handshakeState       int8
 	//hs                   interface{ handshake() error }
 	// constant after handshake; protected by handshakeMutex
-	handshakeMutex sync.Mutex
-	handshakeErr   error   // error resulting from handshake
-	vers           uint16  // TLS version
-	haveVers       bool    // version has been negotiated
-	config         *Config // configuration passed to constructor
+	handshakeMutex   sync.Mutex
+	handshakeErr     error   // error resulting from handshake
+	vers             uint16  // TLS version
+	haveVers         bool    // version has been negotiated
+	config           *Config // configuration passed to constructor
 	handshakes       int
 	extMasterSecret  bool
 	didResume        bool // whether this connection was a session resumption
@@ -1229,7 +1229,7 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 			return nil
 		}
 
-		newSecret := cipherSuite.nextTrafficSecret(c.out.trafficSecret)
+		newSecret = cipherSuite.nextTrafficSecret(c.out.trafficSecret)
 		c.out.setTrafficSecret(cipherSuite, newSecret)
 	}
 
