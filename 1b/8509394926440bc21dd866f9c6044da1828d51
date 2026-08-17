@@ -1,0 +1,33 @@
+internal/crypto/rewrap.go
+  s_b304c1a7d884ad::t_8f4c79ed0141af 134-135
+  s_b304c1a7d884ad::t_be2c2bb0a06a5b 136,141-147,173-177,179-181,184-185
+  s_b304c1a7d884ad::t_ec3a811a7dfe04 86
+  s_b304c1a7d884ad::t_6494e3f4967b22 239-241
+  s_b304c1a7d884ad::t_29115eea3d37ae 24
+  s_b304c1a7d884ad::t_0b07b0138ddf86 27-42
+cmd/tellstone/kek_rewrap.go
+  s_b304c1a7d884ad::t_d42d0bd52e9eee 93-97
+internal/crypto/rewrap_test.go
+  s_b304c1a7d884ad::t_c67c0bec5c5462 65-77,116-137
+  s_b304c1a7d884ad::t_a858d8a0be2025 138,213-215
+internal/trace/trace_test.go
+  s_b304c1a7d884ad::t_762eb504a8c1c3 6-9,27-31,35-43,45,48,50-51,57-63
+  s_b304c1a7d884ad::t_730e876c2baedb 32
+  s_b304c1a7d884ad::t_d71499bb41f8de 33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "1b8509394926440bc21dd866f9c6044da1828d51",
+  "prompts": {},
+  "sessions": {
+    "s_b304c1a7d884ad": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_ff3cf694fffe5fNF1krXFw4PB9",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
