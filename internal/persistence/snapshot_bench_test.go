@@ -57,7 +57,9 @@ func benchmarkSnapshotWrite(b *testing.B, nKeys, valSize int) {
 		if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
 			b.Fatal(err)
 		}
+		b.StopTimer()
 		os.Remove(filepath.Join(dir, "shard_000.snap"))
+		b.StartTimer()
 	}
 }
 
@@ -198,7 +200,9 @@ func benchmarkChildWrite(b *testing.B, nKeys, valSize int) {
 		if err := snapshotChildWrite(dir, 0, pr); err != nil {
 			b.Fatal(err)
 		}
+		b.StopTimer()
 		os.Remove(filepath.Join(dir, "shard_000.snap"))
+		b.StartTimer()
 	}
 }
 

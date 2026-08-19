@@ -105,17 +105,116 @@ func TestSnapshotInvalidMagic(t *testing.T) {
 	}
 }
 
+func TestSnapshotChecksumMismatch(t *testing.T) {
+	dir := newTestDir(t)
+	engine := newTestEngine(t)
+	engine.Set("key1", []byte("value1"), 0)
+	engine.Set("key2", []byte("value2"), 0)
+
+	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+		t.Fatalf("snapshotWrite: %v", err)
+	}
+	engine.Close()
+
+	// Corrupt a byte in the entry body to cause a checksum mismatch.
+	path := filepath.Join(dir, "shard_000.snap")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// Flip a byte in the first key's data (after the header).
+	data[snapHeader+20] ^= 0xFF
+	os.WriteFile(path, data, 0600)
+
+	// Verify the engine is NOT mutated by the corrupt snapshot.
+	engine2 := newTestEngine(t)
+	_, err = snapshotRead(dir, 0, engine2, nil)
+	if err == nil {
+		t.Fatal("expected checksum error for corrupt snapshot")
+	}
+	if engine2.KeyCount() != 0 {
+		t.Fatalf("engine should not be mutated on checksum failure, got %d keys", engine2.KeyCount())
+	}
+}
+
+func TestSnapshotChecksumZeroBody(t *testing.T) {
+	dir := newTestDir(t)
+	engine := newTestEngine(t)
+	engine.Set("k", []byte("v"), 0)
+
+	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+		t.Fatalf("snapshotWrite: %v", err)
+	}
+	engine.Close()
+
+	// Write a valid header but zero out the entire body. The checksum will
+	// not match because the body no longer hashes the same.
+	path := filepath.Join(dir, "shard_000.snap")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	// Zero the body after the header, keeping the header intact.
+	for i := snapHeader; i < len(data); i++ {
+		data[i] = 0
+	}
+	os.WriteFile(path, data, 0600)
+
+	engine2 := newTestEngine(t)
+	_, err = snapshotRead(dir, 0, engine2, nil)
+	if err == nil {
+		t.Fatal("expected checksum error for zeroed body")
+	}
+	if engine2.KeyCount() != 0 {
+		t.Fatalf("engine should not be mutated on checksum failure, got %d keys", engine2.KeyCount())
+	}
+}
+
+func TestSnapshotTruncatedFile(t *testing.T) {
+	dir := newTestDir(t)
+	engine := newTestEngine(t)
+	engine.Set("key1", []byte("long_value_here"), 0)
+
+	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+		t.Fatalf("snapshotWrite: %v", err)
+	}
+	engine.Close()
+
+	// Truncate the file so an entry's key or value is cut short.
+	path := filepath.Join(dir, "shard_000.snap")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	os.WriteFile(path, data[:len(data)-5], 0600)
+
+	engine2 := newTestEngine(t)
+	_, err = snapshotRead(dir, 0, engine2, nil)
+	if err == nil {
+		t.Fatal("expected error for truncated snapshot")
+	}
+}
+
 func TestSnapshotExists(t *testing.T) {
 	dir := newTestDir(t)
 	if snapshotExists(dir, 0) {
 		t.Fatal("snapshot should not exist in empty dir")
 	}
 
-	// Create a minimal snap file.
+	// A file with valid magic should be detected.
 	path := filepath.Join(dir, "shard_000.snap")
-	os.WriteFile(path, make([]byte, snapHeader), 0600)
+	hdr := make([]byte, snapHeader)
+	copy(hdr[0:4], snapMagic)
+	os.WriteFile(path, hdr, 0600)
 	if !snapshotExists(dir, 0) {
-		t.Fatal("snapshot should exist after creating file")
+		t.Fatal("snapshot should exist after creating file with valid magic")
+	}
+
+	// A file with invalid magic should NOT be detected.
+	path2 := filepath.Join(dir, "shard_001.snap")
+	os.WriteFile(path2, make([]byte, snapHeader), 0600)
+	if snapshotExists(dir, 1) {
+		t.Fatal("snapshot should not exist with invalid magic")
 	}
 }
 
@@ -154,16 +253,24 @@ func TestLoadShardSnapshotFirstThenWAL(t *testing.T) {
 		t.Fatalf("NewStorage: %v", err)
 	}
 
-	s.OpenShard(0)
+	if err := s.OpenShard(0); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
 
 	// Write some WAL records.
-	s.Write(0, "wal_key1", []byte("wal_val1"), time.Time{})
-	s.Write(0, "wal_key2", []byte("wal_val2"), time.Time{})
+	if err := s.Write(0, "wal_key1", []byte("wal_val1"), time.Time{}); err != nil {
+		t.Fatalf("Write wal_key1: %v", err)
+	}
+	if err := s.Write(0, "wal_key2", []byte("wal_val2"), time.Time{}); err != nil {
+		t.Fatalf("Write wal_key2: %v", err)
+	}
 
 	// Create a snapshot from a state that had only key1.
 	snapEngine := newTestEngine(t)
 	snapEngine.Set("snap_key", []byte("snap_val"), 0)
-	snapshotWrite(dir, 0, snapEngine, nil)
+	if _, err := snapshotWrite(dir, 0, snapEngine, nil); err != nil {
+		t.Fatalf("snapshotWrite: %v", err)
+	}
 	snapEngine.Close()
 
 	// Now the WAL also has wal_key1 and wal_key2.

@@ -388,7 +388,7 @@ func LoadConfig(args []string) *Config {
 	fs.Var(
 		&snapshotBytes,
 		"snapshot-bytes",
-		"WAL size threshold that triggers a snapshot (e.g. 64MiB); 0 disables size-based triggers (default: 64MiB)",
+		"WAL size threshold that triggers a snapshot (e.g. 64MiB); 0 disables size-based snapshots (default: 0, disabled)",
 	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
@@ -408,9 +408,6 @@ func LoadConfig(args []string) *Config {
 		cfg.numShards = runtime.NumCPU()
 	}
 	cfg.snapshotBytes = uint64(snapshotBytes)
-	if cfg.snapshotBytes == 0 {
-		cfg.snapshotBytes = 64 * 1024 * 1024 // 64 MiB default
-	}
 	// Validate TLS configuration: cert and key must be provided together.
 	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
 		panic("tellstone: --tls-cert and --tls-key must both be provided")
@@ -436,6 +433,11 @@ func LoadConfig(args []string) *Config {
 	// Envelope encryption is a mode of --enable-encryption, not a substitute for it.
 	if cfg.enableEnvelope && !cfg.enableEncryption {
 		panic("tellstone: --enable-envelope requires --enable-encryption")
+	}
+	// Snapshot options require persistence to be enabled; without it the WAL
+	// and snapshot files are never created so the flags are meaningless.
+	if !cfg.enablePersistence && (cfg.snapshotInterval > 0 || cfg.snapshotBytes > 0) {
+		panic("tellstone: --snapshot-interval and --snapshot-bytes require --enable-persistence")
 	}
 	return cfg
 }

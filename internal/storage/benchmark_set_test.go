@@ -86,7 +86,9 @@ func BenchmarkEngineSetVsSetFromBuffer(b *testing.B) {
 	b.Run("Set", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
-			eng.Set(key, val, 0)
+			if err := eng.Set(key, val, 0); err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 
@@ -96,7 +98,9 @@ func BenchmarkEngineSetVsSetFromBuffer(b *testing.B) {
 			buf := make([]byte, len(key)+len(val))
 			copy(buf, key)
 			copy(buf[len(key):], val)
-			eng.SetFromBuffer(buf, len(key), 0)
+			if err := eng.SetFromBuffer(buf, len(key), 0); err != nil {
+				b.Fatal(err)
+			}
 		}
 	})
 }
@@ -116,6 +120,8 @@ func BenchmarkEngineSetFromBufferZeroCopy(b *testing.B) {
 		buf := make([]byte, len(key)+len(val))
 		copy(buf, keyBytes)
 		copy(buf[len(key):], val)
-		eng.SetFromBuffer(buf, len(key), 0)
+		if err := eng.SetFromBuffer(buf, len(key), 0); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

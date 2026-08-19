@@ -137,7 +137,11 @@ func (s *Server) Run() error {
 	// that seals it, and before any listener starts so the restored history is
 	// in place by the time a client can read ACL LOG.
 	s.seedAuditReplay()
-	if err = s.initShards(key, cryptoEngine); err != nil {
+	// Create the signal context before initShards so the snapshot loop
+	// can select on ctx.Done for clean shutdown.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err = s.initShards(key, cryptoEngine, ctx); err != nil {
 		return fmt.Errorf("shard init: %w", err)
 	}
 	s.netSrv = network.NewServer(
@@ -177,8 +181,6 @@ func (s *Server) Run() error {
 		}()
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
@@ -453,7 +455,7 @@ func (s *Server) seedAuditReplay() {
 	}
 }
 
-func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
+func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine, ctx context.Context) error {
 	cfg := s.app.GetConfig()
 	numShards := cfg.GetNumShards()
 	logger := s.app.GetLogger()
@@ -497,7 +499,7 @@ func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
 	// Start the background snapshot manager if persistence is enabled and
 	// snapshots are configured (either interval or bytes threshold).
 	if store != nil && store.Enabled() && (cfg.GetSnapshotInterval() > 0 || cfg.GetSnapshotBytes() > 0) {
-		go s.snapshotLoop(store, cfg, logger)
+		go s.snapshotLoop(ctx, store, cfg, logger)
 	}
 	return nil
 }
@@ -575,15 +577,28 @@ func (s *Server) startRESPServer() {
 // snapshotLoop runs in the background and triggers WAL snapshots based on
 // time interval and WAL size thresholds. It checks every second for
 // size-based triggers and on the configured interval for time-based triggers.
-func (s *Server) snapshotLoop(store *persistence.Storage, cfg *config.Config, logger log.Logger) {
+// Exits when ctx is canceled (shutdown).
+func (s *Server) snapshotLoop(ctx context.Context, store *persistence.Storage, cfg *config.Config, logger log.Logger) {
 	interval := cfg.GetSnapshotInterval()
 	bytesThreshold := cfg.GetSnapshotBytes()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	var lastSnapshot time.Time
+	// Per-shard tracking so each shard's interval is independent; initialise
+	// to now so the first interval-triggered snapshot occurs only after the
+	// configured duration has elapsed.
+	lastSnapshot := make([]time.Time, len(s.shards))
+	now := time.Now()
+	for i := range lastSnapshot {
+		lastSnapshot[i] = now
+	}
 
-	for range ticker.C {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 		for i, sh := range s.shards {
 			shardID := uint32(sh.ID)
 
@@ -604,18 +619,16 @@ func (s *Server) snapshotLoop(store *persistence.Storage, cfg *config.Config, lo
 			}
 
 			// Time-based trigger: snapshot at the configured interval.
-			if interval > 0 && time.Since(lastSnapshot) >= interval {
+			if interval > 0 && time.Since(lastSnapshot[i]) >= interval {
 				if err := store.Snapshot(shardID, sh.Engine); err != nil {
 					if logger.Enabled(log.LevelError) {
 						logger.Log(log.LevelError, "snapshot: interval-triggered snapshot failed",
 							log.Uint("shard", shardID), log.String("error", err.Error()))
 					}
+				} else {
+					lastSnapshot[i] = time.Now()
 				}
 			}
-		}
-		// Update lastSnapshot after processing all shards on a time-based tick.
-		if interval > 0 {
-			lastSnapshot = time.Now()
 		}
 	}
 }

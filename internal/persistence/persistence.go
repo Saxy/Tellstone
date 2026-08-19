@@ -253,15 +253,19 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		return nil
 	}
 
-	// Phase 1: load snapshot if present.
+	// Phase 1: load snapshot if present. A corrupt snapshot means data
+	// preceding it is unrecoverable — abort rather than continuing with
+	// a partial state and replaying the WAL on top of an empty engine.
 	if snapshotExists(s.dir, shardID) {
 		loadedKeys, err := snapshotRead(s.dir, shardID, engine, s.logger)
 		if err != nil {
 			if s.logger.Enabled(log.LevelError) {
-				s.logger.Log(log.LevelError, "persistence: snapshot load failed, falling back to full WAL recovery",
+				s.logger.Log(log.LevelError, "persistence: snapshot load failed, data preceding snapshot is unrecoverable",
 					log.Uint("shard", shardID), log.String("error", err.Error()))
 			}
-		} else if s.logger.Enabled(log.LevelInfo) {
+			return fmt.Errorf("persistence: load shard %d snapshot: %w", shardID, err)
+		}
+		if s.logger.Enabled(log.LevelInfo) {
 			s.logger.Log(log.LevelInfo, "persistence: snapshot restored",
 				log.Uint("shard", shardID), log.Uint64("keys", loadedKeys))
 		}
@@ -306,7 +310,7 @@ func (s *Storage) replayWAL(shardID uint32, engine *storage.Engine) error {
 		var n int
 		n, err = io.ReadFull(f, header)
 		if err != nil {
-			if err == io.EOF || errors.Is(io.ErrUnexpectedEOF, err) {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return fmt.Errorf("persistence: incomplete header read (%d bytes): %w", n, err)
@@ -404,15 +408,20 @@ func (s *Storage) WALSize(shardID uint32) int64 {
 
 // Snapshot triggers a fork-based snapshot for the given shard. The parent
 // serializes the engine state to a pipe, and a child process writes the
-// snapshot file. After a successful snapshot, the WAL is truncated.
+// snapshot file. After a successful snapshot, only the WAL records that existed
+// before serialization are truncated; records appended during the snapshot are
+// preserved so they survive a crash.
 func (s *Storage) Snapshot(shardID uint32, engine *storage.Engine) error {
 	if !s.enabled {
 		return nil
 	}
+	// Capture the WAL boundary before serialization so that records appended
+	// during the snapshot are not lost by truncation.
+	walSize := s.WALSize(shardID)
 	if err := snapshotForkDump(s.dir, shardID, engine, s.logger); err != nil {
 		return err
 	}
-	return s.TruncateWAL(shardID)
+	return s.TruncateWALTo(shardID, walSize)
 }
 
 // TruncateWAL resets the WAL file to empty. Called after a successful snapshot.
@@ -426,12 +435,45 @@ func (s *Storage) TruncateWAL(shardID uint32) error {
 	if err := h.file.Truncate(0); err != nil {
 		return fmt.Errorf("persistence: truncate WAL shard %d: %w", shardID, err)
 	}
+	// Sync after truncation so the zero-length is durable; without this a
+	// crash could replay stale records that were logically discarded.
+	if err := h.file.Sync(); err != nil {
+		return fmt.Errorf("persistence: sync WAL shard %d after truncate: %w", shardID, err)
+	}
 	if _, err := h.file.Seek(0, 0); err != nil {
 		return fmt.Errorf("persistence: seek WAL shard %d: %w", shardID, err)
 	}
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "persistence: WAL truncated",
 			log.Uint("shard", shardID))
+	}
+	return nil
+}
+
+// TruncateWALTo truncates the WAL file to the given offset, discarding any
+// bytes beyond that point. Called after a successful snapshot to remove only
+// the records that were serialized, preserving later writes.
+func (s *Storage) TruncateWALTo(shardID uint32, offset int64) error {
+	h := s.getShard(shardID)
+	if h == nil {
+		return fmt.Errorf("persistence: shard %d not opened", shardID)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.file.Truncate(offset); err != nil {
+		return fmt.Errorf("persistence: truncate WAL shard %d to %d: %w", shardID, offset, err)
+	}
+	// Sync after truncation so the truncated length is durable; without this
+	// a crash could replay stale records that were logically discarded.
+	if err := h.file.Sync(); err != nil {
+		return fmt.Errorf("persistence: sync WAL shard %d after truncate: %w", shardID, err)
+	}
+	if _, err := h.file.Seek(0, io.SeekEnd); err != nil {
+		return fmt.Errorf("persistence: seek WAL shard %d: %w", shardID, err)
+	}
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "persistence: WAL truncated",
+			log.Uint("shard", shardID), log.Int64("to", offset))
 	}
 	return nil
 }

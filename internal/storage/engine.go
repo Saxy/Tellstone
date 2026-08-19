@@ -186,6 +186,9 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 // the key ends and the value begins. This avoids the make+copy that Set
 // performs, saving one allocation per call. Does not support encryption.
 func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error {
+	if keyLen < 0 || keyLen > len(buf) {
+		return errors.New("storage: invalid key length for SetFromBuffer")
+	}
 	if e.cryptoEngine.Enabled() {
 		return e.Set(string(buf[:keyLen]), buf[keyLen:], ttl)
 	}
@@ -374,17 +377,30 @@ func (e *Engine) CryptoDecryptedBytes() uint64 { return atomic.LoadUint64(&e.cry
 func (e *Engine) TotalCommands() uint64        { return atomic.LoadUint64(&e.totalCommands) }
 func (e *Engine) Chronometer() TimelineWheel   { return e.chronometer }
 
-// ForEach iterates all live (non-expired) entries under a single read lock
-// and calls fn for each. The callback must not mutate the engine. Expired
-// entries are skipped (not evicted) to keep the lock duration bounded.
+// ForEach snapshots all live (non-expired) entries under a read lock, releases
+// the lock, then calls fn for each captured entry. The callback may perform
+// arbitrary work without holding the shard lock. Expired entries are skipped
+// (not evicted) to keep the lock duration bounded.
 func (e *Engine) ForEach(fn func(key string, value []byte, expiration time.Time)) {
+	type entry struct {
+		key string
+		val []byte
+		exp time.Time
+	}
 	now := time.Now()
 	e.mu.RLock()
+	snap := make([]entry, 0, len(e.items))
 	for k, v := range e.items {
 		if !v.Expiration.IsZero() && now.After(v.Expiration) {
 			continue
 		}
-		fn(k, v.Value, v.Expiration)
+		// Copy value bytes under the lock so the snapshot survives mutations.
+		vc := make([]byte, len(v.Value))
+		copy(vc, v.Value)
+		snap = append(snap, entry{key: k, val: vc, exp: v.Expiration})
 	}
 	e.mu.RUnlock()
+	for i := range snap {
+		fn(snap[i].key, snap[i].val, snap[i].exp)
+	}
 }

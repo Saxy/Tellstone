@@ -19,7 +19,9 @@ Authors:
 package persistence
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -56,12 +58,12 @@ func IsSnapshotChild() bool {
 func SnapshotChildMain() {
 	dir := os.Getenv("TSD_SNAP_DIR")
 	shardID := 0
-	fmt.Sscanf(os.Getenv("TSD_SNAP_SHARD"), "%d", &shardID)
-	if dir == "" || shardID < 0 {
+	n, err := fmt.Sscanf(os.Getenv("TSD_SNAP_SHARD"), "%d", &shardID)
+	if err != nil || n != 1 || shardID < 0 || dir == "" {
 		os.Exit(1)
 	}
 
-	err := snapshotChildWrite(dir, uint32(shardID), os.Stdin)
+	err = snapshotChildWrite(dir, uint32(shardID), os.Stdin)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -102,9 +104,13 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 	h.Write(hdr[:]) // hash placeholder header (KeyCount=0, checksum=0)
 
 	var keyCount uint64
+	var writeErr error
 	var entry [16]byte
 
 	engine.ForEach(func(key string, value []byte, expiration time.Time) {
+		if writeErr != nil {
+			return
+		}
 		keyLen := uint32(len(key))
 		valLen := uint32(len(value))
 		var ttlNano int64
@@ -119,11 +125,26 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 		h.WriteString(key)
 		h.Write(value)
 
-		f.Write(entry[:])
-		f.WriteString(key)
-		f.Write(value)
+		if _, err := f.Write(entry[:]); err != nil {
+			writeErr = err
+			return
+		}
+		if _, err := f.WriteString(key); err != nil {
+			writeErr = err
+			return
+		}
+		if _, err := f.Write(value); err != nil {
+			writeErr = err
+			return
+		}
 		keyCount++
 	})
+
+	if writeErr != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return 0, fmt.Errorf("snapshot: write entry: %w", writeErr)
+	}
 
 	if err = f.Sync(); err != nil {
 		f.Close()
@@ -136,7 +157,11 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 	binary.LittleEndian.PutUint64(hdr[8:16], keyCount)
 	binary.LittleEndian.PutUint64(hdr[24:32], checksum)
 
-	f.Seek(0, 0)
+	if _, err = f.Seek(0, 0); err != nil {
+		f.Close()
+		os.Remove(tmpPath)
+		return 0, fmt.Errorf("snapshot: seek header: %w", err)
+	}
 	if _, err = f.Write(hdr[:]); err != nil {
 		f.Close()
 		os.Remove(tmpPath)
@@ -165,8 +190,10 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 	return keyCount, nil
 }
 
-// snapshotRead loads a snapshot file into the engine. Verifies magic, version,
-// and checksum before applying entries. Returns the number of keys loaded.
+// snapshotRead loads a snapshot file into the engine. It validates lengths,
+// verifies the checksum, and only then applies entries to the engine so that a
+// corrupted snapshot never mutates the live state. Returns the number of keys
+// loaded.
 func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log.Logger) (uint64, error) {
 	path := filepath.Join(dir, fmt.Sprintf("shard_%03d.snap", shardID))
 	f, err := os.Open(path)
@@ -174,6 +201,12 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 		return 0, fmt.Errorf("snapshot: open %s: %w", path, err)
 	}
 	defer f.Close()
+
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, fmt.Errorf("snapshot: stat %s: %w", path, err)
+	}
+	fileSize := fi.Size()
 
 	var hdr [snapHeader]byte
 	if _, err = io.ReadFull(f, hdr[:]); err != nil {
@@ -197,13 +230,22 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 	binary.LittleEndian.PutUint64(hdr[24:32], 0)
 	h.Write(hdr[:])
 
-	var loadedKeys uint64
-	entryBuf := make([]byte, 16)
+	// Decode all entries into temporary buffers before touching the engine so
+	// that a checksum failure leaves the engine untouched. Each buffer is
+	// contiguous [key|value] for SetFromBuffer compatibility.
+	type decodedEntry struct {
+		kvBuf   []byte // [key|value] contiguous
+		keyLen  uint32
+		ttlNano int64
+	}
+	var entries []decodedEntry
 	var kvBuf []byte
+	entryBuf := make([]byte, 16)
+	remaining := fileSize - int64(snapHeader)
 
 	for {
 		if _, err = io.ReadFull(f, entryBuf); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return 0, fmt.Errorf("snapshot: read entry header: %w", err)
@@ -214,6 +256,14 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 		valLen := binary.LittleEndian.Uint32(entryBuf[4:8])
 		ttlNano := int64(binary.LittleEndian.Uint64(entryBuf[8:16]))
 
+		// Validate key/value lengths: reject integer overflow and data that
+		// exceeds the remaining file bytes.
+		kvLen64 := int64(keyLen) + int64(valLen)
+		if kvLen64 < 0 || kvLen64 > remaining-16 {
+			return 0, fmt.Errorf("snapshot: invalid entry lengths key=%d val=%d (remaining=%d)", keyLen, valLen, remaining)
+		}
+		remaining -= 16 + kvLen64
+
 		kvLen := int(keyLen) + int(valLen)
 		if cap(kvBuf) < kvLen {
 			kvBuf = make([]byte, kvLen)
@@ -223,33 +273,36 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 		if _, err = io.ReadFull(f, kvBuf); err != nil {
 			return 0, fmt.Errorf("snapshot: read key+value: %w", err)
 		}
-		// Hash key and value separately to match the writer's layout.
 		h.Write(kvBuf[:keyLen])
 		h.Write(kvBuf[keyLen:])
 
-		// Compute TTL duration relative to now.
-		var duration time.Duration
-		if ttlNano != 0 {
-			ttl := time.Unix(0, ttlNano)
-			duration = time.Until(ttl)
-			if duration <= 0 {
-				continue // expired — skip
-			}
-		}
-
-		// SetFromBuffer takes ownership of kvBuf — allocate a fresh one on
-		// the next iteration so the engine's map entry remains valid.
-		snap := kvBuf
-		kvBuf = nil
-		if err = engine.SetFromBuffer(snap, int(keyLen), duration); err != nil {
-			return 0, fmt.Errorf("snapshot: engine.SetFromBuffer: %w", err)
-		}
-		loadedKeys++
+		// Copy so each entry owns its memory independent of kvBuf reuse.
+		buf := make([]byte, kvLen)
+		copy(buf, kvBuf)
+		entries = append(entries, decodedEntry{kvBuf: buf, keyLen: keyLen, ttlNano: ttlNano})
 	}
 
 	actualChecksum := h.Sum64()
 	if fileChecksum != 0 && actualChecksum != fileChecksum {
 		return 0, fmt.Errorf("snapshot: checksum mismatch (file=%d, computed=%d)", fileChecksum, actualChecksum)
+	}
+
+	// Checksum is valid — safe to apply entries to the engine.
+	var loadedKeys uint64
+	for i := range entries {
+		e := &entries[i]
+		var duration time.Duration
+		if e.ttlNano != 0 {
+			ttl := time.Unix(0, e.ttlNano)
+			duration = time.Until(ttl)
+			if duration <= 0 {
+				continue // expired — skip
+			}
+		}
+		if err = engine.SetFromBuffer(e.kvBuf, int(e.keyLen), duration); err != nil {
+			return 0, fmt.Errorf("snapshot: engine.SetFromBuffer: %w", err)
+		}
+		loadedKeys++
 	}
 
 	if logger != nil && logger.Enabled(log.LevelInfo) {
@@ -263,10 +316,20 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 }
 
 // snapshotExists reports whether a valid snapshot file exists for the shard.
+// Checks file size and magic bytes so stale or incompatible files are not
+// selected.
 func snapshotExists(dir string, shardID uint32) bool {
 	path := filepath.Join(dir, fmt.Sprintf("shard_%03d.snap", shardID))
-	fi, err := os.Stat(path)
-	return err == nil && fi.Size() >= snapHeader
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	var hdr [4]byte
+	if _, err := io.ReadFull(f, hdr[:]); err != nil {
+		return false
+	}
+	return string(hdr[:]) == snapMagic
 }
 
 // snapshotForkDump triggers a fork-based snapshot. The parent serializes the
@@ -280,14 +343,22 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 		return err
 	}
 
-	cmd := exec.Command(os.Args[0], "--snapshot-child")
+	// Use a bounded deadline so cmd.Wait cannot block indefinitely if the
+	// child hangs or the pipe stalls.
+	const childTimeout = 2 * time.Minute
+	ctx, cancel := context.WithTimeout(context.Background(), childTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, os.Args[0], "--snapshot-child")
 	cmd.Stdin = pr
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	cmd.Env = append(os.Environ(),
-		"TSD_SNAP_DIR="+dir,
+	// Replace inherited env with only the variables the child needs so that
+	// secrets and other host state are not leaked to the child process.
+	cmd.Env = []string{
+		"TSD_SNAP_DIR=" + dir,
 		fmt.Sprintf("TSD_SNAP_SHARD=%d", shardID),
-	)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err = cmd.Start(); err != nil {
@@ -304,8 +375,14 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 	// Parent: close read end (child inherited it via cmd.Stdin).
 	pr.Close()
 
-	// Serialize engine state into the write end under a brief read lock.
-	serializeEngineToWriter(pw, engine)
+	// Serialize engine state into the write end; propagate any write error.
+	if serr := serializeEngineToWriter(pw, engine); serr != nil {
+		pw.Close()
+		// Kill the child since it will never receive EOF.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return fmt.Errorf("snapshot: serialize: %w", serr)
+	}
 
 	// Close write end so the child receives EOF on its stdin.
 	pw.Close()
@@ -327,25 +404,39 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 }
 
 // serializeEngineToWriter writes all engine entries in the snapshot binary
-// format (without file header) to the given writer.
-func serializeEngineToWriter(w io.Writer, engine *storage.Engine) {
-	var entry [16]byte
-
+// format (without file header) to the given writer. Stops at the first write
+// error and returns it.
+func serializeEngineToWriter(w io.Writer, engine *storage.Engine) error {
+	var writeErr error
 	engine.ForEach(func(key string, value []byte, expiration time.Time) {
+		if writeErr != nil {
+			return
+		}
 		keyLen := uint32(len(key))
 		valLen := uint32(len(value))
 		var ttlNano int64
 		if !expiration.IsZero() {
 			ttlNano = expiration.UnixNano()
 		}
-		binary.LittleEndian.PutUint32(entry[0:4], keyLen)
-		binary.LittleEndian.PutUint32(entry[4:8], valLen)
-		binary.LittleEndian.PutUint64(entry[8:16], uint64(ttlNano))
+		var hdr [16]byte
+		binary.LittleEndian.PutUint32(hdr[0:4], keyLen)
+		binary.LittleEndian.PutUint32(hdr[4:8], valLen)
+		binary.LittleEndian.PutUint64(hdr[8:16], uint64(ttlNano))
 
-		w.Write(entry[:])
-		io.WriteString(w, key)
-		w.Write(value)
+		if _, err := w.Write(hdr[:]); err != nil {
+			writeErr = err
+			return
+		}
+		if _, err := io.WriteString(w, key); err != nil {
+			writeErr = err
+			return
+		}
+		if _, err := w.Write(value); err != nil {
+			writeErr = err
+			return
+		}
 	})
+	return writeErr
 }
 
 // snapshotChildWrite reads serialized entries from r and writes the snapshot
@@ -387,7 +478,7 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 
 	for {
 		if _, err := io.ReadFull(r, entryBuf); err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			f.Close()
@@ -423,9 +514,21 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 		}
 		h.Write(valBuf)
 
-		f.Write(entryBuf)
-		f.Write(keyBuf)
-		f.Write(valBuf)
+		if _, err := f.Write(entryBuf); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		if _, err := f.Write(keyBuf); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		if _, err := f.Write(valBuf); err != nil {
+			f.Close()
+			os.Remove(tmpPath)
+			return err
+		}
 		keyCount++
 	}
 
