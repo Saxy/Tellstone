@@ -1,0 +1,61 @@
+internal/crypto/cipher.go
+  s_652d2bb988c100::t_c51ace0755b097 17
+  s_652d2bb988c100::t_ee2951537ce845 198-231
+config/config.go
+  s_652d2bb988c100::t_296b0c2f116649 410-412
+internal/persistence/benchmark_test.go
+  s_652d2bb988c100::t_d5219441449625 20,43,73,97,126,155,168
+internal/persistence/persistence_test.go
+  s_652d2bb988c100::t_b38819981d9367 135
+  s_652d2bb988c100::t_ece1f7537a85b6 823-824,827-828
+  s_652d2bb988c100::t_933b0daaca41ab 705,777,840,893
+  s_652d2bb988c100::t_f5d765589feb98 849-850
+  s_652d2bb988c100::t_2a060e9ee0751e 664-665
+  s_652d2bb988c100::t_2cc0fd1557662d 742-743,757-758
+  s_652d2bb988c100::t_7c8ff4ad82a7fa 900-901
+  s_652d2bb988c100::t_e1dad65289a856 629-652,654-663,666-704,706-733,735-741,744-756,759-776,778-785,788-795,800-812,815-822,825-826,829-839,841-848,851-892,894-899,902-916
+  s_652d2bb988c100::t_6cc2286b1f02ca 786-787,813-814
+  s_652d2bb988c100::t_b6cbb1c4251639 11
+  s_652d2bb988c100::t_51792ce0eac529 734
+  s_652d2bb988c100::t_52406f653c8c1e 119,153,188,237,251,289,307,354,404,441,489,512,542,549,572,595
+  s_652d2bb988c100::t_6c1550526eb1a3 653
+  s_652d2bb988c100::t_0e83ec268a82f2 796-799
+internal/shard/runner.go
+  s_652d2bb988c100::t_515a219edacf03 122
+internal/persistence/snapshot_test.go
+  s_652d2bb988c100::t_c7e10f57ee2efd 311,363,401,426
+internal/storage/engine.go
+  s_652d2bb988c100::t_435c2190db6eee 236-284
+  s_652d2bb988c100::t_cb2bbf49a8257e 429
+internal/persistence/persistence.go
+  s_652d2bb988c100::t_285d8e8c53fa91 307-310,313,329-377,379,382-383
+  s_652d2bb988c100::t_848496e2265a6c 235-239,423-426,449-457,465,495-496,500-515,517-579,581-588,592-630,633
+  s_652d2bb988c100::t_375cb30182f413 516
+  s_652d2bb988c100::t_90e7d65226bc16 28
+  s_652d2bb988c100::t_9c7f00f613df2e 24-27,29
+  s_652d2bb988c100::t_78b7b1a725b42f 48-50,52-56
+  s_652d2bb988c100::t_596e9f7ed7d4d2 13,16
+  s_652d2bb988c100::t_d4f6cd57062fec 130-131,139-143,175-234
+  s_652d2bb988c100::t_f23db7ae348d76 240
+internal/persistence/snapshot_bench_test.go
+  s_652d2bb988c100::t_db71bbc924d867 274
+internal/persistence/snapshot.go
+  s_652d2bb988c100::t_e96fde156e1b89 347,358-360,362-367
+  s_652d2bb988c100::t_966c8fe9a06285 361
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "9fe167a654568f64b851c2bf040fed3f829e3954",
+  "prompts": {},
+  "sessions": {
+    "s_652d2bb988c100": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fec390920ffeLcKtv2HcGjKGvm",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
