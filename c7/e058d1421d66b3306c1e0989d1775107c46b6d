@@ -1,0 +1,63 @@
+config/config.go
+  s_652d2bb988c100::t_c1099daab86e59 391
+  s_652d2bb988c100::t_6a44a4789d156b 437-441
+internal/persistence/persistence.go
+  s_652d2bb988c100::t_0ed5da2763355d 313
+  s_652d2bb988c100::t_5f8fc99cacac61 438-442
+  s_652d2bb988c100::t_046548730985b7 453-480
+  s_652d2bb988c100::t_855224cf1744fd 256-258,263,266-268
+  s_652d2bb988c100::t_0d9b557bfcef19 411-413,418-420,424
+internal/persistence/snapshot_bench_test.go
+  s_652d2bb988c100::t_5481ba507fe34d 60,62
+  s_652d2bb988c100::t_eabd5f28a5a6d7 203,205
+internal/persistence/snapshot.go
+  s_652d2bb988c100::t_cf04cb20cb4e93 62
+  s_652d2bb988c100::t_10fdf4bbe451fa 160
+  s_652d2bb988c100::t_abcc7091f7bea0 24
+  s_652d2bb988c100::t_0c0400dda51f99 234-235,237-239,279-282,292-293,302
+  s_652d2bb988c100::t_cb59a9ab67d201 61
+  s_652d2bb988c100::t_5f714badee870a 22
+  s_652d2bb988c100::t_4aa064fc845274 517-531
+  s_652d2bb988c100::t_c69408f4b736ed 66
+  s_652d2bb988c100::t_5954eeee6cacc6 107,111-113,128-139,143-147
+  s_652d2bb988c100::t_2340dc29e53f01 346-352,356-359,361,378-385
+  s_652d2bb988c100::t_f7099e32a3312f 193-196,205-210,233,236,240-241,243-244,248,259-265,283-291,295-296
+  s_652d2bb988c100::t_b130ac59ac7ac8 161-164
+  s_652d2bb988c100::t_2c872f80728e5e 481
+  s_652d2bb988c100::t_295235b068aefe 319-320,323-332
+  s_652d2bb988c100::t_5c6efdb02ea493 407-410,412-414,421-437,439
+  s_652d2bb988c100::t_42d15a0129644e 148
+  s_652d2bb988c100::t_87b679e97bf28f 266
+internal/storage/benchmark_set_test.go
+  s_652d2bb988c100::t_5dfd110470af4d 89-91,101-103
+  s_652d2bb988c100::t_5839033737e328 123-125
+server/server.go
+  s_652d2bb988c100::t_2af625f95d875a 458
+  s_652d2bb988c100::t_18ebcc4b1430f7 502
+  s_652d2bb988c100::t_4f79872ac498fa 580-581,587-594,596-601,622,628-629
+  s_652d2bb988c100::t_0b64f23f499c28 140-144
+internal/storage/engine.go
+  s_652d2bb988c100::t_bf25c83c742655 386-388
+  s_652d2bb988c100::t_e6c60cba5fe1cf 380-383,385,389,392,397-400,403-405
+  s_652d2bb988c100::t_32b7e75f37336d 189-191
+internal/persistence/snapshot_test.go
+  s_652d2bb988c100::t_95d0dd081d279e 204,206-208,210-217
+  s_652d2bb988c100::t_de7f26f356bab0 256-258,261-266,271-273
+  s_652d2bb988c100::t_f1fdd6c11587bf 108-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "c7e058d1421d66b3306c1e0989d1775107c46b6d",
+  "prompts": {},
+  "sessions": {
+    "s_652d2bb988c100": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fec390920ffeLcKtv2HcGjKGvm",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
