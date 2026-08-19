@@ -244,11 +244,38 @@ func (s *Storage) OpenShard(shardID uint32) error {
 	return nil
 }
 
-// LoadShard replays all records from the shard's WAL file into the given engine,
+// LoadShard restores a shard's in-memory engine. If a snapshot file exists,
+// it is loaded first (fast binary read). Then the WAL is replayed on top to
+// capture any writes that happened after the snapshot. This two-phase approach
+// keeps warm-up fast: the snapshot is compact and the WAL is small.
+func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
+	if !s.enabled {
+		return nil
+	}
+
+	// Phase 1: load snapshot if present.
+	if snapshotExists(s.dir, shardID) {
+		loadedKeys, err := snapshotRead(s.dir, shardID, engine, s.logger)
+		if err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "persistence: snapshot load failed, falling back to full WAL recovery",
+					log.Uint("shard", shardID), log.String("error", err.Error()))
+			}
+		} else if s.logger.Enabled(log.LevelInfo) {
+			s.logger.Log(log.LevelInfo, "persistence: snapshot restored",
+				log.Uint("shard", shardID), log.Uint64("keys", loadedKeys))
+		}
+	}
+
+	// Phase 2: replay the WAL for writes since the last snapshot.
+	return s.replayWAL(shardID, engine)
+}
+
+// replayWAL replays all records from the shard's WAL file into the given engine,
 // skipping expired keys and applying tombstones as deletions. Truncated records
 // from a crash mid-write are detected, and the WAL is truncated to the last valid
 // offset so future loads resume from a clean end.
-func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
+func (s *Storage) replayWAL(shardID uint32, engine *storage.Engine) error {
 	h := s.getShard(shardID)
 	if h == nil {
 		return fmt.Errorf("shard %d not opened", shardID)
@@ -279,7 +306,7 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		var n int
 		n, err = io.ReadFull(f, header)
 		if err != nil {
-			if err == io.EOF || err == io.ErrUnexpectedEOF {
+			if err == io.EOF || errors.Is(io.ErrUnexpectedEOF, err) {
 				break
 			}
 			return fmt.Errorf("persistence: incomplete header read (%d bytes): %w", n, err)
@@ -308,7 +335,7 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		remaining -= int64(keyLen) + int64(valLen)
 		validOffset = fileSize - remaining
 		recordsRead++
-		ttlVal := int64(ttlNano)
+		ttlVal := ttlNano
 		if ttlVal == tombstoneTTL {
 			if s.logger.Enabled(log.LevelDebug) {
 				s.logger.Log(log.LevelDebug, "persistence: replaying delete",
@@ -355,6 +382,56 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 		s.logger.Log(log.LevelInfo, "persistence: shard loaded",
 			log.Uint("shard", shardID), log.Int("records_read", recordsRead),
 			log.Int("records_skipped", recordsSkipped), log.Int("records_loaded", recordsRead-recordsSkipped))
+	}
+	return nil
+}
+
+// WALSize returns the current WAL file size in bytes for the given shard.
+// Returns 0 if the shard is not opened or on error.
+func (s *Storage) WALSize(shardID uint32) int64 {
+	h := s.getShard(shardID)
+	if h == nil {
+		return 0
+	}
+	h.mu.Lock()
+	fi, err := h.file.Stat()
+	h.mu.Unlock()
+	if err != nil {
+		return 0
+	}
+	return fi.Size()
+}
+
+// Snapshot triggers a fork-based snapshot for the given shard. The parent
+// serializes the engine state to a pipe, and a child process writes the
+// snapshot file. After a successful snapshot, the WAL is truncated.
+func (s *Storage) Snapshot(shardID uint32, engine *storage.Engine) error {
+	if !s.enabled {
+		return nil
+	}
+	if err := snapshotForkDump(s.dir, shardID, engine, s.logger); err != nil {
+		return err
+	}
+	return s.TruncateWAL(shardID)
+}
+
+// TruncateWAL resets the WAL file to empty. Called after a successful snapshot.
+func (s *Storage) TruncateWAL(shardID uint32) error {
+	h := s.getShard(shardID)
+	if h == nil {
+		return fmt.Errorf("persistence: shard %d not opened", shardID)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if err := h.file.Truncate(0); err != nil {
+		return fmt.Errorf("persistence: truncate WAL shard %d: %w", shardID, err)
+	}
+	if _, err := h.file.Seek(0, 0); err != nil {
+		return fmt.Errorf("persistence: seek WAL shard %d: %w", shardID, err)
+	}
+	if s.logger.Enabled(log.LevelInfo) {
+		s.logger.Log(log.LevelInfo, "persistence: WAL truncated",
+			log.Uint("shard", shardID))
 	}
 	return nil
 }

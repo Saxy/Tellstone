@@ -20,6 +20,7 @@ import (
 
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
+	"github.com/Saxy/Tellstone/internal/persistence"
 	"github.com/Saxy/Tellstone/internal/version"
 	"github.com/Saxy/Tellstone/logger"
 	"github.com/Saxy/Tellstone/server"
@@ -77,6 +78,13 @@ func initRuntimeSettings(l logger.Logger) {
 }
 
 func main() {
+	// Snapshot child process — spawned by the parent via ForkExec to write
+	// a snapshot file. Runs in isolation and exits immediately.
+	if persistence.IsSnapshotChild() {
+		persistence.SnapshotChildMain()
+		return
+	}
+
 	// Subcommand dispatch — "audit" and "kek" are not server flags, so detect
 	// them before config/flag parsing so "-h" routes to the CLI tool, not the server.
 	if len(os.Args) > 1 && os.Args[1] == "audit" {

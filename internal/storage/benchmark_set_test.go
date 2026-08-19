@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // BenchmarkEngineSetNoTTL measures a sequential Set with no TTL (chronometer not involved).
@@ -49,4 +50,72 @@ func BenchmarkEngineSetGetParallelNoTTL(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// BenchmarkEngineSetFromBufferNoTTL measures SetFromBuffer, which takes ownership
+// of a pre-built [key|value] buffer without copying — zero allocs beyond the buffer.
+func BenchmarkEngineSetFromBufferNoTTL(b *testing.B) {
+	eng := NewEngine(1*time.Millisecond, 64, 0, nil, nil)
+	defer eng.Close()
+	val := []byte("benchmark_value")
+	keys := make([]string, 1000)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("benchmark_key_%d", i)
+	}
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		key := keys[i%1000]
+		buf := make([]byte, len(key)+len(val))
+		copy(buf, key)
+		copy(buf[len(key):], val)
+		if err := eng.SetFromBuffer(buf, len(key), 0); err != nil {
+			b.Fatalf("unexpected error: %v", err)
+		}
+	}
+}
+
+// BenchmarkEngineSetVsSetFromBuffer compares the two paths head-to-head:
+// Set (makes its own buffer + copies) vs SetFromBuffer (caller owns the buffer).
+func BenchmarkEngineSetVsSetFromBuffer(b *testing.B) {
+	eng := NewEngine(1*time.Millisecond, 64, 0, nil, nil)
+	defer eng.Close()
+	val := []byte("benchmark_value_32_bytes_long_xxxxx")
+	key := "bench_key_name_typical_16"
+
+	b.Run("Set", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			eng.Set(key, val, 0)
+		}
+	})
+
+	b.Run("SetFromBuffer", func(b *testing.B) {
+		b.ReportAllocs()
+		for i := 0; i < b.N; i++ {
+			buf := make([]byte, len(key)+len(val))
+			copy(buf, key)
+			copy(buf[len(key):], val)
+			eng.SetFromBuffer(buf, len(key), 0)
+		}
+	})
+}
+
+// BenchmarkEngineSetFromBufferZeroCopy shows the zero-copy variant where the
+// buffer is built with unsafe (no copy from string) — the absolute minimum.
+func BenchmarkEngineSetFromBufferZeroCopy(b *testing.B) {
+	eng := NewEngine(1*time.Millisecond, 64, 0, nil, nil)
+	defer eng.Close()
+	val := []byte("benchmark_value_32_bytes_long_xxxxx")
+	key := "bench_key_name_typical_16"
+	keyBytes := unsafe.Slice(unsafe.StringData(key), len(key))
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		buf := make([]byte, len(key)+len(val))
+		copy(buf, keyBytes)
+		copy(buf[len(key):], val)
+		eng.SetFromBuffer(buf, len(key), 0)
+	}
 }

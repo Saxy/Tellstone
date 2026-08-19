@@ -23,6 +23,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
 	"github.com/Saxy/Tellstone/internal/audit"
 	"github.com/Saxy/Tellstone/internal/command"
@@ -493,6 +494,11 @@ func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine) error {
 			log.String("persistence", p),
 		)
 	}
+	// Start the background snapshot manager if persistence is enabled and
+	// snapshots are configured (either interval or bytes threshold).
+	if store != nil && store.Enabled() && (cfg.GetSnapshotInterval() > 0 || cfg.GetSnapshotBytes() > 0) {
+		go s.snapshotLoop(store, cfg, logger)
+	}
 	return nil
 }
 
@@ -564,6 +570,54 @@ func (s *Server) startRESPServer() {
 			}
 		}
 	}()
+}
+
+// snapshotLoop runs in the background and triggers WAL snapshots based on
+// time interval and WAL size thresholds. It checks every second for
+// size-based triggers and on the configured interval for time-based triggers.
+func (s *Server) snapshotLoop(store *persistence.Storage, cfg *config.Config, logger log.Logger) {
+	interval := cfg.GetSnapshotInterval()
+	bytesThreshold := cfg.GetSnapshotBytes()
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	var lastSnapshot time.Time
+
+	for range ticker.C {
+		for i, sh := range s.shards {
+			shardID := uint32(sh.ID)
+
+			// Size-based trigger: snapshot when WAL exceeds the threshold.
+			if bytesThreshold > 0 && store.WALSize(shardID) >= int64(bytesThreshold) {
+				if err := store.Snapshot(shardID, sh.Engine); err != nil {
+					if logger.Enabled(log.LevelError) {
+						logger.Log(log.LevelError, "snapshot: size-triggered snapshot failed",
+							log.Uint("shard", shardID), log.String("error", err.Error()))
+					}
+				} else {
+					if logger.Enabled(log.LevelInfo) {
+						logger.Log(log.LevelInfo, "snapshot: size-triggered",
+							log.Uint("shard", shardID), log.Int("shard_index", i))
+					}
+				}
+				continue
+			}
+
+			// Time-based trigger: snapshot at the configured interval.
+			if interval > 0 && time.Since(lastSnapshot) >= interval {
+				if err := store.Snapshot(shardID, sh.Engine); err != nil {
+					if logger.Enabled(log.LevelError) {
+						logger.Log(log.LevelError, "snapshot: interval-triggered snapshot failed",
+							log.Uint("shard", shardID), log.String("error", err.Error()))
+					}
+				}
+			}
+		}
+		// Update lastSnapshot after processing all shards on a time-based tick.
+		if interval > 0 {
+			lastSnapshot = time.Now()
+		}
+	}
 }
 
 // networkHandler is the binary frontend's data handler. GET, SET and DEL run

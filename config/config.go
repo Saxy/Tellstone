@@ -53,6 +53,8 @@ type Config struct {
 	oauthProvider     string
 	oauthIssuer       string
 	oauthClientID     string
+	snapshotInterval  time.Duration
+	snapshotBytes     uint64
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -371,7 +373,22 @@ func LoadConfig(args []string) *Config {
 		&cfg.oauthClientID,
 		"oauth-client-id",
 		getEnv("TSD_OAUTH_CLIENT_ID", ""),
-		"OAuth2 client ID used as the expected token audience (default: none)",
+		"OAuth2 client ID; expected token audience (default: none)",
+	)
+	fs.DurationVar(
+		&cfg.snapshotInterval,
+		"snapshot-interval",
+		getEnv("TSD_SNAPSHOT_INTERVAL", time.Duration(0)),
+		"Interval between periodic snapshots (e.g. 5m); 0 disables periodic snapshots (default: 0)",
+	)
+	var snapshotBytes ByteSize
+	if env := os.Getenv("TSD_SNAPSHOT_BYTES"); env != "" {
+		_ = snapshotBytes.Set(env)
+	}
+	fs.Var(
+		&snapshotBytes,
+		"snapshot-bytes",
+		"WAL size threshold that triggers a snapshot (e.g. 64MiB); 0 disables size-based triggers (default: 64MiB)",
 	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
@@ -389,6 +406,10 @@ func LoadConfig(args []string) *Config {
 	cfg.maxMemBytes = uint64(maxMemBytes)
 	if cfg.numShards < 1 {
 		cfg.numShards = runtime.NumCPU()
+	}
+	cfg.snapshotBytes = uint64(snapshotBytes)
+	if cfg.snapshotBytes == 0 {
+		cfg.snapshotBytes = 64 * 1024 * 1024 // 64 MiB default
 	}
 	// Validate TLS configuration: cert and key must be provided together.
 	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
@@ -448,9 +469,11 @@ func (cfg *Config) GetRBACConfig() string             { return cfg.rbacConfig }
 func (cfg *Config) MTLSEnabled() bool {
 	return cfg.tlsCert != "" && cfg.tlsKey != "" && cfg.tlsCA != ""
 }
-func (cfg *Config) AuditEnabled() bool       { return cfg.enableAuditLog }
-func (cfg *Config) AuditLogPath() string     { return cfg.auditLogPath }
-func (cfg *Config) AuditLogEvents() []string { return strings.Split(cfg.auditLogEvents, ",") }
-func (cfg *Config) GetOAuthProvider() string { return cfg.oauthProvider }
-func (cfg *Config) GetOAuthIssuer() string   { return cfg.oauthIssuer }
-func (cfg *Config) GetOAuthClientID() string { return cfg.oauthClientID }
+func (cfg *Config) AuditEnabled() bool                 { return cfg.enableAuditLog }
+func (cfg *Config) AuditLogPath() string               { return cfg.auditLogPath }
+func (cfg *Config) AuditLogEvents() []string           { return strings.Split(cfg.auditLogEvents, ",") }
+func (cfg *Config) GetOAuthProvider() string           { return cfg.oauthProvider }
+func (cfg *Config) GetOAuthIssuer() string             { return cfg.oauthIssuer }
+func (cfg *Config) GetOAuthClientID() string           { return cfg.oauthClientID }
+func (cfg *Config) GetSnapshotInterval() time.Duration { return cfg.snapshotInterval }
+func (cfg *Config) GetSnapshotBytes() uint64           { return cfg.snapshotBytes }

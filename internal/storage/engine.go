@@ -180,6 +180,53 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	return nil
 }
 
+// SetFromBuffer stores a key-value pair from a pre-built buffer containing
+// [keyBytes | valueBytes] contiguously. The engine takes ownership of buf —
+// callers must not reuse it after this call. keyLen is the byte offset where
+// the key ends and the value begins. This avoids the make+copy that Set
+// performs, saving one allocation per call. Does not support encryption.
+func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error {
+	if e.cryptoEngine.Enabled() {
+		return e.Set(string(buf[:keyLen]), buf[keyLen:], ttl)
+	}
+	if e.maxBytes > 0 {
+		totalEntrySize := uint64(len(buf))
+		if atomic.LoadUint64(&e.allocatedBytes)+totalEntrySize > e.maxBytes {
+			return ErrEngineFull
+		}
+	}
+	var exp time.Time
+	if ttl > 0 {
+		exp = time.Now().Add(ttl)
+	}
+	storedKey := unsafe.String(unsafe.SliceData(buf), keyLen)
+	value := buf[keyLen:]
+	e.mu.Lock()
+	oldItem, isUpdate := e.items[storedKey]
+	e.items[storedKey] = Item{
+		Value:      value,
+		Expiration: exp,
+	}
+	e.mu.Unlock()
+	atomic.AddUint64(&e.totalCommands, 1)
+	if isUpdate {
+		oldSize := uint64(len(oldItem.Value) + keyLen)
+		newSize := uint64(len(value) + keyLen)
+		if newSize > oldSize {
+			atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
+		} else if oldSize > newSize {
+			atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
+		}
+	} else {
+		atomic.AddUint64(&e.allocatedBytes, uint64(len(buf)))
+		atomic.AddUint64(&e.keyCount, 1)
+	}
+	if ttl > 0 {
+		e.chronometer.Register(storedKey, ttl)
+	}
+	return nil
+}
+
 // Delete removes key and reports whether it was present. An expired key is
 // evicted physically but counts as absent, mirroring Get's lazy eviction, so
 // callers can derive "did the key exist" without a separate Get lookup.
@@ -326,3 +373,18 @@ func (e *Engine) CryptoEncryptedBytes() uint64 { return atomic.LoadUint64(&e.cry
 func (e *Engine) CryptoDecryptedBytes() uint64 { return atomic.LoadUint64(&e.cryptoDecryptedBytes) }
 func (e *Engine) TotalCommands() uint64        { return atomic.LoadUint64(&e.totalCommands) }
 func (e *Engine) Chronometer() TimelineWheel   { return e.chronometer }
+
+// ForEach iterates all live (non-expired) entries under a single read lock
+// and calls fn for each. The callback must not mutate the engine. Expired
+// entries are skipped (not evicted) to keep the lock duration bounded.
+func (e *Engine) ForEach(fn func(key string, value []byte, expiration time.Time)) {
+	now := time.Now()
+	e.mu.RLock()
+	for k, v := range e.items {
+		if !v.Expiration.IsZero() && now.After(v.Expiration) {
+			continue
+		}
+		fn(k, v.Value, v.Expiration)
+	}
+	e.mu.RUnlock()
+}
