@@ -200,6 +200,7 @@ func benchmarkChildWrite(b *testing.B, nKeys, valSize int) {
 		if err := snapshotChildWrite(dir, 0, pr); err != nil {
 			b.Fatal(err)
 		}
+		pr.Close()
 		b.StopTimer()
 		os.Remove(filepath.Join(dir, "shard_000.snap"))
 		b.StartTimer()
@@ -278,7 +279,7 @@ func BenchmarkLoadShardWithSnapshot1K(b *testing.B) {
 		b.Fatal(err)
 	}
 	// Truncate WAL and write some post-snapshot WAL records.
-	s.TruncateWAL(0)
+	s.TruncateWALTo(0, 0)
 	for i := 0; i < 100; i++ {
 		key := fmt.Sprintf("wal_%08d", i)
 		if err := s.Write(0, key, []byte("wal_value"), time.Time{}); err != nil {

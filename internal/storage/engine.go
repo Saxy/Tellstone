@@ -23,7 +23,10 @@ import (
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
-var ErrEngineFull = errors.New("memory: limit reached")
+var (
+	ErrEngineFull       = errors.New("memory: limit reached")
+	ErrInvalidKeyLength = errors.New("storage: invalid key length for SetFromBuffer")
+)
 
 // defaultMaxBytes defines the safety ceiling for memory consumption.
 //
@@ -187,7 +190,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 // performs, saving one allocation per call. Does not support encryption.
 func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error {
 	if keyLen < 0 || keyLen > len(buf) {
-		return errors.New("storage: invalid key length for SetFromBuffer")
+		return ErrInvalidKeyLength
 	}
 	if e.cryptoEngine.Enabled() {
 		return e.Set(string(buf[:keyLen]), buf[keyLen:], ttl)

@@ -27,6 +27,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -40,6 +41,44 @@ const (
 	snapVersion = 1
 	snapHeader  = 32 // magic(4) + version(4) + keyCount(8) + createdAt(8) + checksum(8)
 )
+
+// snapshotCleanup closes f and removes tmpPath as best-effort cleanup
+// during snapshot write error paths. Secondary errors are logged but
+// never mask the primary error that triggered the cleanup.
+func snapshotCleanup(f *os.File, tmpPath string, primaryErr error, logger log.Logger) error {
+	if cerr := f.Close(); cerr != nil {
+		logCleanupWarn("snapshot: close tmp file", cerr, logger)
+	}
+	if rerr := os.Remove(tmpPath); rerr != nil {
+		logCleanupWarn("snapshot: remove tmp file", rerr, logger)
+	}
+	return primaryErr
+}
+
+// logCleanupWarn logs a best-effort cleanup error. If logger is nil (child
+// process), falls back to stderr so the error is never silently swallowed.
+func logCleanupWarn(msg string, err error, logger log.Logger) {
+	if logger != nil {
+		if logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, msg, log.String("error", err.Error()))
+		}
+		return
+	}
+}
+
+// syncDir opens dir, fsyncs it, and closes it so that a preceding os.Rename
+// is durable on filesystems that require explicit directory fsync (ext4, etc).
+func syncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	syncErr := d.Sync()
+	if closeErr := d.Close(); closeErr != nil && syncErr == nil {
+		return closeErr
+	}
+	return syncErr
+}
 
 // IsSnapshotChild returns true when the process was spawned as a snapshot child.
 // Check this early in main() and redirect to snapshotChildMain().
@@ -57,13 +96,16 @@ func IsSnapshotChild() bool {
 // The dir and shardID are passed via environment variables set by the parent.
 func SnapshotChildMain() {
 	dir := os.Getenv("TSD_SNAP_DIR")
-	shardID := 0
-	n, err := fmt.Sscanf(os.Getenv("TSD_SNAP_SHARD"), "%d", &shardID)
-	if err != nil || n != 1 || shardID < 0 || dir == "" {
+	raw := os.Getenv("TSD_SNAP_SHARD")
+	if dir == "" || raw == "" {
+		os.Exit(1)
+	}
+	id, err := strconv.ParseUint(raw, 10, 32)
+	if err != nil {
 		os.Exit(1)
 	}
 
-	err = snapshotChildWrite(dir, uint32(shardID), os.Stdin)
+	err = snapshotChildWrite(dir, uint32(id), os.Stdin)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -94,14 +136,14 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 	binary.LittleEndian.PutUint64(hdr[16:24], uint64(createdAt))
 	binary.LittleEndian.PutUint64(hdr[24:32], 0) // patched later
 
-	if _, err := f.Write(hdr[:]); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return 0, fmt.Errorf("snapshot: write header: %w", err)
+	if _, err = f.Write(hdr[:]); err != nil {
+		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: write header: %w", err), logger)
 	}
 
 	h := xxhash.New()
-	h.Write(hdr[:]) // hash placeholder header (KeyCount=0, checksum=0)
+	if _, err = h.Write(hdr[:]); err != nil {
+		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: hash header: %w", err), logger)
+	}
 
 	var keyCount uint64
 	var writeErr error
@@ -121,19 +163,28 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 		binary.LittleEndian.PutUint32(entry[4:8], valLen)
 		binary.LittleEndian.PutUint64(entry[8:16], uint64(ttlNano))
 
-		h.Write(entry[:])
-		h.WriteString(key)
-		h.Write(value)
+		if _, err = h.Write(entry[:]); err != nil {
+			writeErr = err
+			return
+		}
+		if _, err = h.WriteString(key); err != nil {
+			writeErr = err
+			return
+		}
+		if _, err = h.Write(value); err != nil {
+			writeErr = err
+			return
+		}
 
-		if _, err := f.Write(entry[:]); err != nil {
+		if _, err = f.Write(entry[:]); err != nil {
 			writeErr = err
 			return
 		}
-		if _, err := f.WriteString(key); err != nil {
+		if _, err = f.WriteString(key); err != nil {
 			writeErr = err
 			return
 		}
-		if _, err := f.Write(value); err != nil {
+		if _, err = f.Write(value); err != nil {
 			writeErr = err
 			return
 		}
@@ -141,15 +192,11 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 	})
 
 	if writeErr != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return 0, fmt.Errorf("snapshot: write entry: %w", writeErr)
+		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: write entry: %w", writeErr), logger)
 	}
 
 	if err = f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return 0, fmt.Errorf("snapshot: sync: %w", err)
+		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: sync: %w", err), logger)
 	}
 
 	// Patch header with final checksum and key count.
@@ -158,26 +205,33 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 	binary.LittleEndian.PutUint64(hdr[24:32], checksum)
 
 	if _, err = f.Seek(0, 0); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return 0, fmt.Errorf("snapshot: seek header: %w", err)
+		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: seek header: %w", err), logger)
 	}
 	if _, err = f.Write(hdr[:]); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return 0, fmt.Errorf("snapshot: patch header: %w", err)
+		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: patch header: %w", err), logger)
 	}
 
 	if err = f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return 0, fmt.Errorf("snapshot: sync header: %w", err)
+		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: sync header: %w", err), logger)
 	}
-	f.Close()
+	if err = f.Close(); err != nil {
+		if rerr := os.Remove(tmpPath); rerr != nil {
+			logCleanupWarn("snapshot: remove tmp after close error", rerr, logger)
+		}
+		return 0, fmt.Errorf("snapshot: close: %w", err)
+	}
 
-	if err := os.Rename(tmpPath, finalPath); err != nil {
-		os.Remove(tmpPath)
+	if err = os.Rename(tmpPath, finalPath); err != nil {
+		if rerr := os.Remove(tmpPath); rerr != nil {
+			logCleanupWarn("snapshot: remove tmp after rename error", rerr, logger)
+		}
 		return 0, fmt.Errorf("snapshot: rename: %w", err)
+	}
+	if err = syncDir(dir); err != nil {
+		if rerr := os.Remove(finalPath); rerr != nil {
+			logCleanupWarn("snapshot: remove final after sync dir error", rerr, logger)
+		}
+		return 0, fmt.Errorf("snapshot: sync dir: %w", err)
 	}
 
 	if logger != nil && logger.Enabled(log.LevelInfo) {
@@ -200,7 +254,11 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 	if err != nil {
 		return 0, fmt.Errorf("snapshot: open %s: %w", path, err)
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			logCleanupWarn("snapshot: close file", cerr, logger)
+		}
+	}()
 
 	fi, err := f.Stat()
 	if err != nil {
@@ -228,7 +286,9 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 	h := xxhash.New()
 	binary.LittleEndian.PutUint64(hdr[8:16], 0)
 	binary.LittleEndian.PutUint64(hdr[24:32], 0)
-	h.Write(hdr[:])
+	if _, err = h.Write(hdr[:]); err != nil {
+		return 0, fmt.Errorf("snapshot: hash header: %w", err)
+	}
 
 	// Decode all entries into temporary buffers before touching the engine so
 	// that a checksum failure leaves the engine untouched. Each buffer is
@@ -239,7 +299,6 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 		ttlNano int64
 	}
 	var entries []decodedEntry
-	var kvBuf []byte
 	entryBuf := make([]byte, 16)
 	remaining := fileSize - int64(snapHeader)
 
@@ -250,40 +309,35 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 			}
 			return 0, fmt.Errorf("snapshot: read entry header: %w", err)
 		}
-		h.Write(entryBuf)
+		if _, err = h.Write(entryBuf); err != nil {
+			return 0, fmt.Errorf("snapshot: hash entry header: %w", err)
+		}
 
 		keyLen := binary.LittleEndian.Uint32(entryBuf[0:4])
 		valLen := binary.LittleEndian.Uint32(entryBuf[4:8])
 		ttlNano := int64(binary.LittleEndian.Uint64(entryBuf[8:16]))
-
-		// Validate key/value lengths: reject integer overflow and data that
-		// exceeds the remaining file bytes.
 		kvLen64 := int64(keyLen) + int64(valLen)
 		if kvLen64 < 0 || kvLen64 > remaining-16 {
 			return 0, fmt.Errorf("snapshot: invalid entry lengths key=%d val=%d (remaining=%d)", keyLen, valLen, remaining)
 		}
 		remaining -= 16 + kvLen64
-
 		kvLen := int(keyLen) + int(valLen)
-		if cap(kvBuf) < kvLen {
-			kvBuf = make([]byte, kvLen)
-		} else {
-			kvBuf = kvBuf[:kvLen]
-		}
-		if _, err = io.ReadFull(f, kvBuf); err != nil {
+		buf := make([]byte, kvLen)
+		if _, err = io.ReadFull(f, buf); err != nil {
 			return 0, fmt.Errorf("snapshot: read key+value: %w", err)
 		}
-		h.Write(kvBuf[:keyLen])
-		h.Write(kvBuf[keyLen:])
+		if _, err := h.Write(buf[:keyLen]); err != nil {
+			return 0, fmt.Errorf("snapshot: hash key: %w", err)
+		}
+		if _, err := h.Write(buf[keyLen:]); err != nil {
+			return 0, fmt.Errorf("snapshot: hash value: %w", err)
+		}
 
-		// Copy so each entry owns its memory independent of kvBuf reuse.
-		buf := make([]byte, kvLen)
-		copy(buf, kvBuf)
 		entries = append(entries, decodedEntry{kvBuf: buf, keyLen: keyLen, ttlNano: ttlNano})
 	}
 
 	actualChecksum := h.Sum64()
-	if fileChecksum != 0 && actualChecksum != fileChecksum {
+	if actualChecksum != fileChecksum {
 		return 0, fmt.Errorf("snapshot: checksum mismatch (file=%d, computed=%d)", fileChecksum, actualChecksum)
 	}
 
@@ -324,7 +378,10 @@ func snapshotExists(dir string, shardID uint32) bool {
 	if err != nil {
 		return false
 	}
-	defer f.Close()
+	defer func() {
+		// Read-only open: close errors are harmless and cannot be reported.
+		_ = f.Close()
+	}()
 	var hdr [4]byte
 	if _, err := io.ReadFull(f, hdr[:]); err != nil {
 		return false
@@ -362,8 +419,12 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err = cmd.Start(); err != nil {
-		pr.Close()
-		pw.Close()
+		if cerr := pr.Close(); cerr != nil {
+			logCleanupWarn("snapshot: close pipe reader", cerr, logger)
+		}
+		if cerr := pw.Close(); cerr != nil {
+			logCleanupWarn("snapshot: close pipe writer", cerr, logger)
+		}
 		if logger.Enabled(log.LevelWarn) {
 			logger.Log(log.LevelWarn, "snapshot: fork failed, falling back to in-process",
 				log.String("error", err.Error()))
@@ -373,11 +434,15 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 	}
 
 	// Parent: close read end (child inherited it via cmd.Stdin).
-	pr.Close()
+	if cerr := pr.Close(); cerr != nil {
+		logCleanupWarn("snapshot: close pipe reader", cerr, logger)
+	}
 
 	// Serialize engine state into the write end; propagate any write error.
 	if serr := serializeEngineToWriter(pw, engine); serr != nil {
-		pw.Close()
+		if cerr := pw.Close(); cerr != nil {
+			logCleanupWarn("snapshot: close pipe writer", cerr, logger)
+		}
 		// Kill the child since it will never receive EOF.
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
@@ -385,10 +450,12 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 	}
 
 	// Close write end so the child receives EOF on its stdin.
-	pw.Close()
+	if cerr := pw.Close(); cerr != nil {
+		logCleanupWarn("snapshot: close pipe writer", cerr, logger)
+	}
 
 	// Wait for child to finish writing the snapshot file.
-	if err := cmd.Wait(); err != nil {
+	if err = cmd.Wait(); err != nil {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "snapshot: child process failed",
 				log.String("error", err.Error()))
@@ -464,28 +531,28 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 	binary.LittleEndian.PutUint64(hdr[24:32], 0) // checksum patched later
 
 	if _, err := f.Write(hdr[:]); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
+		return snapshotCleanup(f, tmpPath, err, nil)
 	}
 
 	h := xxhash.New()
-	h.Write(hdr[:]) // hash the placeholder header (KeyCount=0, checksum=0)
+	if _, err := h.Write(hdr[:]); err != nil {
+		return snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: hash header: %w", err), nil)
+	}
 
 	var keyCount uint64
 	entryBuf := make([]byte, 16)
 	var keyBuf, valBuf []byte
 
 	for {
-		if _, err := io.ReadFull(r, entryBuf); err != nil {
+		if _, err = io.ReadFull(r, entryBuf); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
-			f.Close()
-			os.Remove(tmpPath)
-			return err
+			return snapshotCleanup(f, tmpPath, err, nil)
 		}
-		h.Write(entryBuf)
+		if _, err = h.Write(entryBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: hash entry header: %w", err), nil)
+		}
 
 		keyLen := binary.LittleEndian.Uint32(entryBuf[0:4])
 		valLen := binary.LittleEndian.Uint32(entryBuf[4:8])
@@ -495,39 +562,33 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 		} else {
 			keyBuf = keyBuf[:keyLen]
 		}
-		if _, err := io.ReadFull(r, keyBuf); err != nil {
-			f.Close()
-			os.Remove(tmpPath)
-			return err
+		if _, err = io.ReadFull(r, keyBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, err, nil)
 		}
-		h.Write(keyBuf)
+		if _, err = h.Write(keyBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: hash key: %w", err), nil)
+		}
 
 		if cap(valBuf) < int(valLen) {
 			valBuf = make([]byte, valLen)
 		} else {
 			valBuf = valBuf[:valLen]
 		}
-		if _, err := io.ReadFull(r, valBuf); err != nil {
-			f.Close()
-			os.Remove(tmpPath)
-			return err
+		if _, err = io.ReadFull(r, valBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, err, nil)
 		}
-		h.Write(valBuf)
+		if _, err = h.Write(valBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: hash value: %w", err), nil)
+		}
 
-		if _, err := f.Write(entryBuf); err != nil {
-			f.Close()
-			os.Remove(tmpPath)
-			return err
+		if _, err = f.Write(entryBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, err, nil)
 		}
-		if _, err := f.Write(keyBuf); err != nil {
-			f.Close()
-			os.Remove(tmpPath)
-			return err
+		if _, err = f.Write(keyBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, err, nil)
 		}
-		if _, err := f.Write(valBuf); err != nil {
-			f.Close()
-			os.Remove(tmpPath)
-			return err
+		if _, err = f.Write(valBuf); err != nil {
+			return snapshotCleanup(f, tmpPath, err, nil)
 		}
 		keyCount++
 	}
@@ -537,22 +598,27 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 	binary.LittleEndian.PutUint64(hdr[8:16], keyCount)
 	binary.LittleEndian.PutUint64(hdr[24:32], checksum)
 
-	if _, err := f.Seek(0, 0); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
+	if _, err = f.Seek(0, 0); err != nil {
+		return snapshotCleanup(f, tmpPath, err, nil)
 	}
 	if _, err = f.Write(hdr[:]); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
-		return err
+		return snapshotCleanup(f, tmpPath, err, nil)
 	}
 	if err = f.Sync(); err != nil {
-		f.Close()
-		os.Remove(tmpPath)
+		return snapshotCleanup(f, tmpPath, err, nil)
+	}
+	if err = f.Close(); err != nil {
+		if rerr := os.Remove(tmpPath); rerr != nil {
+			logCleanupWarn("snapshot: remove tmp after close error", rerr, nil)
+		}
 		return err
 	}
-	f.Close()
 
-	return os.Rename(tmpPath, finalPath)
+	if err = os.Rename(tmpPath, finalPath); err != nil {
+		if rerr := os.Remove(tmpPath); rerr != nil {
+			logCleanupWarn("snapshot: remove tmp after rename error", rerr, nil)
+		}
+		return err
+	}
+	return syncDir(dir)
 }

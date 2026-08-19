@@ -96,6 +96,10 @@ type Server struct {
 	// --enable-audit is not set it is a disabled no-op whose Record() costs a
 	// single bool comparison, so listeners never guard the call.
 	audit *audit.LogEngine
+	// snapshotDone is closed when the background snapshot loop exits. Shutdown
+	// waits on it so that no in-flight Snapshot can race with shard engine
+	// closure. Nil when snapshots are not configured.
+	snapshotDone chan struct{}
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -339,6 +343,11 @@ func (s *Server) shutdown(ctx context.Context) {
 			logger.Log(log.LevelError, "server: tcp server shutdown error", log.String("error", err.Error()))
 		}
 	}
+	// Wait for the snapshot loop to finish so no Storage.Snapshot is
+	// in-flight when we close the shard engines.
+	if s.snapshotDone != nil {
+		<-s.snapshotDone
+	}
 	for _, sh := range s.shards {
 		if err := sh.Stop(ctx); err != nil {
 			if logger.Enabled(log.LevelError) {
@@ -499,6 +508,7 @@ func (s *Server) initShards(key []byte, cryptoEngine *crypto.Engine, ctx context
 	// Start the background snapshot manager if persistence is enabled and
 	// snapshots are configured (either interval or bytes threshold).
 	if store != nil && store.Enabled() && (cfg.GetSnapshotInterval() > 0 || cfg.GetSnapshotBytes() > 0) {
+		s.snapshotDone = make(chan struct{})
 		go s.snapshotLoop(ctx, store, cfg, logger)
 	}
 	return nil
@@ -579,6 +589,7 @@ func (s *Server) startRESPServer() {
 // size-based triggers and on the configured interval for time-based triggers.
 // Exits when ctx is canceled (shutdown).
 func (s *Server) snapshotLoop(ctx context.Context, store *persistence.Storage, cfg *config.Config, logger log.Logger) {
+	defer close(s.snapshotDone)
 	interval := cfg.GetSnapshotInterval()
 	bytesThreshold := cfg.GetSnapshotBytes()
 	ticker := time.NewTicker(1 * time.Second)
@@ -600,6 +611,11 @@ func (s *Server) snapshotLoop(ctx context.Context, store *persistence.Storage, c
 		case <-ticker.C:
 		}
 		for i, sh := range s.shards {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
 			shardID := uint32(sh.ID)
 
 			// Size-based trigger: snapshot when WAL exceeds the threshold.
