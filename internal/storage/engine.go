@@ -233,6 +233,55 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	return nil
 }
 
+// SetRaw stores a key with a pre-encrypted value, bypassing encryption. This is
+// used by snapshotRead when restoring an engine with crypto enabled — the
+// snapshot already contains the encrypted values from ForEach, so re-encrypting
+// would double-encrypt. The caller owns the value bytes after this call.
+func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
+	var exp time.Time
+	if ttl > 0 {
+		exp = time.Now().Add(ttl)
+	}
+	if e.maxBytes > 0 {
+		totalEntrySize := uint64(len(key) + len(value))
+		if atomic.LoadUint64(&e.allocatedBytes)+totalEntrySize > e.maxBytes {
+			return ErrEngineFull
+		}
+	}
+	storedKey := strings.Clone(key)
+	e.mu.Lock()
+	oldItem, isUpdate := e.items[storedKey]
+	e.items[storedKey] = Item{
+		Value:      value,
+		Expiration: exp,
+	}
+	e.mu.Unlock()
+	atomic.AddUint64(&e.totalCommands, 1)
+	if isUpdate {
+		oldSize := uint64(len(oldItem.Value) + len(storedKey))
+		newSize := uint64(len(value) + len(storedKey))
+		if newSize > oldSize {
+			atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
+		} else if oldSize > newSize {
+			atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
+		}
+	} else {
+		atomic.AddUint64(&e.allocatedBytes, uint64(len(key)+len(value)))
+		atomic.AddUint64(&e.keyCount, 1)
+	}
+	atomic.AddUint64(&e.cryptoEncryptedBytes, uint64(len(value)))
+	if e.logger.Enabled(log.LevelDebug) {
+		e.logger.Log(log.LevelDebug, "key written to engine state (raw)",
+			log.String("key", key),
+			log.Int64("ttl_ms", ttl.Milliseconds()),
+		)
+	}
+	if ttl > 0 {
+		e.chronometer.Register(storedKey, ttl)
+	}
+	return nil
+}
+
 // Delete removes key and reports whether it was present. An expired key is
 // evicted physically but counts as absent, mirroring Get's lazy eviction, so
 // callers can derive "did the key exist" without a separate Get lookup.
@@ -377,6 +426,7 @@ func (e *Engine) KeyCount() uint64             { return atomic.LoadUint64(&e.key
 func (e *Engine) ExpiredCount() uint64         { return atomic.LoadUint64(&e.expiredCount) }
 func (e *Engine) CryptoEncryptedBytes() uint64 { return atomic.LoadUint64(&e.cryptoEncryptedBytes) }
 func (e *Engine) CryptoDecryptedBytes() uint64 { return atomic.LoadUint64(&e.cryptoDecryptedBytes) }
+func (e *Engine) CryptoEnabled() bool          { return e.cryptoEngine.Enabled() }
 func (e *Engine) TotalCommands() uint64        { return atomic.LoadUint64(&e.totalCommands) }
 func (e *Engine) Chronometer() TimelineWheel   { return e.chronometer }
 

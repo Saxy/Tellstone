@@ -308,7 +308,7 @@ func TestLoadShardSnapshotFirstThenWAL(t *testing.T) {
 		t.Fatalf("NewStorage: %v", err)
 	}
 
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatalf("OpenShard: %v", err)
 	}
 
@@ -360,7 +360,7 @@ func TestSnapshotTruncateAndReplay(t *testing.T) {
 		t.Fatalf("NewStorage: %v", err)
 	}
 
-	s.OpenShard(0)
+	s.OpenShard(0, nil)
 
 	// Populate engine with data, then snapshot from it.
 	engine := newTestEngine(t)
@@ -398,7 +398,7 @@ func TestWALSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	s.OpenShard(0)
+	s.OpenShard(0, nil)
 
 	size := s.WALSize(0)
 	if size != 0 {
@@ -423,7 +423,7 @@ func TestSnapshotConcurrentWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		t.Fatalf("OpenShard: %v", err)
 	}
 

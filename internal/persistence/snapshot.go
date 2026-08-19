@@ -344,6 +344,7 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 
 	// Checksum is valid — safe to apply entries to the engine.
 	var loadedKeys uint64
+	useRaw := engine.CryptoEnabled()
 	for i := range entries {
 		e := &entries[i]
 		var duration time.Duration
@@ -354,8 +355,16 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 				continue // expired — skip
 			}
 		}
-		if err = engine.SetFromBuffer(e.kvBuf, int(e.keyLen), duration); err != nil {
-			return 0, fmt.Errorf("snapshot: engine.SetFromBuffer: %w", err)
+		if useRaw {
+			// Values from ForEach are already encrypted when crypto is on.
+			// SetRaw stores them without re-encrypting.
+			if err = engine.SetRaw(string(e.kvBuf[:e.keyLen]), e.kvBuf[e.keyLen:], duration); err != nil {
+				return 0, fmt.Errorf("snapshot: engine.SetRaw: %w", err)
+			}
+		} else {
+			if err = engine.SetFromBuffer(e.kvBuf, int(e.keyLen), duration); err != nil {
+				return 0, fmt.Errorf("snapshot: engine.SetFromBuffer: %w", err)
+			}
 		}
 		loadedKeys++
 	}

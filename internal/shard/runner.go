@@ -119,7 +119,7 @@ func Run(id ID, cfg *config.Config, key []byte, cryptoEngine *crypto.Engine, log
 		Persistence: store,
 	}
 	if store.Enabled() {
-		if err := store.OpenShard(uint32(id)); err != nil {
+		if err := store.OpenShard(uint32(id), cryptoEngine); err != nil {
 			if logger.Enabled(log.LevelError) {
 				logger.Log(log.LevelError, "persistence: cannot open shard",
 					log.String("error", err.Error()), log.String("shard", fmt.Sprintf("%d", id)))

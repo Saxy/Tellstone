@@ -407,6 +407,9 @@ func LoadConfig(args []string) *Config {
 	if cfg.numShards < 1 {
 		cfg.numShards = runtime.NumCPU()
 	}
+	if cfg.maxMsgSize == 0 {
+		cfg.maxMsgSize = 16 * 1024 * 1024
+	}
 	cfg.snapshotBytes = uint64(snapshotBytes)
 	// Validate TLS configuration: cert and key must be provided together.
 	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {

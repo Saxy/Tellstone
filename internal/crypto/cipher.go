@@ -14,6 +14,7 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"errors"
+	"fmt"
 
 	"github.com/Saxy/Tellstone/internal/log"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -191,6 +192,40 @@ func (e *Engine) DecryptInPlaceWithDst(dst, ciphertext []byte) ([]byte, error) {
 			log.Int("ciphertext_len", len(ciphertext)),
 			log.Int("plaintext_len", len(plaintext)),
 		)
+	}
+	return plaintext, nil
+}
+
+// SealWithCounter encrypts plaintext using a caller-provided nonce instead of a
+// random one. This supports counter-based nonce management for the WAL layer,
+// where nonces must be deterministic and durable. The nonce must be exactly
+// NonceSize() bytes (12) and must never repeat for the same key.
+func (e *Engine) SealWithCounter(nonce, plaintext []byte) ([]byte, error) {
+	if !e.enabled {
+		return plaintext, nil
+	}
+	if len(nonce) != e.aead.NonceSize() {
+		return nil, fmt.Errorf("crypto: nonce must be %d bytes, got %d", e.aead.NonceSize(), len(nonce))
+	}
+	out := make([]byte, len(plaintext)+e.aead.Overhead())
+	return e.aead.Seal(out[:0], nonce, plaintext, nil), nil
+}
+
+// OpenWithCounter decrypts ciphertext using a caller-provided nonce. This is
+// the counterpart to SealWithCounter for counter-based nonce management.
+func (e *Engine) OpenWithCounter(nonce, ciphertext []byte) ([]byte, error) {
+	if !e.enabled {
+		return ciphertext, nil
+	}
+	if len(nonce) != e.aead.NonceSize() {
+		return nil, fmt.Errorf("crypto: nonce must be %d bytes, got %d", e.aead.NonceSize(), len(nonce))
+	}
+	if len(ciphertext) < e.aead.Overhead() {
+		return nil, ErrDecryptionFailed
+	}
+	plaintext, err := e.aead.Open(nil, nonce, ciphertext, nil)
+	if err != nil {
+		return nil, ErrDecryptionFailed
 	}
 	return plaintext, nil
 }

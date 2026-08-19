@@ -17,7 +17,7 @@ func BenchmarkWriteSequential(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		b.Fatal(err)
 	}
 	val := []byte("benchmark_value_32_bytes_long_xxxxx")
@@ -40,7 +40,7 @@ func BenchmarkWriteParallel(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		b.Fatal(err)
 	}
 	val := []byte("bench_val")
@@ -70,7 +70,7 @@ func BenchmarkWriteWithTTL(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		b.Fatal(err)
 	}
 	val := []byte("benchmark_value_32_bytes_long_xxxxx")
@@ -94,7 +94,7 @@ func BenchmarkLoadShardSequential(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		b.Fatal(err)
 	}
 	numRecords := 10000
@@ -123,7 +123,7 @@ func BenchmarkLoadShardSmall(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		b.Fatal(err)
 	}
 	numRecords := 100
@@ -152,7 +152,7 @@ func BenchmarkWriteThenLoad(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	if err := s.OpenShard(0); err != nil {
+	if err := s.OpenShard(0, nil); err != nil {
 		b.Fatal(err)
 	}
 	val := []byte("lifecycle_value_32_bytes_long_xxxxx")
@@ -165,7 +165,7 @@ func BenchmarkWriteThenLoad(b *testing.B) {
 		s.CloseShard(0)
 		os.Remove(filepath.Join(dir, fmt.Sprintf("shard_%03d.db", 0)))
 		b.StartTimer()
-		if err := s.OpenShard(0); err != nil {
+		if err := s.OpenShard(0, nil); err != nil {
 			b.Fatal(err)
 		}
 		for j := 0; j < numRecords; j++ {

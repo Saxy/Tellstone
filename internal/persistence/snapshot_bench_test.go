@@ -271,7 +271,7 @@ func BenchmarkLoadShardWithSnapshot1K(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	s.OpenShard(0)
+	s.OpenShard(0, nil)
 
 	engine := populateEngine(b, 1000, 64)
 	// Write snapshot from engine state.
