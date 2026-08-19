@@ -66,6 +66,20 @@ func logCleanupWarn(msg string, err error, logger log.Logger) {
 	}
 }
 
+// buildSnapshotHeader constructs the 32-byte placeholder snapshot header
+// with KeyCount=0 and checksum=0. Both fields are patched after all entries
+// are written and hashed. The caller must hash hdr before patching.
+func buildSnapshotHeader() [snapHeader]byte {
+	var hdr [snapHeader]byte
+	createdAt := time.Now().UnixNano()
+	copy(hdr[0:4], snapMagic)
+	binary.LittleEndian.PutUint32(hdr[4:8], snapVersion)
+	binary.LittleEndian.PutUint64(hdr[8:16], 0) // KeyCount patched later
+	binary.LittleEndian.PutUint64(hdr[16:24], uint64(createdAt))
+	binary.LittleEndian.PutUint64(hdr[24:32], 0) // checksum patched later
+	return hdr
+}
+
 // syncDir opens dir, fsyncs it, and closes it so that a preceding os.Rename
 // is durable on filesystems that require explicit directory fsync (ext4, etc).
 func syncDir(dir string) error {
@@ -124,17 +138,7 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 		return 0, fmt.Errorf("snapshot: create %s: %w", tmpPath, err)
 	}
 
-	createdAt := time.Now().UnixNano()
-
-	// Placeholder header: KeyCount=0, createdAt=real, checksum=0.
-	// Must match what snapshotRead hashes: it zeroes the checksum slot and
-	// hashes the full 32 bytes, so we hash the same layout here.
-	var hdr [snapHeader]byte
-	copy(hdr[0:4], snapMagic)
-	binary.LittleEndian.PutUint32(hdr[4:8], snapVersion)
-	binary.LittleEndian.PutUint64(hdr[8:16], 0) // patched later
-	binary.LittleEndian.PutUint64(hdr[16:24], uint64(createdAt))
-	binary.LittleEndian.PutUint64(hdr[24:32], 0) // patched later
+	hdr := buildSnapshotHeader()
 
 	if _, err = f.Write(hdr[:]); err != nil {
 		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: write header: %w", err), logger)
@@ -228,9 +232,6 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 		return 0, fmt.Errorf("snapshot: rename: %w", err)
 	}
 	if err = syncDir(dir); err != nil {
-		if rerr := os.Remove(finalPath); rerr != nil {
-			logCleanupWarn("snapshot: remove final after sync dir error", rerr, logger)
-		}
 		return 0, fmt.Errorf("snapshot: sync dir: %w", err)
 	}
 
@@ -304,7 +305,7 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 
 	for {
 		if _, err = io.ReadFull(f, entryBuf); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return 0, fmt.Errorf("snapshot: read entry header: %w", err)
@@ -517,18 +518,7 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 		return err
 	}
 
-	createdAt := time.Now().UnixNano()
-
-	// Build placeholder header: Magic + Version set, KeyCount=0, createdAt=real, checksum=0.
-	// This matches what snapshotRead hashes: it reads the on-disk header, zeroes the
-	// checksum slot (24:32), then hashes the full 32 bytes. We must hash the same
-	// bytes — header with real createdAt but zero KeyCount and zero checksum.
-	var hdr [snapHeader]byte
-	copy(hdr[0:4], snapMagic)
-	binary.LittleEndian.PutUint32(hdr[4:8], snapVersion)
-	binary.LittleEndian.PutUint64(hdr[8:16], 0) // KeyCount patched later
-	binary.LittleEndian.PutUint64(hdr[16:24], uint64(createdAt))
-	binary.LittleEndian.PutUint64(hdr[24:32], 0) // checksum patched later
+	hdr := buildSnapshotHeader()
 
 	if _, err := f.Write(hdr[:]); err != nil {
 		return snapshotCleanup(f, tmpPath, err, nil)
@@ -545,7 +535,7 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 
 	for {
 		if _, err = io.ReadFull(r, entryBuf); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			return snapshotCleanup(f, tmpPath, err, nil)

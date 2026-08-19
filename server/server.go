@@ -344,9 +344,13 @@ func (s *Server) shutdown(ctx context.Context) {
 		}
 	}
 	// Wait for the snapshot loop to finish so no Storage.Snapshot is
-	// in-flight when we close the shard engines.
+	// in-flight when we close the shard engines. Use a select so we
+	// don't block forever if the context deadline is reached.
 	if s.snapshotDone != nil {
-		<-s.snapshotDone
+		select {
+		case <-s.snapshotDone:
+		case <-ctx.Done():
+		}
 	}
 	for _, sh := range s.shards {
 		if err := sh.Stop(ctx); err != nil {
