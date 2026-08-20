@@ -236,7 +236,8 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 // SetRaw stores a key with a pre-encrypted value, bypassing encryption. This is
 // used by snapshotRead when restoring an engine with crypto enabled — the
 // snapshot already contains the encrypted values from ForEach, so re-encrypting
-// would double-encrypt. The caller owns the value bytes after this call.
+// would double-encrypt. The engine retains the value's backing bytes for the
+// entry's lifetime; callers must not mutate or reuse the buffer after this call.
 func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
 	var exp time.Time
 	if ttl > 0 {

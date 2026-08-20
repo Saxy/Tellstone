@@ -1,6 +1,7 @@
 package persistence
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -669,6 +670,22 @@ func TestEncryptedWALRoundTrip(t *testing.T) {
 		t.Fatalf("CloseShard: %v", err)
 	}
 
+	// Verify no plaintext keys or values on disk.
+	data, err := os.ReadFile(filepath.Join(dir, "shard_000.db"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		key := []byte(fmt.Sprintf("key_%d", i))
+		val := []byte(fmt.Sprintf("val_%d", i))
+		if bytes.Contains(data, key) {
+			t.Errorf("plaintext key %q found on disk", key)
+		}
+		if bytes.Contains(data, val) {
+			t.Errorf("plaintext value %q found on disk", val)
+		}
+	}
+
 	// Reopen and replay.
 	if err := s.OpenShard(0, ce); err != nil {
 		t.Fatalf("reopen OpenShard: %v", err)
@@ -798,14 +815,15 @@ func TestEncryptedWALNonceCounterRecovery(t *testing.T) {
 		t.Fatalf("LoadShard: %v", err)
 	}
 
-	// Check the nonce counter was recovered (should be > 0 since 10 records written).
+	// Check the nonce counter was recovered. After 10 writes, the counter
+	// tracks the max nonce (9) and recovery sets it to max+1 = 10.
 	h := s.getShard(0)
 	if h == nil {
 		t.Fatal("shard not found")
 	}
 	ctr := h.nonceCtr.Load()
-	if ctr == 0 {
-		t.Fatal("nonce counter not recovered after reopen")
+	if ctr != 10 {
+		t.Fatalf("nonce counter = %d, want 10", ctr)
 	}
 
 	// Write more records — these must not reuse nonces.
@@ -852,14 +870,16 @@ func TestEncryptedWALCorruptRecordStopsReplay(t *testing.T) {
 	}
 	s.CloseShard(0)
 
-	// Corrupt the file: flip a byte in the middle of the first encrypted record
-	// (after the 4-byte WAL magic header).
+	// Corrupt the file: flip a byte in the 12-byte nonce of the first encrypted
+	// record (after the 4-byte WAL magic header and 4-byte recLen).
 	path := filepath.Join(dir, "shard_000.db")
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("ReadFile: %v", err)
 	}
-	// Flip a byte in the ciphertext region (after magic + 4-byte recLen + 2 nonce bytes).
+	// Flip a byte within the nonce (offset walMagicLen+4+2 = 10, which is
+	// nonce byte 2). This invalidates the nonce and causes AEAD decryption
+	// to fail for the first record, stopping replay immediately.
 	if len(data) > walMagicLen+10 {
 		data[walMagicLen+10] ^= 0xFF
 	}
@@ -867,7 +887,8 @@ func TestEncryptedWALCorruptRecordStopsReplay(t *testing.T) {
 		t.Fatalf("WriteFile: %v", err)
 	}
 
-	// Reopen — should not crash, just load fewer records.
+	// Reopen — should not crash, and no records load since the first
+	// record's nonce is corrupted and AEAD verification fails.
 	if err := s.OpenShard(0, ce); err != nil {
 		t.Fatalf("OpenShard: %v", err)
 	}
@@ -875,10 +896,8 @@ func TestEncryptedWALCorruptRecordStopsReplay(t *testing.T) {
 	if err := s.LoadShard(0, engine); err != nil {
 		t.Fatalf("LoadShard: %v", err)
 	}
-	// At least some records may be loaded, but not all 5 since decryption
-	// of the corrupted record will fail and stop replay.
-	if engine.KeyCount() > 5 {
-		t.Fatalf("expected at most 5 keys, got %d", engine.KeyCount())
+	if engine.KeyCount() != 0 {
+		t.Fatalf("expected 0 keys (corruption stops replay), got %d", engine.KeyCount())
 	}
 }
 

@@ -471,3 +471,25 @@ func TestRBACConfigEnvVar(t *testing.T) {
 		t.Fatalf("rbac-config env mismatch: %q", cfg.GetRBACConfig())
 	}
 }
+
+func TestGetMaxMsgSizeDefault(t *testing.T) {
+	cfg := LoadConfig(nil)
+	if cfg.GetMaxMsgSize() != 16*1024*1024 {
+		t.Fatalf("default maxMsgSize = %d, want %d", cfg.GetMaxMsgSize(), 16*1024*1024)
+	}
+}
+
+func TestGetMaxMsgSizeZeroExplicit(t *testing.T) {
+	t.Setenv("TSD_MAX_MSG_SIZE", "0")
+	cfg := LoadConfig(nil)
+	if cfg.GetMaxMsgSize() != 16*1024*1024 {
+		t.Fatalf("maxMsgSize(0) = %d, want %d", cfg.GetMaxMsgSize(), 16*1024*1024)
+	}
+}
+
+func TestGetMaxMsgSizeNonZero(t *testing.T) {
+	cfg := LoadConfig([]string{"--max-msg-size", "32MiB"})
+	if cfg.GetMaxMsgSize() != 32*1024*1024 {
+		t.Fatalf("maxMsgSize(32MiB) = %d, want %d", cfg.GetMaxMsgSize(), 32*1024*1024)
+	}
+}

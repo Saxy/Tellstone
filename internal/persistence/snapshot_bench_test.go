@@ -54,7 +54,7 @@ func benchmarkSnapshotWrite(b *testing.B, nKeys, valSize int) {
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+		if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 			b.Fatal(err)
 		}
 		b.StopTimer()
@@ -84,7 +84,7 @@ func BenchmarkSnapshotRead100K(b *testing.B) {
 func benchmarkSnapshotRead(b *testing.B, nKeys, valSize int) {
 	dir := b.TempDir()
 	engine := populateEngine(b, nKeys, valSize)
-	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 		b.Fatal(err)
 	}
 	engine.Close()
@@ -92,7 +92,7 @@ func benchmarkSnapshotRead(b *testing.B, nKeys, valSize int) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		e := storage.NewEngine(0, 0, 0, nil, nil)
-		if _, err := snapshotRead(dir, 0, e, nil); err != nil {
+		if _, err := snapshotRead(dir, 0, e, [16]byte{}, nil); err != nil {
 			b.Fatal(err)
 		}
 		e.Close()
@@ -121,12 +121,12 @@ func benchmarkSnapshotRoundTrip(b *testing.B, nKeys, valSize int) {
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+		if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 			b.Fatal(err)
 		}
 		b.StartTimer()
 		e := storage.NewEngine(0, 0, 0, nil, nil)
-		if _, err := snapshotRead(dir, 0, e, nil); err != nil {
+		if _, err := snapshotRead(dir, 0, e, [16]byte{}, nil); err != nil {
 			b.Fatal(err)
 		}
 		e.Close()
@@ -197,7 +197,7 @@ func benchmarkChildWrite(b *testing.B, nKeys, valSize int) {
 			pw.Close()
 		}()
 		b.StartTimer()
-		if err := snapshotChildWrite(dir, 0, pr); err != nil {
+		if err := snapshotChildWrite(dir, 0, pr, [16]byte{}); err != nil {
 			b.Fatal(err)
 		}
 		pr.Close()
@@ -275,7 +275,7 @@ func BenchmarkLoadShardWithSnapshot1K(b *testing.B) {
 
 	engine := populateEngine(b, 1000, 64)
 	// Write snapshot from engine state.
-	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 		b.Fatal(err)
 	}
 	// Truncate WAL and write some post-snapshot WAL records.

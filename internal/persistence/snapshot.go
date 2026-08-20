@@ -21,6 +21,7 @@ package persistence
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -37,9 +38,10 @@ import (
 )
 
 const (
-	snapMagic   = "TSNS"
-	snapVersion = 1
-	snapHeader  = 32 // magic(4) + version(4) + keyCount(8) + createdAt(8) + checksum(8)
+	snapMagic       = "TSNS"
+	snapVersion     = 2
+	snapHeader      = 48 // magic(4) + version(4) + keyCount(8) + createdAt(8) + checksum(8) + fingerprint(16)
+	snapFingerprint = 32 // offset of fingerprint field within header
 )
 
 // snapshotCleanup closes f and removes tmpPath as best-effort cleanup
@@ -66,10 +68,12 @@ func logCleanupWarn(msg string, err error, logger log.Logger) {
 	}
 }
 
-// buildSnapshotHeader constructs the 32-byte placeholder snapshot header
-// with KeyCount=0 and checksum=0. Both fields are patched after all entries
-// are written and hashed. The caller must hash hdr before patching.
-func buildSnapshotHeader() [snapHeader]byte {
+// buildSnapshotHeader constructs the 48-byte placeholder snapshot header
+// with KeyCount=0, checksum=0, and the optional key fingerprint. Both KeyCount
+// and checksum are patched after all entries are written and hashed. The caller
+// must hash hdr before patching. fingerprint is the 16-byte truncated SHA-256
+// of the encryption key; a zero value means encryption is disabled.
+func buildSnapshotHeader(fingerprint [16]byte) [snapHeader]byte {
 	var hdr [snapHeader]byte
 	createdAt := time.Now().UnixNano()
 	copy(hdr[0:4], snapMagic)
@@ -77,6 +81,7 @@ func buildSnapshotHeader() [snapHeader]byte {
 	binary.LittleEndian.PutUint64(hdr[8:16], 0) // KeyCount patched later
 	binary.LittleEndian.PutUint64(hdr[16:24], uint64(createdAt))
 	binary.LittleEndian.PutUint64(hdr[24:32], 0) // checksum patched later
+	copy(hdr[snapFingerprint:snapHeader], fingerprint[:])
 	return hdr
 }
 
@@ -108,6 +113,7 @@ func IsSnapshotChild() bool {
 // SnapshotChildMain runs in the forked child process. It reads serialized
 // engine entries from stdin, writes the snapshot file, and exits.
 // The dir and shardID are passed via environment variables set by the parent.
+// TSD_SNAP_FP (optional) carries the hex-encoded 16-byte key fingerprint.
 func SnapshotChildMain() {
 	dir := os.Getenv("TSD_SNAP_DIR")
 	raw := os.Getenv("TSD_SNAP_SHARD")
@@ -119,7 +125,16 @@ func SnapshotChildMain() {
 		os.Exit(1)
 	}
 
-	err = snapshotChildWrite(dir, uint32(id), os.Stdin)
+	var fp [16]byte
+	if fpHex := os.Getenv("TSD_SNAP_FP"); fpHex != "" {
+		decoded, dErr := hex.DecodeString(fpHex)
+		if dErr != nil || len(decoded) != 16 {
+			os.Exit(1)
+		}
+		copy(fp[:], decoded)
+	}
+
+	err = snapshotChildWrite(dir, uint32(id), os.Stdin, fp)
 	if err != nil {
 		os.Exit(1)
 	}
@@ -128,8 +143,10 @@ func SnapshotChildMain() {
 
 // snapshotWrite serializes all live entries from the engine into a snapshot file.
 // Writes to a temporary file first, then atomically renames over the target.
+// fingerprint is the 16-byte key fingerprint embedded in the header for
+// validation on restore; a zero value means encryption is disabled.
 // Returns the number of keys written.
-func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger log.Logger) (uint64, error) {
+func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, fingerprint [16]byte, logger log.Logger) (uint64, error) {
 	tmpPath := filepath.Join(dir, fmt.Sprintf("shard_%03d.snap.tmp", shardID))
 	finalPath := filepath.Join(dir, fmt.Sprintf("shard_%03d.snap", shardID))
 
@@ -138,7 +155,7 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 		return 0, fmt.Errorf("snapshot: create %s: %w", tmpPath, err)
 	}
 
-	hdr := buildSnapshotHeader()
+	hdr := buildSnapshotHeader(fingerprint)
 
 	if _, err = f.Write(hdr[:]); err != nil {
 		return 0, snapshotCleanup(f, tmpPath, fmt.Errorf("snapshot: write header: %w", err), logger)
@@ -247,9 +264,10 @@ func snapshotWrite(dir string, shardID uint32, engine *storage.Engine, logger lo
 
 // snapshotRead loads a snapshot file into the engine. It validates lengths,
 // verifies the checksum, and only then applies entries to the engine so that a
-// corrupted snapshot never mutates the live state. Returns the number of keys
-// loaded.
-func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log.Logger) (uint64, error) {
+// corrupted snapshot never mutates the live state. If fp is non-zero, the
+// snapshot's embedded fingerprint must match; this prevents restoring a
+// snapshot encrypted with a different key. Returns the number of keys loaded.
+func snapshotRead(dir string, shardID uint32, engine *storage.Engine, fp [16]byte, logger log.Logger) (uint64, error) {
 	path := filepath.Join(dir, fmt.Sprintf("shard_%03d.snap", shardID))
 	f, err := os.Open(path)
 	if err != nil {
@@ -277,6 +295,14 @@ func snapshotRead(dir string, shardID uint32, engine *storage.Engine, logger log
 	version := binary.LittleEndian.Uint32(hdr[4:8])
 	if version != snapVersion {
 		return 0, fmt.Errorf("snapshot: unsupported version %d (want %d)", version, snapVersion)
+	}
+	// Validate key fingerprint. A non-zero fp means encryption is active and
+	// the snapshot must have been created with the same key. A zero fp means
+	// encryption is disabled, so the snapshot must also have a zero fingerprint.
+	fileFingerprint := [16]byte{}
+	copy(fileFingerprint[:], hdr[snapFingerprint:snapHeader])
+	if fileFingerprint != fp {
+		return 0, fmt.Errorf("snapshot: key fingerprint mismatch (snapshot was encrypted with a different key)")
 	}
 	fileKeyCount := binary.LittleEndian.Uint64(hdr[8:16])
 	fileChecksum := binary.LittleEndian.Uint64(hdr[24:32])
@@ -402,11 +428,12 @@ func snapshotExists(dir string, shardID uint32) bool {
 // snapshotForkDump triggers a fork-based snapshot. The parent serializes the
 // engine map to a pipe under a brief read lock, then ForkExec's the same binary
 // with --snapshot-child. The child reads from the pipe and writes the snapshot
-// file. If fork fails, falls back to an in-process write.
-func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger log.Logger) error {
+// file. If fork fails, falls back to an in-process write. fingerprint is the
+// 16-byte key fingerprint embedded in the snapshot header.
+func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, fingerprint [16]byte, logger log.Logger) error {
 	pr, pw, err := os.Pipe()
 	if err != nil {
-		_, err = snapshotWrite(dir, shardID, engine, logger)
+		_, err = snapshotWrite(dir, shardID, engine, fingerprint, logger)
 		return err
 	}
 
@@ -425,6 +452,7 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 	cmd.Env = []string{
 		"TSD_SNAP_DIR=" + dir,
 		fmt.Sprintf("TSD_SNAP_SHARD=%d", shardID),
+		"TSD_SNAP_FP=" + hex.EncodeToString(fingerprint[:]),
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
@@ -439,7 +467,7 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, logger
 			logger.Log(log.LevelWarn, "snapshot: fork failed, falling back to in-process",
 				log.String("error", err.Error()))
 		}
-		_, err := snapshotWrite(dir, shardID, engine, logger)
+		_, err := snapshotWrite(dir, shardID, engine, fingerprint, logger)
 		return err
 	}
 
@@ -517,8 +545,9 @@ func serializeEngineToWriter(w io.Writer, engine *storage.Engine) error {
 }
 
 // snapshotChildWrite reads serialized entries from r and writes the snapshot
-// file. Called by the child process after ForkExec.
-func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
+// file. Called by the child process after ForkExec. fingerprint is the 16-byte
+// key fingerprint embedded in the header; a zero value means encryption is disabled.
+func snapshotChildWrite(dir string, shardID uint32, r io.Reader, fingerprint [16]byte) error {
 	tmpPath := filepath.Join(dir, fmt.Sprintf("shard_%03d.snap.tmp", shardID))
 	finalPath := filepath.Join(dir, fmt.Sprintf("shard_%03d.snap", shardID))
 
@@ -527,7 +556,7 @@ func snapshotChildWrite(dir string, shardID uint32, r io.Reader) error {
 		return err
 	}
 
-	hdr := buildSnapshotHeader()
+	hdr := buildSnapshotHeader(fingerprint)
 
 	if _, err := f.Write(hdr[:]); err != nil {
 		return snapshotCleanup(f, tmpPath, err, nil)

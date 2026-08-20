@@ -44,6 +44,57 @@ func getDefaultDir() string {
 	return filepath.Join(baseDir, "tellstone", "data")
 }
 
+// nonceSidecarPath returns the path for the nonce counter sidecar file.
+// The sidecar persists the high-water nonce counter so it survives WAL loss.
+func nonceSidecarPath(dir string, shardID uint32) string {
+	return filepath.Join(dir, fmt.Sprintf("shard_%03d.nonce", shardID))
+}
+
+// readNonceSidecar reads the persisted nonce counter from the sidecar file.
+// Returns 0 if the file does not exist or is invalid.
+func readNonceSidecar(path string) uint64 {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	var buf [8]byte
+	if _, err := io.ReadFull(f, buf[:]); err != nil {
+		return 0
+	}
+	return binary.LittleEndian.Uint64(buf[:])
+}
+
+// writeNonceSidecar persists the nonce counter to the sidecar file. The counter
+// represents the next value to use (high-water mark + 1). Best-effort: errors
+// are logged but never propagated since the WAL is the source of truth.
+func writeNonceSidecar(path string, ctr uint64, logger log.Logger) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		if logger != nil && logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "persistence: failed to create nonce sidecar",
+				log.String("path", path), log.String("error", err.Error()))
+		}
+		return
+	}
+	defer f.Close()
+	var buf [8]byte
+	binary.LittleEndian.PutUint64(buf[:], ctr)
+	if _, err := f.Write(buf[:]); err != nil {
+		if logger != nil && logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "persistence: failed to write nonce sidecar",
+				log.String("path", path), log.String("error", err.Error()))
+		}
+		return
+	}
+	if err := f.Sync(); err != nil {
+		if logger != nil && logger.Enabled(log.LevelWarn) {
+			logger.Log(log.LevelWarn, "persistence: failed to sync nonce sidecar",
+				log.String("path", path), log.String("error", err.Error()))
+		}
+	}
+}
+
 // shardHandle holds the WAL file and its per-shard mutex for a single shard.
 // When encryption is enabled, crypto holds the DEK engine and nonceCtr tracks
 // the next counter-based nonce value. The counter is durable: it is recovered
@@ -54,6 +105,7 @@ type shardHandle struct {
 	crypto   *crypto.Engine // nil when encryption disabled
 	walVer   uint8          // 0 = plaintext, 1 = encrypted
 	nonceCtr atomic.Uint64  // next nonce counter value
+	shardID  uint32         // shard identifier for sidecar path
 }
 
 // Storage provides a per-shard, append-only write-ahead log (WAL) for crash recovery.
@@ -203,9 +255,16 @@ func (s *Storage) appendRecordEncrypted(h *shardHandle, shardID uint32, header [
 	}
 
 	// On-disk record: [recLen:4B LE][nonce:12B][ciphertext].
-	recLen := uint32(12 + len(ciphertext))
+	recLen := int64(12) + int64(len(ciphertext))
+	if recLen > int64(^uint32(0)) {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: encrypted "+op+" record too large",
+				log.Uint("shard", shardID), log.String("key", key), log.Int64("bytes", recLen))
+		}
+		return fmt.Errorf("persistence: encrypted record too large (%d bytes, max %d)", recLen, ^uint32(0))
+	}
 	var recLenBuf [4]byte
-	binary.LittleEndian.PutUint32(recLenBuf[:], recLen)
+	binary.LittleEndian.PutUint32(recLenBuf[:], uint32(recLen))
 
 	if _, err := h.file.Write(recLenBuf[:]); err != nil {
 		if s.logger.Enabled(log.LevelError) {
@@ -327,7 +386,7 @@ func (s *Storage) OpenShard(shardID uint32, cryptoEng *crypto.Engine) error {
 		return err
 	}
 
-	h := &shardHandle{file: f}
+	h := &shardHandle{file: f, shardID: shardID}
 
 	// Detect or write the WAL header based on file contents and crypto config.
 	fi, err := f.Stat()
@@ -376,6 +435,10 @@ func (s *Storage) OpenShard(shardID uint32, cryptoEng *crypto.Engine) error {
 	}
 
 	s.mapMu.Lock()
+	if old, ok := s.shards[shardID]; ok {
+		// Close the existing handle to avoid file descriptor leak.
+		old.file.Close()
+	}
 	s.shards[shardID] = h
 	s.mapMu.Unlock()
 	if s.logger.Enabled(log.LevelDebug) {
@@ -398,7 +461,11 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 	// preceding it is unrecoverable — abort rather than continuing with
 	// a partial state and replaying the WAL on top of an empty engine.
 	if snapshotExists(s.dir, shardID) {
-		loadedKeys, err := snapshotRead(s.dir, shardID, engine, s.logger)
+		var fp [16]byte
+		if h := s.getShard(shardID); h != nil && h.crypto != nil {
+			fp = h.crypto.KeyFingerprint()
+		}
+		loadedKeys, err := snapshotRead(s.dir, shardID, engine, fp, s.logger)
 		if err != nil {
 			if s.logger.Enabled(log.LevelError) {
 				s.logger.Log(log.LevelError, "persistence: snapshot load failed, data preceding snapshot is unrecoverable",
@@ -531,10 +598,11 @@ func (s *Storage) replayWALEncrypted(h *shardHandle, shardID uint32, f *os.File,
 		if recLen < 12+16 { // nonce(12) + tag(16) minimum
 			break
 		}
+		// Subtract the 4-byte recLen prefix itself before comparing.
+		remaining -= 4
 		if recLen > remaining {
 			break
 		}
-		remaining -= 4
 
 		// Read nonce + ciphertext.
 		record := make([]byte, recLen)
@@ -591,7 +659,17 @@ func (s *Storage) replayWALEncrypted(h *shardHandle, shardID uint32, f *os.File,
 	}
 
 	// Recover the nonce counter so future writes never reuse a nonce.
-	h.nonceCtr.Store(maxNonce + 1)
+	// Take the max of WAL-derived counter and sidecar counter. The sidecar
+	// persists the high-water mark so counter never regresses after WAL truncation.
+	walCtr := maxNonce + 1
+	sidecarCtr := readNonceSidecar(nonceSidecarPath(s.dir, shardID))
+	if sidecarCtr > walCtr {
+		walCtr = sidecarCtr
+	}
+	h.nonceCtr.Store(walCtr)
+
+	// Persist the counter to the sidecar for defense-in-depth.
+	writeNonceSidecar(nonceSidecarPath(s.dir, shardID), walCtr, s.logger)
 
 	s.finishReplay(h, shardID, fileSize, validOffset, recordsRead, recordsSkipped)
 	return nil
@@ -631,7 +709,6 @@ func (s *Storage) finishReplay(h *shardHandle, shardID uint32, fileSize, validOf
 	if validOffset < fileSize {
 		h.mu.Lock()
 		if err := h.file.Truncate(validOffset); err != nil {
-			h.mu.Unlock()
 			if s.logger.Enabled(log.LevelWarn) {
 				s.logger.Log(log.LevelWarn, "persistence: failed to truncate corrupted tail",
 					log.Uint("shard", shardID), log.String("error", err.Error()))
@@ -683,7 +760,11 @@ func (s *Storage) Snapshot(shardID uint32, engine *storage.Engine) error {
 	}
 	// Snapshot the engine state first. ForEach freezes the engine under a
 	// read lock so no new mutations complete during serialization.
-	if err := snapshotForkDump(s.dir, shardID, engine, s.logger); err != nil {
+	var fp [16]byte
+	if h := s.getShard(shardID); h != nil && h.crypto != nil {
+		fp = h.crypto.KeyFingerprint()
+	}
+	if err := snapshotForkDump(s.dir, shardID, engine, fp, s.logger); err != nil {
 		return err
 	}
 	h := s.getShard(shardID)
@@ -751,5 +832,9 @@ func (s *Storage) CloseShard(shardID uint32) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	// Persist the nonce counter before closing so it survives process restart.
+	if h.walVer == 1 {
+		writeNonceSidecar(nonceSidecarPath(s.dir, shardID), h.nonceCtr.Load(), s.logger)
+	}
 	return h.file.Close()
 }

@@ -17,7 +17,7 @@ func TestSnapshotWriteAndRead(t *testing.T) {
 	engine.Set("key3", []byte("value3"), 0)
 	engine.Delete("key3") // tombstone — should not appear in snapshot
 
-	keysWritten, err := snapshotWrite(dir, 0, engine, nil)
+	keysWritten, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil)
 	if err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestSnapshotWriteAndRead(t *testing.T) {
 
 	// Load into a fresh engine.
 	engine2 := newTestEngine(t)
-	loadedKeys, err := snapshotRead(dir, 0, engine2, nil)
+	loadedKeys, err := snapshotRead(dir, 0, engine2, [16]byte{}, nil)
 	if err != nil {
 		t.Fatalf("snapshotRead: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestSnapshotSkipsExpiredKeys(t *testing.T) {
 
 	time.Sleep(2 * time.Millisecond)
 
-	keysWritten, err := snapshotWrite(dir, 0, engine, nil)
+	keysWritten, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil)
 	if err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
@@ -79,7 +79,7 @@ func TestSnapshotSkipsExpiredKeys(t *testing.T) {
 	}
 
 	engine2 := newTestEngine(t)
-	_, err = snapshotRead(dir, 0, engine2, nil)
+	_, err = snapshotRead(dir, 0, engine2, [16]byte{}, nil)
 	if err != nil {
 		t.Fatalf("snapshotRead: %v", err)
 	}
@@ -101,7 +101,7 @@ func TestSnapshotInvalidMagic(t *testing.T) {
 	}
 
 	engine := newTestEngine(t)
-	_, err := snapshotRead(dir, 0, engine, nil)
+	_, err := snapshotRead(dir, 0, engine, [16]byte{}, nil)
 	if err == nil {
 		t.Fatal("expected error for invalid magic")
 	}
@@ -117,7 +117,7 @@ func TestSnapshotChecksumMismatch(t *testing.T) {
 		t.Fatalf("engine.Set: %v", err)
 	}
 
-	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
 	engine.Close()
@@ -136,7 +136,7 @@ func TestSnapshotChecksumMismatch(t *testing.T) {
 
 	// Verify the engine is NOT mutated by the corrupt snapshot.
 	engine2 := newTestEngine(t)
-	_, err = snapshotRead(dir, 0, engine2, nil)
+	_, err = snapshotRead(dir, 0, engine2, [16]byte{}, nil)
 	if err == nil {
 		t.Fatal("expected checksum error for corrupt snapshot")
 	}
@@ -150,7 +150,7 @@ func TestSnapshotChecksumZeroBody(t *testing.T) {
 	engine := newTestEngine(t)
 	engine.Set("k", []byte("v"), 0)
 
-	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
 	engine.Close()
@@ -171,7 +171,7 @@ func TestSnapshotChecksumZeroBody(t *testing.T) {
 	}
 
 	engine2 := newTestEngine(t)
-	_, err = snapshotRead(dir, 0, engine2, nil)
+	_, err = snapshotRead(dir, 0, engine2, [16]byte{}, nil)
 	if err == nil {
 		t.Fatal("expected checksum error for zeroed body")
 	}
@@ -190,7 +190,7 @@ func TestSnapshotZeroedChecksum(t *testing.T) {
 		t.Fatalf("engine.Set: %v", err)
 	}
 
-	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
 	engine.Close()
@@ -210,7 +210,7 @@ func TestSnapshotZeroedChecksum(t *testing.T) {
 	}
 
 	engine2 := newTestEngine(t)
-	_, err = snapshotRead(dir, 0, engine2, nil)
+	_, err = snapshotRead(dir, 0, engine2, [16]byte{}, nil)
 	if err == nil {
 		t.Fatal("expected checksum error for zeroed checksum header")
 	}
@@ -224,7 +224,7 @@ func TestSnapshotTruncatedFile(t *testing.T) {
 	engine := newTestEngine(t)
 	engine.Set("key1", []byte("long_value_here"), 0)
 
-	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
 	engine.Close()
@@ -240,7 +240,7 @@ func TestSnapshotTruncatedFile(t *testing.T) {
 	}
 
 	engine2 := newTestEngine(t)
-	_, err = snapshotRead(dir, 0, engine2, nil)
+	_, err = snapshotRead(dir, 0, engine2, [16]byte{}, nil)
 	if err == nil {
 		t.Fatal("expected error for truncated snapshot")
 	}
@@ -280,13 +280,13 @@ func TestSnapshotRoundTripWithTTL(t *testing.T) {
 	engine.Set("ttl_key", []byte("expires_soon"), 10*time.Minute)
 	engine.Set("perm_key", []byte("stays"), 0)
 
-	_, err := snapshotWrite(dir, 0, engine, nil)
+	_, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil)
 	if err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
 
 	engine2 := newTestEngine(t)
-	_, err = snapshotRead(dir, 0, engine2, nil)
+	_, err = snapshotRead(dir, 0, engine2, [16]byte{}, nil)
 	if err != nil {
 		t.Fatalf("snapshotRead: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestLoadShardSnapshotFirstThenWAL(t *testing.T) {
 	// Create a snapshot from a state that had only key1.
 	snapEngine := newTestEngine(t)
 	snapEngine.Set("snap_key", []byte("snap_val"), 0)
-	if _, err := snapshotWrite(dir, 0, snapEngine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, snapEngine, [16]byte{}, nil); err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
 	snapEngine.Close()
@@ -366,7 +366,7 @@ func TestSnapshotTruncateAndReplay(t *testing.T) {
 	engine := newTestEngine(t)
 	engine.Set("before_snap", []byte("v1"), 0)
 	s.Write(0, "before_snap", []byte("v1"), time.Time{})
-	snapshotWrite(dir, 0, engine, nil)
+	snapshotWrite(dir, 0, engine, [16]byte{}, nil)
 	s.TruncateWALTo(0, 0)
 
 	// Write more data to WAL after snapshot.
@@ -440,7 +440,7 @@ func TestSnapshotConcurrentWrite(t *testing.T) {
 	// Storage.Snapshot behavior) and truncate — this is what Snapshot does
 	// internally. We use snapshotWrite directly because the fork-based path
 	// does not work inside the test binary.
-	if _, err := snapshotWrite(dir, 0, engine, nil); err != nil {
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
 		t.Fatalf("snapshotWrite: %v", err)
 	}
 	walSize := s.WALSize(0)
@@ -467,5 +467,63 @@ func TestSnapshotConcurrentWrite(t *testing.T) {
 	v, ok = freshEngine.Get("after_snap")
 	if !ok || string(v) != "v2" {
 		t.Fatalf("after_snap: got %q, %v", v, ok)
+	}
+}
+
+func TestSnapshotFingerprintValidation(t *testing.T) {
+	dir := newTestDir(t)
+	engine := newTestEngine(t)
+	engine.Set("key1", []byte("value1"), 0)
+
+	var fp [16]byte
+	fp[0] = 0xAA
+	fp[15] = 0xBB
+	if _, err := snapshotWrite(dir, 0, engine, fp, nil); err != nil {
+		t.Fatalf("snapshotWrite: %v", err)
+	}
+
+	// Same fingerprint → must succeed.
+	engine2 := newTestEngine(t)
+	loadedKeys, err := snapshotRead(dir, 0, engine2, fp, nil)
+	if err != nil {
+		t.Fatalf("snapshotRead with matching fingerprint: %v", err)
+	}
+	if loadedKeys != 1 {
+		t.Fatalf("expected 1 key, got %d", loadedKeys)
+	}
+
+	// Different fingerprint → must fail.
+	var wrongFp [16]byte
+	wrongFp[0] = 0xFF
+	engine3 := newTestEngine(t)
+	_, err = snapshotRead(dir, 0, engine3, wrongFp, nil)
+	if err == nil {
+		t.Fatal("expected error for fingerprint mismatch")
+	}
+
+	// Zero fingerprint (plaintext) when snapshot was encrypted → must fail.
+	engine4 := newTestEngine(t)
+	_, err = snapshotRead(dir, 0, engine4, [16]byte{}, nil)
+	if err == nil {
+		t.Fatal("expected error when reading encrypted snapshot with zero fingerprint")
+	}
+}
+
+func TestSnapshotZeroFingerprintAcceptsZero(t *testing.T) {
+	dir := newTestDir(t)
+	engine := newTestEngine(t)
+	engine.Set("key1", []byte("value1"), 0)
+
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
+		t.Fatalf("snapshotWrite: %v", err)
+	}
+
+	engine2 := newTestEngine(t)
+	loadedKeys, err := snapshotRead(dir, 0, engine2, [16]byte{}, nil)
+	if err != nil {
+		t.Fatalf("snapshotRead with zero fingerprint: %v", err)
+	}
+	if loadedKeys != 1 {
+		t.Fatalf("expected 1 key, got %d", loadedKeys)
 	}
 }
