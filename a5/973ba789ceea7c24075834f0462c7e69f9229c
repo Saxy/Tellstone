@@ -1,0 +1,20 @@
+internal/persistence/persistence.go
+  s_652d2bb988c100::t_4792e9c1deb43e 831-833
+  s_652d2bb988c100::t_4dfd79559e1e5a 781-783
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "a5973ba789ceea7c24075834f0462c7e69f9229c",
+  "prompts": {},
+  "sessions": {
+    "s_652d2bb988c100": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fec390920ffeLcKtv2HcGjKGvm",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
