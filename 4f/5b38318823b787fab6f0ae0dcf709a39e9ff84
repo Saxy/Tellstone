@@ -1,0 +1,35 @@
+internal/persistence/persistence_test.go
+  s_652d2bb988c100::t_0ccc3ac3eaa283 936-1019
+internal/persistence/snapshot_test.go
+  s_652d2bb988c100::t_e050dc3d1304cd 481-490,494-497,504-507,512-513,520-521
+  s_652d2bb988c100::t_d2f9b3a979d882 546-558,560-564,571-573,575-693
+  s_652d2bb988c100::t_f61b8cf1bf7129 559,565-570,574
+  s_652d2bb988c100::t_334b8a0ea9a286 4-5,10,12
+  s_652d2bb988c100::t_943be448b1156a 11
+internal/persistence/persistence.go
+  s_652d2bb988c100::t_2d65d4babb8027 823-825
+  s_652d2bb988c100::t_c15fa85818da7c 772-778,780-784
+  s_652d2bb988c100::t_4b273f649eaa27 655-660
+  s_652d2bb988c100::t_b0fc3950434ba1 68-74,76,80-84,86,88-95,97-104,400
+internal/persistence/snapshot.go
+  s_652d2bb988c100::t_628c2f55ea1e39 313-317
+  s_652d2bb988c100::t_70f5dfd16346d5 42-44
+  s_652d2bb988c100::t_02c2c58714b722 273-274,277-278,280-288,293-294,296-298,301-305
+  s_652d2bb988c100::t_1db68b5883aae2 45-47
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "4f5b38318823b787fab6f0ae0dcf709a39e9ff84",
+  "prompts": {},
+  "sessions": {
+    "s_652d2bb988c100": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fec390920ffeLcKtv2HcGjKGvm",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
