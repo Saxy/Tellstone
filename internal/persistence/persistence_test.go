@@ -741,7 +741,8 @@ func TestEncryptedWALHeaderWritten(t *testing.T) {
 }
 
 // TestEncryptedWALRejectsMismatchedCrypto verifies that opening an encrypted
-// WAL without a crypto engine, or a plaintext WAL with a crypto engine, fails.
+// WAL without a crypto engine fails. Opening a plaintext WAL with a crypto
+// engine now succeeds — it migrates the WAL to encrypted format.
 func TestEncryptedWALRejectsMismatchedCrypto(t *testing.T) {
 	dir := newTestDir(t)
 	s, err := NewStorage(true, nil, dir)
@@ -776,9 +777,201 @@ func TestEncryptedWALRejectsMismatchedCrypto(t *testing.T) {
 	}
 	s.CloseShard(1)
 
-	// Reopen plaintext WAL with crypto — should fail.
-	if err := s.OpenShard(1, ce); err == nil {
-		t.Fatal("expected error opening plaintext WAL with crypto")
+	// Reopen plaintext WAL with crypto — should migrate, not fail.
+	if err := s.OpenShard(1, ce); err != nil {
+		t.Fatalf("OpenShard plaintext+crypto should migrate: %v", err)
+	}
+	engine := storage.NewEngine(0, 0, 0, nil, nil)
+	if err := s.LoadShard(1, engine); err != nil {
+		t.Fatalf("LoadShard after migration: %v", err)
+	}
+	val, ok := engine.Get("k")
+	if !ok || string(val) != "v" {
+		t.Fatalf("key 'k' = %q, want 'v'", val)
+	}
+	s.CloseShard(1)
+
+	// Reopen — should now be an encrypted WAL (magic header present).
+	if err := s.OpenShard(1, ce); err != nil {
+		t.Fatalf("OpenShard migrated WAL: %v", err)
+	}
+	if err := s.LoadShard(1, engine); err != nil {
+		t.Fatalf("LoadShard migrated WAL: %v", err)
+	}
+	val, ok = engine.Get("k")
+	if !ok || string(val) != "v" {
+		t.Fatalf("key 'k' after reopen = %q, want 'v'", val)
+	}
+}
+
+// TestPlaintextToEncryptedMigration verifies the full upgrade path:
+// write plaintext WAL (v1.2.0), then open with crypto enabled, replay,
+// migrate, write new encrypted records, close, reopen, verify all data.
+func TestPlaintextToEncryptedMigration(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+
+	// Phase 1: write plaintext WAL (simulates v1.2.0).
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard plaintext: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("legacy_%02d", i)
+		val := fmt.Sprintf("plain-%02d", i)
+		if err := s.Write(0, key, []byte(val), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write %s: %v", key, err)
+		}
+	}
+	s.CloseShard(0)
+
+	// Phase 2: open with crypto — triggers migration.
+	ce := newCryptoEngine(t)
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard with crypto: %v", err)
+	}
+	engine := storage.NewEngine(0, 0, 0, nil, nil)
+	defer engine.Close()
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	// All 20 plaintext records should be in memory.
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("legacy_%02d", i)
+		want := fmt.Sprintf("plain-%02d", i)
+		got, ok := engine.Get(key)
+		if !ok || string(got) != want {
+			t.Fatalf("after migration key %q = %q, want %q", key, got, want)
+		}
+	}
+	// New writes should go encrypted.
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("fresh_%02d", i)
+		val := fmt.Sprintf("enc-%02d", i)
+		if err := s.Write(0, key, []byte(val), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write %s: %v", key, err)
+		}
+	}
+	s.CloseShard(0)
+
+	// Phase 3: reopen as encrypted WAL — all data survives.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard encrypted: %v", err)
+	}
+	engine2 := storage.NewEngine(0, 0, 0, nil, nil)
+	defer engine2.Close()
+	if err := s.LoadShard(0, engine2); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("legacy_%02d", i)
+		want := fmt.Sprintf("plain-%02d", i)
+		got, ok := engine2.Get(key)
+		if !ok || string(got) != want {
+			t.Fatalf("final legacy key %q = %q, want %q", key, got, want)
+		}
+	}
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("fresh_%02d", i)
+		want := fmt.Sprintf("enc-%02d", i)
+		got, ok := engine2.Get(key)
+		if !ok || string(got) != want {
+			t.Fatalf("final fresh key %q = %q, want %q", key, got, want)
+		}
+	}
+	// WAL file should start with encrypted magic header.
+	h := s.getShard(0)
+	if h == nil {
+		t.Fatal("shard 0 not found")
+	}
+	magic := make([]byte, 4)
+	h.mu.Lock()
+	if _, err := h.file.ReadAt(magic, 0); err != nil {
+		h.mu.Unlock()
+		t.Fatalf("ReadAt: %v", err)
+	}
+	h.mu.Unlock()
+	if string(magic) != walMagic {
+		t.Fatalf("WAL magic = %q, want %q", magic, walMagic)
+	}
+}
+
+// TestDevPlaintextToEncryptedUpgrade verifies the upgrade path where the same
+// dev binary first runs without encryption (plaintext WAL), then restarts
+// with encryption enabled — the WAL migrates transparently.
+func TestDevPlaintextToEncryptedUpgrade(t *testing.T) {
+	dir := newTestDir(t)
+	ce := newCryptoEngine(t)
+
+	// Session 1: no crypto — write plaintext WAL.
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		val := fmt.Sprintf("v%02d", i)
+		if err := s.Write(0, key, []byte(val), time.Now().Add(time.Hour)); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	s.CloseShard(0)
+	_ = s
+
+	// Session 2: crypto enabled — should migrate and recover all keys.
+	s2, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	if err := s2.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard with crypto: %v", err)
+	}
+	engine := storage.NewEngine(0, 0, 0, nil, nil)
+	defer engine.Close()
+	if err := s2.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		want := fmt.Sprintf("v%02d", i)
+		got, ok := engine.Get(key)
+		if !ok || string(got) != want {
+			t.Fatalf("after migration key %q = %q, want %q", key, got, want)
+		}
+	}
+	// Verify nonce sidecar was written during migration.
+	sidecarPath := nonceSidecarPath(dir, 0)
+	if _, err := os.Stat(sidecarPath); os.IsNotExist(err) {
+		t.Fatal("nonce sidecar not created during migration")
+	}
+
+	// Session 3: reopen as encrypted — data still survives.
+	s2.CloseShard(0)
+	_ = s2
+	s3, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	if err := s3.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	engine2 := storage.NewEngine(0, 0, 0, nil, nil)
+	defer engine2.Close()
+	if err := s3.LoadShard(0, engine2); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("k%02d", i)
+		want := fmt.Sprintf("v%02d", i)
+		got, ok := engine2.Get(key)
+		if !ok || string(got) != want {
+			t.Fatalf("final key %q = %q, want %q", key, got, want)
+		}
 	}
 }
 
@@ -1009,5 +1202,280 @@ func TestEncryptedNonceCounterSurvivesTruncateWithoutClose(t *testing.T) {
 	ctrAfterRestart := h2.nonceCtr.Load()
 	if ctrAfterRestart != 15 {
 		t.Fatalf("counter after restart = %d, want 15 (no regression from truncation)", ctrAfterRestart)
+	}
+}
+
+// writeRawPlaintextWAL writes raw v1.2.0-format WAL records directly to disk.
+// This simulates a data directory left behind by a Tellstone v1.2.0 node
+// (plaintext WAL, no magic header, no snapshots, no encryption).
+func writeRawPlaintextWAL(t *testing.T, path string, records [][]byte) {
+	t.Helper()
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatalf("create WAL file: %v", err)
+	}
+	for _, rec := range records {
+		if _, err := f.Write(rec); err != nil {
+			t.Fatalf("write record: %v", err)
+		}
+	}
+	if err := f.Sync(); err != nil {
+		t.Fatalf("sync WAL: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close WAL: %v", err)
+	}
+}
+
+// buildPlaintextRecord builds a single plaintext WAL record in the v1.2.0 binary
+// format: [keyLen:4B LE][valLen:4B LE][ttlNano:8B LE][key][value].
+func buildPlaintextRecord(key string, value []byte, ttl time.Time) []byte {
+	var header [16]byte
+	binary.LittleEndian.PutUint32(header[0:4], uint32(len(key)))
+	binary.LittleEndian.PutUint32(header[4:8], uint32(len(value)))
+	if !ttl.IsZero() {
+		binary.LittleEndian.PutUint64(header[8:16], uint64(ttl.UnixNano()))
+	}
+	rec := make([]byte, 0, 16+len(key)+len(value))
+	rec = append(rec, header[:]...)
+	rec = append(rec, key...)
+	rec = append(rec, value...)
+	return rec
+}
+
+// TestV120PlaintextWALBackwardCompat verifies that v1.3.0 can open, replay, and
+// read data from a plaintext WAL created by v1.2.0 (no magic header, no snapshot
+// files, no encryption). The WAL bytes are hand-crafted to match the v1.2.0
+// on-disk format exactly.
+func TestV120PlaintextWALBackwardCompat(t *testing.T) {
+	dir := newTestDir(t)
+
+	// Simulate a v1.2.0 data directory: 20 records written directly to disk
+	// in plaintext WAL format. No .snap files, no .nonce files, no magic header.
+	var records [][]byte
+	for i := 0; i < 20; i++ {
+		records = append(records, buildPlaintextRecord(
+			fmt.Sprintf("legacy_%d", i),
+			[]byte(fmt.Sprintf("val_%d", i)),
+			time.Time{},
+		))
+	}
+	walPath := filepath.Join(dir, "shard_000.db")
+	writeRawPlaintextWAL(t, walPath, records)
+
+	// v1.3.0 opens the shard with nil crypto (plaintext mode).
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+
+	// LoadShard should skip snapshot (none exists) and replay the WAL.
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+
+	if engine.KeyCount() != 20 {
+		t.Fatalf("expected 20 keys after v1.2.0 WAL replay, got %d", engine.KeyCount())
+	}
+
+	// Spot-check a few records.
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("legacy_%d", i)
+		want := fmt.Sprintf("val_%d", i)
+		v, ok := engine.Get(key)
+		if !ok {
+			t.Fatalf("key %q not found after v1.2.0 WAL replay", key)
+		}
+		if string(v) != want {
+			t.Fatalf("key %q: got %q, want %q", key, v, want)
+		}
+	}
+}
+
+// TestV120PlaintextWALSnapshotMigration verifies the full upgrade path from
+// v1.2.0 to v1.3.0:
+//
+//  1. Hand-craft a v1.2.0 plaintext WAL (no magic, no snapshot).
+//  2. Open with v1.3.0, load, verify all records.
+//  3. Take a snapshot with v1.3.0 (produces a .snap file).
+//  4. Truncate the WAL.
+//  5. Close and reopen — only the snapshot + truncated WAL should exist.
+//  6. Load again, verify all original records survived.
+func TestV120PlaintextWALSnapshotMigration(t *testing.T) {
+	dir := newTestDir(t)
+
+	// Step 1: Create a v1.2.0 plaintext WAL with 30 records.
+	var records [][]byte
+	for i := 0; i < 30; i++ {
+		records = append(records, buildPlaintextRecord(
+			fmt.Sprintf("mig_%d", i),
+			[]byte(fmt.Sprintf("data_%d", i)),
+			time.Time{},
+		))
+	}
+	walPath := filepath.Join(dir, "shard_000.db")
+	writeRawPlaintextWAL(t, walPath, records)
+
+	// Step 2: Open with v1.3.0, load, verify.
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if engine.KeyCount() != 30 {
+		t.Fatalf("expected 30 keys, got %d", engine.KeyCount())
+	}
+
+	// Step 3: Snapshot — serializes the engine to a .snap file, then truncates WAL.
+	// Use snapshotWrite directly (Snapshot() uses ForkExec which needs a built binary).
+	if _, err := snapshotWrite(dir, 0, engine, [16]byte{}, nil); err != nil {
+		t.Fatalf("snapshotWrite: %v", err)
+	}
+
+	// Truncate WAL to snapshot boundary (same as what Snapshot() does after writing).
+	if err := s.TruncateWALTo(0, 0); err != nil {
+		t.Fatalf("TruncateWALTo: %v", err)
+	}
+
+	// Verify snapshot file exists.
+	snapPath := filepath.Join(dir, "shard_000.snap")
+	if _, err := os.Stat(snapPath); err != nil {
+		t.Fatalf("snapshot file not created: %v", err)
+	}
+
+	// Step 4: Close the shard.
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
+
+	// Step 5: Reopen — should load from snapshot + truncated WAL.
+	s2, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage (reopen): %v", err)
+	}
+	defer s2.CloseShard(0)
+	if err := s2.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard (reopen): %v", err)
+	}
+	engine2 := newTestEngine(t)
+	if err := s2.LoadShard(0, engine2); err != nil {
+		t.Fatalf("LoadShard (reopen): %v", err)
+	}
+
+	// Step 6: Verify all 30 records survived the migration.
+	if engine2.KeyCount() != 30 {
+		t.Fatalf("expected 30 keys after migration, got %d", engine2.KeyCount())
+	}
+	for i := 0; i < 30; i++ {
+		key := fmt.Sprintf("mig_%d", i)
+		want := fmt.Sprintf("data_%d", i)
+		v, ok := engine2.Get(key)
+		if !ok {
+			t.Fatalf("key %q not found after migration", key)
+		}
+		if string(v) != want {
+			t.Fatalf("key %q: got %q, want %q", key, v, want)
+		}
+	}
+}
+
+// TestV120PlaintextWALWriteAfterMigration verifies that new writes after
+// upgrading from a v1.2.0 plaintext WAL work correctly alongside the legacy
+// data.
+func TestV120PlaintextWALWriteAfterMigration(t *testing.T) {
+	dir := newTestDir(t)
+
+	// Create a v1.2.0 plaintext WAL with 10 records.
+	var records [][]byte
+	for i := 0; i < 10; i++ {
+		records = append(records, buildPlaintextRecord(
+			fmt.Sprintf("old_%d", i),
+			[]byte(fmt.Sprintf("v%d", i)),
+			time.Time{},
+		))
+	}
+	walPath := filepath.Join(dir, "shard_000.db")
+	writeRawPlaintextWAL(t, walPath, records)
+
+	// Open with v1.3.0, load legacy data, then write new data.
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if engine.KeyCount() != 10 {
+		t.Fatalf("expected 10 legacy keys, got %d", engine.KeyCount())
+	}
+
+	// Write new records through v1.3.0.
+	for i := 0; i < 10; i++ {
+		if err := s.Write(0, fmt.Sprintf("new_%d", i), []byte(fmt.Sprintf("nv%d", i)), time.Time{}); err != nil {
+			t.Fatalf("Write new_%d: %v", i, err)
+		}
+	}
+
+	// Close and reopen — both legacy and new records should survive.
+	s.CloseShard(0)
+	s2, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage (reopen): %v", err)
+	}
+	defer s2.CloseShard(0)
+	if err := s2.OpenShard(0, nil); err != nil {
+		t.Fatalf("OpenShard (reopen): %v", err)
+	}
+	engine2 := newTestEngine(t)
+	if err := s2.LoadShard(0, engine2); err != nil {
+		t.Fatalf("LoadShard (reopen): %v", err)
+	}
+
+	if engine2.KeyCount() != 20 {
+		t.Fatalf("expected 20 keys (10 legacy + 10 new), got %d", engine2.KeyCount())
+	}
+
+	// Verify legacy records.
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("old_%d", i)
+		want := fmt.Sprintf("v%d", i)
+		v, ok := engine2.Get(key)
+		if !ok {
+			t.Fatalf("legacy key %q not found", key)
+		}
+		if string(v) != want {
+			t.Fatalf("legacy key %q: got %q, want %q", key, v, want)
+		}
+	}
+
+	// Verify new records.
+	for i := 0; i < 10; i++ {
+		key := fmt.Sprintf("new_%d", i)
+		want := fmt.Sprintf("nv%d", i)
+		v, ok := engine2.Get(key)
+		if !ok {
+			t.Fatalf("new key %q not found", key)
+		}
+		if string(v) != want {
+			t.Fatalf("new key %q: got %q, want %q", key, v, want)
+		}
 	}
 }

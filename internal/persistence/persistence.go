@@ -109,12 +109,14 @@ func writeNonceSidecar(path string, ctr uint64) error {
 // the next counter-based nonce value. The counter is durable: it is recovered
 // from the WAL on replay so nonces never repeat across crashes.
 type shardHandle struct {
-	file     *os.File
-	mu       sync.Mutex
-	crypto   *crypto.Engine
-	walVer   uint8
-	nonceCtr atomic.Uint64
-	shardID  uint32
+	file          *os.File
+	mu            sync.Mutex
+	crypto        *crypto.Engine
+	walVer        uint8
+	nonceCtr      atomic.Uint64
+	shardID       uint32
+	needsMigrate  bool           // plaintext WAL opened with crypto — migrate after replay
+	pendingCrypto *crypto.Engine // crypto engine waiting for migration
 }
 
 // Storage provides a per-shard, append-only write-ahead log (WAL) for crash recovery.
@@ -374,8 +376,8 @@ func (s *Storage) Delete(shardID uint32, key string) error {
 // OpenShard opens (or creates) the WAL file for the given shard.
 // If cryptoEng is non-nil, the WAL is encrypted with counter-based nonces and
 // a 4-byte magic header is written to new files. Existing plaintext WALs
-// cannot be retroactively encrypted — an error is returned if a plaintext
-// file is found while crypto is requested.
+// (e.g. from v1.2.0) are transparently migrated: records are replayed first,
+// then the file is truncated and re-initialized with the encrypted header.
 // Must be called before Write or LoadShard for that shard.
 // Returns nil immediately when persistence is disabled.
 func (s *Storage) OpenShard(shardID uint32, cryptoEng *crypto.Engine) error {
@@ -423,9 +425,16 @@ func (s *Storage) OpenShard(shardID uint32, cryptoEng *crypto.Engine) error {
 			h.crypto = cryptoEng
 			h.walVer = 1
 		} else {
+			// Plaintext WAL found. If encryption is requested, replay
+			// the existing plaintext records first, then migrate the WAL
+			// to encrypted format in-place after LoadShard completes.
 			if cryptoEng != nil && cryptoEng.Enabled() {
-				_ = f.Close()
-				return fmt.Errorf("persistence: shard %d has plaintext WAL but encryption is requested; delete the file to start fresh", shardID)
+				h.needsMigrate = true
+				h.pendingCrypto = cryptoEng
+				if s.logger.Enabled(log.LevelInfo) {
+					s.logger.Log(log.LevelInfo, "persistence: plaintext WAL will migrate to encrypted",
+						log.Uint("shard", shardID))
+				}
 			}
 			h.walVer = 0
 		}
@@ -473,7 +482,82 @@ func (s *Storage) LoadShard(shardID uint32, engine *storage.Engine) error {
 				log.Uint("shard", shardID), log.Uint64("keys", loadedKeys))
 		}
 	}
-	return s.replayWAL(shardID, engine)
+	if err := s.replayWAL(shardID, engine); err != nil {
+		return err
+	}
+	// After replaying a plaintext WAL with encryption enabled, migrate
+	// the WAL to encrypted format in-place. The plaintext records are
+	// now in memory; truncate the file, write the encrypted magic header,
+	// re-serialize all records as encrypted, and switch the handle to
+	// encrypted mode so new writes are sealed.
+	h := s.getShard(shardID)
+	if h != nil && h.needsMigrate {
+		h.mu.Lock()
+		if err := h.file.Truncate(0); err != nil {
+			h.mu.Unlock()
+			return fmt.Errorf("persistence: truncate WAL for migration: %w", err)
+		}
+		if _, err := h.file.Seek(0, 0); err != nil {
+			h.mu.Unlock()
+			return fmt.Errorf("persistence: seek WAL for migration: %w", err)
+		}
+		if _, err := h.file.WriteString(walMagic); err != nil {
+			h.mu.Unlock()
+			return fmt.Errorf("persistence: write WAL magic for migration: %w", err)
+		}
+		h.crypto = h.pendingCrypto
+		h.pendingCrypto = nil
+		h.walVer = 1
+		h.needsMigrate = false
+		h.mu.Unlock()
+		h.mu.Lock()
+		var recordsWritten int
+		atRestEncrypted := engine.CryptoEnabled()
+		engine.ForEach(func(key string, value []byte, expiration time.Time) {
+			walValue := value
+			if atRestEncrypted {
+				plainValue, decErr := h.crypto.DecryptInPlace(value)
+				if decErr != nil {
+					if s.logger.Enabled(log.LevelError) {
+						s.logger.Log(log.LevelError, "persistence: migration decrypt failed",
+							log.Uint("shard", shardID), log.String("key", key), log.String("error", decErr.Error()))
+					}
+					return
+				}
+				walValue = plainValue
+			}
+			var header [16]byte
+			var ttlNano int64
+			if !expiration.IsZero() {
+				ttlNano = expiration.UnixNano()
+			}
+			binary.LittleEndian.PutUint32(header[0:4], uint32(len(key)))
+			binary.LittleEndian.PutUint32(header[4:8], uint32(len(walValue)))
+			binary.LittleEndian.PutUint64(header[8:16], uint64(ttlNano))
+			if err := s.appendRecordEncrypted(h, shardID, header, key, walValue, "migration"); err != nil {
+				if s.logger.Enabled(log.LevelError) {
+					s.logger.Log(log.LevelError, "persistence: migration write failed",
+						log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+				}
+			} else {
+				recordsWritten++
+			}
+		})
+		h.mu.Unlock()
+		noncePath := nonceSidecarPath(s.dir, shardID)
+		nonceVal := h.nonceCtr.Load()
+		if err := writeNonceSidecar(noncePath, nonceVal); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "persistence: migration nonce sidecar write failed",
+					log.Uint("shard", shardID), log.String("error", err.Error()))
+			}
+		}
+		if s.logger.Enabled(log.LevelInfo) {
+			s.logger.Log(log.LevelInfo, "persistence: WAL migrated from plaintext to encrypted",
+				log.Uint("shard", shardID), log.Int("records", recordsWritten))
+		}
+	}
+	return nil
 }
 
 // replayWAL replays all records from the shard's WAL file into the given engine,
@@ -573,12 +657,11 @@ func (s *Storage) replayWALEncrypted(h *shardHandle, shardID uint32, f *os.File,
 		return err
 	}
 	remaining := fileSize - int64(walMagicLen)
-	validOffset := int64(walMagicLen) // preserve the magic header even if no records follow
+	validOffset := int64(walMagicLen)
 	var maxNonce uint64
 	recLenBuf := make([]byte, 4)
 	var recordsRead int
 	var recordsSkipped int
-
 	for {
 		if _, err := io.ReadFull(f, recLenBuf); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -594,8 +677,6 @@ func (s *Storage) replayWALEncrypted(h *shardHandle, shardID uint32, f *os.File,
 		if recLen > remaining {
 			break
 		}
-
-		// Read nonce + ciphertext.
 		record := make([]byte, recLen)
 		if _, err := io.ReadFull(f, record); err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
@@ -640,18 +721,12 @@ func (s *Storage) replayWALEncrypted(h *shardHandle, shardID uint32, f *os.File,
 			return err
 		}
 	}
-
-	// Recover the nonce counter so future writes never reuse a nonce.
-	// Take the max of WAL-derived counter and sidecar counter. The sidecar
-	// persists the high-water mark so counter never regresses after WAL truncation.
 	walCtr := maxNonce + 1
 	sidecarCtr := readNonceSidecar(nonceSidecarPath(s.dir, shardID))
 	if sidecarCtr > walCtr {
 		walCtr = sidecarCtr
 	}
 	h.nonceCtr.Store(walCtr)
-
-	// Persist the counter to the sidecar for defense-in-depth.
 	if err := writeNonceSidecar(nonceSidecarPath(s.dir, shardID), walCtr); err != nil {
 		if s.logger.Enabled(log.LevelWarn) {
 			s.logger.Log(log.LevelWarn, "persistence: nonce sidecar persist failed",
