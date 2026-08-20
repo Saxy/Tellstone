@@ -781,7 +781,7 @@ func TestEncryptedWALRejectsMismatchedCrypto(t *testing.T) {
 	if err := s.OpenShard(1, ce); err != nil {
 		t.Fatalf("OpenShard plaintext+crypto should migrate: %v", err)
 	}
-	engine := storage.NewEngine(0, 0, 0, nil, nil)
+	engine := newTestEngine(t)
 	if err := s.LoadShard(1, engine); err != nil {
 		t.Fatalf("LoadShard after migration: %v", err)
 	}
@@ -832,8 +832,7 @@ func TestPlaintextToEncryptedMigration(t *testing.T) {
 	if err := s.OpenShard(0, ce); err != nil {
 		t.Fatalf("OpenShard with crypto: %v", err)
 	}
-	engine := storage.NewEngine(0, 0, 0, nil, nil)
-	defer engine.Close()
+	engine := newTestEngine(t)
 	if err := s.LoadShard(0, engine); err != nil {
 		t.Fatalf("LoadShard: %v", err)
 	}
@@ -860,8 +859,7 @@ func TestPlaintextToEncryptedMigration(t *testing.T) {
 	if err := s.OpenShard(0, ce); err != nil {
 		t.Fatalf("OpenShard encrypted: %v", err)
 	}
-	engine2 := storage.NewEngine(0, 0, 0, nil, nil)
-	defer engine2.Close()
+	engine2 := newTestEngine(t)
 	if err := s.LoadShard(0, engine2); err != nil {
 		t.Fatalf("LoadShard: %v", err)
 	}
@@ -920,8 +918,9 @@ func TestDevPlaintextToEncryptedUpgrade(t *testing.T) {
 			t.Fatalf("Write: %v", err)
 		}
 	}
-	s.CloseShard(0)
-	_ = s
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
 
 	// Session 2: crypto enabled — should migrate and recover all keys.
 	s2, err := NewStorage(true, nil, dir)
@@ -931,8 +930,7 @@ func TestDevPlaintextToEncryptedUpgrade(t *testing.T) {
 	if err := s2.OpenShard(0, ce); err != nil {
 		t.Fatalf("OpenShard with crypto: %v", err)
 	}
-	engine := storage.NewEngine(0, 0, 0, nil, nil)
-	defer engine.Close()
+	engine := newTestEngine(t)
 	if err := s2.LoadShard(0, engine); err != nil {
 		t.Fatalf("LoadShard: %v", err)
 	}
@@ -951,8 +949,9 @@ func TestDevPlaintextToEncryptedUpgrade(t *testing.T) {
 	}
 
 	// Session 3: reopen as encrypted — data still survives.
-	s2.CloseShard(0)
-	_ = s2
+	if err := s2.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
 	s3, err := NewStorage(true, nil, dir)
 	if err != nil {
 		t.Fatalf("NewStorage: %v", err)
@@ -960,8 +959,7 @@ func TestDevPlaintextToEncryptedUpgrade(t *testing.T) {
 	if err := s3.OpenShard(0, ce); err != nil {
 		t.Fatalf("OpenShard: %v", err)
 	}
-	engine2 := storage.NewEngine(0, 0, 0, nil, nil)
-	defer engine2.Close()
+	engine2 := newTestEngine(t)
 	if err := s3.LoadShard(0, engine2); err != nil {
 		t.Fatalf("LoadShard: %v", err)
 	}
