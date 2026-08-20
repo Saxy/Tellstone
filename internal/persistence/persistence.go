@@ -824,5 +824,11 @@ func (s *Storage) CloseShard(shardID uint32) error {
 			return err
 		}
 	}
-	return h.file.Close()
+	if err := h.file.Close(); err != nil {
+		return err
+	}
+	s.mapMu.Lock()
+	delete(s.shards, shardID)
+	s.mapMu.Unlock()
+	return nil
 }
