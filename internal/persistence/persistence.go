@@ -778,9 +778,9 @@ func (s *Storage) Snapshot(shardID uint32, engine *storage.Engine) error {
 // counter at the time of truncation, even if the WAL records are gone.
 func (s *Storage) truncateWALLocked(h *shardHandle, shardID uint32, offset int64) error {
 	if h.walVer == 1 {
-		if err := writeNonceSidecar(nonceSidecarPath(s.dir, shardID), h.nonceCtr.Load()); err != nil {
-			return fmt.Errorf("persistence: persist nonce sidecar before truncate: %w", err)
-		}
+		sidecarErr := writeNonceSidecar(nonceSidecarPath(s.dir, shardID), h.nonceCtr.Load())
+		closeErr := h.file.Close()
+		return errors.Join(sidecarErr, closeErr)
 	}
 	if err := h.file.Truncate(offset); err != nil {
 		return fmt.Errorf("persistence: truncate WAL shard %d to %d: %w", shardID, offset, err)
