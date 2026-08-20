@@ -1,0 +1,58 @@
+internal/persistence/snapshot_bench_test.go
+  s_652d2bb988c100::t_a8607177939d6f 95,129
+  s_652d2bb988c100::t_d9ddf5cecbceca 200
+  s_652d2bb988c100::t_3b472ac635bd4e 57,87,124,278
+internal/persistence/snapshot_test.go
+  s_652d2bb988c100::t_433a0734eee74c 104
+  s_652d2bb988c100::t_9b1543fe816b0d 472-529
+  s_652d2bb988c100::t_b7d412c8287e25 41,82,139,174,213,243,289
+  s_652d2bb988c100::t_04cc4d7ad28c2c 20,73,120,153,193,227,283,369,443
+  s_652d2bb988c100::t_e58ff8200c5ba0 326
+internal/storage/engine.go
+  s_652d2bb988c100::t_356e50cff35f2a 239-240
+config/config_test.go
+  s_652d2bb988c100::t_ca031875618c5b 474-495
+internal/persistence/persistence_test.go
+  s_652d2bb988c100::t_8cc0cb3fedcce6 673-688
+  s_652d2bb988c100::t_fda9e721aea277 818-819,825-826
+  s_652d2bb988c100::t_8e22a67caa8000 873-874,880-882,890-891,899-900
+  s_652d2bb988c100::t_68cb826679740c 4
+internal/persistence/persistence.go
+  s_652d2bb988c100::t_ff113b4977b75d 438-441
+  s_652d2bb988c100::t_2d8ba5126ec8c8 763-767
+  s_652d2bb988c100::t_f114b7cbf0d0f9 47-97
+  s_652d2bb988c100::t_f2a16c9309f558 662-672
+  s_652d2bb988c100::t_2fa4703b87a880 389
+  s_652d2bb988c100::t_d5a70a09656a09 601-602
+  s_652d2bb988c100::t_d993d277606c61 258-265,267
+  s_652d2bb988c100::t_1541bde9c8aefd 464-468
+  s_652d2bb988c100::t_5e94c45db7b609 835-838
+  s_652d2bb988c100::t_1fd170b7a3aea2 108
+internal/persistence/snapshot.go
+  s_652d2bb988c100::t_b3fad1b20af1f5 41-44
+  s_652d2bb988c100::t_2c22c9a6872eee 299-306
+  s_652d2bb988c100::t_720d8466ec8316 267-270
+  s_652d2bb988c100::t_639643200d2023 431-433,436,455,470
+  s_652d2bb988c100::t_65d88795d2a26b 158,559
+  s_652d2bb988c100::t_57e86115a3ca51 548-550
+  s_652d2bb988c100::t_571ffc28d14d4f 24
+  s_652d2bb988c100::t_15618ba70c7453 146-147,149
+  s_652d2bb988c100::t_ff1192dd66a26b 71-76,84
+  s_652d2bb988c100::t_8d6a41a11d9764 116,128-137
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "fbc69755fbf62c6576c5d41a4d6b6bbb74e8a20b",
+  "prompts": {},
+  "sessions": {
+    "s_652d2bb988c100": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fec390920ffeLcKtv2HcGjKGvm",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
