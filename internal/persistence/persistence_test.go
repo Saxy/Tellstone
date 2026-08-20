@@ -989,12 +989,6 @@ func TestEncryptedNonceCounterSurvivesTruncateWithoutClose(t *testing.T) {
 	if err := s.TruncateWALTo(0, walMagicLen); err != nil {
 		t.Fatalf("TruncateWALTo: %v", err)
 	}
-
-	// Phase 3: simulate restart — reopen and replay. The sidecar must
-	// carry the counter forward even though the WAL is empty.
-	if err := s.CloseShard(0); err != nil {
-		t.Fatalf("CloseShard: %v", err)
-	}
 	s2, err := NewStorage(true, nil, dir)
 	if err != nil {
 		t.Fatalf("NewStorage phase 3: %v", err)
