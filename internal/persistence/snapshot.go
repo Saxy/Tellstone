@@ -29,7 +29,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
@@ -425,7 +424,7 @@ func snapshotForkDump(dir string, shardID uint32, engine *storage.Engine, finger
 		fmt.Sprintf("TSD_SNAP_SHARD=%d", shardID),
 		"TSD_SNAP_FP=" + hex.EncodeToString(fingerprint[:]),
 	}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setChildProcessGroup(cmd)
 	if err = cmd.Start(); err != nil {
 		if cerr := pr.Close(); cerr != nil {
 			logCleanupWarn("snapshot: close pipe reader", cerr, logger)
