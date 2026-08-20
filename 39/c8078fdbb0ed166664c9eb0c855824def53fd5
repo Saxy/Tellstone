@@ -1,0 +1,14 @@
+internal/persistence/persistence.go
+  h_31b8ea865a30bd 781-783
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "39c8078fdbb0ed166664c9eb0c855824def53fd5",
+  "prompts": {},
+  "humans": {
+    "h_31b8ea865a30bd": {
+      "author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
