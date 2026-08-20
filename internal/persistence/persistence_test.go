@@ -933,3 +933,87 @@ func TestEncryptedWALPlaintextReplayUnchanged(t *testing.T) {
 		t.Fatalf("expected 30 keys, got %d", engine.KeyCount())
 	}
 }
+
+// TestEncryptedNonceCounterSurvivesTruncateWithoutClose verifies that the nonce
+// counter does not regress when the WAL is truncated to walMagicLen (effectively
+// empty) without calling CloseShard. The sidecar must be persisted before
+// truncation in truncateWALLocked so a crash after truncation still has the
+// correct counter on restart.
+func TestEncryptedNonceCounterSurvivesTruncateWithoutClose(t *testing.T) {
+	dir := newTestDir(t)
+	ce := newCryptoEngine(t)
+
+	// Phase 1: open shard, write 10 records, close (persist sidecar).
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		if err := s.Write(0, fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i)), time.Time{}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
+
+	// Phase 2: reopen, write 5 more records (counter is now 15), then
+	// truncate to walMagicLen (empty WAL) WITHOUT CloseShard.
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard phase 2: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard phase 2: %v", err)
+	}
+	for i := 10; i < 15; i++ {
+		if err := s.Write(0, fmt.Sprintf("k%d", i), []byte(fmt.Sprintf("v%d", i)), time.Time{}); err != nil {
+			t.Fatalf("Write: %v", err)
+		}
+	}
+
+	h := s.getShard(0)
+	if h == nil {
+		t.Fatal("shard not found")
+	}
+	ctrBeforeTruncate := h.nonceCtr.Load()
+	if ctrBeforeTruncate != 15 {
+		t.Fatalf("counter before truncate = %d, want 15", ctrBeforeTruncate)
+	}
+
+	// Truncate WAL to magic-only (empty). Do NOT call CloseShard — simulates
+	// a crash after truncation but before graceful shutdown.
+	if err := s.TruncateWALTo(0, walMagicLen); err != nil {
+		t.Fatalf("TruncateWALTo: %v", err)
+	}
+
+	// Phase 3: simulate restart — reopen and replay. The sidecar must
+	// carry the counter forward even though the WAL is empty.
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
+	s2, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage phase 3: %v", err)
+	}
+	defer s2.CloseShard(0)
+	if err := s2.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard phase 3: %v", err)
+	}
+	engine2 := newTestEngine(t)
+	if err := s2.LoadShard(0, engine2); err != nil {
+		t.Fatalf("LoadShard phase 3: %v", err)
+	}
+
+	h2 := s2.getShard(0)
+	if h2 == nil {
+		t.Fatal("shard not found phase 3")
+	}
+	ctrAfterRestart := h2.nonceCtr.Load()
+	if ctrAfterRestart != 15 {
+		t.Fatalf("counter after restart = %d, want 15 (no regression from truncation)", ctrAfterRestart)
+	}
+}

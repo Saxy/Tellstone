@@ -473,6 +473,7 @@ func TestRBACConfigEnvVar(t *testing.T) {
 }
 
 func TestGetMaxMsgSizeDefault(t *testing.T) {
+	t.Setenv("TSD_MAX_MSG_SIZE", "")
 	cfg := LoadConfig(nil)
 	if cfg.GetMaxMsgSize() != 16*1024*1024 {
 		t.Fatalf("default maxMsgSize = %d, want %d", cfg.GetMaxMsgSize(), 16*1024*1024)
