@@ -1,0 +1,46 @@
+internal/cluster/integration_test.go
+  s_3a03e1470b7cc6::t_4dddc043cb5e24 408
+internal/cluster/network/transport.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 14-15
+internal/cluster/storage.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 238
+  s_3a03e1470b7cc6::t_a92d93eac839d7 138-141,152-159
+  s_3a03e1470b7cc6::t_543e64a3e58b55 217-220,228-231,234-237,239-241,244
+  s_3a03e1470b7cc6::t_6adedfbfd1cf67 272-276
+internal/cluster/proposals.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 12-13
+internal/cluster/fsm.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 14-17
+internal/cluster/network/codec.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 12-13,17,21-33,37-39
+internal/cluster/network/codec_test.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 697,705,707-708,718-721
+internal/cluster/manual_test.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 13-14,281-283
+server/server.go
+  s_3a03e1470b7cc6::t_4681c83c5b9b37 81,704-711
+internal/cluster/storage_test.go
+  s_3a03e1470b7cc6::t_0a88b5dd906d1a 155-297
+config/config_test.go
+  s_3a03e1470b7cc6::t_113a4a90961d90 554,565,568-569,571-576
+  s_3a03e1470b7cc6::t_01350a952aa205 500-502,509
+  s_3a03e1470b7cc6::t_c3322dcd2e9b7a 499,503-508,510-547,549-553,555-564,566-567,570,577-579
+  s_3a03e1470b7cc6::t_1c30ea141f7b07 548
+  s_3a03e1470b7cc6::t_dfacdefa31fde7 6,9
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "1603b33432289c1086a690d87248dc5bdc241d0d",
+  "prompts": {},
+  "sessions": {
+    "s_3a03e1470b7cc6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd28f255affeOOc6523JcrPORB",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
