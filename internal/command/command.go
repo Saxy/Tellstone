@@ -27,7 +27,10 @@ import (
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte, ttl time.Duration) error
-	Delete(key string) bool
+	// Delete removes a key and reports whether it existed. A non-nil error
+	// means the deletion did not happen (e.g. not leader in cluster mode);
+	// the boolean is only meaningful when err is nil.
+	Delete(key string) (bool, error)
 }
 
 // Reply is the transport-specific wire encoder.

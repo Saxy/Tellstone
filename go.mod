@@ -3,9 +3,11 @@ module github.com/Saxy/Tellstone
 go 1.26.5
 
 require (
+	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-echarts/go-echarts/v2 v2.7.2
 	github.com/panjf2000/gnet/v2 v2.10.0
+	go.etcd.io/raft/v3 v3.7.0
 	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.45.0
 	go.opentelemetry.io/otel/sdk v1.45.0
@@ -16,7 +18,6 @@ require (
 
 require (
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
-	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect

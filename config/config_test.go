@@ -3,8 +3,10 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -493,4 +495,85 @@ func TestGetMaxMsgSizeNonZero(t *testing.T) {
 	if cfg.GetMaxMsgSize() != 32*1024*1024 {
 		t.Fatalf("maxMsgSize(32MiB) = %d, want %d", cfg.GetMaxMsgSize(), 32*1024*1024)
 	}
+}
+
+// tryLoadClusterConfig runs LoadConfig in cluster mode and returns the
+// parsed config plus the panic message ("" when validation passed).
+func tryLoadClusterConfig(extra ...string) (cfg *Config, msg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg = fmt.Sprint(r)
+		}
+	}()
+	args := append([]string{"--cluster-mode"}, extra...)
+	return LoadConfig(args), ""
+}
+
+// TestClusterMembershipValidation pins the flag-time rejection of invalid
+// bootstrap membership: every case below must fail fast with a descriptive
+// panic instead of surfacing as a broken raft cluster after StartNode.
+func TestClusterMembershipValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "missing peers",
+			args: []string{"--node-id", "1"},
+			want: "at least one peer address",
+		},
+		{
+			name: "comma-only peers",
+			args: []string{"--peers", ",,,", "--node-id", "1"},
+			want: "at least one peer address",
+		},
+		{
+			name: "node-id zero",
+			args: []string{"--peers", "1@127.0.0.1:9001", "--node-id", "0"},
+			want: "requires --node-id",
+		},
+		{
+			name: "node-id absent from membership",
+			args: []string{"--peers", "1@127.0.0.1:9001,2@127.0.0.1:9002", "--node-id", "3"},
+			want: "not present in --peers",
+		},
+		{
+			name: "duplicate peer ids",
+			args: []string{"--peers", "1@127.0.0.1:9001,1@127.0.0.1:9002", "--node-id", "1"},
+			want: "duplicate node ID 1",
+		},
+		{
+			name: "explicit zero peer id",
+			args: []string{"--peers", "5@127.0.0.1:9001,0@127.0.0.1:9002", "--node-id", "5"},
+			want: "peer ID 0",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, msg := tryLoadClusterConfig(tc.args...)
+			if msg == "" {
+				t.Fatalf("LoadConfig(%v): expected panic containing %q, got none", tc.args, tc.want)
+			}
+			if !strings.Contains(msg, tc.want) {
+				t.Fatalf("panic message %q does not contain %q", msg, tc.want)
+			}
+		})
+	}
+
+	t.Run("valid membership passes", func(t *testing.T) {
+		cfg, msg := tryLoadClusterConfig(
+			"--peers", "1@127.0.0.1:9001,2@127.0.0.1:9002",
+			"--node-id", "2",
+		)
+		if msg != "" {
+			t.Fatalf("valid membership rejected: %s", msg)
+		}
+		if cfg.GetNodeID() != 2 {
+			t.Fatalf("node-id: got %d, want 2", cfg.GetNodeID())
+		}
+		if cfg.GetPeers() != "1@127.0.0.1:9001,2@127.0.0.1:9002" {
+			t.Fatalf("peers: got %q", cfg.GetPeers())
+		}
+	})
 }

@@ -12,12 +12,14 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/cluster"
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
@@ -55,6 +57,11 @@ type Config struct {
 	oauthClientID     string
 	snapshotInterval  time.Duration
 	snapshotBytes     uint64
+	// Cluster mode (Raft consensus per region).
+	clusterMode bool
+	nodeID      uint64
+	peerAddr    string
+	peers       string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -390,6 +397,31 @@ func LoadConfig(args []string) *Config {
 		"snapshot-bytes",
 		"WAL size threshold that triggers a snapshot (e.g. 64MiB); 0 disables size-based snapshots (default: 0, disabled)",
 	)
+	// Cluster mode: Raft consensus per region.
+	fs.BoolVar(
+		&cfg.clusterMode,
+		"cluster-mode",
+		getEnv("TSD_CLUSTER_MODE", false),
+		"Enable Raft consensus per region (default: false)",
+	)
+	fs.Uint64Var(
+		&cfg.nodeID,
+		"node-id",
+		getEnv("TSD_NODE_ID", uint64(0)),
+		"Unique node identifier; required (non-zero) when --cluster-mode is enabled and must appear in --peers (default: 0)",
+	)
+	fs.StringVar(
+		&cfg.peerAddr,
+		"peer-addr",
+		getEnv("TSD_PEER_ADDR", "0.0.0.0:9989"),
+		"Raft transport listen address (default: 0.0.0.0:9989)",
+	)
+	fs.StringVar(
+		&cfg.peers,
+		"peers",
+		getEnv("TSD_PEERS", ""),
+		"Comma-separated list of peer addresses for initial cluster bootstrap (default: none)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -442,6 +474,40 @@ func LoadConfig(args []string) *Config {
 	if !cfg.enablePersistence && (cfg.snapshotInterval > 0 || cfg.snapshotBytes > 0) {
 		panic("tellstone: --snapshot-interval and --snapshot-bytes require --enable-persistence")
 	}
+	// Cluster mode requires a parseable, non-empty bootstrap membership that
+	// includes this node. Parsing here — with the same ParsePeers the server
+	// startup path uses — rejects malformed membership at flag-validation
+	// time (empty lists, comma-only input, duplicate IDs, explicit ID 0)
+	// instead of surfacing as a broken raft cluster after StartNode.
+	if cfg.clusterMode {
+		peers, err := cluster.ParsePeers(cfg.peers)
+		if err != nil {
+			panic(fmt.Sprintf("tellstone: --peers: %v", err))
+		}
+		if len(peers) == 0 {
+			panic("tellstone: --cluster-mode requires --peers with at least one peer address")
+		}
+		if cfg.nodeID == 0 {
+			panic("tellstone: --cluster-mode requires --node-id to be set")
+		}
+		seen := make(map[uint64]struct{}, len(peers))
+		localFound := false
+		for _, p := range peers {
+			if p.ID == 0 {
+				panic("tellstone: --peers contains peer ID 0; IDs must be non-zero")
+			}
+			if _, dup := seen[p.ID]; dup {
+				panic(fmt.Sprintf("tellstone: --peers contains duplicate node ID %d", p.ID))
+			}
+			seen[p.ID] = struct{}{}
+			if p.ID == cfg.nodeID {
+				localFound = true
+			}
+		}
+		if !localFound {
+			panic("tellstone: --node-id is not present in --peers; the local node must be part of the bootstrap membership")
+		}
+	}
 	return cfg
 }
 
@@ -482,3 +548,7 @@ func (cfg *Config) GetOAuthIssuer() string             { return cfg.oauthIssuer 
 func (cfg *Config) GetOAuthClientID() string           { return cfg.oauthClientID }
 func (cfg *Config) GetSnapshotInterval() time.Duration { return cfg.snapshotInterval }
 func (cfg *Config) GetSnapshotBytes() uint64           { return cfg.snapshotBytes }
+func (cfg *Config) ClusterMode() bool                  { return cfg.clusterMode }
+func (cfg *Config) GetNodeID() uint64                  { return cfg.nodeID }
+func (cfg *Config) GetPeerAddr() string                { return cfg.peerAddr }
+func (cfg *Config) GetPeers() string                   { return cfg.peers }

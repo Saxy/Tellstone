@@ -55,7 +55,10 @@ const (
 type Store interface {
 	Get(key string) ([]byte, bool)
 	Set(key string, value []byte, ttl time.Duration) error
-	Delete(key string) bool
+	// Delete removes a key and reports whether it existed. A non-nil error
+	// means the deletion did not happen; the boolean is only meaningful
+	// when err is nil.
+	Delete(key string) (bool, error)
 }
 
 // authJob carries one AUTH verification request from the event loop to the

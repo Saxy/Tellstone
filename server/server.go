@@ -26,6 +26,7 @@ import (
 	"github.com/Saxy/Tellstone/config"
 	"github.com/Saxy/Tellstone/internal/app/tellstone"
 	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/cluster"
 	"github.com/Saxy/Tellstone/internal/command"
 	"github.com/Saxy/Tellstone/internal/crypto"
 	"github.com/Saxy/Tellstone/internal/log"
@@ -56,9 +57,9 @@ func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
 	return resp.Err
 }
 
-func (rs *RouterStore) Delete(key string) bool {
+func (rs *RouterStore) Delete(key string) (bool, error) {
 	resp := rs.router.Dispatch(shard.CmdDel, key, nil, 0)
-	return resp.OK
+	return resp.OK, resp.Err
 }
 
 // binCmdGet, binCmdSet and binCmdDel are the data-command tokens the binary
@@ -77,7 +78,11 @@ type Server struct {
 	shards []*shard.Shard
 	// rs adapts the router to the command layer's Store seam for the binary
 	// frontend. It is populated by initShards, before any connection is served.
-	rs          RouterStore
+	rs RouterStore
+	// store is the active Store implementation. In standalone mode it wraps rs
+	// directly; in cluster mode it wraps a clusterStore that routes writes
+	// through Raft consensus. Both the binary and RESP frontends use this.
+	store       command.Store
 	netSrv      *network.Server
 	respSrv     *resp.Server
 	metricsSrv  *http.Server
@@ -100,6 +105,10 @@ type Server struct {
 	// waits on it so that no in-flight Snapshot can race with shard engine
 	// closure. Nil when snapshots are not configured.
 	snapshotDone chan struct{}
+	// raftNode is the Raft consensus node for cluster mode. Nil when
+	// --cluster-mode is disabled. Shutdown stops it before closing shard
+	// engines so no in-flight apply can race the shutdown.
+	raftNode *cluster.Node
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -147,6 +156,17 @@ func (s *Server) Run() error {
 	defer stop()
 	if err = s.initShards(key, cryptoEngine, ctx); err != nil {
 		return fmt.Errorf("shard init: %w", err)
+	}
+	if cfg.ClusterMode() {
+		if err = s.initCluster(); err != nil {
+			return fmt.Errorf("cluster init: %w", err)
+		}
+	}
+	// Wire the active store: cluster-aware when cluster mode is on, plain
+	// router otherwise. Both the binary and RESP frontends use this.
+	s.store = &s.rs
+	if s.raftNode != nil {
+		s.store = newClusterStore(&s.rs, s.raftNode, s.app.GetLogger())
 	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
@@ -352,6 +372,11 @@ func (s *Server) shutdown(ctx context.Context) {
 		case <-ctx.Done():
 		}
 	}
+	// Stop the raft node before shards so no in-flight FSM apply can race
+	// a shard engine closure. Nil when cluster mode is disabled.
+	if s.raftNode != nil {
+		s.raftNode.Stop()
+	}
 	for _, sh := range s.shards {
 		if err := sh.Stop(ctx); err != nil {
 			if logger.Enabled(log.LevelError) {
@@ -537,7 +562,11 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	if s.policy != nil {
 		rbacMetrics = s.policy
 	}
-	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics, rbacMetrics)
+	var clusterMetrics metrics.ClusterMetrics
+	if s.raftNode != nil {
+		clusterMetrics = s.raftNode.Transport()
+	}
+	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics, rbacMetrics, clusterMetrics)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -565,10 +594,9 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 func (s *Server) startRESPServer() {
 	cfg := s.app.GetConfig()
 	logger := s.app.GetLogger()
-	store := &RouterStore{router: s.router}
 	respSrv := resp.NewServer(
 		cfg.GetRESPAddr(),
-		store,
+		s.store,
 		s.shards,
 		logger,
 		s.tlsConfigs,
@@ -653,6 +681,55 @@ func (s *Server) snapshotLoop(ctx context.Context, store *persistence.Storage, c
 	}
 }
 
+// initCluster creates and starts the Raft consensus node when --cluster-mode
+// is active. The node replicates write operations (SET/DEL) across the cluster
+// and applies committed entries to the local shards via a shardDispatcher that
+// uses the same FNV-1a routing as the normal request path.
+func (s *Server) initCluster() error {
+	cfg := s.app.GetConfig()
+	logger := s.app.GetLogger()
+
+	peers, err := cluster.ParsePeers(cfg.GetPeers())
+	if err != nil {
+		return fmt.Errorf("parse peers: %w", err)
+	}
+	// Defense in depth: config validation already rejects empty membership,
+	// but this is the point where the parsed list reaches cluster startup, so
+	// a zero-peer list must never pass here.
+	if len(peers) == 0 {
+		return fmt.Errorf("cluster mode requires at least one peer address in --peers")
+	}
+
+	nodeCfg := cluster.NodeConfig{
+		NodeID:        cfg.GetNodeID(),
+		PeerAddr:      cfg.GetPeerAddr(),
+		Peers:         peers,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		TickInterval:  100 * time.Millisecond,
+		Dispatcher:    newShardDispatcher(s.shards, logger),
+		Logger:        logger,
+	}
+
+	n, err := cluster.NewNode(nodeCfg)
+	if err != nil {
+		return fmt.Errorf("create raft node: %w", err)
+	}
+	if err = n.Start(); err != nil {
+		return fmt.Errorf("start raft node: %w", err)
+	}
+	s.raftNode = n
+
+	if logger.Enabled(log.LevelInfo) {
+		logger.Log(log.LevelInfo, "server: cluster mode enabled",
+			log.Uint64("node_id", cfg.GetNodeID()),
+			log.String("peer_addr", cfg.GetPeerAddr()),
+			log.Int("peers", len(peers)),
+		)
+	}
+	return nil
+}
+
 // networkHandler is the binary frontend's data handler. GET, SET and DEL run
 // through the shared command layer (lookup, validation, execution); the reply
 // is read back from the pooled BinaryReply the network layer attached to the
@@ -665,7 +742,7 @@ func (s *Server) networkHandler(msg *network.Message, c *command.Ctx) ([]byte, n
 	}
 	switch msg.Op {
 	case network.OpGet:
-		c.Store = &s.rs
+		c.Store = s.store
 		c.Args = append(c.Args, binCmdGet, msg.Key)
 		command.Execute(c)
 		payload, mtype := c.Reply.(*network.BinaryReply).Result()
@@ -674,7 +751,7 @@ func (s *Server) networkHandler(msg *network.Message, c *command.Ctx) ([]byte, n
 		if len(msg.Key) == 0 {
 			return network.ResponseEmptyKey, network.MsgError, nil
 		}
-		c.Store = &s.rs
+		c.Store = s.store
 		c.Args = append(c.Args, binCmdSet, msg.Key, msg.Value)
 		c.TTL = time.Duration(msg.TTL) * time.Millisecond
 		command.Execute(c)
@@ -687,7 +764,7 @@ func (s *Server) networkHandler(msg *network.Message, c *command.Ctx) ([]byte, n
 		payload, mtype := br.Result()
 		return payload, mtype, nil
 	case network.OpDelete:
-		c.Store = &s.rs
+		c.Store = s.store
 		c.Args = append(c.Args, binCmdDel, msg.Key)
 		command.Execute(c)
 		payload, mtype := c.Reply.(*network.BinaryReply).Result()

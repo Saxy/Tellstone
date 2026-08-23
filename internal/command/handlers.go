@@ -66,7 +66,12 @@ func del(c *Ctx) {
 	}
 	var n int64
 	for _, k := range c.Args[1:] {
-		if c.Store.Delete(alias(k)) {
+		ok, err := c.Store.Delete(alias(k))
+		if err != nil {
+			c.Reply.StorageErr(err)
+			return
+		}
+		if ok {
 			n++
 		}
 	}
