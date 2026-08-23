@@ -1,0 +1,50 @@
+server/cluster.go
+  s_3a03e1470b7cc6::t_8eeff5d68e3544 23,28-31,34,39,59-61
+  s_3a03e1470b7cc6::t_6df468a0ae3af8 128-137
+  s_3a03e1470b7cc6::t_c36b650ff1f4cc 155-159,166,175-184,192,194
+server/server.go
+  s_3a03e1470b7cc6::t_30064606339909 60,62
+  s_3a03e1470b7cc6::t_18e51a17c9ab83 696-701
+config/config.go
+  s_3a03e1470b7cc6::t_450f3f68850f2c 411
+  s_3a03e1470b7cc6::t_d98aeedded35aa 477-509
+  s_3a03e1470b7cc6::t_f5cf622b644757 15,22
+internal/cluster/network/transport.go
+  s_3a03e1470b7cc6::t_b1b0d0f465d44c 24,26-27
+  s_3a03e1470b7cc6::t_ae5c72ef3b8de2 411-414,431-434,445-447,449,460-463,469,488-493,496-498
+  s_3a03e1470b7cc6::t_84b6c04d3ef5e6 235-239,241-246
+  s_3a03e1470b7cc6::t_8a9794682524ae 376-378,386-388
+internal/cluster/network/codec.go
+  s_3a03e1470b7cc6::t_ca1294aeb7205c 49
+  s_3a03e1470b7cc6::t_0086469cb9b9e5 762-765,768
+  s_3a03e1470b7cc6::t_b49998f38a088b 81-89,106
+internal/command/handlers.go
+  s_3a03e1470b7cc6::t_366a3fcaf01707 69-74
+internal/resp/server_test.go
+  s_3a03e1470b7cc6::t_25193254d428d5 46,51
+internal/cluster/fsm.go
+  s_3a03e1470b7cc6::t_0c5790a00bd4a7 66-74,76-80,91,95,97-99,105
+  s_3a03e1470b7cc6::t_108257b389af37 28
+internal/resp/server.go
+  s_3a03e1470b7cc6::t_123fa54b0fcddb 58-61
+internal/command/command_test.go
+  s_3a03e1470b7cc6::t_91fe12d70ea538 45,48
+internal/command/command.go
+  s_3a03e1470b7cc6::t_db829b3219d104 30-33
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "718873444e7398c6717eb9510a6a3cff99862f83",
+  "prompts": {},
+  "sessions": {
+    "s_3a03e1470b7cc6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd28f255affeOOc6523JcrPORB",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
