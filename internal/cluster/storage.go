@@ -228,7 +228,6 @@ func (s *Storage) SetSnapshot(snap *pb.Snapshot) {
 	// A snapshot at or behind the current boundary (last compacted or
 	// snapshotted index) is stale: record it but move nothing.
 	if idx <= s.firstIndex()-1 {
-		s.snapshot = snap
 		return
 	}
 	s.snapshot = snap
