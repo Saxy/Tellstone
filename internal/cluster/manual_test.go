@@ -49,26 +49,30 @@ type manualServer struct {
 	started    bool
 }
 
+// manualRepoRoot returns the repository root, derived from this file's own
+// location so the build works from any checkout on any machine (including CI).
+func manualRepoRoot(t *testing.T) string {
+	t.Helper()
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot determine repo root: runtime.Caller failed")
+	}
+	// This file lives in <repo>/internal/cluster/ — two levels up is the root.
+	return filepath.Join(filepath.Dir(file), "..", "..")
+}
+
 // manualBuild compiles the tellstone binary for the manual test.
 func manualBuild(t *testing.T) string {
 	t.Helper()
 	bin := manualBinaryPath
 	cmd := exec.Command("go", "build", "-o", bin, "./cmd/tellstone/")
-	cmd.Dir = filepath.Join(os.Getenv("GOPATH"), "src/github.com/Saxy/Tellstone")
-	if cmd.Dir == "" || !dirExists(cmd.Dir) {
-		cmd.Dir = "/home/maxhagen/projects/saxy/github/Tellstone"
-	}
+	cmd.Dir = manualRepoRoot(t)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("build tellstone: %v\n%s", err, out)
 	}
 	t.Logf("built binary: %s", bin)
 	return bin
-}
-
-func dirExists(path string) bool {
-	info, err := os.Stat(path)
-	return err == nil && info.IsDir()
 }
 
 // manualStartCluster starts n Tellstone processes with --cluster-mode.
@@ -274,10 +278,14 @@ func connectTo(addr string) (net.Conn, error) {
 }
 
 // TestManual is the end-to-end manual integration test.
-// Run with: go test -v -race -count=1 -run=TestManual ./internal/cluster/ -timeout=60s
+// Run with: TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
+//     -run=TestManual ./internal/cluster/ -timeout=60s
 func TestManual(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping manual test in short mode")
+	}
+	if os.Getenv("TELLSTONE_MANUAL_TEST") == "" {
+		t.Skip("manual cluster test only runs with TELLSTONE_MANUAL_TEST=1")
 	}
 
 	t.Log("=== MANUAL CLUSTER TEST ===")
