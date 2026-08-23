@@ -16,6 +16,7 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -168,6 +169,27 @@ func startTestCluster(t *testing.T) (nodes []*Node, dispatchers []*testDispatche
 	return nodes, dispatchers, cleanup
 }
 
+// waitForLeader polls until one of the nodes reports leadership and returns
+// it. Fails the test on timeout instead of leaving a nil leader (or a default
+// index of 0) behind for the caller to trip over.
+func waitForLeader(t *testing.T, nodes []*Node) *Node {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for {
+		select {
+		case <-deadline:
+			t.Fatal("timeout waiting for leader election")
+		default:
+		}
+		for _, n := range nodes {
+			if n.IsLeader() {
+				return n
+			}
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
 // waitForApplied waits until all dispatchers have processed at least n
 // operations. Returns an error on timeout.
 func waitForApplied(dispatchers []*testDispatcher, n int64, timeout time.Duration) error {
@@ -213,15 +235,12 @@ func TestClusterProposeAndWaitSet(t *testing.T) {
 	nodes, dispatchers, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	var leader *Node
-	for _, n := range nodes {
-		if n.IsLeader() {
-			leader = n
-			break
-		}
-	}
+	leader := waitForLeader(t, nodes)
 
-	data := EncodeSet("hello", []byte("world"), 0)
+	data, err := EncodeSet("hello", []byte("world"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := leader.ProposeAndWait(ctx, data); err != nil {
@@ -249,16 +268,13 @@ func TestClusterProposeAndWaitDel(t *testing.T) {
 	nodes, dispatchers, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	var leader *Node
-	for _, n := range nodes {
-		if n.IsLeader() {
-			leader = n
-			break
-		}
-	}
+	leader := waitForLeader(t, nodes)
 
 	// SET first.
-	setData := EncodeSet("toDelete", []byte("val"), 0)
+	setData, err := EncodeSet("toDelete", []byte("val"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := leader.ProposeAndWait(ctx, setData); err != nil {
@@ -269,7 +285,10 @@ func TestClusterProposeAndWaitDel(t *testing.T) {
 	}
 
 	// DEL.
-	delData := EncodeDel("toDelete")
+	delData, err := EncodeDel("toDelete")
+	if err != nil {
+		t.Fatalf("EncodeDel: %v", err)
+	}
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel2()
 	if err := leader.ProposeAndWait(ctx2, delData); err != nil {
@@ -293,19 +312,16 @@ func TestClusterMultipleWrites(t *testing.T) {
 	nodes, dispatchers, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	var leader *Node
-	for _, n := range nodes {
-		if n.IsLeader() {
-			leader = n
-			break
-		}
-	}
+	leader := waitForLeader(t, nodes)
 
 	const writeCount = 20
 	for i := 0; i < writeCount; i++ {
 		key := fmt.Sprintf("key-%d", i)
 		value := fmt.Sprintf("val-%d", i)
-		data := EncodeSet(key, []byte(value), 0)
+		data, derr := EncodeSet(key, []byte(value), 0)
+		if derr != nil {
+			t.Fatalf("EncodeSet key-%d: %v", i, derr)
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		if err := leader.ProposeAndWait(ctx, data); err != nil {
 			cancel()
@@ -351,10 +367,13 @@ func TestClusterNonLeaderRejectsPropose(t *testing.T) {
 		t.Fatal("no follower found")
 	}
 
-	data := EncodeSet("nope", []byte("nope"), 0)
+	data, err := EncodeSet("nope", []byte("nope"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	err := follower.ProposeAndWait(ctx, data)
+	err = follower.ProposeAndWait(ctx, data)
 	if err != ErrNotLeader {
 		t.Fatalf("expected ErrNotLeader, got: %v", err)
 	}
@@ -367,12 +386,9 @@ func TestClusterProposalTimeout(t *testing.T) {
 	nodes, _, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	var leaderIdx int
-	for i, n := range nodes {
-		if n.IsLeader() {
-			leaderIdx = i
-			break
-		}
+	leaderIdx := slices.Index(nodes, waitForLeader(t, nodes))
+	if leaderIdx < 0 {
+		t.Fatal("leader disappeared before index lookup")
 	}
 
 	// Stop the leader to prevent commit.
@@ -383,7 +399,10 @@ func TestClusterProposalTimeout(t *testing.T) {
 	time.Sleep(2 * time.Second)
 
 	// Attempt to propose on the stopped node — should fail.
-	data := EncodeSet("timeout-test", []byte("val"), 0)
+	data, err := EncodeSet("timeout-test", []byte("val"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
 	err := nodes[leaderIdx].ProposeAndWait(ctx, data)
@@ -398,23 +417,27 @@ func TestClusterSetThenOverwrite(t *testing.T) {
 	nodes, dispatchers, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	var leader *Node
-	for _, n := range nodes {
-		if n.IsLeader() {
-			leader = n
-			break
-		}
-	}
+	leader := waitForLeader(t, nodes)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := leader.ProposeAndWait(ctx, EncodeSet("overwrite", []byte("v1"), 0)); err != nil {
+	v1, eerr := EncodeSet("overwrite", []byte("v1"), 0)
+	if eerr != nil {
+		cancel()
+		t.Fatalf("EncodeSet v1: %v", eerr)
+	}
+	if err := leader.ProposeAndWait(ctx, v1); err != nil {
 		cancel()
 		t.Fatalf("ProposeAndWait v1: %v", err)
 	}
 	cancel()
 
 	ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
-	if err := leader.ProposeAndWait(ctx2, EncodeSet("overwrite", []byte("v2"), 0)); err != nil {
+	v2, eerr := EncodeSet("overwrite", []byte("v2"), 0)
+	if eerr != nil {
+		cancel2()
+		t.Fatalf("EncodeSet v2: %v", eerr)
+	}
+	if err := leader.ProposeAndWait(ctx2, v2); err != nil {
 		cancel2()
 		t.Fatalf("ProposeAndWait v2: %v", err)
 	}
@@ -442,13 +465,7 @@ func TestClusterConcurrentProposals(t *testing.T) {
 	nodes, dispatchers, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	var leader *Node
-	for _, n := range nodes {
-		if n.IsLeader() {
-			leader = n
-			break
-		}
-	}
+	leader := waitForLeader(t, nodes)
 
 	const goroutines = 10
 	const writesPerGoroutine = 5
@@ -464,7 +481,12 @@ func TestClusterConcurrentProposals(t *testing.T) {
 			for w := 0; w < writesPerGoroutine; w++ {
 				key := fmt.Sprintf("g%d-w%d", gID, w)
 				value := fmt.Sprintf("v%d-%d", gID, w)
-				data := EncodeSet(key, []byte(value), 0)
+				data, derr := EncodeSet(key, []byte(value), 0)
+				if derr != nil {
+					errCh <- fmt.Errorf("goroutine %d write %d encode: %w", gID, w, derr)
+					cancel()
+					return
+				}
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 				if err := leader.ProposeAndWait(ctx, data); err != nil {
 					errCh <- fmt.Errorf("goroutine %d write %d: %w", gID, w, err)
@@ -501,15 +523,12 @@ func TestClusterTTLReplication(t *testing.T) {
 	nodes, dispatchers, cleanup := startTestCluster(t)
 	defer cleanup()
 
-	var leader *Node
-	for _, n := range nodes {
-		if n.IsLeader() {
-			leader = n
-			break
-		}
-	}
+	leader := waitForLeader(t, nodes)
 
-	data := EncodeSet("ttlkey", []byte("ttlval"), 30*time.Second)
+	data, err := EncodeSet("ttlkey", []byte("ttlval"), 30*time.Second)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := leader.ProposeAndWait(ctx, data); err != nil {

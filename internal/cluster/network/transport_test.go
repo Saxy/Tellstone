@@ -204,7 +204,11 @@ func TestTransportStatsBatchingRatio(t *testing.T) {
 		}
 		transports[i] = tr
 	}
-	defer func() { for _, t := range transports { t.Stop() } }()
+	defer func() {
+		for _, tr := range transports {
+			tr.Stop()
+		}
+	}()
 
 	// Sender (node 1).
 	sender := NewTransport("127.0.0.1:0", 1, handler, logger)

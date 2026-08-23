@@ -30,6 +30,18 @@ import (
 // current Raft leader. Callers should redirect the client to the leader.
 var ErrNotLeader = errors.New("cluster: not leader")
 
+const (
+	// logCompactionThreshold compacts the local raft log once this many
+	// entries have been applied since the previous compaction. The storage
+	// is in-memory, so without periodic compaction the entry slice grows
+	// without bound on a long-running leader.
+	logCompactionThreshold = 8192
+	// logRetention keeps this many applied entries behind the compaction
+	// point so lagging followers can still catch up from us instead of
+	// needing a full snapshot resend.
+	logRetention = 4096
+)
+
 // NodeConfig holds the parameters for creating a new Raft node.
 type NodeConfig struct {
 	NodeID        uint64
@@ -61,6 +73,9 @@ type Node struct {
 	// appliedIndex is the highest Raft log index applied to the FSM. Updated
 	// atomically by processReady after each committed entry is applied.
 	appliedIndex uint64
+	// lastCompacted is the log index through which storage has been
+	// compacted. Only touched by the readyLoop goroutine, so no lock needed.
+	lastCompacted uint64
 }
 
 // NewNode creates a new Raft node but does not start it. Call Start() to
@@ -311,6 +326,24 @@ func (n *Node) processReady(rd raft.Ready) {
 			}
 			if atomic.CompareAndSwapUint64(&n.appliedIndex, cur, idx) {
 				break
+			}
+		}
+	}
+
+	// 4. Periodically compact the log through an entry safely behind the
+	// applied index. Compaction only ever advances to applied-retention, so
+	// entries still needed by lagging followers remain available; raft never
+	// reads its own storage past the applied point.
+	applied := atomic.LoadUint64(&n.appliedIndex)
+	if applied-n.lastCompacted >= logCompactionThreshold {
+		compactTo := applied - logRetention
+		if first, err := n.storage.FirstIndex(); err == nil && compactTo >= first {
+			n.storage.Compact(compactTo)
+			n.lastCompacted = compactTo
+			if n.cfg.Logger.Enabled(log.LevelDebug) {
+				n.cfg.Logger.Log(log.LevelDebug, "cluster: log compacted",
+					log.Uint64("through_index", compactTo),
+				)
 			}
 		}
 	}

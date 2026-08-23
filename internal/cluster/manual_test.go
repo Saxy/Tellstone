@@ -377,6 +377,7 @@ func TestManual(t *testing.T) {
 		addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
 		conn, err := connectTo(addr)
 		if err != nil {
+			t.Errorf("node %d: connect failed during read verification: %v", s.id, err)
 			t.Logf("  node %d: connect failed: %v", s.id, err)
 			continue
 		}
@@ -398,14 +399,27 @@ func TestManual(t *testing.T) {
 		conn.Close()
 	}
 
+	// Assert the read results instead of only logging them: every written
+	// key must be present with its exact value on every node.
+	want := make(map[string]string, len(writes))
+	for _, w := range writes {
+		want[w.key] = w.value
+	}
 	for _, r := range allResults {
 		if r.err != nil {
+			t.Errorf("node %d GET %s: error %v", r.nodeID, r.key, r.err)
 			t.Logf("  node %d GET %s: ERROR %v", r.nodeID, r.key, r.err)
-		} else if r.found {
-			t.Logf("  node %d GET %s = %q ✓", r.nodeID, r.key, r.value)
-		} else {
-			t.Logf("  node %d GET %s = NOT_FOUND (%s)", r.nodeID, r.key, r.value)
+			continue
 		}
+		if !r.found {
+			t.Errorf("node %d GET %s: NOT_FOUND, want %q", r.nodeID, r.key, want[r.key])
+			t.Logf("  node %d GET %s = NOT_FOUND (%s)", r.nodeID, r.key, r.value)
+			continue
+		}
+		if r.value != want[r.key] {
+			t.Errorf("node %d GET %s = %q, want %q", r.nodeID, r.key, r.value, want[r.key])
+		}
+		t.Logf("  node %d GET %s = %q ✓", r.nodeID, r.key, r.value)
 	}
 
 	// --- Verify DEL replication ---
@@ -424,18 +438,23 @@ func TestManual(t *testing.T) {
 		addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
 		conn, err := connectTo(addr)
 		if err != nil {
+			t.Errorf("node %d: connect failed during delete verification: %v", s.id, err)
 			t.Logf("  node %d: connect failed: %v", s.id, err)
 			continue
 		}
 		val, msgType, err := binaryGet(conn, "name")
 		conn.Close()
 		if err != nil {
+			t.Errorf("node %d GET name: error %v", s.id, err)
 			t.Logf("  node %d GET name: ERROR %v", s.id, err)
-		} else if msgType == 0x07 {
-			t.Logf("  node %d GET name = NOT_FOUND ✓ (deleted)", s.id)
-		} else {
-			t.Logf("  node %d GET name = %q (expected NOT_FOUND)", s.id, val)
+			continue
 		}
+		if msgType != 0x07 {
+			t.Errorf("node %d GET name = %q, want NOT_FOUND (msgType 0x07) after delete", s.id, val)
+			t.Logf("  node %d GET name = %q (expected NOT_FOUND)", s.id, val)
+			continue
+		}
+		t.Logf("  node %d GET name = NOT_FOUND ✓ (deleted)", s.id)
 	}
 
 	t.Log("")

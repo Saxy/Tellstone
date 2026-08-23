@@ -1,3 +1,14 @@
+/*
+Package cluster
+Tellstone Cloud-Native In-Memory Database
+File: config_test.go
+Description: Unit tests for cluster configuration parsing: peer list
+parsing, address-hash ID derivation, and bootstrap membership helpers.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package cluster
 
 import (

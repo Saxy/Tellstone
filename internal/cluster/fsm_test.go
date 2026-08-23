@@ -1,7 +1,19 @@
+/*
+Package cluster
+Tellstone Cloud-Native In-Memory Database
+File: fsm_test.go
+Description: Tests for the raft finite state machine and its binary log
+entry codec: SET/DEL encode-decode round trips and apply dispatch.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package cluster
 
 import (
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,7 +42,10 @@ func TestApplySet(t *testing.T) {
 	md := &mockDispatcher{}
 	fsm := NewFSM(md, log.NewNoOpLogger())
 
-	data := EncodeSet("hello", []byte("world"), 5*time.Second)
+	data, err := EncodeSet("hello", []byte("world"), 5*time.Second)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	entry := &pb.Entry{Data: data}
 	if err := fsm.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -53,7 +68,10 @@ func TestApplyDel(t *testing.T) {
 	md := &mockDispatcher{}
 	fsm := NewFSM(md, log.NewNoOpLogger())
 
-	data := EncodeDel("foo")
+	data, err := EncodeDel("foo")
+	if err != nil {
+		t.Fatalf("EncodeDel: %v", err)
+	}
 	entry := &pb.Entry{Data: data}
 	if err := fsm.Apply(entry); err != nil {
 		t.Fatalf("Apply: %v", err)
@@ -89,7 +107,10 @@ func TestApplyDispatchError(t *testing.T) {
 	ed := &errDispatcher{}
 	fsm := NewFSM(ed, log.NewNoOpLogger())
 
-	data := EncodeSet("k", []byte("v"), 0)
+	data, err := EncodeSet("k", []byte("v"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	entry := &pb.Entry{Data: data}
 	if err := fsm.Apply(entry); err == nil {
 		t.Fatal("expected error from dispatcher")
@@ -101,7 +122,10 @@ func TestEncodeDecodeSet(t *testing.T) {
 	value := []byte("world")
 	ttl := 5 * time.Second
 
-	encoded := EncodeSet(key, value, ttl)
+	encoded, err := EncodeSet(key, value, ttl)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	op, gotKey, gotValue, gotTTL, err := DecodeLogEntry(encoded)
 	if err != nil {
 		t.Fatalf("DecodeLogEntry: %v", err)
@@ -122,7 +146,10 @@ func TestEncodeDecodeSet(t *testing.T) {
 
 func TestEncodeDecodeDel(t *testing.T) {
 	key := "foo"
-	encoded := EncodeDel(key)
+	encoded, err := EncodeDel(key)
+	if err != nil {
+		t.Fatalf("EncodeDel: %v", err)
+	}
 	op, gotKey, gotValue, gotTTL, err := DecodeLogEntry(encoded)
 	if err != nil {
 		t.Fatalf("DecodeLogEntry: %v", err)
@@ -142,7 +169,10 @@ func TestEncodeDecodeDel(t *testing.T) {
 }
 
 func TestEncodeDecodeSetZeroTTL(t *testing.T) {
-	encoded := EncodeSet("k", []byte("v"), 0)
+	encoded, err := EncodeSet("k", []byte("v"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	op, _, _, gotTTL, err := DecodeLogEntry(encoded)
 	if err != nil {
 		t.Fatalf("DecodeLogEntry: %v", err)
@@ -160,7 +190,10 @@ func TestEncodeDecodeLargeValue(t *testing.T) {
 	for i := range value {
 		value[i] = byte(i % 256)
 	}
-	encoded := EncodeSet("big", value, time.Minute)
+	encoded, err := EncodeSet("big", value, time.Minute)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	_, _, gotValue, _, err := DecodeLogEntry(encoded)
 	if err != nil {
 		t.Fatalf("DecodeLogEntry: %v", err)
@@ -186,5 +219,48 @@ func TestDecodeLogEntryKeyTooLong(t *testing.T) {
 	_, _, _, _, err := DecodeLogEntry(buf)
 	if err == nil {
 		t.Fatal("expected error for oversized key length")
+	}
+}
+
+func TestEncodeKeyExceedsWireFormat(t *testing.T) {
+	// A 65536-byte key cannot fit the uint16 length field. The encoders must
+	// reject it — truncating the length would silently corrupt the entry for
+	// every replica decoding it.
+	tooBig := strings.Repeat("x", maxKeyLen+1)
+	if _, err := EncodeSet(tooBig, []byte("v"), 0); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("EncodeSet(65536-byte key): got %v, want ErrKeyTooLarge", err)
+	}
+	if _, err := EncodeDel(tooBig); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("EncodeDel(65536-byte key): got %v, want ErrKeyTooLarge", err)
+	}
+}
+
+func TestEncodeKeyAtWireFormatBoundary(t *testing.T) {
+	// Exactly maxKeyLen (65535) bytes must still encode and decode intact.
+	maxKey := strings.Repeat("k", maxKeyLen)
+	data, err := EncodeSet(maxKey, []byte("val"), time.Second)
+	if err != nil {
+		t.Fatalf("EncodeSet(65535-byte key): %v", err)
+	}
+	op, gotKey, gotValue, gotTTL, err := DecodeLogEntry(data)
+	if err != nil {
+		t.Fatalf("DecodeLogEntry: %v", err)
+	}
+	if op != OpSet || gotKey != maxKey || string(gotValue) != "val" || gotTTL != time.Second {
+		t.Fatalf("round trip mismatch: op=%d keyLen=%d value=%q ttl=%v",
+			op, len(gotKey), gotValue, gotTTL)
+	}
+
+	delData, err := EncodeDel(maxKey)
+	if err != nil {
+		t.Fatalf("EncodeDel(65535-byte key): %v", err)
+	}
+	op, gotKey, gotValue, _, err = DecodeLogEntry(delData)
+	if err != nil {
+		t.Fatalf("DecodeLogEntry(del): %v", err)
+	}
+	if op != OpDel || gotKey != maxKey || len(gotValue) != 0 {
+		t.Fatalf("del round trip mismatch: op=%d keyLen=%d valueLen=%d",
+			op, len(gotKey), len(gotValue))
 	}
 }

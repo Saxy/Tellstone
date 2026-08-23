@@ -627,10 +627,14 @@ func encodeSnapshotAppend(buf []byte, s *pb.Snapshot) []byte {
 }
 
 func encodeConfStateAppend(buf []byte, cs *pb.ConfState) []byte {
+	// Nil ConfState encodes identically to an empty ConfState and the field
+	// set is written directly with no leading presence byte — decodeConfState
+	// always reads voters/learners/votersOutgoing/learnersNext/autoleave in
+	// that order. The old presence byte shifted every subsequent field,
+	// corrupting snapshots encoded by this batching path.
 	if cs == nil {
-		return append(buf, 0)
+		cs = &pb.ConfState{}
 	}
-	buf = append(buf, 1)
 	buf = appendVarint(buf, uint64(len(cs.GetVoters())))
 	for _, v := range cs.GetVoters() {
 		buf = appendVarint(buf, v)
@@ -669,13 +673,16 @@ func appendVarint(buf []byte, v uint64) []byte {
 // Errors
 // ---------------------------------------------------------------------------
 
+// Distinct sentinel errors for every transport failure condition, so
+// errors.Is can tell them apart. Aliasing several names to the same io error
+// made e.g. errUnknownPeer and errSendQueueFull indistinguishable.
 var (
-	errTransportStopped = io.ErrClosedPipe
-	errNoDestination    = io.ErrShortWrite
-	errUnknownPeer      = io.ErrNoProgress
-	errDialFailed       = io.ErrShortWrite
-	errConnectionClosed = io.ErrClosedPipe
-	errSendQueueFull    = io.ErrNoProgress
+	errTransportStopped = errors.New("cluster network: transport stopped")
+	errNoDestination    = errors.New("cluster network: message has no destination peer")
+	errUnknownPeer      = errors.New("cluster network: unknown peer")
+	errDialFailed       = errors.New("cluster network: dial failed")
+	errConnectionClosed = errors.New("cluster network: connection closed")
+	errSendQueueFull    = errors.New("cluster network: send queue full")
 )
 
 // ---------------------------------------------------------------------------

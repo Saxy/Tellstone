@@ -1,3 +1,14 @@
+/*
+Package cluster
+Tellstone Cloud-Native In-Memory Database
+File: storage_test.go
+Description: Tests for the in-memory raft.Storage implementation: log
+append/compact/snapshot behavior and index-term boundary lookups.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package cluster
 
 import (

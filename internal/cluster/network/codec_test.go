@@ -129,7 +129,10 @@ func TestCodecRoundTrip(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			batch := []*pb.Message{tt.msg}
-			frame := EncodeBatch(batch)
+			frame, err := EncodeBatch(batch)
+			if err != nil {
+				t.Fatalf("EncodeBatch: %v", err)
+			}
 			// Strip the 4-byte length prefix to get the payload.
 			payload := frame[4:]
 			got, err := DecodeBatch(payload)
@@ -157,7 +160,10 @@ func TestCodecBatchRoundTrip(t *testing.T) {
 		{Type: pbTypePtr(pb.MsgAppResp), To: uint64Ptr(1), From: uint64Ptr(3), Term: uint64Ptr(3), Index: uint64Ptr(4)},
 	}
 
-	frame := EncodeBatch(batch)
+	frame, eerr := EncodeBatch(batch)
+	if eerr != nil {
+		t.Fatalf("EncodeBatch: %v", eerr)
+	}
 	payload := frame[4:]
 	got, err := DecodeBatch(payload)
 	if err != nil {
@@ -187,7 +193,10 @@ func TestCodecSingleFrameProvesBatching(t *testing.T) {
 		}
 	}
 
-	frame := EncodeBatch(batch)
+	frame, err := EncodeBatch(batch)
+	if err != nil {
+		t.Fatalf("EncodeBatch: %v", err)
+	}
 
 	// Start a TCP server that reads exactly one frame.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -281,13 +290,19 @@ func TestCodecBatchSizeProvesPacketReduction(t *testing.T) {
 	// Without batching: each message is its own 4-byte header + payload.
 	individualWrites := 0
 	for _, m := range msgs {
-		single := EncodeBatch([]*pb.Message{m})
+		single, serr := EncodeBatch([]*pb.Message{m})
+		if serr != nil {
+			t.Fatalf("EncodeBatch(single): %v", serr)
+		}
 		individualWrites++
 		_ = single
 	}
 
 	// With batching: all messages in a single frame.
-	batched := EncodeBatch(msgs)
+	batched, berr := EncodeBatch(msgs)
+	if berr != nil {
+		t.Fatalf("EncodeBatch: %v", berr)
+	}
 	payload := batched[4:]
 	decoded, err := DecodeBatch(payload)
 	if err != nil {
@@ -374,8 +389,8 @@ func assertMessagesEqual(t *testing.T, want, got *pb.Message) {
 	}
 }
 
-func pbTypePtr(t pb.MessageType) *pb.MessageType   { return &t }
-func entryTypePtr(t pb.EntryType) *pb.EntryType { return &t }
+func pbTypePtr(t pb.MessageType) *pb.MessageType { return &t }
+func entryTypePtr(t pb.EntryType) *pb.EntryType  { return &t }
 
 // ---------------------------------------------------------------------------
 // Malformed frame tests — verify the codec rejects adversarial payloads
@@ -405,15 +420,18 @@ func TestDecodeBatchZeroCount(t *testing.T) {
 
 func TestDecodeBatchTruncatedPayload(t *testing.T) {
 	// Valid header: count=3, but only enough bytes for 1 message.
-	good := EncodeBatch([]*pb.Message{
+	good, err := EncodeBatch([]*pb.Message{
 		{Type: pbTypePtr(pb.MsgApp), To: uint64Ptr(1)},
 	})
+	if err != nil {
+		t.Fatalf("EncodeBatch: %v", err)
+	}
 	if len(good) < 6 {
 		t.Fatal("good frame too short for test")
 	}
 	// Truncate: claim 3 messages but provide data for only 1.
 	truncated := good[:6]
-	_, err := DecodeBatch(truncated[4:])
+	_, err = DecodeBatch(truncated[4:])
 	if err != errCodecFrame {
 		t.Fatalf("expected errCodecFrame for truncated payload, got %v", err)
 	}
@@ -443,9 +461,12 @@ func TestDecodeBatchSingleMsgTrailingBytes(t *testing.T) {
 	// DecodeBatch should still succeed (it only reads `count` messages).
 	// Trailing bytes are not an error — the frame length prefix already
 	// bounded the read.
-	good := EncodeBatch([]*pb.Message{
+	good, err := EncodeBatch([]*pb.Message{
 		{Type: pbTypePtr(pb.MsgHeartbeat), To: uint64Ptr(1), From: uint64Ptr(2)},
 	})
+	if err != nil {
+		t.Fatalf("EncodeBatch: %v", err)
+	}
 	extra := append(good, 0xDE, 0xAD)
 	msgs, err := DecodeBatch(extra[4:])
 	if err != nil {
@@ -528,7 +549,10 @@ func TestSnapshotNilConfStateRoundTrip(t *testing.T) {
 		Term:     uint64Ptr(3),
 		Snapshot: snap,
 	}
-	frame := EncodeBatch([]*pb.Message{msg})
+	frame, err := EncodeBatch([]*pb.Message{msg})
+	if err != nil {
+		t.Fatalf("EncodeBatch: %v", err)
+	}
 	decoded, err := DecodeBatch(frame[4:])
 	if err != nil {
 		t.Fatalf("DecodeBatch: %v", err)
@@ -565,7 +589,10 @@ func TestSnapshotNilMetadataRoundTrip(t *testing.T) {
 		To:       uint64Ptr(2),
 		Snapshot: snap,
 	}
-	frame := EncodeBatch([]*pb.Message{msg})
+	frame, err := EncodeBatch([]*pb.Message{msg})
+	if err != nil {
+		t.Fatalf("EncodeBatch: %v", err)
+	}
 	decoded, err := DecodeBatch(frame[4:])
 	if err != nil {
 		t.Fatalf("DecodeBatch: %v", err)
@@ -619,4 +646,139 @@ func assertConfStatesEqual(t *testing.T, want, got *pb.ConfState) {
 	if len(got.GetLearnersNext()) != len(want.GetLearnersNext()) {
 		t.Errorf("LearnersNext: got %d, want %d", len(got.GetLearnersNext()), len(want.GetLearnersNext()))
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Batch count and length-prefix overflow regression tests — a 1-byte message
+// count or a near-uint64-max varint length must be rejected (or split by the
+// sender), never silently wrap.
+// ---------------------------------------------------------------------------
+
+// maxVarint is the 10-byte little-endian varint encoding of math.MaxUint64.
+var maxVarint = []byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01}
+
+func TestEncodeBatchRejectsOversizedBatch(t *testing.T) {
+	// One over the wire limit must be rejected, not wrapped into the low
+	// byte of the count field.
+	msgs := make([]*pb.Message, maxBatchCount+1)
+	for i := range msgs {
+		msgs[i] = &pb.Message{Type: pbTypePtr(pb.MsgHeartbeat), To: uint64Ptr(uint64(i + 1))}
+	}
+	if _, err := EncodeBatch(msgs); err == nil {
+		t.Fatal("expected error for batch exceeding maxBatchCount, got nil")
+	}
+
+	// Exactly maxBatchCount must still encode and decode faithfully.
+	atLimit := msgs[:maxBatchCount]
+	frame, err := EncodeBatch(atLimit)
+	if err != nil {
+		t.Fatalf("EncodeBatch(maxBatchCount): %v", err)
+	}
+	got, err := DecodeBatch(frame[4:])
+	if err != nil {
+		t.Fatalf("DecodeBatch: %v", err)
+	}
+	if len(got) != maxBatchCount {
+		t.Fatalf("decoded %d messages, want %d", len(got), maxBatchCount)
+	}
+}
+
+func TestDecodeMalformedLengthPrefixes(t *testing.T) {
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{
+			name: "context_length_overflow",
+			// count=1 | MsgApp | bitmask(fieldContext) | varint MaxUint64
+			payload: append([]byte{
+				1,
+				byte(pb.MsgApp),
+				byte(fieldContext >> 8), byte(fieldContext&0xFF),
+			}, maxVarint...),
+		},
+		{
+			name: "entry_data_length_overflow",
+			// count=1 | MsgApp | bitmask(fieldEntries) | entries=1 |
+			// entry(type=0, term=1, index=1, dataLen=MaxUint64)
+			payload: func() []byte {
+				p := []byte{1, byte(pb.MsgApp), byte(fieldEntries >> 8), byte(fieldEntries&0xFF), 1,
+					0} // entry type
+				p = append(p, 1)        // term
+				p = append(p, 1)        // index
+				p = append(p, maxVarint...) // data length
+				return p
+			}(),
+		},
+		{
+			name: "snapshot_data_length_overflow",
+			// count=1 | MsgSnap | bitmask(fieldSnapshot) | snapshot present |
+			// index=1 | term=1 | empty ConfState | dataLen=MaxUint64
+			payload: func() []byte {
+				p := []byte{1, byte(pb.MsgSnap), byte(fieldSnapshot >> 8), byte(fieldSnapshot&0xFF), 1}
+				p = append(p, 1)            // present
+				p = append(p, 1)            // meta index
+				p = append(p, 1)            // meta term
+				p = append(p, 0, 0, 0, 0, 0) // ConfState: four zero counts + autoleave
+				p = append(p, maxVarint...)  // data length
+				return p
+			}(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := DecodeBatch(tt.payload)
+			if err == nil {
+				t.Fatalf("expected error for malformed %s, decoded %d messages", tt.name, len(got))
+			}
+			if err != errCodecFrame && err.Error() != "unexpected EOF" {
+				// Any error is acceptable; a panic is not. errCodecFrame is
+				// the expected sentinel for these payloads.
+				t.Logf("%s: rejected with %v", tt.name, err)
+			}
+		})
+	}
+}
+
+// TestSnapshotBatchingPathRoundTrip encodes a snapshot message through the
+// production batching path (encodeMsgFields → encodeFrame) and decodes it with
+// DecodeBatch. This pins the wire contract between transport.go's append-style
+// encoder and codec.go's decoder: encodeConfStateAppend used to write a
+// presence byte decodeConfState never read, corrupting every encoded snapshot.
+func TestSnapshotBatchingPathRoundTrip(t *testing.T) {
+	msg := &pb.Message{
+		Type: pbTypePtr(pb.MsgSnap),
+		To:   uint64Ptr(2),
+		From: uint64Ptr(1),
+		Term: uint64Ptr(5),
+		Snapshot: &pb.Snapshot{
+			Metadata: &pb.SnapshotMetadata{
+				Index:     uint64Ptr(100),
+				Term:      uint64Ptr(4),
+				ConfState: &pb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}},
+			},
+			Data: []byte("snapshot-data"),
+		},
+	}
+
+	bm := fieldBitmask(msg)
+	var buf []byte
+	buf = append(buf, byte(msg.GetType()), byte(bm>>8), byte(bm))
+	buf = encodeMsgFields(buf, msg, bm)
+
+	frame := encodeFrame(buf, 1)
+	got, err := DecodeBatch(frame[4:])
+	if err != nil {
+		t.Fatalf("DecodeBatch: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(got))
+	}
+	assertMessagesEqual(t, msg, got[0])
+
+	snap := got[0].GetSnapshot()
+	if snap == nil {
+		t.Fatal("expected non-nil snapshot")
+	}
+	assertConfStatesEqual(t, msg.GetSnapshot().GetMetadata().GetConfState(), snap.GetMetadata().GetConfState())
 }

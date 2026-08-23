@@ -1,3 +1,14 @@
+/*
+Package cluster
+Tellstone Cloud-Native In-Memory Database
+File: proposals_test.go
+Description: Tests for the synchronous proposal tracker that tags raft
+log entries with proposal IDs and signals completion on apply.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package cluster
 
 import (
@@ -35,14 +46,20 @@ func TestTagAndExtract(t *testing.T) {
 
 func TestExtractUntaggedData(t *testing.T) {
 	// OpSet (0x01) should NOT be extracted as a proposal ID.
-	data := EncodeSet("k", []byte("v"), 0)
+	data, err := EncodeSet("k", []byte("v"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	_, ok := extractProposalID(data)
 	if ok {
 		t.Fatal("extractProposalID should return false for untagged SET data")
 	}
 
 	// OpDel (0x02) should NOT be extracted as a proposal ID.
-	data = EncodeDel("k")
+	data, err = EncodeDel("k")
+	if err != nil {
+		t.Fatalf("EncodeDel: %v", err)
+	}
 	_, ok = extractProposalID(data)
 	if ok {
 		t.Fatal("extractProposalID should return false for untagged DEL data")
@@ -144,7 +161,10 @@ func TestTaggedProposalRoundTrip(t *testing.T) {
 	id, _ := pt.add()
 
 	// Simulate a full SET encode → tag → extract → decode round trip.
-	setData := EncodeSet("mykey", []byte("myval"), 0)
+	setData, err := EncodeSet("mykey", []byte("myval"), 0)
+	if err != nil {
+		t.Fatalf("EncodeSet: %v", err)
+	}
 	tagged := tagProposal(tagID(id), setData)
 
 	// Extract the proposal ID.
