@@ -1,0 +1,19 @@
+docs/adr/009-phase1-transport-status.md
+  s_fa1a3e26bff1b7::t_5dc53e80263d1d 86-88
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "e0152445915c9e2f55426eedfde0d8e110ec4488",
+  "prompts": {},
+  "sessions": {
+    "s_fa1a3e26bff1b7": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fdabb5d92ffezK0rPIlejrXkUY",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
