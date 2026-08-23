@@ -7,10 +7,11 @@ Tellstone server processes, wires them into a Raft cluster, sends binary
 protocol SET/GET/DEL commands through the leader, and reads back from
 every node to verify replication. Every step is logged in detail.
 
-This test is gated behind the -run=TestManual flag so it never runs in
-CI. Execute with:
+This test is skipped unless explicitly requested via TELLSTONE_MANUAL_TEST=1,
+so plain go test runs (including CI) stay green. Execute with:
 
-    go test -v -race -count=1 -run=TestManual ./internal/cluster/ -timeout=60s
+    TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
+        -run=TestManual ./internal/cluster/ -timeout=60s
 
 Authors:
 
@@ -27,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"testing"
 	"time"
