@@ -9,7 +9,8 @@ the waiting goroutine. This lets the write path block until the quorum has
 committed the entry and the FSM has applied it locally.
 
 Wire format for tagged entries:
-  [8B proposal ID (big-endian uint64)][encoded SET/DEL payload]
+
+	[8B proposal ID (big-endian uint64)][encoded SET/DEL payload]
 
 Authors:
 

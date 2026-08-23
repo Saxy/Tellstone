@@ -9,34 +9,34 @@ descriptor lookups, allocation through protoiface).
 
 Wire format:
 
-    Frame:  [4B big-endian payload_length][payload]
-    Payload:[1B msg_count][msg_1]...[msg_N]
+	Frame:  [4B big-endian payload_length][payload]
+	Payload:[1B msg_count][msg_1]...[msg_N]
 
 Each message:
 
-    [1B raft_msg_type][2B present_fields_bitmask][fields in bit order]
+	[1B raft_msg_type][2B present_fields_bitmask][fields in bit order]
 
 Field bitmask bits (only present fields are encoded, in bit order):
 
-    0  To          uint64 varint
-    1  From        uint64 varint
-    2  Term        uint64 varint
-    3  LogTerm     uint64 varint
-    4  Index       uint64 varint
-    5  Commit      uint64 varint
-    6  Reject      1-byte bool
-    7  RejectHint  uint64 varint
-    8  Context     varint length + bytes
-    9  Entries     varint count + entries
-    10 Snapshot    inline snapshot encoding
-    11 Vote        uint64 varint
-    12 Responses   varint count + messages (recursive)
+	0  To          uint64 varint
+	1  From        uint64 varint
+	2  Term        uint64 varint
+	3  LogTerm     uint64 varint
+	4  Index       uint64 varint
+	5  Commit      uint64 varint
+	6  Reject      1-byte bool
+	7  RejectHint  uint64 varint
+	8  Context     varint length + bytes
+	9  Entries     varint count + entries
+	10 Snapshot    inline snapshot encoding
+	11 Vote        uint64 varint
+	12 Responses   varint count + messages (recursive)
 
 Varint encoding (little-endian, 7 bits per byte, MSB = continuation):
 
-    [0xxxxxxx]                     value < 128
-    [1xxxxxxx][0xxxxxxx]           value < 16384
-    [1xxxxxxx][1xxxxxxx]...[0xxxxxxx]  up to 10 bytes (uint64 max)
+	[0xxxxxxx]                     value < 128
+	[1xxxxxxx][0xxxxxxx]           value < 16384
+	[1xxxxxxx][1xxxxxxx]...[0xxxxxxx]  up to 10 bytes (uint64 max)
 
 Authors:
 

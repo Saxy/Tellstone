@@ -10,8 +10,8 @@ every node to verify replication. Every step is logged in detail.
 This test is skipped unless explicitly requested via TELLSTONE_MANUAL_TEST=1,
 so plain go test runs (including CI) stay green. Execute with:
 
-    TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
-        -run=TestManual ./internal/cluster/ -timeout=60s
+	TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
+	    -run=TestManual ./internal/cluster/ -timeout=60s
 
 Authors:
 
@@ -278,8 +278,9 @@ func connectTo(addr string) (net.Conn, error) {
 }
 
 // TestManual is the end-to-end manual integration test.
-// Run with: TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
-//     -run=TestManual ./internal/cluster/ -timeout=60s
+//
+//	Run with: TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
+//	    -run=TestManual ./internal/cluster/ -timeout=60s
 func TestManual(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping manual test in short mode")

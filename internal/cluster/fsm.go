@@ -10,10 +10,11 @@ optimised for the hot path: no protobuf, no JSON, no allocations in the
 encode/decode hot path.
 
 Log entry wire format:
-  [1B op][8B TTL ms][2B keyLen][keyLen key][remaining value]
 
-  op = 0x01 → SET   (value present, length = total - 11 - keyLen)
-  op = 0x02 → DEL   (no value, length = 0)
+	[1B op][8B TTL ms][2B keyLen][keyLen key][remaining value]
+
+	op = 0x01 → SET   (value present, length = total - 11 - keyLen)
+	op = 0x02 → DEL   (no value, length = 0)
 
 Authors:
 

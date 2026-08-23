@@ -694,7 +694,7 @@ func TestDecodeMalformedLengthPrefixes(t *testing.T) {
 			payload: append([]byte{
 				1,
 				byte(pb.MsgApp),
-				byte(fieldContext >> 8), byte(fieldContext&0xFF),
+				byte(fieldContext >> 8), byte(fieldContext & 0xFF),
 			}, maxVarint...),
 		},
 		{
@@ -702,10 +702,10 @@ func TestDecodeMalformedLengthPrefixes(t *testing.T) {
 			// count=1 | MsgApp | bitmask(fieldEntries) | entries=1 |
 			// entry(type=0, term=1, index=1, dataLen=MaxUint64)
 			payload: func() []byte {
-				p := []byte{1, byte(pb.MsgApp), byte(fieldEntries >> 8), byte(fieldEntries&0xFF), 1,
+				p := []byte{1, byte(pb.MsgApp), byte(fieldEntries >> 8), byte(fieldEntries & 0xFF), 1,
 					0} // entry type
-				p = append(p, 1)        // term
-				p = append(p, 1)        // index
+				p = append(p, 1)            // term
+				p = append(p, 1)            // index
 				p = append(p, maxVarint...) // data length
 				return p
 			}(),
@@ -715,10 +715,10 @@ func TestDecodeMalformedLengthPrefixes(t *testing.T) {
 			// count=1 | MsgSnap | bitmask(fieldSnapshot) | snapshot present |
 			// index=1 | term=1 | empty ConfState | dataLen=MaxUint64
 			payload: func() []byte {
-				p := []byte{1, byte(pb.MsgSnap), byte(fieldSnapshot >> 8), byte(fieldSnapshot&0xFF), 1}
-				p = append(p, 1)            // present
-				p = append(p, 1)            // meta index
-				p = append(p, 1)            // meta term
+				p := []byte{1, byte(pb.MsgSnap), byte(fieldSnapshot >> 8), byte(fieldSnapshot & 0xFF), 1}
+				p = append(p, 1)             // present
+				p = append(p, 1)             // meta index
+				p = append(p, 1)             // meta term
 				p = append(p, 0, 0, 0, 0, 0) // ConfState: four zero counts + autoleave
 				p = append(p, maxVarint...)  // data length
 				return p

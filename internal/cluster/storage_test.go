@@ -152,3 +152,146 @@ func TestStorageSetHardState(t *testing.T) {
 		t.Fatalf("HardState.Commit: got %d, want 10", got.GetCommit())
 	}
 }
+
+// TestStorageTermBoundaryAfterCompaction verifies that the term of the entry
+// just below the retained window — FirstIndex()-1, which raft queries while
+// restoring across a truncated log — stays queryable after compaction,
+// whether entries remain or the log was emptied.
+func TestStorageTermBoundaryAfterCompaction(t *testing.T) {
+	t.Run("partial compaction keeps boundary term", func(t *testing.T) {
+		s := NewStorage()
+		s.Append([]*pb.Entry{
+			makeEntry(1, 1), makeEntry(2, 1), makeEntry(3, 2), makeEntry(4, 2),
+		})
+		// Drop entries 1-3; the window now starts at 4.
+		s.Compact(3)
+
+		first, err := s.FirstIndex()
+		if err != nil {
+			t.Fatalf("FirstIndex: %v", err)
+		}
+		if first != 4 {
+			t.Fatalf("FirstIndex: got %d, want 4", first)
+		}
+		term, err := s.Term(first - 1)
+		if err != nil {
+			t.Fatalf("Term(%d): %v", first-1, err)
+		}
+		if term != 2 {
+			t.Fatalf("boundary Term: got %d, want 2", term)
+		}
+		// Retained entries still resolve normally.
+		if got, err := s.Term(4); err != nil || got != 2 {
+			t.Fatalf("Term(4): got (%d, %v), want (2, nil)", got, err)
+		}
+		if _, err := s.Term(1); err == nil {
+			t.Fatal("expected ErrCompacted for index below the window")
+		}
+	})
+
+	t.Run("full compaction preserves final entry as anchor", func(t *testing.T) {
+		s := NewStorage()
+		s.Append([]*pb.Entry{makeEntry(1, 1), makeEntry(2, 1), makeEntry(3, 2)})
+		s.Compact(3)
+
+		first, err := s.FirstIndex()
+		if err != nil {
+			t.Fatalf("FirstIndex: %v", err)
+		}
+		if first != 4 {
+			t.Fatalf("FirstIndex: got %d, want 4", first)
+		}
+		last, err := s.LastIndex()
+		if err != nil {
+			t.Fatalf("LastIndex: %v", err)
+		}
+		if last != 3 {
+			t.Fatalf("LastIndex: got %d, want 3 (anchor)", last)
+		}
+		term, err := s.Term(last)
+		if err != nil {
+			t.Fatalf("Term(anchor): %v", err)
+		}
+		if term != 2 {
+			t.Fatalf("anchor Term: got %d, want 2", term)
+		}
+	})
+}
+
+// TestStorageSetSnapshotAnchorConsistency verifies that installing a snapshot
+// advances the anchor to the snapshot index/term in every truncation shape —
+// partial slice, full consumption, and a snapshot beyond the stored tail —
+// and that stale snapshots leave the anchor untouched.
+func TestStorageSetSnapshotAnchorConsistency(t *testing.T) {
+	newSnap := func(index, term uint64) *pb.Snapshot {
+		return &pb.Snapshot{Metadata: &pb.SnapshotMetadata{Index: &index, Term: &term}}
+	}
+
+	t.Run("partial truncation advances anchor", func(t *testing.T) {
+		s := NewStorage()
+		s.Append([]*pb.Entry{
+			makeEntry(1, 1), makeEntry(2, 1), makeEntry(3, 2), makeEntry(4, 2),
+		})
+		s.SetSnapshot(newSnap(3, 2))
+
+		if got, _ := s.FirstIndex(); got != 4 {
+			t.Fatalf("FirstIndex: got %d, want 4", got)
+		}
+		if term, err := s.Term(3); err != nil || term != 2 {
+			t.Fatalf("Term(snapshot boundary): got (%d, %v), want (2, nil)", term, err)
+		}
+		if got, _ := s.LastIndex(); got != 4 {
+			t.Fatalf("LastIndex: got %d, want 4", got)
+		}
+	})
+
+	t.Run("truncation consuming all entries", func(t *testing.T) {
+		s := NewStorage()
+		s.Append([]*pb.Entry{makeEntry(1, 1), makeEntry(2, 2)})
+		s.SetSnapshot(newSnap(2, 2))
+
+		if got, _ := s.FirstIndex(); got != 3 {
+			t.Fatalf("FirstIndex: got %d, want 3", got)
+		}
+		if got, _ := s.LastIndex(); got != 2 {
+			t.Fatalf("LastIndex: got %d, want 2", got)
+		}
+		if term, err := s.Term(2); err != nil || term != 2 {
+			t.Fatalf("Term(boundary): got (%d, %v), want (2, nil)", term, err)
+		}
+	})
+
+	t.Run("snapshot beyond stored tail resets to snapshot boundary", func(t *testing.T) {
+		s := NewStorage()
+		s.Append([]*pb.Entry{makeEntry(1, 1), makeEntry(2, 1)})
+		// A follower restored from a leader snapshot ahead of its local tail.
+		s.SetSnapshot(newSnap(9, 3))
+
+		if got, _ := s.FirstIndex(); got != 10 {
+			t.Fatalf("FirstIndex: got %d, want 10", got)
+		}
+		if got, _ := s.LastIndex(); got != 9 {
+			t.Fatalf("LastIndex: got %d, want 9", got)
+		}
+		if term, err := s.Term(9); err != nil || term != 3 {
+			t.Fatalf("Term(9): got (%d, %v), want (3, nil)", term, err)
+		}
+	})
+
+	t.Run("stale snapshot leaves anchor untouched", func(t *testing.T) {
+		s := NewStorage()
+		s.Append([]*pb.Entry{makeEntry(1, 1), makeEntry(2, 2)})
+		s.SetSnapshot(newSnap(5, 3))
+		s.SetSnapshot(newSnap(2, 1)) // behind the installed boundary
+
+		if got, _ := s.LastIndex(); got != 5 {
+			t.Fatalf("LastIndex: got %d, want 5", got)
+		}
+		if term, err := s.Term(5); err != nil || term != 3 {
+			t.Fatalf("Term(5): got (%d, %v), want (3, nil)", term, err)
+		}
+		if _, err := s.Term(6); err == nil {
+			t.Fatal("expected ErrUnavailable past the anchor")
+		}
+	})
+}

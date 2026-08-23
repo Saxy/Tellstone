@@ -405,7 +405,7 @@ func TestClusterProposalTimeout(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	err := nodes[leaderIdx].ProposeAndWait(ctx, data)
+	err = nodes[leaderIdx].ProposeAndWait(ctx, data)
 	if err == nil {
 		t.Fatal("expected error from stopped node, got nil")
 	}
@@ -484,7 +484,6 @@ func TestClusterConcurrentProposals(t *testing.T) {
 				data, derr := EncodeSet(key, []byte(value), 0)
 				if derr != nil {
 					errCh <- fmt.Errorf("goroutine %d write %d encode: %w", gID, w, derr)
-					cancel()
 					return
 				}
 				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

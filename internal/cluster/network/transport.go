@@ -11,8 +11,8 @@ This is critical for SDN environments with per-packet overhead.
 
 Wire format (from codec.go):
 
-    Frame:  [4B big-endian payload_length][payload]
-    Payload:[1B msg_count][msg_1]...[msg_N]
+	Frame:  [4B big-endian payload_length][payload]
+	Payload:[1B msg_count][msg_1]...[msg_N]
 
 Authors:
 

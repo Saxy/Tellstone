@@ -78,7 +78,7 @@ type Server struct {
 	shards []*shard.Shard
 	// rs adapts the router to the command layer's Store seam for the binary
 	// frontend. It is populated by initShards, before any connection is served.
-	rs          RouterStore
+	rs RouterStore
 	// store is the active Store implementation. In standalone mode it wraps rs
 	// directly; in cluster mode it wraps a clusterStore that routes writes
 	// through Raft consensus. Both the binary and RESP frontends use this.
@@ -701,14 +701,14 @@ func (s *Server) initCluster() error {
 	}
 
 	nodeCfg := cluster.NodeConfig{
-		NodeID:         cfg.GetNodeID(),
-		PeerAddr:       cfg.GetPeerAddr(),
-		Peers:          peers,
-		ElectionTick:   10,
-		HeartbeatTick:  1,
-		TickInterval:   100 * time.Millisecond,
-		Dispatcher:     newShardDispatcher(s.shards, logger),
-		Logger:         logger,
+		NodeID:        cfg.GetNodeID(),
+		PeerAddr:      cfg.GetPeerAddr(),
+		Peers:         peers,
+		ElectionTick:  10,
+		HeartbeatTick: 1,
+		TickInterval:  100 * time.Millisecond,
+		Dispatcher:    newShardDispatcher(s.shards, logger),
+		Logger:        logger,
 	}
 
 	n, err := cluster.NewNode(nodeCfg)

@@ -135,7 +135,10 @@ func (s *Storage) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
 
 // Term returns the term of the entry at index i. Index 0 is a sentinel used
 // by raft during bootstrap (lastEntryID on empty log); we return 0, nil for
-// this case to avoid ErrUnavailable panics.
+// this case to avoid ErrUnavailable panics. The boundary index
+// FirstIndex()-1 — the newest entry removed by compaction or covered by a
+// snapshot — is answered from the anchor preserving its term, because raft
+// queries it while restoring state across a truncated log window.
 func (s *Storage) Term(i uint64) (uint64, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -146,19 +149,19 @@ func (s *Storage) Term(i uint64) (uint64, error) {
 	if i == 0 && last == 0 {
 		return 0, nil
 	}
+	if i == first-1 {
+		if s.compacted != nil {
+			return s.compacted.GetTerm(), nil
+		}
+		if s.snapshot != nil {
+			return s.snapshot.GetMetadata().GetTerm(), nil
+		}
+	}
 	if i < first {
 		return 0, raft.ErrCompacted
 	}
 	if i > last {
 		return 0, raft.ErrUnavailable
-	}
-	if len(s.entries) == 0 {
-		// i resolves to the compaction anchor or snapshot boundary itself;
-		// the entry body is gone but its index/term are preserved there.
-		if s.compacted != nil {
-			return s.compacted.GetTerm(), nil
-		}
-		return s.snapshot.GetMetadata().GetTerm(), nil
 	}
 	return s.entries[i-first].GetTerm(), nil
 }
@@ -211,39 +214,34 @@ func (s *Storage) Append(entries []*pb.Entry) {
 }
 
 // SetSnapshot replaces the current snapshot and compacts the log to the
-// snapshot's last index.
+// snapshot's last index. Whenever the snapshot index is ahead of the current
+// boundary the compacted anchor advances to it, carrying the snapshot term so
+// FirstIndex, LastIndex and Term stay consistent whether entries remain or
+// the truncation consumed the whole slice.
 func (s *Storage) SetSnapshot(snap *pb.Snapshot) {
 	if snap == nil {
 		return
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.snapshot = snap
 	idx := snap.GetMetadata().GetIndex()
-	if len(s.entries) == 0 {
-		// No entries to truncate. If the snapshot is ahead of the previous
-		// anchor it supersedes it; otherwise the older anchor stays.
-		if s.compacted != nil && idx > s.compacted.GetIndex() {
-			snapIdx, snapTerm := idx, snap.GetMetadata().GetTerm()
-		s.compacted = &pb.Entry{Index: &snapIdx, Term: &snapTerm}
+	// A snapshot at or behind the current boundary (last compacted or
+	// snapshotted index) is stale: record it but move nothing.
+	if idx <= s.firstIndex()-1 {
+		s.snapshot = snap
+		return
+	}
+	s.snapshot = snap
+	if len(s.entries) > 0 {
+		first := s.entries[0].GetIndex()
+		if cut := idx - first + 1; int(cut) < len(s.entries) {
+			s.entries = s.entries[cut:]
+		} else {
+			s.entries = nil
 		}
-		return
 	}
-	first := s.entries[0].GetIndex()
-	if idx < first {
-		// Stale snapshot behind our log start — keep the entries.
-		return
-	}
-	if cut := idx - first + 1; int(cut) <= len(s.entries) {
-		s.entries = s.entries[cut:]
-		return
-	}
-	// Snapshot beyond our stored tail (a far-behind follower restored from
-	// a leader snapshot): slicing would panic, so reset the entry list to
-	// the snapshot boundary instead.
 	snapIdx, snapTerm := idx, snap.GetMetadata().GetTerm()
-		s.compacted = &pb.Entry{Index: &snapIdx, Term: &snapTerm}
-	s.entries = nil
+	s.compacted = &pb.Entry{Index: &snapIdx, Term: &snapTerm}
 }
 
 // Compact discards all log entries up to and including index.
@@ -271,5 +269,10 @@ func (s *Storage) Compact(index uint64) {
 		s.entries = nil
 		return
 	}
+	// Entries survive the cut: keep the newest removed entry as the anchor
+	// so Term(FirstIndex()-1) still resolves while a truncated window
+	// remains.
+	dropped := s.entries[cut-1]
+	s.compacted = &pb.Entry{Index: dropped.Index, Term: dropped.Term}
 	s.entries = s.entries[cut:]
 }
