@@ -1,0 +1,19 @@
+internal/cluster/manual_test.go
+  s_fa1a3e26bff1b7::t_5779fa94df7de4 10-11,13-14,31
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.23",
+  "base_commit_sha": "df486fec08f955ff59dce3f03b369f85f12dfcce",
+  "prompts": {},
+  "sessions": {
+    "s_fa1a3e26bff1b7": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fdabb5d92ffezK0rPIlejrXkUY",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
