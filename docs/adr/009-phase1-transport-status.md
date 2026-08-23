@@ -83,7 +83,9 @@ Both fixed: `copy()` added, operations serialized per connection.
 go test -race -count=1 ./internal/cluster/... -timeout=120s
 
 # Manual end-to-end test (3-node cluster, SET/GET/DEL)
-go test -v -race -count=1 -run=TestManual ./internal/cluster/ -timeout=60s
+# Skipped unless explicitly requested — CI runs stay green.
+TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
+    -run=TestManual ./internal/cluster/ -timeout=60s
 
 # Codec proof (batching effectiveness)
 go test -v -run=TestCodecSingleFrameProvesBatching ./internal/cluster/network/
