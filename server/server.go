@@ -57,9 +57,9 @@ func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
 	return resp.Err
 }
 
-func (rs *RouterStore) Delete(key string) bool {
+func (rs *RouterStore) Delete(key string) (bool, error) {
 	resp := rs.router.Dispatch(shard.CmdDel, key, nil, 0)
-	return resp.OK
+	return resp.OK, nil
 }
 
 // binCmdGet, binCmdSet and binCmdDel are the data-command tokens the binary
@@ -692,6 +692,12 @@ func (s *Server) initCluster() error {
 	peers, err := cluster.ParsePeers(cfg.GetPeers())
 	if err != nil {
 		return fmt.Errorf("parse peers: %w", err)
+	}
+	// Defense in depth: config validation already rejects empty membership,
+	// but this is the point where the parsed list reaches cluster startup, so
+	// a zero-peer list must never pass here.
+	if len(peers) == 0 {
+		return fmt.Errorf("cluster mode requires at least one peer address in --peers")
 	}
 
 	nodeCfg := cluster.NodeConfig{

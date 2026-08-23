@@ -43,12 +43,12 @@ func (f *fakeStore) Set(key string, value []byte, _ time.Duration) error {
 	return nil
 }
 
-func (f *fakeStore) Delete(key string) bool {
+func (f *fakeStore) Delete(key string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	_, ok := f.m[key]
 	delete(f.m, key)
-	return ok
+	return ok, nil
 }
 
 func freeAddr(t *testing.T) string {

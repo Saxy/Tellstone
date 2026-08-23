@@ -46,6 +46,7 @@ package network
 
 import (
 	"errors"
+	"fmt"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -77,8 +78,15 @@ const (
 )
 
 // EncodeBatch writes a batch of Raft messages into a length-prefixed frame.
-// It returns the complete frame bytes including the 4-byte header.
-func EncodeBatch(msgs []*pb.Message) []byte {
+// It returns the complete frame bytes including the 4-byte header. Batches
+// larger than maxBatchCount are rejected: the wire format stores the message
+// count in one byte, so an oversized input would silently wrap and decode as
+// a truncated (or empty) batch on the receiving side. The batching sender
+// flushes before reaching this limit; EncodeBatch is the backstop.
+func EncodeBatch(msgs []*pb.Message) ([]byte, error) {
+	if len(msgs) > maxBatchCount {
+		return nil, fmt.Errorf("cluster network: batch of %d messages exceeds maxBatchCount %d", len(msgs), maxBatchCount)
+	}
 	totalPayload := 1 // 1 byte for message count
 	for _, m := range msgs {
 		totalPayload += encodedMsgSize(m)
@@ -95,7 +103,7 @@ func EncodeBatch(msgs []*pb.Message) []byte {
 	for _, m := range msgs {
 		offset = encodeMsg(frame, offset, m)
 	}
-	return frame[:offset]
+	return frame[:offset], nil
 }
 
 // DecodeBatch parses a batch payload (after the 4-byte length prefix has been
@@ -751,10 +759,13 @@ func getBytes(data []byte, off int) ([]byte, int, error) {
 	if err != nil {
 		return nil, 0, err
 	}
-	l := int(length)
-	if newOff+l > len(data) {
+	// Compare in uint64 space before converting to int: a malformed
+	// near-uint64-max length would wrap to a negative int and slip past a
+	// bounds check performed after the conversion.
+	if length > uint64(len(data)-newOff) {
 		return nil, 0, errCodecFrame
 	}
+	l := int(length)
 	result := make([]byte, l)
 	copy(result, data[newOff:newOff+l])
 	return result, newOff + l, nil

@@ -20,20 +20,23 @@ import (
 
 	"github.com/Saxy/Tellstone/internal/cluster"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/router"
 	"github.com/Saxy/Tellstone/internal/shard"
 )
 
 // shardDispatcher implements cluster.Dispatcher by routing committed Raft
-// entries to the correct local shard via the same FNV-1a hash the normal
-// request path uses. This ensures replicated data lands in the same shard
-// on every node.
+// entries to the correct local shard via the router's placement hash. Reusing
+// Router.ShardID guarantees replicated data lands in the same shard on every
+// node — a private copy of the hash could silently diverge from the request
+// routing path.
 type shardDispatcher struct {
 	shards []*shard.Shard
+	router *router.Router
 	logger log.Logger
 }
 
 func newShardDispatcher(shards []*shard.Shard, logger log.Logger) *shardDispatcher {
-	return &shardDispatcher{shards: shards, logger: logger}
+	return &shardDispatcher{shards: shards, router: router.New(shards), logger: logger}
 }
 
 // Dispatch routes a decoded operation to the local shard that owns the key.
@@ -53,9 +56,9 @@ func (d *shardDispatcher) Dispatch(key string, op byte, value []byte, ttl time.D
 		}
 		return nil
 	}
-	shard := routeKey(d.shards, key)
-	shardIdx := shard.ID
-	resp := shard.Execute(opStr, key, value, ttl)
+	target := d.shards[d.router.ShardID(key)]
+	shardIdx := target.ID
+	resp := target.Execute(opStr, key, value, ttl)
 	if resp.Err != nil {
 		if d.logger.Enabled(log.LevelError) {
 			d.logger.Log(log.LevelError, "cluster dispatcher: shard execute failed",
@@ -77,17 +80,6 @@ func (d *shardDispatcher) Dispatch(key string, op byte, value []byte, ttl time.D
 		)
 	}
 	return nil
-}
-
-// routeKey picks the shard that owns a key using FNV-1a, matching the router.
-func routeKey(shards []*shard.Shard, key string) *shard.Shard {
-	h := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		h ^= uint32(key[i])
-		h *= 16777619
-	}
-	idx := h % uint32(len(shards))
-	return shards[idx]
 }
 
 // clusterStore wraps a RouterStore and routes writes through Raft when
@@ -133,7 +125,16 @@ func (cs *clusterStore) Set(key string, value []byte, ttl time.Duration) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	data := cluster.EncodeSet(key, value, ttl)
+	data, err := cluster.EncodeSet(key, value, ttl)
+	if err != nil {
+		if cs.logger.Enabled(log.LevelError) {
+			cs.logger.Log(log.LevelError, "cluster store: SET encode failed",
+				log.String("error", err.Error()),
+				log.Int("key_len", len(key)),
+			)
+		}
+		return err
+	}
 	if err := cs.node.ProposeAndWait(ctx, data); err != nil {
 		if cs.logger.Enabled(log.LevelError) {
 			cs.logger.Log(log.LevelError, "cluster store: SET propose failed",
@@ -151,14 +152,18 @@ func (cs *clusterStore) Set(key string, value []byte, ttl time.Duration) error {
 	return nil
 }
 
-func (cs *clusterStore) Delete(key string) bool {
+// Delete routes a deletion through Raft. It returns whether the key existed
+// plus an error for the failure cases: not leader (MOVED redirect, same as
+// Set), encode failure, or propose/timeout failure. The boolean is only
+// meaningful when err is nil.
+func (cs *clusterStore) Delete(key string) (bool, error) {
 	if !cs.node.IsLeader() {
 		if cs.logger.Enabled(log.LevelDebug) {
 			cs.logger.Log(log.LevelDebug, "cluster store: DEL rejected, not leader",
 				log.String("key", key),
 			)
 		}
-		return false
+		return false, fmt.Errorf("MOVED: not leader; redirect to leader")
 	}
 	if cs.logger.Enabled(log.LevelDebug) {
 		cs.logger.Log(log.LevelDebug, "cluster store: DEL proposing via raft",
@@ -167,7 +172,16 @@ func (cs *clusterStore) Delete(key string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	data := cluster.EncodeDel(key)
+	data, err := cluster.EncodeDel(key)
+	if err != nil {
+		if cs.logger.Enabled(log.LevelError) {
+			cs.logger.Log(log.LevelError, "cluster store: DEL encode failed",
+				log.String("error", err.Error()),
+				log.Int("key_len", len(key)),
+			)
+		}
+		return false, err
+	}
 	if err := cs.node.ProposeAndWait(ctx, data); err != nil {
 		if cs.logger.Enabled(log.LevelError) {
 			cs.logger.Log(log.LevelError, "cluster store: DEL propose failed",
@@ -175,7 +189,7 @@ func (cs *clusterStore) Delete(key string) bool {
 				log.String("key", key),
 			)
 		}
-		return false
+		return false, err
 	}
-	return true
+	return true, nil
 }

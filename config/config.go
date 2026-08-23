@@ -12,12 +12,14 @@ package config
 
 import (
 	"flag"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/cluster"
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
@@ -406,7 +408,7 @@ func LoadConfig(args []string) *Config {
 		&cfg.nodeID,
 		"node-id",
 		getEnv("TSD_NODE_ID", uint64(0)),
-		"Unique node identifier; 0 = auto-generate from address hash (default: 0)",
+		"Unique node identifier; required (non-zero) when --cluster-mode is enabled and must appear in --peers (default: 0)",
 	)
 	fs.StringVar(
 		&cfg.peerAddr,
@@ -472,12 +474,39 @@ func LoadConfig(args []string) *Config {
 	if !cfg.enablePersistence && (cfg.snapshotInterval > 0 || cfg.snapshotBytes > 0) {
 		panic("tellstone: --snapshot-interval and --snapshot-bytes require --enable-persistence")
 	}
-	// Cluster mode requires at least one peer for bootstrap.
-	if cfg.clusterMode && cfg.peers == "" {
-		panic("tellstone: --cluster-mode requires --peers with at least one peer address")
-	}
-	if cfg.clusterMode && cfg.nodeID == 0 {
-		panic("tellstone: --cluster-mode requires --node-id to be set")
+	// Cluster mode requires a parseable, non-empty bootstrap membership that
+	// includes this node. Parsing here — with the same ParsePeers the server
+	// startup path uses — rejects malformed membership at flag-validation
+	// time (empty lists, comma-only input, duplicate IDs, explicit ID 0)
+	// instead of surfacing as a broken raft cluster after StartNode.
+	if cfg.clusterMode {
+		peers, err := cluster.ParsePeers(cfg.peers)
+		if err != nil {
+			panic(fmt.Sprintf("tellstone: --peers: %v", err))
+		}
+		if len(peers) == 0 {
+			panic("tellstone: --cluster-mode requires --peers with at least one peer address")
+		}
+		if cfg.nodeID == 0 {
+			panic("tellstone: --cluster-mode requires --node-id to be set")
+		}
+		seen := make(map[uint64]struct{}, len(peers))
+		localFound := false
+		for _, p := range peers {
+			if p.ID == 0 {
+				panic("tellstone: --peers contains peer ID 0; IDs must be non-zero")
+			}
+			if _, dup := seen[p.ID]; dup {
+				panic(fmt.Sprintf("tellstone: --peers contains duplicate node ID %d", p.ID))
+			}
+			seen[p.ID] = struct{}{}
+			if p.ID == cfg.nodeID {
+				localFound = true
+			}
+		}
+		if !localFound {
+			panic("tellstone: --node-id is not present in --peers; the local node must be part of the bootstrap membership")
+		}
 	}
 	return cfg
 }

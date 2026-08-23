@@ -42,10 +42,10 @@ func (f *fakeStore) Set(key string, value []byte, ttl time.Duration) error {
 	return f.setErr
 }
 
-func (f *fakeStore) Delete(key string) bool {
+func (f *fakeStore) Delete(key string) (bool, error) {
 	_, ok := f.m[key]
 	delete(f.m, key)
-	return ok
+	return ok, nil
 }
 
 type replyKind int

@@ -21,7 +21,10 @@ Authors:
 package network
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -229,10 +232,18 @@ func (t *Transport) acceptLoop(ln net.Listener) {
 //     to the handler or allocate based on adversarial lengths.
 func (t *Transport) readLoop(conn net.Conn) {
 	defer conn.Close()
-	// Watch for shutdown: close the connection to unblock io.ReadFull.
+	// Per-connection shutdown watcher. ctx is cancelled when this readLoop
+	// exits (normal termination or read error), so the goroutine below does
+	// not leak holding the connection until the next transport-wide Stop.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	go func() {
-		<-t.stopCh
-		conn.Close()
+		select {
+		case <-t.stopCh:
+			// Transport shutdown: close the connection to unblock io.ReadFull.
+			conn.Close()
+		case <-ctx.Done():
+		}
 	}()
 	hdr := make([]byte, headerSize)
 	for {
@@ -362,7 +373,9 @@ func (t *Transport) dial(peerID uint64) (*batchConn, error) {
 	}
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		return nil, errDialFailed
+		// Wrap so callers can errors.Is(errDialFailed) while the log still
+		// carries the underlying cause (refused, timeout, unreachable…).
+		return nil, fmt.Errorf("%w: %v", errDialFailed, err)
 	}
 	bc := newBatchConn(conn, t.logger, t.stopCh, &t.stats)
 	actual, _ := t.conns.LoadOrStore(peerID, bc)
@@ -370,6 +383,9 @@ func (t *Transport) dial(peerID uint64) (*batchConn, error) {
 		conn.Close()
 		return actual.(*batchConn), nil
 	}
+	// A failed flush must drop this entry from conns so the next send dials
+	// a fresh connection instead of queueing into the dead one forever.
+	bc.onDead = func() { t.conns.Delete(peerID) }
 	t.wg.Add(1)
 	go bc.run(t.wg.Done)
 	return bc, nil
@@ -389,10 +405,13 @@ func (t *Transport) lookupPeerAddr(id uint64) string {
 
 type batchConn struct {
 	conn   net.Conn
-	mu     sync.Mutex
 	logger log.Logger
 	stopCh <-chan struct{}
 	stats  *TransportStats
+	// onDead removes this connection's entry from the owning Transport's
+	// conn map so a later getOrCreateConn dials a fresh connection instead
+	// of reusing the dead one. Nil in tests that build a batchConn directly.
+	onDead func()
 
 	sendCh chan []*pb.Message
 	closed atomic.Bool
@@ -409,7 +428,10 @@ func newBatchConn(conn net.Conn, logger log.Logger, stopCh <-chan struct{}, stat
 }
 
 // run is the sender goroutine. It accumulates messages from sendCh and flushes
-// them as batched TCP frames on a timer or when the buffer fills.
+// them as batched TCP frames on a timer, when the buffer fills, or when the
+// message count reaches the wire format's one-byte limit. It exits after the
+// first failed flush — the connection is dead at that point and retrying
+// writes against it would drop every later batch too.
 func (bc *batchConn) run(done func()) {
 	defer done()
 	defer bc.conn.Close()
@@ -420,9 +442,11 @@ func (bc *batchConn) run(done func()) {
 	var buf []byte
 	msgCount := 0
 
-	flush := func() {
+	// flush writes the pending batch. Returns false when the write failed;
+	// the caller must stop using the connection.
+	flush := func() bool {
 		if msgCount == 0 {
-			return
+			return true
 		}
 		frame := encodeFrame(buf, msgCount)
 		n, err := bc.conn.Write(frame)
@@ -433,12 +457,16 @@ func (bc *batchConn) run(done func()) {
 					log.String("error", err.Error()))
 			}
 			bc.closed.Store(true)
-			return
+			if bc.onDead != nil {
+				bc.onDead()
+			}
+			return false
 		}
 		bc.stats.FramesSent.Add(1)
 		bc.stats.BytesSent.Add(int64(n))
 		buf = buf[:0]
 		msgCount = 0
+		return true
 	}
 
 	for {
@@ -457,11 +485,17 @@ func (bc *batchConn) run(done func()) {
 				buf = encodeMsgFields(buf, m, bm)
 				msgCount++
 			}
-			if len(buf) >= batchMaxBytes {
-				flush()
+			// Flush before msgCount exceeds maxBatchCount (255): the frame
+			// stores the count in a single byte and would silently wrap.
+			if len(buf) >= batchMaxBytes || msgCount >= maxBatchCount {
+				if !flush() {
+					return
+				}
 			}
 		case <-ticker.C:
-			flush()
+			if !flush() {
+				return
+			}
 		}
 	}
 }

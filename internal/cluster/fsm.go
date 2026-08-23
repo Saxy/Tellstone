@@ -25,6 +25,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
@@ -62,31 +63,46 @@ func NewFSM(dispatcher Dispatcher, logger log.Logger) *FSM {
 	}
 }
 
+// maxKeyLen is the largest key the wire format can carry: the key length is
+// a uint16 field. Longer keys must be rejected by the encoders — truncating
+// the length field would corrupt the entry for every replica decoding it.
+const maxKeyLen = math.MaxUint16
+
+// ErrKeyTooLarge is returned by EncodeSet and EncodeDel when the key exceeds
+// maxKeyLen and cannot be represented in the log entry wire format.
+var ErrKeyTooLarge = errors.New("cluster fsm: key exceeds wire format maximum of 65535 bytes")
+
 // EncodeSet creates a Raft log entry payload for a SET operation.
-func EncodeSet(key string, value []byte, ttl time.Duration) []byte {
+func EncodeSet(key string, value []byte, ttl time.Duration) ([]byte, error) {
+	keyBytes := []byte(key)
+	if len(keyBytes) > maxKeyLen {
+		return nil, ErrKeyTooLarge
+	}
 	var ttlMs int64
 	if ttl > 0 {
 		ttlMs = ttl.Milliseconds()
 	}
-	keyBytes := []byte(key)
 	buf := make([]byte, opHeaderSize+len(keyBytes)+len(value))
 	buf[0] = OpSet
 	binary.BigEndian.PutUint64(buf[1:9], uint64(ttlMs))
 	binary.BigEndian.PutUint16(buf[9:11], uint16(len(keyBytes)))
 	copy(buf[11:11+len(keyBytes)], keyBytes)
 	copy(buf[11+len(keyBytes):], value)
-	return buf
+	return buf, nil
 }
 
 // EncodeDel creates a Raft log entry payload for a DEL operation.
-func EncodeDel(key string) []byte {
+func EncodeDel(key string) ([]byte, error) {
 	keyBytes := []byte(key)
+	if len(keyBytes) > maxKeyLen {
+		return nil, ErrKeyTooLarge
+	}
 	buf := make([]byte, opHeaderSize+len(keyBytes))
 	buf[0] = OpDel
 	binary.BigEndian.PutUint64(buf[1:9], 0)
 	binary.BigEndian.PutUint16(buf[9:11], uint16(len(keyBytes)))
 	copy(buf[11:11+len(keyBytes)], keyBytes)
-	return buf
+	return buf, nil
 }
 
 // DecodeLogEntry parses a log entry payload into its components.
