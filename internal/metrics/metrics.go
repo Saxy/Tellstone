@@ -133,6 +133,17 @@ func (c *Collector) writeMetric(name, mType, help string, value uint64) {
 	_, _ = c.writer.Write([]byte("\n\n"))
 }
 
+// ClusterMetrics exposes Raft transport wire-level counters without coupling
+// the metrics package to the concrete transport implementation. The transport
+// satisfies this structurally via five Load methods on its atomic counters.
+type ClusterMetrics interface {
+	ClusterMessagesSent() int64
+	ClusterFramesSent() int64
+	ClusterBytesSent() int64
+	ClusterMessagesRecv() int64
+	ClusterFramesRecv() int64
+}
+
 // TLSMetrics exposes process-level certificate rotation state without coupling
 // the metrics package to the concrete filesystem watcher.
 type TLSMetrics interface {
@@ -155,14 +166,16 @@ type AggregateCollector struct {
 	networkServer   *network.Server
 	tlsMetrics      TLSMetrics
 	rbacMetrics     RBACMetrics
+	clusterMetrics  ClusterMetrics
 }
 
-func NewAggregateCollector(shardCollectors []*Collector, netSrv *network.Server, tlsMetrics TLSMetrics, rbacMetrics RBACMetrics) *AggregateCollector {
+func NewAggregateCollector(shardCollectors []*Collector, netSrv *network.Server, tlsMetrics TLSMetrics, rbacMetrics RBACMetrics, clusterMetrics ClusterMetrics) *AggregateCollector {
 	return &AggregateCollector{
 		shardCollectors: shardCollectors,
 		networkServer:   netSrv,
 		tlsMetrics:      tlsMetrics,
 		rbacMetrics:     rbacMetrics,
+		clusterMetrics:  clusterMetrics,
 	}
 }
 
@@ -217,6 +230,13 @@ func (ac *AggregateCollector) WritePrometheus(w io.Writer) {
 		for _, name := range names {
 			writeLabeledSample("tellstone_rbac_commands_total", "role", name, counts[name])
 		}
+	}
+	if ac.clusterMetrics != nil {
+		writeRaw("tellstone_cluster_messages_sent_total", "counter", "Raft messages sent to peers.", uint64(ac.clusterMetrics.ClusterMessagesSent()))
+		writeRaw("tellstone_cluster_frames_sent_total", "counter", "TCP frames written to peers.", uint64(ac.clusterMetrics.ClusterFramesSent()))
+		writeRaw("tellstone_cluster_bytes_sent_total", "counter", "Bytes written to peer connections.", uint64(ac.clusterMetrics.ClusterBytesSent()))
+		writeRaw("tellstone_cluster_messages_recv_total", "counter", "Raft messages received from peers.", uint64(ac.clusterMetrics.ClusterMessagesRecv()))
+		writeRaw("tellstone_cluster_frames_recv_total", "counter", "TCP frames received from peers.", uint64(ac.clusterMetrics.ClusterFramesRecv()))
 	}
 }
 

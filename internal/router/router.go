@@ -45,3 +45,8 @@ func (r *Router) Dispatch(op string, key string, value []byte, ttl time.Duration
 func (r *Router) NumShards() int {
 	return int(r.numShards)
 }
+
+// ShardID returns the shard index that owns a key, for diagnostic logging.
+func (r *Router) ShardID(key string) uint32 {
+	return hashKey(key) % r.numShards
+}

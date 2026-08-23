@@ -55,6 +55,11 @@ type Config struct {
 	oauthClientID     string
 	snapshotInterval  time.Duration
 	snapshotBytes     uint64
+	// Cluster mode (Raft consensus per region).
+	clusterMode bool
+	nodeID      uint64
+	peerAddr    string
+	peers       string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -390,6 +395,31 @@ func LoadConfig(args []string) *Config {
 		"snapshot-bytes",
 		"WAL size threshold that triggers a snapshot (e.g. 64MiB); 0 disables size-based snapshots (default: 0, disabled)",
 	)
+	// Cluster mode: Raft consensus per region.
+	fs.BoolVar(
+		&cfg.clusterMode,
+		"cluster-mode",
+		getEnv("TSD_CLUSTER_MODE", false),
+		"Enable Raft consensus per region (default: false)",
+	)
+	fs.Uint64Var(
+		&cfg.nodeID,
+		"node-id",
+		getEnv("TSD_NODE_ID", uint64(0)),
+		"Unique node identifier; 0 = auto-generate from address hash (default: 0)",
+	)
+	fs.StringVar(
+		&cfg.peerAddr,
+		"peer-addr",
+		getEnv("TSD_PEER_ADDR", "0.0.0.0:9989"),
+		"Raft transport listen address (default: 0.0.0.0:9989)",
+	)
+	fs.StringVar(
+		&cfg.peers,
+		"peers",
+		getEnv("TSD_PEERS", ""),
+		"Comma-separated list of peer addresses for initial cluster bootstrap (default: none)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -442,6 +472,13 @@ func LoadConfig(args []string) *Config {
 	if !cfg.enablePersistence && (cfg.snapshotInterval > 0 || cfg.snapshotBytes > 0) {
 		panic("tellstone: --snapshot-interval and --snapshot-bytes require --enable-persistence")
 	}
+	// Cluster mode requires at least one peer for bootstrap.
+	if cfg.clusterMode && cfg.peers == "" {
+		panic("tellstone: --cluster-mode requires --peers with at least one peer address")
+	}
+	if cfg.clusterMode && cfg.nodeID == 0 {
+		panic("tellstone: --cluster-mode requires --node-id to be set")
+	}
 	return cfg
 }
 
@@ -482,3 +519,7 @@ func (cfg *Config) GetOAuthIssuer() string             { return cfg.oauthIssuer 
 func (cfg *Config) GetOAuthClientID() string           { return cfg.oauthClientID }
 func (cfg *Config) GetSnapshotInterval() time.Duration { return cfg.snapshotInterval }
 func (cfg *Config) GetSnapshotBytes() uint64           { return cfg.snapshotBytes }
+func (cfg *Config) ClusterMode() bool                  { return cfg.clusterMode }
+func (cfg *Config) GetNodeID() uint64                  { return cfg.nodeID }
+func (cfg *Config) GetPeerAddr() string                { return cfg.peerAddr }
+func (cfg *Config) GetPeers() string                   { return cfg.peers }

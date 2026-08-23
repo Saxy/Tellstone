@@ -42,7 +42,7 @@ func (m fakeRBACMetrics) DeniedCommands() uint64               { return m.denied
 func (m fakeRBACMetrics) RoleCommandCounts() map[string]uint64 { return m.roleCounts }
 
 func TestAggregateCollectorTLSMetrics(t *testing.T) {
-	collector := NewAggregateCollector(nil, nil, fakeTLSMetrics{reloads: 2, errors: 1, expiry: 1234}, nil)
+	collector := NewAggregateCollector(nil, nil, fakeTLSMetrics{reloads: 2, errors: 1, expiry: 1234}, nil, nil)
 	var output bytes.Buffer
 	collector.WritePrometheus(&output)
 	got := output.String()
@@ -57,7 +57,7 @@ func TestAggregateCollectorTLSMetrics(t *testing.T) {
 	}
 
 	output.Reset()
-	NewAggregateCollector(nil, nil, nil, nil).WritePrometheus(&output)
+	NewAggregateCollector(nil, nil, nil, nil, nil).WritePrometheus(&output)
 	if strings.Contains(output.String(), "tellstone_tls_") {
 		t.Fatalf("TLS metrics must be omitted when rotation is disabled:\n%s", output.String())
 	}
@@ -68,7 +68,7 @@ func TestAggregateCollectorRBACMetrics(t *testing.T) {
 		authFailures:   3,
 		deniedCommands: 7,
 		roleCounts:     map[string]uint64{"admin": 10, "readonly": 2},
-	})
+	}, nil)
 	var output bytes.Buffer
 	collector.WritePrometheus(&output)
 	got := output.String()
@@ -94,7 +94,7 @@ func TestAggregateCollectorRBACMetrics(t *testing.T) {
 	}
 
 	output.Reset()
-	NewAggregateCollector(nil, nil, nil, nil).WritePrometheus(&output)
+	NewAggregateCollector(nil, nil, nil, nil, nil).WritePrometheus(&output)
 	if strings.Contains(output.String(), "tellstone_rbac_") {
 		t.Fatalf("RBAC metrics must be omitted when RBAC is disabled:\n%s", output.String())
 	}
@@ -137,4 +137,48 @@ func TestCollectorEngineSnapshot(t *testing.T) {
 	// Ensure no panic when calling GetNetworkSnapshot.
 	netSnap := col.GetNetworkSnapshot()
 	_ = netSnap // silence unused variable warning
+}
+
+type fakeClusterMetrics struct {
+	messagesSent int64
+	framesSent   int64
+	bytesSent    int64
+	messagesRecv int64
+	framesRecv   int64
+}
+
+func (m fakeClusterMetrics) ClusterMessagesSent() int64 { return m.messagesSent }
+func (m fakeClusterMetrics) ClusterFramesSent() int64   { return m.framesSent }
+func (m fakeClusterMetrics) ClusterBytesSent() int64    { return m.bytesSent }
+func (m fakeClusterMetrics) ClusterMessagesRecv() int64 { return m.messagesRecv }
+func (m fakeClusterMetrics) ClusterFramesRecv() int64   { return m.framesRecv }
+
+func TestAggregateCollectorClusterMetrics(t *testing.T) {
+	collector := NewAggregateCollector(nil, nil, nil, nil, fakeClusterMetrics{
+		messagesSent: 100,
+		framesSent:   10,
+		bytesSent:    2048,
+		messagesRecv: 95,
+		framesRecv:   9,
+	})
+	var output bytes.Buffer
+	collector.WritePrometheus(&output)
+	got := output.String()
+	for _, want := range []string{
+		"tellstone_cluster_messages_sent_total 100",
+		"tellstone_cluster_frames_sent_total 10",
+		"tellstone_cluster_bytes_sent_total 2048",
+		"tellstone_cluster_messages_recv_total 95",
+		"tellstone_cluster_frames_recv_total 9",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing cluster metric %q in output:\n%s", want, got)
+		}
+	}
+
+	output.Reset()
+	NewAggregateCollector(nil, nil, nil, nil, nil).WritePrometheus(&output)
+	if strings.Contains(output.String(), "tellstone_cluster_") {
+		t.Fatalf("cluster metrics must be omitted when cluster mode is disabled:\n%s", output.String())
+	}
 }
