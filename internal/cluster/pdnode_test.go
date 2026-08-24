@@ -36,6 +36,11 @@ func waitForAlloc(t *testing.T, pool *TSOPool) uint64 {
 
 func TestStartPDNodeHybrid(t *testing.T) {
 	base := freePort(t)
+	// Leave room for the +20000 derived peer port; freePort can hand back
+	// high ephemeral ports whose offset would overflow 65535.
+	if base > 45535 {
+		base -= 30000
+	}
 	m := Peer{ID: 1, Addr: fmt.Sprintf("127.0.0.1:%d", base)}
 
 	pd, err := StartPDNode(StartPDNodeConfig{
