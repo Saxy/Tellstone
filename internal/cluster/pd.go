@@ -205,16 +205,23 @@ func waitForPDLeader(endpoint string, deadline time.Time) error {
 
 	for {
 		// Honor an already-expired (or fully consumed) startup deadline.
-		if time.Now().After(deadline) {
+		if remaining := time.Until(deadline); remaining <= 0 {
 			return ErrPDNotReady
+		} else {
+			// Bound the status request and the retry delay by the time
+			// left, so we never overshoot the deadline by a fixed window.
+			reqCtx, cancel := context.WithTimeout(context.Background(), min(remaining, 2*time.Second))
+			st, serr := cli.Status(reqCtx, endpoint)
+			cancel()
+			if serr == nil && st.Leader != 0 {
+				// Re-check: the call may have consumed the deadline.
+				if time.Now().After(deadline) {
+					return ErrPDNotReady
+				}
+				return nil
+			}
+			time.Sleep(min(remaining, 200*time.Millisecond))
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		st, serr := cli.Status(ctx, endpoint)
-		cancel()
-		if serr == nil && st.Leader != 0 {
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
 	}
 }
 

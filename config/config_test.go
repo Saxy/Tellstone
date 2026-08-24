@@ -4,8 +4,10 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -625,6 +627,13 @@ func TestNodeRoleValidation(t *testing.T) {
 				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
 			want: "requires --node-role=data",
 		},
+		{
+			name: "data role with malformed pd-addr (no port)",
+			args: []string{"--cluster-mode", "--node-role", "data",
+				"--pd-addr", "127.0.0.1",
+				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
+			want: "malformed",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -735,6 +744,24 @@ func TestPDAddressResolution(t *testing.T) {
 		)
 		if !strings.Contains(msg, "--pd-client-addr") {
 			t.Fatalf("expected malformed-address panic naming the flag, got %q", msg)
+		}
+	})
+}
+
+// TestTSOHeadroomBounds covers the overflow guard on --tso-headroom-seconds:
+// the largest duration representable in seconds is accepted, the first value
+// above it is rejected before it can become a negative time.Duration.
+func TestTSOHeadroomBounds(t *testing.T) {
+	const maxSeconds = math.MaxInt64 / int64(time.Second) // 9223372036
+	t.Run("maximum accepted value", func(t *testing.T) {
+		if _, msg := tryLoadConfig("--tso-headroom-seconds", strconv.FormatInt(maxSeconds, 10)); msg != "" {
+			t.Fatalf("max accepted headroom rejected: %s", msg)
+		}
+	})
+	t.Run("first rejected value overflows", func(t *testing.T) {
+		_, msg := tryLoadConfig("--tso-headroom-seconds", strconv.FormatInt(maxSeconds+1, 10))
+		if !strings.Contains(msg, "too large") {
+			t.Fatalf("expected overflow panic, got %q", msg)
 		}
 	})
 }

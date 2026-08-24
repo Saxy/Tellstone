@@ -537,10 +537,14 @@ func TestManualPDTSO(t *testing.T) {
 				cli.Close()
 				t.Fatalf("node %d: grant %d: %v", s.id, k, err)
 			}
-			if lo == 0 || hi < lo {
-				cli.Close()
-				t.Fatalf("node %d: grant %d returned bad range [%d,%d]", s.id, k, lo, hi)
-			}
+		if lo == 0 || hi < lo {
+			cli.Close()
+			t.Fatalf("node %d: grant %d returned bad range [%d,%d]", s.id, k, lo, hi)
+		}
+		if hi-lo+1 != 100 {
+			cli.Close()
+			t.Fatalf("node %d: grant %d returned bad size %d (want 100)", s.id, k, hi-lo+1)
+		}
 			t.Logf("  node %d granted [%d,%d] (%d timestamps)", s.id, lo, hi, hi-lo+1)
 			grants = append(grants, grant{node: uint64(s.id), lo: lo, hi: hi})
 		}

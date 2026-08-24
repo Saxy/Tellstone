@@ -236,8 +236,8 @@ func pdEndpointURLs(dataAddr string) (client, peer string, err error) {
 	if port+20000 > 65535 {
 		return "", "", fmt.Errorf("cluster: data address port %d leaves no room for derived PD ports (need +20000 ≤ 65535)", port)
 	}
-	client = fmt.Sprintf("http://%s:%d", host, port+10000)
-	peer = fmt.Sprintf("http://%s:%d", host, port+20000)
+	client = "http://" + net.JoinHostPort(host, strconv.Itoa(port+10000))
+	peer = "http://" + net.JoinHostPort(host, strconv.Itoa(port+20000))
 	return client, peer, nil
 }
 

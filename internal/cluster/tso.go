@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -269,12 +270,25 @@ func (g *EtcdGranter) GrantRange(ctx context.Context, n uint64) (uint64, uint64,
 		var watermark uint64
 		var rev int64
 		if len(getResp.Kvs) == 1 {
+			if len(getResp.Kvs[0].Value) != 8 {
+				return 0, 0, fmt.Errorf("cluster: malformed TSO watermark value (len %d, want 8)", len(getResp.Kvs[0].Value))
+			}
 			watermark = binary.LittleEndian.Uint64(getResp.Kvs[0].Value)
 			rev = getResp.Kvs[0].ModRevision
+		}
+		// The watermark saturates at the top of the address space; refuse to
+		// hand out a wrapped range that would reuse or collide with history.
+		if watermark == math.MaxUint64 {
+			return 0, 0, errors.New("cluster: TSO watermark exhausted (max uint64)")
 		}
 		start := watermark + 1
 		if nowMS := uint64(time.Now().UnixMilli()); nowMS > TimestampMillis(watermark) {
 			start = PackTimestamp(nowMS, 0)
+		}
+		// Guard the uint64 addition below against wrap-around, which would
+		// otherwise silently reuse low timestamps already granted.
+		if n-1 > math.MaxUint64-start {
+			return 0, 0, fmt.Errorf("cluster: TSO grant size overflows uint64 (start %d, n %d)", start, n)
 		}
 		end := start + n - 1
 

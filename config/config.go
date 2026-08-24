@@ -13,6 +13,7 @@ package config
 import (
 	"flag"
 	"fmt"
+	"math"
 	"net"
 	"os"
 	"path/filepath"
@@ -591,10 +592,20 @@ func LoadConfig(args []string) *Config {
 	if cfg.nodeRole != "hybrid" && !cfg.clusterMode {
 		panic(fmt.Sprintf("tellstone: --node-role=%s requires --cluster-mode", cfg.nodeRole))
 	}
-	if cfg.nodeRole == "data" && cfg.pdAddr == "" {
-		panic("tellstone: --node-role=data requires --pd-addr pointing at an external placement driver")
-	}
-	if cfg.nodeRole != "data" && cfg.pdAddr != "" {
+	if cfg.nodeRole == "data" {
+		if cfg.pdAddr == "" {
+			panic("tellstone: --node-role=data requires --pd-addr pointing at an external placement driver")
+		}
+		// Reject malformed endpoints (e.g. a value with no port) before
+		// StartPDNode dials them via clientv3 and fails opaquely.
+		addr := cfg.pdAddr
+		if i := strings.Index(addr, "://"); i >= 0 {
+			addr = addr[i+3:]
+		}
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			panic(fmt.Sprintf("tellstone: --pd-addr %q is malformed (need host:port): %v", cfg.pdAddr, err))
+		}
+	} else if cfg.pdAddr != "" {
 		panic("tellstone: --pd-addr connects to an external placement driver and requires --node-role=data")
 	}
 	if cfg.tsoMinBatch < 1 {
@@ -602,6 +613,11 @@ func LoadConfig(args []string) *Config {
 	}
 	if cfg.tsoHeadroomSeconds < 1 {
 		panic("tellstone: --tso-headroom-seconds must be at least 1")
+	}
+	// Reject values whose seconds-to-time.Duration conversion would overflow
+	// int64 nanoseconds; otherwise a negative Headroom would corrupt the pool.
+	if int64(cfg.tsoHeadroomSeconds) > math.MaxInt64/int64(time.Second) {
+		panic("tellstone: --tso-headroom-seconds too large (would overflow duration)")
 	}
 	if cfg.tsoRefillThreshold < 1 || cfg.tsoRefillThreshold > 99 {
 		panic("tellstone: --tso-refill-threshold must be between 1 and 99")

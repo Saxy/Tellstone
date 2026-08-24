@@ -25,11 +25,13 @@ Update the status table as work lands.
                           │                      │
                  control plane (clientv3/gRPC)   │
                           │                      │
-                ┌─────────┴──────────────────────▼─────┐
-                │ PD leader (etcd-elected among members)│
-                │ grants disjoint timestamp ranges,     │
-                │ CAS-advances watermark in etcd KV     │
-                └───────────────────────────────────────┘
+                 ┌──────────────────────────────────────┐
+                 │ PD member set (embedded etcd among    │
+                 │ members; leader reserved for future   │
+                 │ singleton duties only). Any member    │
+                 │ grants disjoint ranges via            │
+                 │ CAS-advanced watermark in etcd KV.    │
+                 └──────────────────────────────────────┘
 ```
 
 Roles:
@@ -127,14 +129,22 @@ the phase-1 panic style.
 
 ## Failure Timeline (acceptance scenario)
 
+The watermark-CAS grant protocol is decentralized: any member can extend the
+timestamp space, so there is no grant-gating PD leader to elect. The failure
+mode the suite covers is losing the entire PD member set (the embedded etcd
+quorum):
+
 ```
-T+0s      PD leader process stopped
+T+0s      all PD members (etcd quorum) stopped
 T+0–30s   nodes allocate from pools (writes would continue;
           this phase verifies via harness consumption)
 T+30s     pools exhausted → Alloc blocks / ErrTSOExhausted
-T+~2–5s   surviving etcd members elect new PD leader
-recovery  leader restarted → rejoins, pools refill, allocation resumes
+recovery  any PD member restarted → quorum reforms, pools refill,
+          allocation resumes above everything previously granted
 ```
+
+> Leader-only failover (stopping a single member while the quorum survives) is
+> not covered by the current suite and must not be marked complete.
 
 ## Verification Plan
 
@@ -142,7 +152,7 @@ recovery  leader restarted → rejoins, pools refill, allocation resumes
 |-------|--------|
 | 1- and 3-node embedded clusters form and elect | unit tests, ephemeral ports |
 | Global monotonicity under concurrency | `-race` test, N goroutines × M allocations vs sorted set |
-| Failover never reissues | stop leader mid-test, new leader continues above old watermark |
+| Failover never reissues | stop entire PD quorum mid-test (3-member), restart → resumes above old watermark (decentralized CAS, no grant-gating leader) |
 | Pool exhaustion semantics | harness drains pool, asserts block/ErrTSOExhausted, restart, resume |
 | Hot-path cost | `go test -bench=Alloc -benchmem`: target ns/op sub-50, `allocs/op = 0` |
 | Role wiring | `pd` role starts no shards; `data` role starts no etcd, dials `--pd-addr` |

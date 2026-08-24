@@ -15,6 +15,7 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"math"
 	"sort"
 	"sync"
 	"testing"
@@ -318,6 +319,77 @@ func TestGrantRangeSurvivesRestart(t *testing.T) {
 	}
 	if start2 <= end {
 		t.Fatalf("post-restart grant [%d,%d] overlaps pre-restart high water %d", start2, end2, end)
+	}
+}
+
+// startGrantTest spins up a single embedded PD member and returns a granter
+// plus a cancelable context for the GrantRange hardening tests below.
+func startGrantTest(t *testing.T) (*EtcdGranter, context.Context, context.CancelFunc) {
+	t.Helper()
+	cport, pport := freePort(t), freePort(t)
+	pd, err := StartPD(PDConfig{
+		NodeID:          1,
+		DataDir:         t.TempDir(),
+		ClientListenURL: joinHostPortURL("127.0.0.1", cport),
+		PeerListenURL:   joinHostPortURL("127.0.0.1", pport),
+		AllPeerURLs: map[uint64]string{
+			1: joinHostPortURL("127.0.0.1", pport),
+		},
+	})
+	if err != nil {
+		t.Fatalf("StartPD: %v", err)
+	}
+	t.Cleanup(pd.Stop)
+	cli, err := clientv3.New(clientv3.Config{Endpoints: []string{pd.ClientURL()}, DialTimeout: 5 * time.Second})
+	if err != nil {
+		t.Fatalf("clientv3.New: %v", err)
+	}
+	t.Cleanup(func() { _ = cli.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	t.Cleanup(cancel)
+	return NewEtcdGranter(cli), ctx, cancel
+}
+
+// TestGrantRangeRejectsMalformedWatermark seeds a watermark value of the
+// wrong length and verifies GrantRange returns an error instead of panicking
+// in binary.LittleEndian.Uint64.
+func TestGrantRangeRejectsMalformedWatermark(t *testing.T) {
+	g, ctx, _ := startGrantTest(t)
+	// A watermark value shorter than 8 bytes is malformed.
+	if _, err := g.cli.Put(ctx, tsoWatermarkKey, string([]byte{1, 2, 3, 4})); err != nil {
+		t.Fatalf("seeding watermark: %v", err)
+	}
+	if _, _, err := g.GrantRange(ctx, 100); err == nil {
+		t.Fatal("GrantRange accepted a malformed watermark value; want error")
+	}
+}
+
+// TestGrantRangeRejectsSaturatedWatermark seeds the watermark at the top of
+// the uint64 space; GrantRange must refuse rather than wrap start to 0.
+func TestGrantRangeRejectsSaturatedWatermark(t *testing.T) {
+	g, ctx, _ := startGrantTest(t)
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, math.MaxUint64)
+	if _, err := g.cli.Put(ctx, tsoWatermarkKey, string(buf)); err != nil {
+		t.Fatalf("seeding watermark: %v", err)
+	}
+	if _, _, err := g.GrantRange(ctx, 1); err == nil {
+		t.Fatal("GrantRange accepted a saturated watermark; want error")
+	}
+}
+
+// TestGrantRangeRejectsOverflowSize seeds a high watermark and requests a
+// range whose end would overflow uint64; GrantRange must refuse instead of
+// handing out timestamps that wrap into already-granted low values.
+func TestGrantRangeRejectsOverflowSize(t *testing.T) {
+	g, ctx, _ := startGrantTest(t)
+	buf := make([]byte, 8)
+	binary.LittleEndian.PutUint64(buf, math.MaxUint64-10)
+	if _, err := g.cli.Put(ctx, tsoWatermarkKey, string(buf)); err != nil {
+		t.Fatalf("seeding watermark: %v", err)
+	}
+	if _, _, err := g.GrantRange(ctx, 100); err == nil {
+		t.Fatal("GrantRange accepted an overflowing range; want error")
 	}
 }
 
