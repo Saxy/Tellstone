@@ -13,7 +13,9 @@ package config
 import (
 	"flag"
 	"fmt"
+	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -62,6 +64,20 @@ type Config struct {
 	nodeID      uint64
 	peerAddr    string
 	peers       string
+	// Placement driver / TSO (phase 2). nodeRole selects the deployment
+	// topology per ADR-010 §5: hybrid runs data shards plus an embedded
+	// etcd member, pd runs only the embedded member, data skips the embed
+	// entirely and dials the external PD at pdAddr. pdClientAddr/pdPeerAddr
+	// hold the *resolved* etcd endpoints (override or derived from --addr).
+	nodeRole           string
+	pdAddr             string
+	pdClientAddr       string
+	pdPeerAddr         string
+	pdMembers          string
+	pdDir              string
+	tsoMinBatch        uint64
+	tsoHeadroomSeconds uint
+	tsoRefillThreshold int
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -422,6 +438,61 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_PEERS", ""),
 		"Comma-separated list of peer addresses for initial cluster bootstrap (default: none)",
 	)
+	// Placement driver / TSO (phase 2, ADR-010).
+	fs.StringVar(
+		&cfg.nodeRole,
+		"node-role",
+		getEnv("TSD_NODE_ROLE", "hybrid"),
+		"Cluster deployment role: hybrid (data shards + embedded PD), pd (PD member only), or data (external PD via --pd-addr) (default: hybrid)",
+	)
+	fs.StringVar(
+		&cfg.pdAddr,
+		"pd-addr",
+		getEnv("TSD_PD_ADDR", ""),
+		"External placement driver address; required when --node-role=data (default: none)",
+	)
+	fs.StringVar(
+		&cfg.pdClientAddr,
+		"pd-client-addr",
+		getEnv("TSD_PD_CLIENT_ADDR", ""),
+		"Override the embedded etcd client address; derived from --addr port +10000 when unset (default: none)",
+	)
+	fs.StringVar(
+		&cfg.pdPeerAddr,
+		"pd-peer-addr",
+		getEnv("TSD_PD_PEER_ADDR", ""),
+		"Override the embedded etcd peer address; derived from --addr port +20000 when unset (default: none)",
+	)
+	fs.StringVar(
+		&cfg.pdMembers,
+		"pd-members",
+		getEnv("TSD_PD_MEMBERS", ""),
+		"Comma-separated ID@addr list of placement driver members; defaults to --peers. Set when data-role nodes share the Raft membership (default: --peers)",
+	)
+	fs.StringVar(
+		&cfg.pdDir,
+		"pd-dir",
+		getEnv("TSD_PD_DIR", ""),
+		"Data directory for the embedded placement driver; <persistence-dir>/pd when set, otherwise ./pd (default: derived)",
+	)
+	fs.Uint64Var(
+		&cfg.tsoMinBatch,
+		"tso-min-batch",
+		getEnv("TSD_TSO_MIN_BATCH", uint64(1000)),
+		"Minimum number of timestamps per TSO pool refill batch (default: 1000)",
+	)
+	fs.UintVar(
+		&cfg.tsoHeadroomSeconds,
+		"tso-headroom-seconds",
+		getEnv("TSD_TSO_HEADROOM_SECONDS", uint(30)),
+		"Seconds of write headroom a full TSO pool provides at the observed write rate (default: 30)",
+	)
+	fs.IntVar(
+		&cfg.tsoRefillThreshold,
+		"tso-refill-threshold",
+		getEnv("TSD_TSO_REFILL_THRESHOLD", 20),
+		"Remaining-pool percentage that triggers a refill request (default: 20)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -508,7 +579,147 @@ func LoadConfig(args []string) *Config {
 			panic("tellstone: --node-id is not present in --peers; the local node must be part of the bootstrap membership")
 		}
 	}
+
+	// Placement driver / TSO (phase 2, ADR-010 §5–§7). Roles only exist in
+	// cluster mode; the data role replaces the embedded etcd member with an
+	// external --pd-addr endpoint.
+	switch cfg.nodeRole {
+	case "hybrid", "pd", "data":
+	default:
+		panic(fmt.Sprintf("tellstone: --node-role must be hybrid, pd, or data (got %q)", cfg.nodeRole))
+	}
+	if cfg.nodeRole != "hybrid" && !cfg.clusterMode {
+		panic(fmt.Sprintf("tellstone: --node-role=%s requires --cluster-mode", cfg.nodeRole))
+	}
+	if cfg.nodeRole == "data" && cfg.pdAddr == "" {
+		panic("tellstone: --node-role=data requires --pd-addr pointing at an external placement driver")
+	}
+	if cfg.nodeRole != "data" && cfg.pdAddr != "" {
+		panic("tellstone: --pd-addr connects to an external placement driver and requires --node-role=data")
+	}
+	if cfg.tsoMinBatch < 1 {
+		panic("tellstone: --tso-min-batch must be at least 1")
+	}
+	if cfg.tsoHeadroomSeconds < 1 {
+		panic("tellstone: --tso-headroom-seconds must be at least 1")
+	}
+	if cfg.tsoRefillThreshold < 1 || cfg.tsoRefillThreshold > 99 {
+		panic("tellstone: --tso-refill-threshold must be between 1 and 99")
+	}
+	// The PD member list defaults to the Raft peer list (homogeneous
+	// clusters); an explicit --pd-members splits the two when data-role
+	// nodes share Raft membership without hosting an etcd member.
+	if cfg.pdMembers != "" && (!cfg.clusterMode || cfg.nodeRole == "data") {
+		panic("tellstone: --pd-members requires --cluster-mode with a hybrid or pd node role")
+	}
+	pdDirBase := cfg.pdDir
+	if pdDirBase == "" && cfg.persistenceDir != "" {
+		pdDirBase = filepath.Join(cfg.persistenceDir, "pd")
+	}
+	if pdDirBase == "" {
+		pdDirBase = "./pd"
+	}
+	cfg.pdDir = pdDirBase
+
+	// Resolve the embedded etcd endpoints (ADR-010 §6): an explicit
+	// override or the data port +10000/+20000. Resolved endpoints must not
+	// collide with any configured listen address (own data and Raft ports,
+	// every --peers entry) — a derived port silently swallowing another
+	// channel would fail far from the cause. Wildcard binds (0.0.0.0)
+	// collide on port regardless of the remote host.
+	if cfg.clusterMode && cfg.nodeRole != "data" {
+		configured := map[string]string{
+			cfg.addr:     "--addr",
+			cfg.peerAddr: "--peer-addr",
+		}
+		members, perr := cluster.ParsePeers(cfg.peers)
+		if perr != nil {
+			panic(fmt.Sprintf("tellstone: --peers: %v", perr))
+		}
+		for _, p := range members {
+			configured[p.Addr] = "--peers"
+		}
+		cfg.pdClientAddr = resolvePDEndpoint(cfg.pdClientAddr, cfg.addr, 10000, "--pd-client-addr")
+		cfg.pdPeerAddr = resolvePDEndpoint(cfg.pdPeerAddr, cfg.addr, 20000, "--pd-peer-addr")
+		for _, endpoint := range []string{cfg.pdClientAddr, cfg.pdPeerAddr} {
+			for addr, flag := range configured {
+				if pdEndpointsCollide(endpoint, addr) {
+					panic(fmt.Sprintf(
+						"tellstone: resolved PD endpoint %s collides with %s %s; adjust the port or set an explicit override",
+						endpoint, flag, addr))
+				}
+			}
+		}
+
+		// The local node hosts an etcd member in these roles, so it must
+		// appear in the effective member list under its own node ID.
+		memberList := cfg.pdMembers
+		if memberList == "" {
+			memberList = cfg.peers
+		}
+		pdPeers, merr := cluster.ParsePeers(memberList)
+		if merr != nil {
+			panic(fmt.Sprintf("tellstone: --pd-members: %v", merr))
+		}
+		localMember := false
+		for _, p := range pdPeers {
+			if p.ID == cfg.nodeID {
+				localMember = true
+				break
+			}
+		}
+		if !localMember {
+			panic("tellstone: --node-id is not present in the PD membership; hybrid and pd roles must host an embedded etcd member")
+		}
+	}
 	return cfg
+}
+
+// hostPort splits and range-checks a host:port address.
+func hostPort(addr string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("port %q out of range", portStr)
+	}
+	return host, port, nil
+}
+
+// resolvePDEndpoint returns the effective embedded-etcd endpoint: the
+// explicit override when set, otherwise the data address with the port
+// shifted by delta (ADR-010 §6).
+func resolvePDEndpoint(override, dataAddr string, delta int, flag string) string {
+	source, port := dataAddr, 0
+	if override != "" {
+		source = override
+	}
+	host, p, err := hostPort(source)
+	if err != nil {
+		panic(fmt.Sprintf("tellstone: %s %q is not a valid host:port: %v", flag, source, err))
+	}
+	if override != "" {
+		port = p
+	} else {
+		port = p + delta
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
+}
+
+// pdEndpointsCollide reports whether two host:port endpoints would bind the
+// same socket, treating wildcard hosts (empty, 0.0.0.0, ::) as matching any
+// counterpart on the same port.
+func pdEndpointsCollide(a, b string) bool {
+	ha, pa, errA := hostPort(a)
+	hb, pb, errB := hostPort(b)
+	if errA != nil || errB != nil {
+		return false // malformed addresses are rejected at their own flag site
+	}
+	wildcard := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
+	sameHost := ha == hb || wildcard(ha) || wildcard(hb)
+	return sameHost && pa == pb
 }
 
 func (cfg *Config) GetAddr() string                   { return cfg.addr }
@@ -552,3 +763,22 @@ func (cfg *Config) ClusterMode() bool                  { return cfg.clusterMode 
 func (cfg *Config) GetNodeID() uint64                  { return cfg.nodeID }
 func (cfg *Config) GetPeerAddr() string                { return cfg.peerAddr }
 func (cfg *Config) GetPeers() string                   { return cfg.peers }
+func (cfg *Config) GetNodeRole() string                { return cfg.nodeRole }
+func (cfg *Config) GetPDAddr() string                  { return cfg.pdAddr }
+func (cfg *Config) GetPDClientAddr() string            { return cfg.pdClientAddr }
+func (cfg *Config) GetPDPeerAddr() string              { return cfg.pdPeerAddr }
+
+// GetPDMembers returns the effective PD member list: --pd-members when set,
+// otherwise the Raft --peers list.
+func (cfg *Config) GetPDMembers() string {
+	if cfg.pdMembers != "" {
+		return cfg.pdMembers
+	}
+	return cfg.peers
+}
+func (cfg *Config) GetPDDir() string       { return cfg.pdDir }
+func (cfg *Config) GetTSOMinBatch() uint64 { return cfg.tsoMinBatch }
+func (cfg *Config) GetTSOHeadroom() time.Duration {
+	return time.Duration(cfg.tsoHeadroomSeconds) * time.Second
+}
+func (cfg *Config) GetTSORefillThreshold() int { return cfg.tsoRefillThreshold }

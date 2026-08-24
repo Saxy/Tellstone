@@ -577,3 +577,247 @@ func TestClusterMembershipValidation(t *testing.T) {
 		}
 	})
 }
+
+// tryLoadConfig runs LoadConfig and returns the parsed config plus the
+// panic message ("" when validation passed).
+func tryLoadConfig(args ...string) (cfg *Config, msg string) {
+	defer func() {
+		if r := recover(); r != nil {
+			msg = fmt.Sprint(r)
+		}
+	}()
+	return LoadConfig(args), ""
+}
+
+// TestNodeRoleValidation pins the phase-2 role rules from ADR-010 §5:
+// roles exist only in cluster mode, data requires an external PD, and the
+// external-PD flag is exclusive to the data role.
+func TestNodeRoleValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "unknown role",
+			args: []string{"--node-role", "observer"},
+			want: "must be hybrid, pd, or data",
+		},
+		{
+			name: "data role outside cluster mode",
+			args: []string{"--node-role", "data", "--pd-addr", "127.0.0.1:2379"},
+			want: "requires --cluster-mode",
+		},
+		{
+			name: "pd role outside cluster mode",
+			args: []string{"--node-role", "pd"},
+			want: "requires --cluster-mode",
+		},
+		{
+			name: "data role without external pd",
+			args: []string{"--cluster-mode", "--node-role", "data",
+				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
+			want: "requires --pd-addr",
+		},
+		{
+			name: "external pd flag on hybrid role",
+			args: []string{"--cluster-mode", "--pd-addr", "127.0.0.1:2379",
+				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
+			want: "requires --node-role=data",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, msg := tryLoadConfig(tc.args...)
+			if !strings.Contains(msg, tc.want) {
+				t.Fatalf("panic message %q does not contain %q", msg, tc.want)
+			}
+		})
+	}
+
+	t.Run("defaults are hybrid with no pd flags", func(t *testing.T) {
+		cfg, msg := tryLoadConfig()
+		if msg != "" {
+			t.Fatalf("default config rejected: %s", msg)
+		}
+		if cfg.GetNodeRole() != "hybrid" {
+			t.Fatalf("node role: got %q, want hybrid", cfg.GetNodeRole())
+		}
+		if cfg.GetPDAddr() != "" {
+			t.Fatalf("pd addr: got %q, want empty", cfg.GetPDAddr())
+		}
+		if cfg.GetTSOMinBatch() != 1000 || cfg.GetTSOHeadroom() != 30*time.Second ||
+			cfg.GetTSORefillThreshold() != 20 {
+			t.Fatalf("tso defaults: batch=%d headroom=%v threshold=%d",
+				cfg.GetTSOMinBatch(), cfg.GetTSOHeadroom(), cfg.GetTSORefillThreshold())
+		}
+	})
+}
+
+// TestPDAddressResolution verifies ADR-010 §6 addressing: deterministic
+// derivation from the data port, explicit overrides, and startup rejection
+// of endpoints that would swallow another configured listener.
+func TestPDAddressResolution(t *testing.T) {
+	t.Run("derived ports follow data+10000/+20000", func(t *testing.T) {
+		cfg, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--addr", "127.0.0.1:7000",
+			"--peer-addr", "127.0.0.1:7001",
+			"--peers", "1@127.0.0.1:9001,2@127.0.0.1:9002",
+			"--node-id", "1",
+		)
+		if msg != "" {
+			t.Fatalf("valid cluster config rejected: %s", msg)
+		}
+		if got := cfg.GetPDClientAddr(); got != "127.0.0.1:17000" {
+			t.Fatalf("client addr: got %q, want 127.0.0.1:17000", got)
+		}
+		if got := cfg.GetPDPeerAddr(); got != "127.0.0.1:27000" {
+			t.Fatalf("peer addr: got %q, want 127.0.0.1:27000", got)
+		}
+	})
+
+	t.Run("overrides win over derivation", func(t *testing.T) {
+		cfg, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--addr", "127.0.0.1:7000",
+			"--pd-client-addr", "127.0.0.1:12379",
+			"--pd-peer-addr", "127.0.0.1:12380",
+			"--peers", "1@127.0.0.1:9001",
+			"--node-id", "1",
+		)
+		if msg != "" {
+			t.Fatalf("valid cluster config rejected: %s", msg)
+		}
+		if got := cfg.GetPDClientAddr(); got != "127.0.0.1:12379" {
+			t.Fatalf("client addr: got %q, want override 127.0.0.1:12379", got)
+		}
+		if got := cfg.GetPDPeerAddr(); got != "127.0.0.1:12380" {
+			t.Fatalf("peer addr: got %q, want override 127.0.0.1:12380", got)
+		}
+	})
+
+	t.Run("derived endpoint colliding with a peer data port is rejected", func(t *testing.T) {
+		// Data port 7000 derives client port 17000; peer 3 already uses it.
+		_, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--addr", "127.0.0.1:7000",
+			"--peers", "1@127.0.0.1:9001,3@127.0.0.1:17000",
+			"--node-id", "1",
+		)
+		if !strings.Contains(msg, "collides") {
+			t.Fatalf("expected collision panic, got %q", msg)
+		}
+	})
+
+	t.Run("wildcard bind collides across hosts on same port", func(t *testing.T) {
+		// Default --peer-addr binds 0.0.0.0:<raft>; a PD endpoint on that
+		// port must be rejected even though the hosts differ textually.
+		_, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--addr", "127.0.0.1:7989", // client would derive to 17989
+			"--peer-addr", "0.0.0.0:9989",
+			"--pd-client-addr", "10.0.0.1:9989", // different host, same port
+			"--peers", "1@127.0.0.1:9001",
+			"--node-id", "1",
+		)
+		if !strings.Contains(msg, "collides") {
+			t.Fatalf("expected wildcard collision panic, got %q", msg)
+		}
+	})
+
+	t.Run("malformed override rejected", func(t *testing.T) {
+		_, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--pd-client-addr", "no-port-here",
+			"--peers", "1@127.0.0.1:9001",
+			"--node-id", "1",
+		)
+		if !strings.Contains(msg, "--pd-client-addr") {
+			t.Fatalf("expected malformed-address panic naming the flag, got %q", msg)
+		}
+	})
+}
+
+// TestPDMembersAndDirValidation covers ADR-010 §5 membership split and the
+// --pd-dir fallback chain.
+func TestPDMembersAndDirValidation(t *testing.T) {
+	t.Run("pd-members outside cluster mode rejected", func(t *testing.T) {
+		_, msg := tryLoadConfig("--pd-members", "1@127.0.0.1:9001")
+		if !strings.Contains(msg, "--pd-members") {
+			t.Fatalf("expected pd-members panic, got %q", msg)
+		}
+	})
+
+	t.Run("pd-members with data role rejected", func(t *testing.T) {
+		_, msg := tryLoadConfig(
+			"--cluster-mode", "--node-role", "data",
+			"--pd-addr", "127.0.0.1:2379",
+			"--peers", "1@127.0.0.1:9001",
+			"--node-id", "1",
+			"--pd-members", "1@127.0.0.1:9001",
+		)
+		if !strings.Contains(msg, "--pd-members") {
+			t.Fatalf("expected pd-members panic, got %q", msg)
+		}
+	})
+
+	t.Run("local node must host a member in hybrid role", func(t *testing.T) {
+		_, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--addr", "127.0.0.1:7000",
+			"--peers", "1@127.0.0.1:9001,2@127.0.0.1:9002",
+			"--node-id", "2",
+			"--pd-members", "1@127.0.0.1:9001", // excludes local node 2
+		)
+		if !strings.Contains(msg, "PD membership") {
+			t.Fatalf("expected missing-local-member panic, got %q", msg)
+		}
+	})
+
+	t.Run("effective members default to peers", func(t *testing.T) {
+		cfg, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--addr", "127.0.0.1:7000",
+			"--peers", "1@127.0.0.1:9001,2@127.0.0.1:9002",
+			"--node-id", "1",
+		)
+		if msg != "" {
+			t.Fatalf("valid config rejected: %s", msg)
+		}
+		if got := cfg.GetPDMembers(); got != cfg.GetPeers() {
+			t.Fatalf("members: got %q, want %q", got, cfg.GetPeers())
+		}
+	})
+
+	t.Run("explicit members override peers default", func(t *testing.T) {
+		cfg, msg := tryLoadConfig(
+			"--cluster-mode",
+			"--addr", "127.0.0.1:7000",
+			"--peers", "1@127.0.0.1:9001,3@127.0.0.1:9003",
+			"--node-id", "1",
+			"--pd-members", "1@127.0.0.1:9001,2@127.0.0.1:9101",
+		)
+		if msg != "" {
+			t.Fatalf("valid config rejected: %s", msg)
+		}
+		if got := cfg.GetPDMembers(); got != "1@127.0.0.1:9001,2@127.0.0.1:9101" {
+			t.Fatalf("members: got %q", got)
+		}
+	})
+
+	t.Run("pd-dir fallback chain", func(t *testing.T) {
+		cfg, _ := tryLoadConfig()
+		if got := cfg.GetPDDir(); got != "./pd" {
+			t.Fatalf("bare default dir: got %q, want ./pd", got)
+		}
+		cfg, _ = tryLoadConfig("--persistence-dir", "/data/ts")
+		if got := cfg.GetPDDir(); got != "/data/ts/pd" {
+			t.Fatalf("persistence-derived dir: got %q, want /data/ts/pd", got)
+		}
+		cfg, _ = tryLoadConfig("--persistence-dir", "/data/ts", "--pd-dir", "/fast/ssd")
+		if got := cfg.GetPDDir(); got != "/fast/ssd" {
+			t.Fatalf("explicit dir: got %q, want /fast/ssd", got)
+		}
+	})
+}

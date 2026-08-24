@@ -335,6 +335,11 @@ verify a follower takes over and all data is intact.
 
 **Goal:** Cluster brain with timestamp allocation.
 
+**Decisions:** See [ADR-010](adr/010-phase2-pd-tso-decisions.md) for
+substrate, scope, transport policy, and deployment modes, and
+[PHASE2-PD-TSO-DESIGN](PHASE2-PD-TSO-DESIGN.md) for the detailed design
+and implementation status.
+
 **Deliverables:**
 
 - `internal/cluster/pd.go` — embedded etcd cluster membership
