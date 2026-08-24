@@ -1,0 +1,53 @@
+config/config.go
+  s_3a03e1470b7cc6::t_8462056f258876 711-713
+  s_3a03e1470b7cc6::t_05f6ee553cd01c 644-646
+internal/cluster/pd_test.go
+  s_3a03e1470b7cc6::t_a16f32aa72b900 30
+internal/cluster/tso_test.go
+  s_3a03e1470b7cc6::t_5e181efdf45a10 247-249
+  s_3a03e1470b7cc6::t_68d8ab03bca9f6 324-328
+server/server.go
+  s_3a03e1470b7cc6::t_9adacf78090371 739-743
+  s_3a03e1470b7cc6::t_5026aab5a01ca0 760
+internal/cluster/pd.go
+  s_3a03e1470b7cc6::t_29d04842e498be 174-176,179,187
+  s_3a03e1470b7cc6::t_8c880faf3e1f58 74-78
+  s_3a03e1470b7cc6::t_1fdefc8911a4e8 196,207-210
+docs/adr/010-phase2-pd-tso-decisions.md
+  s_3a03e1470b7cc6::t_18c9a3bdb53782 82
+internal/cluster/tso.go
+  s_3a03e1470b7cc6::t_bac8a8898ac5b8 198-200,207
+  s_3a03e1470b7cc6::t_992283f39a7780 75
+  s_3a03e1470b7cc6::t_21fcd4247a0e58 177
+  s_3a03e1470b7cc6::t_4697bc6a229729 149-152
+docs/PHASE2-PD-TSO-DESIGN.md
+  s_3a03e1470b7cc6::t_e5b74f5a1254e6 162
+  s_3a03e1470b7cc6::t_12ed12a24d1f37 102,106-109
+internal/cluster/pdnode.go
+  s_3a03e1470b7cc6::t_28dc3cb9671f20 23
+  s_3a03e1470b7cc6::t_dcacac3fb2fd53 21-22
+  s_3a03e1470b7cc6::t_7d59e1b17e4601 111-114,116-119,122,124-130,138
+  s_3a03e1470b7cc6::t_a79f66f9abbc85 220-239,241-244
+  s_3a03e1470b7cc6::t_cf9573b031882c 240
+internal/cluster/manual_test.go
+  s_3a03e1470b7cc6::t_4030af443cd9ed 5-11,13-15,17-18
+  s_3a03e1470b7cc6::t_bfae8355f53ef9 485-563
+  s_3a03e1470b7cc6::t_24a10bad36ef1a 28,37,41-42
+  s_3a03e1470b7cc6::t_ae2b6b7ffb4b70 91,101-103,113-119,128,132
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "0b2ce9191db49b1956f7cfac78c3bda633b55f34",
+  "prompts": {},
+  "sessions": {
+    "s_3a03e1470b7cc6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd28f255affeOOc6523JcrPORB",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
