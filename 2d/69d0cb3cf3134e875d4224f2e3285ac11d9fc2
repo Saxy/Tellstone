@@ -1,0 +1,21 @@
+internal/cluster/pdnode_test.go
+  s_3a03e1470b7cc6::t_e921fa1fac168f 39-43
+internal/cluster/pdnode.go
+  s_3a03e1470b7cc6::t_063cbaf2dea7f4 233-238
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "2d69d0cb3cf3134e875d4224f2e3285ac11d9fc2",
+  "prompts": {},
+  "sessions": {
+    "s_3a03e1470b7cc6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd28f255affeOOc6523JcrPORB",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
