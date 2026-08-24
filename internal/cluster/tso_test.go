@@ -244,6 +244,9 @@ func TestGrantRangeAgainstEtcd(t *testing.T) {
 		}(i)
 	}
 	wg.Wait()
+	if len(rngs) == 0 {
+		t.Fatal("no PD grants collected; see prior grant errors")
+	}
 
 	sort.Slice(rngs, func(a, b int) bool { return rngs[a].lo < rngs[b].lo })
 	for i := 1; i < len(rngs); i++ {
@@ -318,10 +321,11 @@ func TestGrantRangeSurvivesRestart(t *testing.T) {
 	}
 }
 
-// BenchmarkAlloc measures the request-path cost of a single timestamp: a
-// mutex-guarded fetch from a pre-adopted range, no etcd in the loop. The
-// pool is adopted with a span large enough that it never needs a refill
-// during the benchmark, so this isolates the hot path. allocs/op must be 0.
+// BenchmarkAlloc measures the request-path cost of a single timestamp: an
+// atomic compare-and-swap loop over a pre-adopted range, no etcd in the
+// loop. The pool is adopted with a span large enough that it never needs a
+// refill during the benchmark, so this isolates the hot path. allocs/op
+// must be 0.
 func BenchmarkAlloc(b *testing.B) {
 	p := NewTSOPool(TSOPoolConfig{MinBatch: 1, Headroom: time.Second, RefillThresholdPct: 20})
 	if err := p.Adopt(1, 1<<40); err != nil {

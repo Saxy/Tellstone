@@ -736,6 +736,11 @@ func (s *Server) initCluster() error {
 	if err != nil {
 		return fmt.Errorf("parse PD members: %w", err)
 	}
+	// A single hybrid node with no explicit --pd-members runs its own
+	// singleton PD; multi-node clusters must pass the full member list.
+	if len(pdMembers) == 0 {
+		pdMembers = []cluster.Peer{{ID: cfg.GetNodeID(), Addr: cfg.GetAddr()}}
+	}
 	pdNode, err := cluster.StartPDNode(cluster.StartPDNodeConfig{
 		Role:           role,
 		NodeID:         cfg.GetNodeID(),
@@ -752,6 +757,7 @@ func (s *Server) initCluster() error {
 		},
 	})
 	if err != nil {
+		s.raftNode.Stop()
 		return fmt.Errorf("start placement driver: %w", err)
 	}
 	s.pdNode = pdNode

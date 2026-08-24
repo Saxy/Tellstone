@@ -18,6 +18,9 @@ package cluster
 import (
 	"context"
 	"fmt"
+	"net"
+	"strconv"
+	"strings"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -105,17 +108,26 @@ func StartPDNode(cfg StartPDNodeConfig) (*PDNode, error) {
 	}
 
 	// hybrid / pd: derive member endpoints and boot the embedded member.
-	ep, err := DerivePDEndpoints(cfg.Members)
+	// Endpoints are built deterministically from the data address (ADR-010
+	// §6: client = data+10000, peer = data+20000) with an explicit scheme,
+	// so we never depend on a map lookup that may return a stale value.
+	clientURL, peerURL, err := pdEndpointURLs(cfg.DataAddr)
 	if err != nil {
-		return nil, fmt.Errorf("cluster: deriving PD endpoints: %w", err)
-	}
-	clientURL := ep.ClientURLs[cfg.NodeID]
-	peerURL := ep.PeerURLs[cfg.NodeID]
-	if cfg.PeerOverride != "" {
-		ep.PeerURLs[cfg.NodeID] = cfg.PeerOverride
+		return nil, fmt.Errorf("cluster: PD endpoints from %q: %w", cfg.DataAddr, err)
 	}
 	if cfg.ClientOverride != "" {
-		clientURL = cfg.ClientOverride
+		clientURL = withScheme(cfg.ClientOverride)
+	}
+	if cfg.PeerOverride != "" {
+		peerURL = withScheme(cfg.PeerOverride)
+	}
+	peerMap := make(map[uint64]string, len(cfg.Members))
+	for _, m := range cfg.Members {
+		_, pu, e := pdEndpointURLs(m.Addr)
+		if e != nil {
+			return nil, fmt.Errorf("cluster: PD peer endpoint from %q: %w", m.Addr, e)
+		}
+		peerMap[m.ID] = pu
 	}
 
 	pd, err := StartPD(PDConfig{
@@ -123,7 +135,7 @@ func StartPDNode(cfg StartPDNodeConfig) (*PDNode, error) {
 		DataDir:         cfg.PDDir,
 		ClientListenURL: clientURL,
 		PeerListenURL:   peerURL,
-		AllPeerURLs:     ep.PeerURLs,
+		AllPeerURLs:     peerMap,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cluster: starting embedded PD: %w", err)
@@ -204,4 +216,29 @@ func (m *TSOManager) refill() {
 		return
 	}
 	_ = m.pool.Adopt(start, end)
+}
+
+// pdEndpointURLs derives the embedded etcd client and peer URLs from a
+// node's data address (ADR-010 §6): client = data+10000, peer = data+20000,
+// both with an explicit http:// scheme for etcd's URL parser.
+func pdEndpointURLs(dataAddr string) (client, peer string, err error) {
+	host, portStr, err := net.SplitHostPort(dataAddr)
+	if err != nil {
+		return "", "", err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", "", err
+	}
+	client = fmt.Sprintf("http://%s:%d", host, port+10000)
+	peer = fmt.Sprintf("http://%s:%d", host, port+20000)
+	return client, peer, nil
+}
+
+// withScheme ensures an endpoint carries an http:// scheme.
+func withScheme(u string) string {
+	if strings.Contains(u, "://") {
+		return u
+	}
+	return "http://" + u
 }

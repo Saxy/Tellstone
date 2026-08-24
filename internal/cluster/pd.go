@@ -71,6 +71,11 @@ func DerivePDEndpoints(members []Peer) (*PDEndpoints, error) {
 		if err != nil {
 			return nil, fmt.Errorf("cluster: PD member %d address %q: %w", m.ID, m.Addr, err)
 		}
+		// The peer endpoint is base+20000; reject bases that would overflow
+		// the valid TCP port range so we fail fast instead of binding :0.
+		if port > 45535 {
+			return nil, fmt.Errorf("cluster: PD member %d address %q: base port %d leaves no room for derived PD ports (need +20000 ≤ 65535)", m.ID, m.Addr, port)
+		}
 		ep.ClientURLs[m.ID] = (&url.URL{
 			Scheme: "http",
 			Host:   joinHostPort(host, port+10000),
@@ -166,9 +171,12 @@ func StartPD(cfg PDConfig) (*PD, error) {
 		return nil, fmt.Errorf("cluster: starting embedded PD member %d: %w", cfg.NodeID, err)
 	}
 
+	// One startup budget covers both the etcd ready signal and the leader
+	// wait, so a slow member fails at pdReadyTimeout rather than 2x that.
+	startDeadline := time.Now().Add(pdReadyTimeout)
 	select {
 	case <-emb.Server.ReadyNotify():
-		if err = waitForPDLeader(clientAdv.String()); err != nil {
+		if err = waitForPDLeader(clientAdv.String(), startDeadline); err != nil {
 			stopEmbedded(emb)
 			return nil, fmt.Errorf("cluster: member %d: %w", cfg.NodeID, err)
 		}
@@ -176,7 +184,7 @@ func StartPD(cfg PDConfig) (*PD, error) {
 	case err := <-emb.Err():
 		stopEmbedded(emb)
 		return nil, fmt.Errorf("cluster: embedded PD member %d failed: %w", cfg.NodeID, err)
-	case <-time.After(pdReadyTimeout):
+	case <-time.After(time.Until(startDeadline)):
 		stopEmbedded(emb)
 		return nil, fmt.Errorf("cluster: member %d: %w", cfg.NodeID, ErrPDNotReady)
 	}
@@ -185,7 +193,7 @@ func StartPD(cfg PDConfig) (*PD, error) {
 // waitForPDLeader polls the member's client endpoint until etcd reports a
 // cluster leader, or pdReadyTimeout elapses. A single node elects itself;
 // a multi-node group waits for quorum.
-func waitForPDLeader(endpoint string) error {
+func waitForPDLeader(endpoint string, deadline time.Time) error {
 	cli, err := clientv3.New(clientv3.Config{
 		Endpoints:   []string{endpoint},
 		DialTimeout: 5 * time.Second,
@@ -195,16 +203,16 @@ func waitForPDLeader(endpoint string) error {
 	}
 	defer cli.Close()
 
-	deadline := time.Now().Add(pdReadyTimeout)
 	for {
+		// Honor an already-expired (or fully consumed) startup deadline.
+		if time.Now().After(deadline) {
+			return ErrPDNotReady
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		st, serr := cli.Status(ctx, endpoint)
 		cancel()
 		if serr == nil && st.Leader != 0 {
 			return nil
-		}
-		if time.Now().After(deadline) {
-			return ErrPDNotReady
 		}
 		time.Sleep(200 * time.Millisecond)
 	}

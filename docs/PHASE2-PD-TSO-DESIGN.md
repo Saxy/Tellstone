@@ -99,13 +99,14 @@ that is never reused.
 type Pool struct {
     cur  atomic.Uint64 // next timestamp to hand out
     end  atomic.Uint64 // exclusive upper bound of owned range
-    rate rateEstimator // EWMA of allocations/sec
+    sampler rateSampler // EWMA of allocations/sec
 }
 ```
 
-- **Alloc:** `cur.Add(1)` fast path when result ≤ end — one atomic op,
-  zero heap allocations. Slow path (pool empty) blocks per ADR-003 or
-  returns `ErrTSOExhausted` in non-blocking callers.
+- **Alloc:** `tryAlloc` runs a compare-and-swap loop on `cur` while `cur <
+  end` — one atomic op on the hot path, zero heap allocations. Slow path
+  (pool empty) blocks per ADR-003 or returns `ErrTSOExhausted` in
+  non-blocking callers.
 - **Refill trigger:** remaining < 20 % of current range.
 - **Batch sizing:** `max(min_batch, EWMA(rate) × headroom_seconds)`,
   defaults `min_batch = 1000`, `headroom = 30 s` (ADR-003).
@@ -158,6 +159,7 @@ recovery  leader restarted → rejoins, pools refill, allocation resumes
 | PD/TSO node stack + refill loop (`internal/cluster/pdnode.go`) | ✅ Done | `StartPDNode` per role (hybrid/pd boot embedded member; data dials `--pd-addr`), `TSOManager` primes + tops up the pool; wired into `server.go` initCluster/Stop |
 | Acceptance failover test | ✅ Done | `internal/cluster/failover_test.go`: 3-member PD, kill whole quorum → pools drain → `Alloc` blocks → restart quorum → resumes (decentralized CAS, no single leader) |
 | Benchmarks (hot path proof) | ✅ Done | `BenchmarkAlloc`: 7.3 ns/op single / 41 ns/op parallel, **0 allocs/op** (`-benchmem`) |
+| Manual end-to-end PD/TSO proof | ✅ Done | `TestManualPDTSO` (gated `TELLSTONE_MANUAL_TEST=1`): boots a real 3-node `--cluster-mode` server, dials each node's embedded etcd client port, asserts 15 grants across the cluster are globally disjoint |
 | Close-out status update | ✅ Done | all code + tests land; tracked in this doc |
 
 Deferred by decision (not part of phase 2):

@@ -72,8 +72,7 @@ type TSOPool struct {
 	total     atomic.Uint64
 	mu        sync.Mutex
 	cond      *sync.Cond
-	lastSize  uint64
-	depleted  bool
+	lastSize  atomic.Uint64
 	closed    bool
 	minBatch  uint64
 	headroom  time.Duration
@@ -140,7 +139,6 @@ func (p *TSOPool) Alloc(ctx context.Context) (uint64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for {
-		p.depleted = true
 		if ts, ok := p.tryAlloc(); ok {
 			return ts, nil
 		}
@@ -148,6 +146,10 @@ func (p *TSOPool) Alloc(ctx context.Context) (uint64, error) {
 			return 0, errors.New("cluster: TSO pool closed")
 		}
 		stop := context.AfterFunc(ctx, p.cond.Broadcast)
+		if ctx.Err() != nil {
+			stop()
+			return 0, fmt.Errorf("cluster: TSO allocation cancelled: %w", ctx.Err())
+		}
 		p.cond.Wait()
 		stop()
 		if err := ctx.Err(); err != nil {
@@ -172,7 +174,7 @@ func (p *TSOPool) NeedsRefill() bool {
 	if remaining == 0 {
 		return true
 	}
-	size := p.lastSize
+	size := p.lastSize.Load()
 	if size == 0 {
 		return true
 	}
@@ -193,14 +195,16 @@ func (p *TSOPool) NextBatchSize() uint64 {
 // Adopt publishes a freshly granted range [start, end] and wakes every
 // blocked allocator.
 func (p *TSOPool) Adopt(start, end uint64) error {
+	if start == 0 {
+		return fmt.Errorf("cluster: invalid TSO range [%d, %d]: start must be non-zero", start, end)
+	}
 	if end < start {
 		return fmt.Errorf("cluster: invalid TSO range [%d, %d]", start, end)
 	}
 	p.cur.Store(start - 1)
 	p.end.Store(end)
 	p.mu.Lock()
-	p.lastSize = end - start + 1
-	p.depleted = false
+	p.lastSize.Store(end - start + 1)
 	p.cond.Broadcast()
 	p.mu.Unlock()
 	return nil

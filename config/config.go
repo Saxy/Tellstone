@@ -641,6 +641,9 @@ func LoadConfig(args []string) *Config {
 		}
 		cfg.pdClientAddr = resolvePDEndpoint(cfg.pdClientAddr, cfg.addr, 10000, "--pd-client-addr")
 		cfg.pdPeerAddr = resolvePDEndpoint(cfg.pdPeerAddr, cfg.addr, 20000, "--pd-peer-addr")
+		if pdEndpointsCollide(cfg.pdClientAddr, cfg.pdPeerAddr) {
+			panic("tellstone: resolved PD client and peer endpoints are identical; set distinct --pd-client-addr/--pd-peer-addr overrides")
+		}
 		for _, endpoint := range []string{cfg.pdClientAddr, cfg.pdPeerAddr} {
 			for addr, flag := range configured {
 				if pdEndpointsCollide(endpoint, addr) {
@@ -704,6 +707,9 @@ func resolvePDEndpoint(override, dataAddr string, delta int, flag string) string
 		port = p
 	} else {
 		port = p + delta
+	}
+	if port < 1 || port > 65535 {
+		panic(fmt.Sprintf("tellstone: %s %q resolves to port %d, out of valid range [1,65535]", flag, source, port))
 	}
 	return net.JoinHostPort(host, strconv.Itoa(port))
 }

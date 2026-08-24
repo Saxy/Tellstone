@@ -2,16 +2,20 @@
 Package cluster
 Tellstone Cloud-Native In-Memory Database
 File: manual_test.go
-Description: Manual end-to-end test for cluster mode. Boots three real
-Tellstone server processes, wires them into a Raft cluster, sends binary
-protocol SET/GET/DEL commands through the leader, and reads back from
-every node to verify replication. Every step is logged in detail.
+Description: Manual end-to-end tests for cluster mode. TestManual boots
+three real Tellstone server processes, wires them into a Raft cluster, and
+sends binary protocol SET/GET/DEL through the leader to verify
+replication. TestManualPDTSO boots the same 3-node --cluster-mode cluster
+and proves the phase 2 Placement Driver + Timestamp Oracle is live by
+dialing each node's embedded etcd and asserting globally disjoint
+timestamp grants. Every step is logged in detail.
 
-This test is skipped unless explicitly requested via TELLSTONE_MANUAL_TEST=1,
-so plain go test runs (including CI) stay green. Execute with:
+These tests are skipped unless explicitly requested via
+TELLSTONE_MANUAL_TEST=1, so plain go test runs (including CI) stay green.
+Execute with:
 
-	TELLSTONE_MANUAL_TEST=1 go test -v -race -count=1 \
-	    -run=TestManual ./internal/cluster/ -timeout=60s
+	TELLSTONE_MANUAL_TEST=1 go test -v -count=1 \
+	    -run='TestManual|TestManualPDTSO' ./internal/cluster/ -timeout=120s
 
 Authors:
 
@@ -21,6 +25,7 @@ package cluster
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -29,9 +34,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"syscall"
 	"testing"
 	"time"
+
+	"go.etcd.io/etcd/client/v3"
 )
 
 const (
@@ -80,6 +88,7 @@ func manualStartCluster(t *testing.T, n int, bin string) []*manualServer {
 	t.Helper()
 
 	peers := make([]string, n)
+	pdMembers := make([]string, n)
 	servers := make([]*manualServer, n)
 
 	for i := 0; i < n; i++ {
@@ -89,6 +98,9 @@ func manualStartCluster(t *testing.T, n int, bin string) []*manualServer {
 			raftPort:   manualBasePort + 9 + i*10,
 		}
 		peers[i] = fmt.Sprintf("%d@127.0.0.1:%d", i+1, servers[i].raftPort)
+		// PD membership is keyed on the *data* address; the embedded etcd
+		// client/peer ports are derived from it by a fixed offset.
+		pdMembers[i] = fmt.Sprintf("%d@127.0.0.1:%d", i+1, servers[i].binaryPort)
 	}
 
 	peerStr := ""
@@ -98,6 +110,13 @@ func manualStartCluster(t *testing.T, n int, bin string) []*manualServer {
 		}
 		peerStr += p
 	}
+	pdStr := ""
+	for _, p := range pdMembers {
+		if pdStr != "" {
+			pdStr += ","
+		}
+		pdStr += p
+	}
 
 	for _, s := range servers {
 		dir := filepath.Join(os.TempDir(), fmt.Sprintf("tellstone-manual-%d", s.id))
@@ -106,9 +125,11 @@ func manualStartCluster(t *testing.T, n int, bin string) []*manualServer {
 
 		args := []string{
 			"--cluster-mode",
+			"--node-role", "hybrid",
 			"--node-id", fmt.Sprintf("%d", s.id),
 			"--peer-addr", fmt.Sprintf("127.0.0.1:%d", s.raftPort),
 			"--peers", peerStr,
+			"--pd-members", pdStr,
 			"--addr", fmt.Sprintf("127.0.0.1:%d", s.binaryPort),
 			"--log-level", "info",
 		}
@@ -460,4 +481,83 @@ func TestManual(t *testing.T) {
 
 	t.Log("")
 	t.Log("=== MANUAL CLUSTER TEST COMPLETE ===")
+}
+
+// TestManualPDTSO is the manual end-to-end proof for the phase 2
+// Placement Driver + Timestamp Oracle. It boots a real 3-node
+// --cluster-mode Tellstone (which now brings up the embedded PD/TSO stack
+// on every hybrid node), then dials each node's embedded etcd client port
+// and exercises the watermark-CAS grant path directly. Two invariants are
+// asserted: every node grants successfully, and the ranges handed out
+// across the whole cluster are globally disjoint (cluster-wide monotonic).
+//
+// Run with:
+//
+//	TELLSTONE_MANUAL_TEST=1 go test -v -count=1 \
+//	    -run=TestManualPDTSO ./internal/cluster/ -timeout=120s
+func TestManualPDTSO(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping manual test in short mode")
+	}
+	if os.Getenv("TELLSTONE_MANUAL_TEST") == "" {
+		t.Skip("manual PD/TSO test only runs with TELLSTONE_MANUAL_TEST=1")
+	}
+
+	t.Log("=== MANUAL PD/TSO TEST ===")
+	bin := manualBuild(t)
+	servers := manualStartCluster(t, 3, bin)
+	defer manualStopCluster(t, servers)
+
+	// Give the embedded etcd members a moment to form a quorum and for the
+	// per-node pools to prime before we poke the grant path.
+	time.Sleep(3 * time.Second)
+
+	type grant struct {
+		node uint64
+		lo   uint64
+		hi   uint64
+	}
+	var grants []grant
+	ctx := context.Background()
+
+	for _, s := range servers {
+		// The PD client endpoint is the data address + 10000 (ADR-010 §6).
+		pdAddr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort+10000)
+		cli, err := clientv3.New(clientv3.Config{
+			Endpoints:   []string{pdAddr},
+			DialTimeout: 5 * time.Second,
+		})
+		if err != nil {
+			t.Fatalf("node %d: dial PD at %s: %v", s.id, pdAddr, err)
+		}
+		g := NewEtcdGranter(cli)
+		for k := 0; k < 5; k++ {
+			lo, hi, err := g.GrantRange(ctx, 100)
+			if err != nil {
+				cli.Close()
+				t.Fatalf("node %d: grant %d: %v", s.id, k, err)
+			}
+			if lo == 0 || hi < lo {
+				cli.Close()
+				t.Fatalf("node %d: grant %d returned bad range [%d,%d]", s.id, k, lo, hi)
+			}
+			t.Logf("  node %d granted [%d,%d] (%d timestamps)", s.id, lo, hi, hi-lo+1)
+			grants = append(grants, grant{node: uint64(s.id), lo: lo, hi: hi})
+		}
+		cli.Close()
+	}
+
+	// Global monotonicity: sort by lower bound and assert no overlaps. The
+	// decentralized CAS guarantees this; the test proves it holds across
+	// the live cluster rather than only in-process unit tests.
+	sort.Slice(grants, func(i, j int) bool { return grants[i].lo < grants[j].lo })
+	for i := 1; i < len(grants); i++ {
+		if grants[i].lo <= grants[i-1].hi {
+			t.Fatalf("PD grants overlap: node %d [%d,%d] vs node %d [%d,%d]",
+				grants[i-1].node, grants[i-1].lo, grants[i-1].hi,
+				grants[i].node, grants[i].lo, grants[i].hi)
+		}
+	}
+	t.Logf("OK: %d PD grants across 3 nodes are globally disjoint", len(grants))
+	t.Log("=== MANUAL PD/TSO TEST COMPLETE ===")
 }

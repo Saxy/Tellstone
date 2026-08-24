@@ -27,7 +27,7 @@ import (
 // The bind-close-reuse window is small enough for in-process tests.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("reserving free port: %v", err)
 	}

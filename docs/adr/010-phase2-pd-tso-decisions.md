@@ -79,7 +79,7 @@ supported client contract.
 
 **Decision:** Single binary, role selected by flag:
 
-```
+```text
 --node-role=hybrid   # default: data shards + embedded PD member
 --node-role=pd       # PD member only, no data shards
 --node-role=data     # data shards only, connects external PD via --pd-addr
