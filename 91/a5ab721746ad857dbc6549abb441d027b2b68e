@@ -1,0 +1,32 @@
+internal/cluster/pdnode.go
+  s_3a03e1470b7cc6::t_4ad43e9d03a912 132-138
+config/config.go
+  s_3a03e1470b7cc6::t_5ded78fa2d3c7a 599-602,607
+  s_3a03e1470b7cc6::t_40e871c9cb3b00 621-623
+docs/PHASE2-PD-TSO-DESIGN.md
+  s_3a03e1470b7cc6::t_b1152ec8790d8f 49
+  s_3a03e1470b7cc6::t_682511ce3fb9c8 122
+  s_3a03e1470b7cc6::t_b798dc949a46e3 13
+  s_3a03e1470b7cc6::t_5efcc1a2fd17c7 137
+internal/cluster/pdnode_test.go
+  s_3a03e1470b7cc6::t_62b4547c3b4708 82-102,105-107
+  s_3a03e1470b7cc6::t_f48fd11b2e3dbe 103-104
+config/config_test.go
+  s_3a03e1470b7cc6::t_cf14f4b4cd794d 637-657
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "91a5ab721746ad857dbc6549abb441d027b2b68e",
+  "prompts": {},
+  "sessions": {
+    "s_3a03e1470b7cc6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd28f255affeOOc6523JcrPORB",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
