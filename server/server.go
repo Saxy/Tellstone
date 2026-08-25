@@ -109,6 +109,10 @@ type Server struct {
 	// --cluster-mode is disabled. Shutdown stops it before closing shard
 	// engines so no in-flight apply can race the shutdown.
 	raftNode *cluster.Node
+	// pdNode is the Placement Driver / TSO stack for cluster mode. Nil
+	// otherwise. It is stopped after the raft node during shutdown; the
+	// pool it serves stands alone, so ordering is not load-bearing.
+	pdNode *cluster.PDNode
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -376,6 +380,11 @@ func (s *Server) shutdown(ctx context.Context) {
 	// a shard engine closure. Nil when cluster mode is disabled.
 	if s.raftNode != nil {
 		s.raftNode.Stop()
+	}
+	// Stop the PD/TSO stack after the raft node; the pool it serves is
+	// independent of the raft group, so this ordering is not load-bearing.
+	if s.pdNode != nil {
+		s.pdNode.Stop()
 	}
 	for _, sh := range s.shards {
 		if err := sh.Stop(ctx); err != nil {
@@ -719,6 +728,39 @@ func (s *Server) initCluster() error {
 		return fmt.Errorf("start raft node: %w", err)
 	}
 	s.raftNode = n
+
+	// Placement Driver / TSO stack (phase 2). The role defaults to hybrid
+	// when cluster mode is set without an explicit --node-role.
+	role := cfg.GetNodeRole()
+	pdMembers, err := cluster.ParsePeers(cfg.GetPDMembers())
+	if err != nil {
+		return fmt.Errorf("parse PD members: %w", err)
+	}
+	// A single hybrid node with no explicit --pd-members runs its own
+	// singleton PD; multi-node clusters must pass the full member list.
+	if len(pdMembers) == 0 {
+		pdMembers = []cluster.Peer{{ID: cfg.GetNodeID(), Addr: cfg.GetAddr()}}
+	}
+	pdNode, err := cluster.StartPDNode(cluster.StartPDNodeConfig{
+		Role:           role,
+		NodeID:         cfg.GetNodeID(),
+		DataAddr:       cfg.GetAddr(),
+		PDAddr:         cfg.GetPDAddr(),
+		Members:        pdMembers,
+		PDDir:          cfg.GetPDDir(),
+		ClientOverride: cfg.GetPDClientAddr(),
+		PeerOverride:   cfg.GetPDPeerAddr(),
+		TSO: cluster.TSOPoolConfig{
+			MinBatch:           cfg.GetTSOMinBatch(),
+			Headroom:           cfg.GetTSOHeadroom(),
+			RefillThresholdPct: cfg.GetTSORefillThreshold(),
+		},
+	})
+	if err != nil {
+		s.raftNode.Stop()
+		return fmt.Errorf("start placement driver: %w", err)
+	}
+	s.pdNode = pdNode
 
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "server: cluster mode enabled",
