@@ -129,6 +129,13 @@ func StartPDNode(cfg StartPDNodeConfig) (*PDNode, error) {
 		}
 		peerMap[m.ID] = pu
 	}
+	// The local member may bind an explicit peer override that differs from
+	// the data-address derivation; its advertised peer URL must match what it
+	// actually listens on, otherwise the embedded etcd cluster fails to form.
+	if _, ok := peerMap[cfg.NodeID]; !ok {
+		return nil, fmt.Errorf("cluster: local member %d not present in PD member list", cfg.NodeID)
+	}
+	peerMap[cfg.NodeID] = peerURL
 
 	pd, err := StartPD(PDConfig{
 		NodeID:          cfg.NodeID,

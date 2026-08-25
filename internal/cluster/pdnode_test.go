@@ -79,6 +79,32 @@ func TestStartPDNodeHybrid(t *testing.T) {
 	}
 }
 
+// TestStartPDNodeHybridPeerOverride verifies that an explicit peer override is
+// the URL the local member advertises in the cluster config (regression for
+// the bug where the derived-from-data-address peer URL was advertised instead,
+// breaking etcd cluster formation).
+func TestStartPDNodeHybridPeerOverride(t *testing.T) {
+	base := freeBasePort(t)
+	m := Peer{ID: 1, Addr: fmt.Sprintf("127.0.0.1:%d", base)}
+	overrideBase := freeBasePort(t)
+	pd, err := StartPDNode(StartPDNodeConfig{
+		Role:         "hybrid",
+		NodeID:       1,
+		DataAddr:     m.Addr,
+		Members:      []Peer{m},
+		PDDir:        t.TempDir(),
+		PeerOverride: fmt.Sprintf("127.0.0.1:%d", overrideBase+20000),
+		TSO:          TSOPoolConfig{MinBatch: 1000, Headroom: 30 * time.Second, RefillThresholdPct: 20},
+	})
+	if err != nil {
+		t.Fatalf("StartPDNode hybrid with peer override: %v", err)
+	}
+	defer pd.Stop()
+	if first := waitForAlloc(t, pd.Pool()); first == 0 {
+		t.Fatal("pool should allocate after priming with peer override")
+	}
+}
+
 func TestStartPDNodeDataDialsExternal(t *testing.T) {
 	// Stand up a plain embedded member to act as the "external PD".
 	extBase, extPeer := freePort(t), freePort(t)

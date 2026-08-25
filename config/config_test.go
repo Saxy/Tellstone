@@ -634,6 +634,27 @@ func TestNodeRoleValidation(t *testing.T) {
 				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
 			want: "malformed",
 		},
+		{
+			name: "data role with non-numeric pd-addr port",
+			args: []string{"--cluster-mode", "--node-role", "data",
+				"--pd-addr", "127.0.0.1:abc",
+				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
+			want: "out of range",
+		},
+		{
+			name: "data role with zero pd-addr port",
+			args: []string{"--cluster-mode", "--node-role", "data",
+				"--pd-addr", "127.0.0.1:0",
+				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
+			want: "out of range",
+		},
+		{
+			name: "data role with out-of-range pd-addr port",
+			args: []string{"--cluster-mode", "--node-role", "data",
+				"--pd-addr", "127.0.0.1:70000",
+				"--peers", "1@127.0.0.1:9001", "--node-id", "1"},
+			want: "out of range",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

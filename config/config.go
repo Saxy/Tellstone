@@ -596,13 +596,15 @@ func LoadConfig(args []string) *Config {
 		if cfg.pdAddr == "" {
 			panic("tellstone: --node-role=data requires --pd-addr pointing at an external placement driver")
 		}
-		// Reject malformed endpoints (e.g. a value with no port) before
-		// StartPDNode dials them via clientv3 and fails opaquely.
+		// Reject malformed endpoints (no port, non-numeric port, or a port
+		// outside 1–65535) before StartPDNode dials them via clientv3 and
+		// fails opaquely. Strip any scheme first, then reuse hostPort which
+		// range-checks the port.
 		addr := cfg.pdAddr
 		if i := strings.Index(addr, "://"); i >= 0 {
 			addr = addr[i+3:]
 		}
-		if _, _, err := net.SplitHostPort(addr); err != nil {
+		if _, _, err := hostPort(addr); err != nil {
 			panic(fmt.Sprintf("tellstone: --pd-addr %q is malformed (need host:port): %v", cfg.pdAddr, err))
 		}
 	} else if cfg.pdAddr != "" {
@@ -616,7 +618,9 @@ func LoadConfig(args []string) *Config {
 	}
 	// Reject values whose seconds-to-time.Duration conversion would overflow
 	// int64 nanoseconds; otherwise a negative Headroom would corrupt the pool.
-	if int64(cfg.tsoHeadroomSeconds) > math.MaxInt64/int64(time.Second) {
+	// Compare in the unsigned domain so a value larger than int64 can never be
+	// misread as negative and slip past the check.
+	if uint64(cfg.tsoHeadroomSeconds) > uint64(math.MaxInt64)/uint64(time.Second) {
 		panic("tellstone: --tso-headroom-seconds too large (would overflow duration)")
 	}
 	if cfg.tsoRefillThreshold < 1 || cfg.tsoRefillThreshold > 99 {

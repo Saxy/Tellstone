@@ -10,7 +10,7 @@ Update the status table as work lands.
 
 ## Architecture
 
-```
+```text
 ┌────────────────────────────────────────────────────────────┐
 │ Tellstone node (--node-role=hybrid, default)               │
 │                                                            │
@@ -46,7 +46,7 @@ Roles:
 
 Single uint64, monotonic across the cluster:
 
-```
+```text
  63          20 19            0
 ┌───────────────┬───────────────┐
 │ physical_ms   │ logical       │
@@ -119,7 +119,7 @@ type Pool struct {
 
 Derived ports (ADR-010 §6), override via flags:
 
-```
+```text
 data addr "n1:9988" → etcd client "n1:19988", etcd peer "n1:29988"
 ```
 
@@ -134,7 +134,7 @@ timestamp space, so there is no grant-gating PD leader to elect. The failure
 mode the suite covers is losing the entire PD member set (the embedded etcd
 quorum):
 
-```
+```text
 T+0s      all PD members (etcd quorum) stopped
 T+0–30s   nodes allocate from pools (writes would continue;
           this phase verifies via harness consumption)
