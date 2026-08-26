@@ -15,6 +15,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -29,6 +30,15 @@ import (
 // ErrNotLeader is returned by ProposeAndWait when the node is not the
 // current Raft leader. Callers should redirect the client to the leader.
 var ErrNotLeader = errors.New("cluster: not leader")
+
+// Application-level message types carried over the existing network.Transport
+// (D3: no protobuf/gRPC for Phase 3). They use out-of-range raftpb.MessageType
+// codes and are intercepted in handleMessage before being passed to
+// raftNode.Step, so raft never sees them.
+const (
+	msgForwardWrite pb.MessageType = 100
+	msgForwardResp  pb.MessageType = 101
+)
 
 const (
 	// logCompactionThreshold compacts the local raft log once this many
@@ -76,6 +86,16 @@ type Node struct {
 	// lastCompacted is the log index through which storage has been
 	// compacted. Only touched by the readyLoop goroutine, so no lock needed.
 	lastCompacted uint64
+	// readIndexChans maps a ReadIndex correlation id to the waiter that wants
+	// the committed index to wait for.
+	readIndexID    atomic.Uint64
+	readIndexChans sync.Map // correlation id (uint64) -> chan uint64
+	// forwardChans maps a forwarded-write correlation id to its result waiter.
+	forwardID    atomic.Uint64
+	forwardChans sync.Map // correlation id (uint64) -> chan error
+	// peerAddrs resolves a peer node ID to its configured address (used by
+	// routing/forwarding to target the region leader).
+	peerAddrs map[uint64]string
 }
 
 // NewNode creates a new Raft node but does not start it. Call Start() to
@@ -94,6 +114,11 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	store := NewStorage()
 	fsm := NewFSM(cfg.Dispatcher, cfg.Logger)
 
+	addrs := make(map[uint64]string, len(cfg.Peers))
+	for _, p := range cfg.Peers {
+		addrs[p.ID] = p.Addr
+	}
+
 	n := &Node{
 		cfg:       cfg,
 		storage:   store,
@@ -101,6 +126,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		stopCh:    make(chan struct{}),
 		stopped:   make(chan struct{}),
 		proposals: newProposalTracker(),
+		peerAddrs: addrs,
 	}
 
 	// Build the peer list for StartNode. On the initial bootstrap every node
@@ -204,10 +230,177 @@ func (n *Node) IsLeader() bool {
 	return n.raftNode.Status().RaftState == raft.StateLeader
 }
 
-// handleMessage is called by the transport when a raft message arrives from a
-// peer. It delivers the message to the raft node via Step().
+// LeaderID returns the node ID of the current Raft leader (0 if none yet).
+func (n *Node) LeaderID() uint64 {
+	return n.raftNode.Status().Lead
+}
+
+// AppliedIndex returns the highest Raft log index applied to the local FSM.
+func (n *Node) AppliedIndex() uint64 {
+	return atomic.LoadUint64(&n.appliedIndex)
+}
+
+// PeerAddr resolves a peer node ID to its configured address.
+func (n *Node) PeerAddr(id uint64) string {
+	return n.peerAddrs[id]
+}
+
+// ReadIndex performs a Raft read-only query: it returns the committed index
+// the local state machine must have applied before serving a linearizable
+// read. See LinearizableRead for the wait.
+func (n *Node) ReadIndex(ctx context.Context) (uint64, error) {
+	id := n.readIndexID.Add(1)
+	ch := make(chan uint64, 1)
+	n.readIndexChans.Store(id, ch)
+	defer n.readIndexChans.Delete(id)
+	if err := n.raftNode.ReadIndex(ctx, uint64ToBytes(id)); err != nil {
+		return 0, err
+	}
+	select {
+	case idx := <-ch:
+		return idx, nil
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-n.stopCh:
+		return 0, errors.New("cluster node stopped")
+	}
+}
+
+// LinearizableRead blocks until the local FSM has applied at least the
+// committed index returned by ReadIndex, guaranteeing a read observes all
+// previously committed writes. This is how followers serve reads locally
+// (D2: Read Anywhere, no forwarding).
+func (n *Node) LinearizableRead(ctx context.Context) error {
+	idx, err := n.ReadIndex(ctx)
+	if err != nil {
+		return err
+	}
+	for {
+		if atomic.LoadUint64(&n.appliedIndex) >= idx {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-n.stopCh:
+			return errors.New("cluster node stopped")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+}
+
+// ForwardWrite sends an already-encoded FSM operation to the region leader
+// (identified by leaderID) over the existing transport and waits for the
+// apply result. Used by clusterStore when this node is not the leader (D3).
+func (n *Node) ForwardWrite(ctx context.Context, leaderID uint64, opData []byte) error {
+	// Routing may resolve to this node (e.g. it just became leader and the
+	// table is briefly stale), or the caller may already be the leader. In
+	// that case propose directly instead of round-tripping to ourself.
+	if leaderID == n.cfg.NodeID {
+		return n.ProposeAndWait(ctx, opData)
+	}
+	id := n.forwardID.Add(1)
+	ch := make(chan error, 1)
+	n.forwardChans.Store(id, ch)
+	defer n.forwardChans.Delete(id)
+	msg := &pb.Message{
+		Type:    msgForwardType(),
+		From:    &n.cfg.NodeID,
+		To:      &leaderID,
+		Context: uint64ToBytes(id),
+		Entries: []*pb.Entry{{Data: opData}},
+	}
+	if err := n.transport.Send(msg); err != nil {
+		return err
+	}
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.stopCh:
+		return errors.New("cluster node stopped")
+	}
+}
+
+// handleMessage is called by the transport for every inbound message.
+// Application-level forward messages are handled locally; everything else is
+// delivered to the raft node via Step().
 func (n *Node) handleMessage(msg *pb.Message) {
+	switch msg.GetType() {
+	case msgForwardWrite:
+		n.handleForwardWrite(msg)
+		return
+	case msgForwardResp:
+		if len(msg.Context) == 8 {
+			if v, ok := n.forwardChans.Load(bytesToUint64(msg.Context)); ok {
+				ch := v.(chan error)
+				var rerr error
+				if len(msg.Entries) > 0 && len(msg.Entries[0].Data) > 0 {
+					rerr = errors.New(string(msg.Entries[0].Data))
+				}
+				select {
+				case ch <- rerr:
+				default:
+				}
+			}
+		}
+		return
+	}
 	_ = n.raftNode.Step(context.Background(), msg)
+}
+
+// handleForwardWrite applies a forwarded write on the leader (the only node
+// that may propose) and replies to the requester. If this node is no longer
+// leader (stale routing), it replies with ErrNotLeader so the caller retries.
+func (n *Node) handleForwardWrite(msg *pb.Message) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var opData []byte
+	if len(msg.Entries) > 0 {
+		opData = msg.Entries[0].Data
+	}
+	applyErr := n.ProposeAndWait(ctx, opData)
+	var respData []byte
+	if applyErr != nil {
+		respData = []byte(applyErr.Error())
+	}
+	resp := &pb.Message{
+		Type:    msgForwardRespType(),
+		From:    &n.cfg.NodeID,
+		To:      msg.From,
+		Context: msg.Context,
+		Entries: []*pb.Entry{{Data: respData}},
+	}
+	_ = n.transport.Send(resp)
+}
+
+// uint64ToBytes / bytesToUint64 encode a correlation id for the wire.
+func uint64ToBytes(v uint64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, v)
+	return b
+}
+
+func bytesToUint64(b []byte) uint64 {
+	if len(b) < 8 {
+		return 0
+	}
+	return binary.BigEndian.Uint64(b)
+}
+
+// msgForwardType / msgForwardRespType return pointers to the application-level
+// message types for use in raftpb.Message struct literals (which take pointer
+// fields).
+func msgForwardType() *pb.MessageType {
+	t := msgForwardWrite
+	return &t
+}
+
+func msgForwardRespType() *pb.MessageType {
+	t := msgForwardResp
+	return &t
 }
 
 // tickLoop advances the raft node's logical clock at the configured interval.
@@ -326,6 +519,19 @@ func (n *Node) processReady(rd raft.Ready) {
 			}
 			if atomic.CompareAndSwapUint64(&n.appliedIndex, cur, idx) {
 				break
+			}
+		}
+	}
+
+	// 3b. Resolve any pending ReadIndex queries. The leader (or a follower
+	// after a ReadIndex round-trip) has now caught up to the returned commit
+	// index, so waiters can proceed with a linearizable read.
+	for _, rs := range rd.ReadStates {
+		if v, ok := n.readIndexChans.Load(bytesToUint64(rs.RequestCtx)); ok {
+			ch := v.(chan uint64)
+			select {
+			case ch <- rs.Index:
+			default:
 			}
 		}
 	}
