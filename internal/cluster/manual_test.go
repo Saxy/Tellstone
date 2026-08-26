@@ -605,21 +605,23 @@ func TestManualRouting(t *testing.T) {
 		val := fmt.Sprintf("v%d", i)
 		s := servers[i%len(servers)]
 		addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
-		conn, err := connectTo(addr)
-		if err != nil {
-			t.Fatalf("connect node %d (%s): %v", s.id, addr, err)
-		}
 		// Retry briefly in case the region leader has not been claimed yet.
+		// Each attempt uses a freshly opened connection so a failed attempt's
+		// stale response can never be consumed by a later retry.
 		var setErr error
 		for attempt := 0; attempt < 10; attempt++ {
+			conn, err := connectTo(addr)
+			if err != nil {
+				t.Fatalf("connect node %d (%s): %v", s.id, addr, err)
+			}
 			_, setErr = binarySet(conn, key, val, 0)
+			conn.Close()
 			if setErr == nil {
 				break
 			}
 			t.Logf("  node %d SET %s attempt %d: %v (retrying)", s.id, key, attempt+1, setErr)
 			time.Sleep(300 * time.Millisecond)
 		}
-		conn.Close()
 		if setErr != nil {
 			t.Fatalf("node %d SET %s (forwarded to leader) failed: %v", s.id, key, setErr)
 		}

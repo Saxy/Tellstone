@@ -123,6 +123,9 @@ type Server struct {
 	routingTable *cluster.RoutingTable
 	// regionCancel stops the RegionManager goroutine on shutdown.
 	regionCancel context.CancelFunc
+	// regionDone is closed once the RegionManager Run goroutine has returned,
+	// so shutdown can wait for it before the PD node closes its etcd client.
+	regionDone chan struct{}
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -374,14 +377,20 @@ func (s *Server) shutdown(ctx context.Context) {
 		case <-ctx.Done():
 		}
 	}
+	// Stop the region manager first and wait for its Run goroutine to return
+	// before the PD node closes its etcd client, so no region-manager
+	// operation uses a closed client.
+	if s.regionCancel != nil {
+		s.regionCancel()
+	}
+	if s.regionDone != nil {
+		<-s.regionDone
+	}
 	if s.raftNode != nil {
 		s.raftNode.Stop()
 	}
 	if s.pdNode != nil {
 		s.pdNode.Stop()
-	}
-	if s.regionCancel != nil {
-		s.regionCancel()
 	}
 	for _, sh := range s.shards {
 		if err := sh.Stop(ctx); err != nil {
@@ -763,7 +772,9 @@ func (s *Server) initCluster() error {
 		peerIDs[i] = p.ID
 	}
 	rm := cluster.NewRegionManager(s.pdNode.Client(), cfg.GetNodeID(), s.raftNode, peerIDs)
-	if err = rm.BootstrapDefaultRegion(context.Background()); err != nil {
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer bootCancel()
+	if err = rm.BootstrapDefaultRegion(bootCtx); err != nil {
 		s.raftNode.Stop()
 		s.pdNode.Stop()
 		return fmt.Errorf("bootstrap default region: %w", err)
@@ -772,12 +783,14 @@ func (s *Server) initCluster() error {
 	s.regionMgr = rm
 	s.regionCancel = rmCancel
 	s.routingTable = rm.RoutingTable()
+	s.regionDone = make(chan struct{})
 	go func() {
 		if rerr := rm.Run(rmCtx); rerr != nil && logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "server: region manager stopped",
 				log.String("error", rerr.Error()),
 			)
 		}
+		close(s.regionDone)
 	}()
 
 	if logger.Enabled(log.LevelInfo) {

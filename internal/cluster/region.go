@@ -17,6 +17,7 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"fmt"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -78,14 +79,19 @@ func (m *RegionManager) RoutingTable() *RoutingTable { return m.rt }
 // first writer wins (D4: one default region to start).
 func (m *RegionManager) BootstrapDefaultRegion(ctx context.Context) error {
 	key := regionKey(1)
-	val := encodeRegion(Region{
+	nr := Region{
 		ID:       1,
 		StartKey: []byte{},
 		EndKey:   nil,
 		Peers:    m.peers,
 		Leader:   0,
 		Epoch:    1,
-	})
+	}
+	if regionExceedsWireLimit(nr) {
+		return fmt.Errorf("region %d exceeds wire limit: peers=%d startKey=%d endKey=%d",
+			nr.ID, len(nr.Peers), len(nr.StartKey), len(nr.EndKey))
+	}
+	val := encodeRegion(nr)
 	txn := m.cli.Txn(ctx).
 		If(clientv3.Compare(clientv3.CreateRevision(key), "=", 0)).
 		Then(clientv3.OpPut(key, string(val)))
@@ -110,42 +116,70 @@ func (m *RegionManager) Refresh(ctx context.Context) error {
 	return nil
 }
 
-// Run seeds the routing table from etcd, then watches for changes until ctx is
-// cancelled. The leadership loop runs concurrently.
-func (m *RegionManager) Run(ctx context.Context) error {
+// seed reads the full region set from etcd, merges it into the local routing
+// table, and returns the next revision to watch from.
+func (m *RegionManager) seed(ctx context.Context) (int64, error) {
 	resp, err := m.cli.Get(ctx, regionKeyPrefix, clientv3.WithPrefix())
 	if err != nil {
-		return err
+		return 0, err
 	}
 	for _, kv := range resp.Kvs {
 		if r, ok := decodeRegion(kv.Value); ok {
 			m.rt.Update(r)
 		}
 	}
-	go m.leadershipLoop(ctx)
+	return resp.Header.Revision + 1, nil
+}
 
-	rev := resp.Header.Revision + 1
-	ch := m.cli.Watch(ctx, regionKeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(rev))
+// Run seeds the routing table from etcd, then watches for changes until ctx is
+// cancelled. The leadership loop runs concurrently. If the watch is interrupted
+// (e.g. etcd compaction returning ErrCompacted) or the channel closes, Run
+// re-reads the latest metadata and recreates the watch so no updates are
+// missed (D4 convergence across compaction).
+func (m *RegionManager) Run(ctx context.Context) error {
+	rev, err := m.seed(ctx)
+	if err != nil {
+		return err
+	}
+	go m.leadershipLoop(ctx)
 	for {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		case wresp, ok := <-ch:
-			if !ok {
-				return nil
-			}
-			if werr := wresp.Err(); werr != nil {
-				continue
-			}
-			for _, ev := range wresp.Events {
-				if ev.Type == clientv3.EventTypeDelete {
-					continue
+		}
+		ch := m.cli.Watch(ctx, regionKeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(rev))
+		recreate := false
+		for !recreate {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case wresp, ok := <-ch:
+				if !ok {
+					// Watch channel closed (compaction or client teardown).
+					recreate = true
+					break
 				}
-				if r, ok := decodeRegion(ev.Kv.Value); ok {
-					m.rt.Update(r)
+				if werr := wresp.Err(); werr != nil {
+					// Terminal watch error (e.g. rpctypes.ErrCompacted):
+					// re-read the latest metadata before recreating the watch.
+					recreate = true
+					break
+				}
+				for _, ev := range wresp.Events {
+					if ev.Type == clientv3.EventTypeDelete {
+						continue
+					}
+					if r, ok := decodeRegion(ev.Kv.Value); ok {
+						m.rt.Update(r)
+					}
 				}
 			}
 		}
+		// Reconnect: pull the latest metadata and continue with a fresh watch.
+		newRev, rerr := m.seed(ctx)
+		if rerr != nil {
+			return rerr
+		}
+		rev = newRev
 	}
 }
 
@@ -181,6 +215,9 @@ func (m *RegionManager) leadershipLoop(ctx context.Context) {
 				Peers:    m.peers,
 				Leader:   m.nodeID,
 				Epoch:    epoch,
+			}
+			if regionExceedsWireLimit(nr) {
+				continue
 			}
 			if _, err := m.cli.Put(ctx, regionKey(1), string(encodeRegion(nr))); err != nil {
 				continue
@@ -242,11 +279,24 @@ func decodeRegion(b []byte) (Region, bool) {
 	if !ok {
 		return r, false
 	}
-	b, r.EndKey, ok = readBytesField(b)
+	_, r.EndKey, ok = readBytesField(b)
 	if !ok {
 		return r, false
 	}
 	return r, true
+}
+
+// maxRegionWireField is the largest length encodable in the uint16 wire format
+// used for peer-count and key-byte-length fields.
+const maxRegionWireField = 65535
+
+// regionExceedsWireLimit reports whether r cannot be encoded without truncating
+// its peer count or key fields: the wire format stores these lengths as uint16,
+// so a larger value would silently corrupt the encoding.
+func regionExceedsWireLimit(r Region) bool {
+	return len(r.Peers) > maxRegionWireField ||
+		len(r.StartKey) > maxRegionWireField ||
+		len(r.EndKey) > maxRegionWireField
 }
 
 func appendUint64(buf []byte, v uint64) []byte {

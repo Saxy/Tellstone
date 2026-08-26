@@ -57,8 +57,8 @@ not wired into the write path yet (deferred to the SQL/MVCC phase per ADR-010).
 
 ## Architecture
 
-```
-            ┌─────────────┐  etcd Watch (/tellstone/regions/*)  ┌──────────────┐
+```text
+             ┌─────────────┐  etcd Watch (/tellstone/regions/*)  ┌──────────────┐
             │   PD etcd   │ ───────────────────────────────────▶│ RoutingTable │
             │  (region    │                                      │  (per node)  │
             │  metadata)  │ ◀── RegionManager (leader rewrites  │              │

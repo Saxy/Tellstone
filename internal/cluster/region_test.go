@@ -90,9 +90,104 @@ func TestRegionManagerBootstrapAndWatch(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// A concurrent writer (second client) bumping the leader must converge via
-	// Watch into the local routing table.
-	nr := Region{ID: 1, StartKey: []byte{}, EndKey: nil, Peers: []uint64{1, 2, 3}, Leader: 2, Epoch: 2}
+	// Stop the leader manager so its leadership loop no longer rewrites the
+	// region's leader field; the external write below is the only writer.
+	runCancel()
+
+	// An external writer (a second client) bumping the region leader must
+	// converge via Watch into a follower's local routing table. The follower
+	// manager is non-leader, so its own leadership loop stays silent and the
+	// external write is observed unchanged (D4 convergence on a follower).
+	followerMgr := NewRegionManager(cli, 99, stubLP{leader: false}, []uint64{1, 2, 3})
+	frunCtx, frunCancel := context.WithCancel(ctx)
+	defer frunCancel()
+	go func() { _ = followerMgr.Run(frunCtx) }()
+
+	nr := Region{ID: 1, StartKey: []byte{}, EndKey: nil, Peers: []uint64{1, 2, 3}, Leader: 2, Epoch: 100}
+	if _, err := cli.Put(ctx, regionKey(1), string(encodeRegion(nr))); err != nil {
+		t.Fatalf("external put: %v", err)
+	}
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if r := followerMgr.RoutingTable().Find([]byte("x")); r != nil && r.Leader == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("follower watch did not converge to leader 2")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestRegionWireLimit verifies the uint16 wire-format bounds: a region at the
+// 65,535 limit encodes/decodes cleanly, while 65,536 peers or key bytes are
+// rejected before they can silently truncate the encoding.
+func TestRegionWireLimit(t *testing.T) {
+	atLimit := Region{
+		ID:       1,
+		StartKey: make([]byte, maxRegionWireField),
+		EndKey:   nil,
+		Peers:    make([]uint64, maxRegionWireField),
+		Leader:   1,
+		Epoch:    1,
+	}
+	if regionExceedsWireLimit(atLimit) {
+		t.Fatal("region at the 65535 limit should be within bounds")
+	}
+	if _, ok := decodeRegion(encodeRegion(atLimit)); !ok {
+		t.Fatal("encode/decode at 65535 limit failed")
+	}
+
+	if !regionExceedsWireLimit(Region{ID: 1, Peers: make([]uint64, maxRegionWireField+1), Leader: 1, Epoch: 1}) {
+		t.Fatal("65536 peers should exceed the wire limit")
+	}
+	if !regionExceedsWireLimit(Region{ID: 1, StartKey: make([]byte, maxRegionWireField+1), Leader: 1, Epoch: 1}) {
+		t.Fatal("65536 start-key bytes should exceed the wire limit")
+	}
+	if !regionExceedsWireLimit(Region{ID: 1, EndKey: make([]byte, maxRegionWireField+1), Leader: 1, Epoch: 1}) {
+		t.Fatal("65536 end-key bytes should exceed the wire limit")
+	}
+}
+
+// TestRegionManagerCompactedWatch verifies that after an etcd compaction the
+// RegionManager still converges on a subsequent update: Run reseeds from etcd
+// and recreates the watch instead of silently dropping events (D4).
+func TestRegionManagerCompactedWatch(t *testing.T) {
+	cli, ctx, cancel := startRegionTest(t)
+	defer cancel()
+
+	mgr := NewRegionManager(cli, 1, stubLP{leader: true}, []uint64{1, 2, 3})
+	if err := mgr.BootstrapDefaultRegion(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+	runCtx, runCancel := context.WithCancel(ctx)
+	defer runCancel()
+	go func() { _ = mgr.Run(runCtx) }()
+
+	// Wait for the leader to claim region 1.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if r := mgr.RoutingTable().Find([]byte("x")); r != nil && r.Leader == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("leader did not claim region 1")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Compact the historical revisions so the in-flight watch is now stale.
+	resp, err := cli.Get(ctx, regionKeyPrefix, clientv3.WithPrefix())
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if _, err := cli.Compact(ctx, resp.Header.Revision); err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	// A post-compaction write must still converge (Run recovers from the
+	// compacted watch and reseeds from etcd).
+	nr := Region{ID: 1, StartKey: []byte{}, EndKey: nil, Peers: []uint64{1, 2, 3}, Leader: 2, Epoch: 5}
 	if _, err := cli.Put(ctx, regionKey(1), string(encodeRegion(nr))); err != nil {
 		t.Fatalf("external put: %v", err)
 	}
@@ -102,7 +197,7 @@ func TestRegionManagerBootstrapAndWatch(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("watch did not converge to leader 2")
+			t.Fatal("watch did not recover from compaction to converge to leader 2")
 		}
 		time.Sleep(20 * time.Millisecond)
 	}

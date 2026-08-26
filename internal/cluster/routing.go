@@ -71,8 +71,8 @@ func (rt *RoutingTable) Update(meta Region) {
 		return bytes.Compare(rt.regions[i].StartKey, meta.StartKey) >= 0
 	})
 	if idx < len(rt.regions) && bytes.Equal(rt.regions[idx].StartKey, meta.StartKey) {
-		if meta.Epoch < rt.regions[idx].Epoch {
-			return // stale
+		if meta.Epoch <= rt.regions[idx].Epoch {
+			return // stale (lower or equal epoch)
 		}
 		rt.regions[idx] = regionRouteOf(meta)
 		return

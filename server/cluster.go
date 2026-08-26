@@ -86,8 +86,9 @@ func (d *shardDispatcher) Dispatch(key string, op byte, value []byte, ttl time.D
 // cluster mode is active. Phase 3 routing: a write is proposed directly when
 // this node is the Raft leader, otherwise it is forwarded to the leader of
 // the region that owns the key (read from the local routing table). Reads go
-// to the local engine after a linearizable ReadIndex round-trip, so any
-// replica can serve reads (read-anywhere) with up-to-date guarantees.
+// to the local engine after a linearizable ReadIndex round-trip; if that
+// round-trip cannot complete in time, the local value is served as a
+// best-effort fallback and may be slightly stale (read-anywhere).
 type clusterStore struct {
 	local  *RouterStore
 	node   *cluster.Node
@@ -101,9 +102,15 @@ func newClusterStore(local *RouterStore, node *cluster.Node, rt *cluster.Routing
 }
 
 func (cs *clusterStore) Get(key string) ([]byte, bool) {
-	if err := cs.node.LinearizableRead(context.Background()); err != nil {
+	// Linearizable read: wait (bounded) until this replica has applied at least
+	// the Raft commit index observed by ReadIndex, then serve from the local
+	// engine. On timeout/failure we fall back to the local value (best-effort,
+	// may be slightly stale) rather than failing the read.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := cs.node.LinearizableRead(ctx); err != nil {
 		if cs.logger.Enabled(log.LevelWarn) {
-			cs.logger.Log(log.LevelWarn, "cluster store: linearizable read failed, serving local",
+			cs.logger.Log(log.LevelWarn, "cluster store: linearizable read failed, serving local (best-effort, may be stale)",
 				log.String("error", err.Error()),
 				log.String("key", key),
 			)
@@ -129,7 +136,11 @@ func (cs *clusterStore) routeWrite(key string, data []byte) error {
 	const (
 		maxAttempts = 6
 		backoff     = 200 * time.Millisecond
+		// Overall cap for a single Set/Delete so a run of stale/unreachable
+		// leaders cannot block the caller indefinitely.
+		writeBudget = 8 * time.Second
 	)
+	deadline := time.Now().Add(writeBudget)
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		route := cs.rt.Find([]byte(key))
@@ -138,10 +149,20 @@ func (cs *clusterStore) routeWrite(key string, data []byte) error {
 		}
 		if route.Leader == 0 {
 			cs.refreshRouting()
-			time.Sleep(backoff)
+			if attempt < maxAttempts-1 {
+				time.Sleep(backoff)
+			}
 			continue
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// Bound each forward attempt by the remaining overall budget.
+		budget := time.Until(deadline)
+		if budget <= 0 {
+			break
+		}
+		if budget > 5*time.Second {
+			budget = 5 * time.Second
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
 		err := cs.node.ForwardWrite(ctx, route.Leader, data)
 		cancel()
 		if err == nil {
@@ -156,7 +177,9 @@ func (cs *clusterStore) routeWrite(key string, data []byte) error {
 			)
 		}
 		cs.refreshRouting()
-		time.Sleep(backoff)
+		if attempt < maxAttempts-1 && time.Until(deadline) > 0 {
+			time.Sleep(backoff)
+		}
 	}
 	if lastErr != nil {
 		return fmt.Errorf("MOVED: write to region leader failed: %w", lastErr)
@@ -211,9 +234,10 @@ func (cs *clusterStore) Set(key string, value []byte, ttl time.Duration) error {
 }
 
 // Delete routes a deletion through Raft (or forwards it to the region leader).
-// It returns whether the key existed plus an error for the failure cases:
-// encode failure, no covering region (CLUSTERDOWN), or propose/forward
-// failure. The boolean is only meaningful when err is nil.
+// It returns (true, nil) on successful replication; the boolean is NOT a report
+// of whether the key previously existed — the forwarded/raft apply path does not
+// surface that distinction. Error cases: encode failure, no covering region
+// (CLUSTERDOWN), or propose/forward failure.
 func (cs *clusterStore) Delete(key string) (bool, error) {
 	if cs.logger.Enabled(log.LevelDebug) {
 		cs.logger.Log(log.LevelDebug, "cluster store: DEL",
