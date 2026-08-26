@@ -565,3 +565,98 @@ func TestManualPDTSO(t *testing.T) {
 	t.Logf("OK: %d PD grants across 3 nodes are globally disjoint", len(grants))
 	t.Log("=== MANUAL PD/TSO TEST COMPLETE ===")
 }
+
+// TestManualRouting is the manual end-to-end proof for the phase 3 region
+// routing layer. It boots a real 3-node --cluster-mode Tellstone cluster and
+// asserts two invariants:
+//
+//   - Write-forwarding (D2/D3): a SET issued against EVERY node — including
+//     followers — succeeds. Followers resolve the region leader from the
+//     routing table and forward the op over the cluster transport.
+//   - Read-anywhere (D1): once a write has replicated, a GET against every
+//     node returns the value, served from the local replica after a
+//     linearizable ReadIndex round-trip.
+//
+// Run with:
+//
+//	TELLSTONE_MANUAL_TEST=1 go test -v -count=1 \
+//	    -run=TestManualRouting ./internal/cluster/ -timeout=120s
+func TestManualRouting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping manual test in short mode")
+	}
+	if os.Getenv("TELLSTONE_MANUAL_TEST") == "" {
+		t.Skip("manual routing test only runs with TELLSTONE_MANUAL_TEST=1")
+	}
+
+	t.Log("=== MANUAL ROUTING TEST ===")
+	bin := manualBuild(t)
+	servers := manualStartCluster(t, 3, bin)
+	defer manualStopCluster(t, servers)
+
+	// Give the cluster time to elect a Raft leader and for the RegionManager to
+	// claim the default region (routing table convergence, D4).
+	time.Sleep(3 * time.Second)
+
+	// D2/D3: issue a SET against each of the 3 nodes in turn so that follower
+	// writes are exercised. Every SET must succeed via forwarding.
+	keys := []string{"routing-a", "routing-b", "routing-c"}
+	for i, key := range keys {
+		val := fmt.Sprintf("v%d", i)
+		s := servers[i%len(servers)]
+		addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
+		// Retry briefly in case the region leader has not been claimed yet.
+		// Each attempt uses a freshly opened connection so a failed attempt's
+		// stale response can never be consumed by a later retry.
+		var setErr error
+		for attempt := 0; attempt < 10; attempt++ {
+			conn, err := connectTo(addr)
+			if err != nil {
+				t.Fatalf("connect node %d (%s): %v", s.id, addr, err)
+			}
+			_, setErr = binarySet(conn, key, val, 0)
+			conn.Close()
+			if setErr == nil {
+				break
+			}
+			t.Logf("  node %d SET %s attempt %d: %v (retrying)", s.id, key, attempt+1, setErr)
+			time.Sleep(300 * time.Millisecond)
+		}
+		if setErr != nil {
+			t.Fatalf("node %d SET %s (forwarded to leader) failed: %v", s.id, key, setErr)
+		}
+		t.Logf("  node %d SET %s = %q (forwarded) OK", s.id, key, val)
+	}
+
+	t.Log("Waiting for replication to propagate...")
+	time.Sleep(2 * time.Second)
+
+	// D1: read-anywhere. Every node must return each forwarded write.
+	for _, s := range servers {
+		addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
+		conn, err := connectTo(addr)
+		if err != nil {
+			t.Fatalf("connect node %d (%s): %v", s.id, addr, err)
+		}
+		for i, key := range keys {
+			val, msgType, err := binaryGet(conn, key)
+			if err != nil {
+				conn.Close()
+				t.Fatalf("node %d GET %s: %v", s.id, key, err)
+			}
+			if msgType == 0x07 {
+				conn.Close()
+				t.Fatalf("node %d GET %s: NOT_FOUND (want forwarded value)", s.id, key)
+			}
+			want := fmt.Sprintf("v%d", i)
+			if val != want {
+				conn.Close()
+				t.Fatalf("node %d GET %s = %q, want %q", s.id, key, val, want)
+			}
+			t.Logf("  node %d GET %s = %q (read-anywhere) OK", s.id, key, val)
+		}
+		conn.Close()
+	}
+
+	t.Log("=== MANUAL ROUTING TEST COMPLETE ===")
+}

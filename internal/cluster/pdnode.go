@@ -61,6 +61,10 @@ type PDNode struct {
 // Pool returns the local timestamp pool.
 func (p *PDNode) Pool() *TSOPool { return p.pool }
 
+// Client exposes the etcd client backing this PD node. It is used by the
+// Phase 3 RegionManager to persist and watch region metadata.
+func (p *PDNode) Client() *clientv3.Client { return p.cli }
+
 // Role reports the topology this node runs.
 func (p *PDNode) Role() string { return p.role }
 

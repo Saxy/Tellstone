@@ -113,6 +113,19 @@ type Server struct {
 	// otherwise. It is stopped after the raft node during shutdown; the
 	// pool it serves stands alone, so ordering is not load-bearing.
 	pdNode *cluster.PDNode
+	// regionMgr is the Phase 3 region metadata manager (nil when --cluster-mode
+	// is disabled). It persists region definitions in the PD etcd store and
+	// keeps routingTable converged via Watch.
+	regionMgr *cluster.RegionManager
+	// routingTable is the local, Watch-maintained view of region metadata used
+	// to route writes to the correct region leader. Nil when --cluster-mode is
+	// disabled.
+	routingTable *cluster.RoutingTable
+	// regionCancel stops the RegionManager goroutine on shutdown.
+	regionCancel context.CancelFunc
+	// regionDone is closed once the RegionManager Run goroutine has returned,
+	// so shutdown can wait for it before the PD node closes its etcd client.
+	regionDone chan struct{}
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -150,12 +163,7 @@ func (s *Server) Run() error {
 	if err = s.initAudit(key, cryptoEngine); err != nil {
 		return fmt.Errorf("audit init: %w", err)
 	}
-	// After initAudit so the engine has resolved the destination and the key
-	// that seals it, and before any listener starts so the restored history is
-	// in place by the time a client can read ACL LOG.
 	s.seedAuditReplay()
-	// Create the signal context before initShards so the snapshot loop
-	// can select on ctx.Done for clean shutdown.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	if err = s.initShards(key, cryptoEngine, ctx); err != nil {
@@ -166,11 +174,9 @@ func (s *Server) Run() error {
 			return fmt.Errorf("cluster init: %w", err)
 		}
 	}
-	// Wire the active store: cluster-aware when cluster mode is on, plain
-	// router otherwise. Both the binary and RESP frontends use this.
 	s.store = &s.rs
 	if s.raftNode != nil {
-		s.store = newClusterStore(&s.rs, s.raftNode, s.app.GetLogger())
+		s.store = newClusterStore(&s.rs, s.raftNode, s.routingTable, s.regionMgr, s.app.GetLogger())
 	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
@@ -239,8 +245,6 @@ func (s *Server) Run() error {
 			logger.Log(log.LevelError, "server: tcp error", log.String("error", err.Error()))
 		}
 	}
-	// Stop the SIGHUP watcher so its goroutine exits with Run instead of
-	// lingering until the process dies.
 	signal.Stop(hup)
 	close(hup)
 	return err
@@ -367,22 +371,24 @@ func (s *Server) shutdown(ctx context.Context) {
 			logger.Log(log.LevelError, "server: tcp server shutdown error", log.String("error", err.Error()))
 		}
 	}
-	// Wait for the snapshot loop to finish so no Storage.Snapshot is
-	// in-flight when we close the shard engines. Use a select so we
-	// don't block forever if the context deadline is reached.
 	if s.snapshotDone != nil {
 		select {
 		case <-s.snapshotDone:
 		case <-ctx.Done():
 		}
 	}
-	// Stop the raft node before shards so no in-flight FSM apply can race
-	// a shard engine closure. Nil when cluster mode is disabled.
+	// Stop the region manager first and wait for its Run goroutine to return
+	// before the PD node closes its etcd client, so no region-manager
+	// operation uses a closed client.
+	if s.regionCancel != nil {
+		s.regionCancel()
+	}
+	if s.regionDone != nil {
+		<-s.regionDone
+	}
 	if s.raftNode != nil {
 		s.raftNode.Stop()
 	}
-	// Stop the PD/TSO stack after the raft node; the pool it serves is
-	// independent of the raft group, so this ordering is not load-bearing.
 	if s.pdNode != nil {
 		s.pdNode.Stop()
 	}
@@ -761,6 +767,31 @@ func (s *Server) initCluster() error {
 		return fmt.Errorf("start placement driver: %w", err)
 	}
 	s.pdNode = pdNode
+	peerIDs := make([]uint64, len(peers))
+	for i, p := range peers {
+		peerIDs[i] = p.ID
+	}
+	rm := cluster.NewRegionManager(s.pdNode.Client(), cfg.GetNodeID(), s.raftNode, peerIDs)
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer bootCancel()
+	if err = rm.BootstrapDefaultRegion(bootCtx); err != nil {
+		s.raftNode.Stop()
+		s.pdNode.Stop()
+		return fmt.Errorf("bootstrap default region: %w", err)
+	}
+	rmCtx, rmCancel := context.WithCancel(context.Background())
+	s.regionMgr = rm
+	s.regionCancel = rmCancel
+	s.routingTable = rm.RoutingTable()
+	s.regionDone = make(chan struct{})
+	go func() {
+		if rerr := rm.Run(rmCtx); rerr != nil && logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "server: region manager stopped",
+				log.String("error", rerr.Error()),
+			)
+		}
+		close(s.regionDone)
+	}()
 
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "server: cluster mode enabled",
