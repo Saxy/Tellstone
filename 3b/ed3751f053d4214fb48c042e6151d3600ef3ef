@@ -1,0 +1,64 @@
+docs/PHASE3-ROUTING-DESIGN.md
+  s_3a03e1470b7cc6::t_84de4590673208 1-109
+server/cluster.go
+  s_3a03e1470b7cc6::t_7c8c9aaa9daea0 172
+  s_3a03e1470b7cc6::t_f8530263797a48 196,233
+  s_3a03e1470b7cc6::t_a1b1cf09940803 125-127,129-143,145-150,152,154-155,158-159,161-171,173,175
+  s_3a03e1470b7cc6::t_28584c69fe4788 95,99-100
+  s_3a03e1470b7cc6::t_2ac9d2d80b0d82 86-90,94,104-111,123-124,128,144,174,176-178,180,198,206,213-216,219,235
+internal/cluster/region.go
+  s_3a03e1470b7cc6::t_76eef82bceac80 1-95,113-199,205-277,279
+  s_3a03e1470b7cc6::t_eb8a7f2df60772 96-112
+  s_3a03e1470b7cc6::t_b3e21a5cbd9aff 200-204
+  s_3a03e1470b7cc6::t_93411769d0b88c 278
+internal/cluster/pdnode.go
+  s_3a03e1470b7cc6::t_36f1041e2d4aa4 64-67
+internal/cluster/routing.go
+  s_3a03e1470b7cc6::t_7328a34262ba39 1-103
+server/server.go
+  s_3a03e1470b7cc6::t_d99a09b82cd4a1 761-781
+  s_3a03e1470b7cc6::t_56532d14100f7b 116-125
+  s_3a03e1470b7cc6::t_687a9d19ebe7ba 176
+  s_3a03e1470b7cc6::t_cacb100aa2f60b 383-385
+internal/cluster/region_test.go
+  s_3a03e1470b7cc6::t_813a3d94333d77 1-109
+internal/cluster/node.go
+  s_3a03e1470b7cc6::t_63d274890f5615 297-302
+  s_3a03e1470b7cc6::t_c942506a8bc259 89-98
+  s_3a03e1470b7cc6::t_6c55a802e56d71 34-42
+  s_3a03e1470b7cc6::t_cd6c78428fdd22 117-121,129
+  s_3a03e1470b7cc6::t_ced3a95b1bc6fd 233-296,303-307,311,313-329,332-350,354-369,372-373,375-390
+  s_3a03e1470b7cc6::t_5b4dc95be29ff3 308-310,312
+  s_3a03e1470b7cc6::t_c922524cbd43f3 370-371,374
+  s_3a03e1470b7cc6::t_6a040c80387c56 391,393-405
+  s_3a03e1470b7cc6::t_7166cb6b8fea80 331
+  s_3a03e1470b7cc6::t_ad7eb9ac578f67 526-529,531-538
+  s_3a03e1470b7cc6::t_f3cedff0b951d8 18
+  s_3a03e1470b7cc6::t_ec278b7cfb70ab 530
+  s_3a03e1470b7cc6::t_bc68ae7e51eff2 392
+internal/cluster/routing_integration_test.go
+  s_3a03e1470b7cc6::t_613474c9903fd4 1-17,19-123,131,133-146,156,158-160,164-174,176-181,183
+  s_3a03e1470b7cc6::t_cec87695b28105 18
+  s_3a03e1470b7cc6::t_b6cd68c7ad84bf 124-130,132,147-155,157,161-163
+  s_3a03e1470b7cc6::t_fb512086f7a22e 175,182
+internal/cluster/routing_test.go
+  s_3a03e1470b7cc6::t_54bd2bdb47e335 1-56
+internal/cluster/manual_test.go
+  s_3a03e1470b7cc6::t_bb59ad8c48d685 568-660
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.24",
+  "base_commit_sha": "3bed3751f053d4214fb48c042e6151d3600ef3ef",
+  "prompts": {},
+  "sessions": {
+    "s_3a03e1470b7cc6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_fd28f255affeOOc6523JcrPORB",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
