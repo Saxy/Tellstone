@@ -82,23 +82,43 @@ func (d *shardDispatcher) Dispatch(key string, op byte, value []byte, ttl time.D
 	return nil
 }
 
+// localReader is the seam clusterStore reads through. The production
+// implementation is *RouterStore (reads from the shared-nothing shard layer);
+// the manual split test injects a lightweight in-memory key store.
+type localReader interface {
+	Get(key string) ([]byte, bool)
+}
+
 // clusterStore wraps a RouterStore and routes writes through Raft when
-// cluster mode is active. Phase 3 routing: a write is proposed directly when
-// this node is the Raft leader, otherwise it is forwarded to the leader of
-// the region that owns the key (read from the local routing table). Reads go
-// to the local engine after a linearizable ReadIndex round-trip; if that
-// round-trip cannot complete in time, the local value is served as a
+// cluster mode is active. Phase 3/4 routing: a write is proposed directly
+// against the local Raft group of the region that owns the key; when this node
+// is not that region's leader, the write is forwarded to the region leader
+// resolved from the local routing table. Reads go to the local engine after a
+// linearizable ReadIndex round-trip against the owning region's local group;
+// if that round-trip cannot complete in time, the local value is served as a
 // best-effort fallback and may be slightly stale (read-anywhere).
 type clusterStore struct {
-	local  *RouterStore
+	local  localReader
 	node   *cluster.Node
+	coord  *RegionCoordinator
 	rt     *cluster.RoutingTable
 	mgr    *cluster.RegionManager
 	logger log.Logger
 }
 
-func newClusterStore(local *RouterStore, node *cluster.Node, rt *cluster.RoutingTable, mgr *cluster.RegionManager, logger log.Logger) *clusterStore {
-	return &clusterStore{local: local, node: node, rt: rt, mgr: mgr, logger: logger}
+func newClusterStore(local localReader, node *cluster.Node, rt *cluster.RoutingTable, mgr *cluster.RegionManager, coord *RegionCoordinator, logger log.Logger) *clusterStore {
+	return &clusterStore{local: local, node: node, coord: coord, rt: rt, mgr: mgr, logger: logger}
+}
+
+// nodeForRegion returns the local Raft group node that hosts the region owning
+// the key's route, falling back to the bootstrap node when unavailable.
+func (cs *clusterStore) nodeForRegion(route *cluster.RegionRoute) *cluster.Node {
+	if cs.coord != nil && route != nil {
+		if n := cs.coord.NodeForRegion(route.ID); n != nil {
+			return n
+		}
+	}
+	return cs.node
 }
 
 func (cs *clusterStore) Get(key string) ([]byte, bool) {
@@ -106,9 +126,16 @@ func (cs *clusterStore) Get(key string) ([]byte, bool) {
 	// the Raft commit index observed by ReadIndex, then serve from the local
 	// engine. On timeout/failure we fall back to the local value (best-effort,
 	// may be slightly stale) rather than failing the read.
+	var rn *cluster.Node
+	if route := cs.rt.Find([]byte(key)); route != nil {
+		rn = cs.nodeForRegion(route)
+	}
+	if rn == nil {
+		rn = cs.node
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := cs.node.LinearizableRead(ctx); err != nil {
+	if err := rn.LinearizableRead(ctx); err != nil {
 		if cs.logger.Enabled(log.LevelWarn) {
 			cs.logger.Log(log.LevelWarn, "cluster store: linearizable read failed, serving local (best-effort, may be stale)",
 				log.String("error", err.Error()),
@@ -127,12 +154,14 @@ func (cs *clusterStore) Get(key string) ([]byte, bool) {
 	return val, ok
 }
 
-// routeWrite proposes directly when this node leads the Raft group, otherwise
-// forwards the operation to the region leader resolved from the routing table.
-// It is resilient to a stale or unreachable region leader (D4 churn): on a
-// failed forward it refreshes the routing table and retries, and it waits
-// briefly for the leader to be claimed before reporting CLUSTERNOTREADY.
-func (cs *clusterStore) routeWrite(key string, data []byte) error {
+// routeWritePropose proposes a single log-entry write (or a chunk chain) on
+// the region group that owns the key, forwarding to the region leader when
+// this node is not the leader. It is resilient to a stale or unreachable
+// region leader (D4 churn): on a failed forward it refreshes the routing table
+// and retries, and it waits briefly for the leader to be claimed before
+// reporting CLUSTERNOTREADY. payloads holds one entry (fast path) or a chunk
+// chain for large values.
+func (cs *clusterStore) routeWrite(key string, payloads [][]byte) error {
 	const (
 		maxAttempts = 6
 		backoff     = 200 * time.Millisecond
@@ -140,6 +169,7 @@ func (cs *clusterStore) routeWrite(key string, data []byte) error {
 		// leaders cannot block the caller indefinitely.
 		writeBudget = 8 * time.Second
 	)
+	chunked := len(payloads) > 1
 	deadline := time.Now().Add(writeBudget)
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -154,7 +184,8 @@ func (cs *clusterStore) routeWrite(key string, data []byte) error {
 			}
 			continue
 		}
-		// Bound each forward attempt by the remaining overall budget.
+		regionNode := cs.nodeForRegion(route)
+		// Bound each attempt by the remaining overall budget.
 		budget := time.Until(deadline)
 		if budget <= 0 {
 			break
@@ -163,14 +194,25 @@ func (cs *clusterStore) routeWrite(key string, data []byte) error {
 			budget = 5 * time.Second
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), budget)
-		err := cs.node.ForwardWrite(ctx, route.Leader, data)
+		var err error
+		if route.Leader == cs.nodeID() {
+			if chunked {
+				err = regionNode.ProposeChunked(ctx, payloads)
+			} else {
+				err = regionNode.ProposeAndWait(ctx, payloads[0])
+			}
+		} else if chunked {
+			err = regionNode.ForwardChunks(ctx, route.Leader, payloads)
+		} else {
+			err = regionNode.ForwardWrite(ctx, route.Leader, payloads[0])
+		}
 		cancel()
 		if err == nil {
 			return nil
 		}
 		lastErr = err
 		if cs.logger.Enabled(log.LevelDebug) {
-			cs.logger.Log(log.LevelDebug, "cluster store: forward failed, refreshing routing and retrying",
+			cs.logger.Log(log.LevelDebug, "cluster store: write failed, refreshing routing and retrying",
 				log.String("key", key),
 				log.String("error", err.Error()),
 				log.Int("attempt", attempt+1),
@@ -185,6 +227,14 @@ func (cs *clusterStore) routeWrite(key string, data []byte) error {
 		return fmt.Errorf("MOVED: write to region leader failed: %w", lastErr)
 	}
 	return fmt.Errorf("CLUSTERNOTREADY: region leader not elected for key %q", key)
+}
+
+// nodeID returns this node's Raft node ID.
+func (cs *clusterStore) nodeID() uint64 {
+	if cs.coord != nil {
+		return cs.coord.host.NodeID()
+	}
+	return cs.node.NodeID()
 }
 
 // refreshRouting pulls the latest region metadata from etcd into the local
@@ -206,6 +256,33 @@ func (cs *clusterStore) Set(key string, value []byte, ttl time.Duration) error {
 			log.Int64("ttl_ms", ttl.Milliseconds()),
 		)
 	}
+	// Values at or below ChunkMax travel as a single atomic raft entry.
+	// Larger values are split into a chunk chain (writeSeq 1); the FSM
+	// reassembles on the last chunk. Exactly one chain per key is in flight
+	// from a caller, so interleaving is only possible across clients and
+	// self-heals via whole-chain retry.
+	if len(value) > cluster.ChunkMax {
+		chunks, err := encodeChunks(key, value, ttl)
+		if err != nil {
+			return err
+		}
+		if err = cs.routeWrite(key, chunks); err != nil {
+			if cs.logger.Enabled(log.LevelError) {
+				cs.logger.Log(log.LevelError, "cluster store: SET (chunked) failed",
+					log.String("error", err.Error()),
+					log.String("key", key),
+				)
+			}
+			return err
+		}
+		if cs.logger.Enabled(log.LevelDebug) {
+			cs.logger.Log(log.LevelDebug, "cluster store: SET (chunked) succeeded",
+				log.String("key", key),
+				log.Int("chunks", len(chunks)),
+			)
+		}
+		return nil
+	}
 	data, err := cluster.EncodeSet(key, value, ttl)
 	if err != nil {
 		if cs.logger.Enabled(log.LevelError) {
@@ -216,7 +293,7 @@ func (cs *clusterStore) Set(key string, value []byte, ttl time.Duration) error {
 		}
 		return err
 	}
-	if err = cs.routeWrite(key, data); err != nil {
+	if err = cs.routeWrite(key, [][]byte{data}); err != nil {
 		if cs.logger.Enabled(log.LevelError) {
 			cs.logger.Log(log.LevelError, "cluster store: SET failed",
 				log.String("error", err.Error()),
@@ -231,6 +308,25 @@ func (cs *clusterStore) Set(key string, value []byte, ttl time.Duration) error {
 		)
 	}
 	return nil
+}
+
+// encodeChunks splits a large value into a chunk chain of log-entry payloads.
+func encodeChunks(key string, value []byte, ttl time.Duration) ([][]byte, error) {
+	total := (len(value) + cluster.ChunkMax - 1) / cluster.ChunkMax
+	chunks := make([][]byte, 0, total)
+	for i := 0; i < total; i++ {
+		lo := i * cluster.ChunkMax
+		hi := lo + cluster.ChunkMax
+		if hi > len(value) {
+			hi = len(value)
+		}
+		enc, err := cluster.EncodeChunkSet(key, ttl, 1, total, i, value[lo:hi])
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, enc)
+	}
+	return chunks, nil
 }
 
 // Delete routes a deletion through Raft (or forwards it to the region leader).
@@ -254,7 +350,7 @@ func (cs *clusterStore) Delete(key string) (bool, error) {
 		}
 		return false, err
 	}
-	if err = cs.routeWrite(key, data); err != nil {
+	if err = cs.routeWrite(key, [][]byte{data}); err != nil {
 		if cs.logger.Enabled(log.LevelError) {
 			cs.logger.Log(log.LevelError, "cluster store: DEL failed",
 				log.String("error", err.Error()),

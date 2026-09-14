@@ -239,3 +239,73 @@ func FuzzEngine_Operations(f *testing.F) {
 		}
 	})
 }
+
+// TestEngine_Scan verifies range scans return exactly the entries in
+// [start, end) sorted lexicographically, skipping expired entries.
+func TestEngine_Scan(t *testing.T) {
+	engine := NewEngine(0, 0, 0, nil, nil)
+	defer engine.Close()
+
+	keys := []string{"user:alice", "user:bob", "user:carol", "admin:root", "user:dave"}
+	for i, k := range keys {
+		if err := engine.Set(k, []byte{byte(i)}, 0); err != nil {
+			t.Fatalf("set %q: %v", k, err)
+		}
+	}
+
+	t.Run("full range", func(t *testing.T) {
+		var got []string
+		engine.Scan(nil, nil, func(key string, _ []byte) { got = append(got, key) })
+		want := []string{"admin:root", "user:alice", "user:bob", "user:carol", "user:dave"}
+		if len(got) != len(want) {
+			t.Fatalf("got %d keys, want %d: %v", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("key[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("prefix range", func(t *testing.T) {
+		var got []string
+		engine.Scan([]byte("user:"), []byte("user:\xff"), func(key string, _ []byte) { got = append(got, key) })
+		want := []string{"user:alice", "user:bob", "user:carol", "user:dave"}
+		if len(got) != len(want) {
+			t.Fatalf("got %d keys, want %d: %v", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("key[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("bounded range", func(t *testing.T) {
+		var got []string
+		engine.Scan([]byte("user:b"), []byte("user:d"), func(key string, _ []byte) { got = append(got, key) })
+		want := []string{"user:bob", "user:carol"}
+		if len(got) != len(want) {
+			t.Fatalf("got %d keys, want %d: %v", len(got), len(want), got)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Errorf("key[%d] = %q, want %q", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("excludes expired", func(t *testing.T) {
+		if err := engine.Set("user:expired", []byte("x"), 10*time.Millisecond); err != nil {
+			t.Fatalf("set expired: %v", err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		var got []string
+		engine.Scan(nil, nil, func(key string, _ []byte) { got = append(got, key) })
+		for _, k := range got {
+			if k == "user:expired" {
+				t.Errorf("expired key %q was returned by Scan", k)
+			}
+		}
+	})
+}

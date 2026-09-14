@@ -126,6 +126,17 @@ type Server struct {
 	// regionDone is closed once the RegionManager Run goroutine has returned,
 	// so shutdown can wait for it before the PD node closes its etcd client.
 	regionDone chan struct{}
+	// regionSizeTracker tracks per-region byte counts for split decisions.
+	// Nil when --cluster-mode is disabled.
+	regionSizeTracker *cluster.RegionSizeTracker
+	// sizeReportCancel stops the background size-report goroutine on shutdown.
+	sizeReportCancel context.CancelFunc
+	// sizeReportDone is closed when the size-report goroutine exits.
+	sizeReportDone chan struct{}
+	// regionCoord hosts per-region Raft group nodes (one group per region over
+	// a shared transport) and runs auto-splits. Nil when --cluster-mode is
+	// disabled.
+	regionCoord *RegionCoordinator
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -176,7 +187,7 @@ func (s *Server) Run() error {
 	}
 	s.store = &s.rs
 	if s.raftNode != nil {
-		s.store = newClusterStore(&s.rs, s.raftNode, s.routingTable, s.regionMgr, s.app.GetLogger())
+		s.store = newClusterStore(&s.rs, s.raftNode, s.routingTable, s.regionMgr, s.regionCoord, s.app.GetLogger())
 	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
@@ -380,11 +391,22 @@ func (s *Server) shutdown(ctx context.Context) {
 	// Stop the region manager first and wait for its Run goroutine to return
 	// before the PD node closes its etcd client, so no region-manager
 	// operation uses a closed client.
+	if s.sizeReportCancel != nil {
+		s.sizeReportCancel()
+	}
+	if s.sizeReportDone != nil {
+		<-s.sizeReportDone
+	}
 	if s.regionCancel != nil {
 		s.regionCancel()
 	}
 	if s.regionDone != nil {
 		<-s.regionDone
+	}
+	// Stop non-bootstrap region nodes before the bootstrap raft node, which
+	// owns the shared transport they use.
+	if s.regionCoord != nil {
+		s.regionCoord.Stop()
 	}
 	if s.raftNode != nil {
 		s.raftNode.Stop()
@@ -717,6 +739,7 @@ func (s *Server) initCluster() error {
 
 	nodeCfg := cluster.NodeConfig{
 		NodeID:        cfg.GetNodeID(),
+		GroupID:       1, // bootstrap region (region 1) until splits create more
 		PeerAddr:      cfg.GetPeerAddr(),
 		Peers:         peers,
 		ElectionTick:  10,
@@ -792,6 +815,47 @@ func (s *Server) initCluster() error {
 		}
 		close(s.regionDone)
 	}()
+
+	// Phase 4: region size tracking for auto-split decisions.
+	tracker := cluster.NewRegionSizeTracker()
+	s.regionSizeTracker = tracker
+	resolver := func(key string) uint64 {
+		route := s.routingTable.Find([]byte(key))
+		if route == nil {
+			return 0
+		}
+		return route.ID
+	}
+	n.FSM().SetSizeTracker(tracker, resolver)
+	sizeReportCtx, sizeReportCancel := context.WithCancel(context.Background())
+	s.sizeReportCancel = sizeReportCancel
+	s.sizeReportDone = make(chan struct{})
+	go func() {
+		tracker.ReportLoop(sizeReportCtx, s.pdNode.Client(), 10*time.Second)
+		close(s.sizeReportDone)
+	}()
+
+	// Phase 4: per-region Raft group host + auto-split coordinator. Region 1
+	// (the bootstrap group) is the node we already started; any region created
+	// by a split is hosted as an additional group node sharing the transport.
+	coord := NewRegionCoordinator(
+		s.pdNode.Client(),
+		cfg.GetNodeID(),
+		n,
+		rm,
+		newShardDispatcher(s.shards, logger),
+		peers,
+		cfg.GetClusterSplitThreshold(),
+		logger,
+		tracker,
+		resolver,
+	)
+	s.regionCoord = coord
+	// Multi-region leadership: the coordinator hosts one raft node per region,
+	// so the region manager's leader publication must resolve leadership per
+	// region (not just the bootstrap group).
+	rm.SetLeadershipProvider(coord.LeadershipProvider())
+	go coord.Run(rmCtx)
 
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "server: cluster mode enabled",

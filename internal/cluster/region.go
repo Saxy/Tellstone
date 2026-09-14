@@ -26,12 +26,13 @@ import (
 // Region is the authoritative metadata for one key-range Raft group. It is
 // serialized and stored in etcd under /tellstone/regions/<id>.
 type Region struct {
-	ID       uint64
-	StartKey []byte
-	EndKey   []byte
-	Peers    []uint64 // node IDs of the region's Raft members
-	Leader   uint64   // current leader node ID (0 until first leader claims it)
-	Epoch    uint64   // bumped on every split/move/leadership change
+	ID        uint64
+	StartKey  []byte
+	EndKey    []byte
+	Peers     []uint64 // node IDs of the region's Raft members
+	Leader    uint64   // current leader node ID (0 until first leader claims it)
+	Epoch     uint64   // bumped on every split/move/leadership change
+	SizeBytes uint64   // tracked byte count for split decisions (Phase 4)
 }
 
 const regionKeyPrefix = "/tellstone/regions/"
@@ -183,9 +184,38 @@ func (m *RegionManager) Run(ctx context.Context) error {
 	}
 }
 
-// leadershipLoop, on the Raft leader, ensures region 1's Leader field points at
-// this node. It only writes when the field is stale, so non-leaders are silent
-// and the single leader wins quickly after an election.
+// RegionLeadershipProvider is an optional extension to LeadershipProvider for
+// multi-region (Phase 4) deployments: per-region leaders are reported for the
+// region's own Raft group. Nodes hosting only the bootstrap group can keep the
+// plain LeadershipProvider; leadership for any other region is then reported
+// as not-leader.
+type RegionLeadershipProvider interface {
+	IsLeaderFor(regionID uint64) bool
+}
+
+// SetLeadershipProvider swaps the node's leadership signal after creation.
+// Used by the server when per-region Raft group nodes are hosted by a separate
+// coordinator that owns the leadership query, avoiding a construction cycle.
+func (m *RegionManager) SetLeadershipProvider(lp LeadershipProvider) { m.lp = lp }
+
+// isLeaderFor reports whether this node is the current Raft leader of the
+// region's group. A plain LeadershipProvider only knows the bootstrap group
+// (region 1); a RegionLeadershipProvider resolves every region.
+func (m *RegionManager) isLeaderFor(regionID uint64) bool {
+	if rlp, ok := m.lp.(RegionLeadershipProvider); ok {
+		return rlp.IsLeaderFor(regionID)
+	}
+	if m.lp == nil {
+		return false
+	}
+	return regionID == 1 && m.lp.IsLeader()
+}
+
+// leadershipLoop, on each region's Raft leader, ensures the region's Leader
+// field points at this node. It scans all region metadata and only writes when
+// the field is stale, so non-leaders are silent and each region's single
+// leader wins quickly after an election. Without this, routed writes to a
+// split region would never learn the leader (route.Leader == 0).
 func (m *RegionManager) leadershipLoop(ctx context.Context) {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
@@ -194,38 +224,35 @@ func (m *RegionManager) leadershipLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !m.lp.IsLeader() {
-				continue
-			}
-			cur, err := m.getRegion(ctx, 1)
+			resp, err := m.cli.Get(ctx, regionKeyPrefix, clientv3.WithPrefix())
 			if err != nil {
 				continue
 			}
-			if cur != nil && cur.Leader == m.nodeID {
-				continue
-			}
-			epoch := uint64(1)
-			if cur != nil {
-				epoch = cur.Epoch + 1
-			}
-			nr := Region{
-				ID:       1,
-				StartKey: []byte{},
-				EndKey:   nil,
-				Peers:    m.peers,
-				Leader:   m.nodeID,
-				Epoch:    epoch,
-			}
-			if regionExceedsWireLimit(nr) {
-				continue
-			}
-			if _, err := m.cli.Put(ctx, regionKey(1), string(encodeRegion(nr))); err != nil {
-				continue
+			for _, kv := range resp.Kvs {
+				cur, ok := decodeRegion(kv.Value)
+				if !ok {
+					continue
+				}
+				if cur.Leader == m.nodeID {
+					continue
+				}
+				if !m.isLeaderFor(cur.ID) {
+					continue
+				}
+				cur.Leader = m.nodeID
+				cur.Epoch++
+				if regionExceedsWireLimit(cur) {
+					continue
+				}
+				if _, err := m.cli.Put(ctx, regionKey(cur.ID), string(encodeRegion(cur))); err != nil {
+					continue
+				}
 			}
 		}
 	}
 }
 
+// getRegion reads a single region from etcd.
 func (m *RegionManager) getRegion(ctx context.Context, id uint64) (*Region, error) {
 	resp, err := m.cli.Get(ctx, regionKey(id))
 	if err != nil {
@@ -241,10 +268,34 @@ func (m *RegionManager) getRegion(ctx context.Context, id uint64) (*Region, erro
 	return &r, nil
 }
 
+// UpdateRegionSize writes a region's byte count to etcd so the PD can monitor
+// it for split decisions. Only the SizeBytes field is updated; all other
+// metadata is preserved. This is called by the leader's size report loop.
+func (m *RegionManager) UpdateRegionSize(ctx context.Context, id uint64, sizeBytes uint64) error {
+	r, err := m.getRegion(ctx, id)
+	if err != nil {
+		return err
+	}
+	if r == nil {
+		return nil // region does not exist yet; skip
+	}
+	r.SizeBytes = sizeBytes
+	_, err = m.cli.Put(ctx, regionKey(id), string(encodeRegion(*r)))
+	return err
+}
+
+// RegionKeyPrefix returns the etcd key prefix under which region metadata is
+// stored. Exported for server-side coordinators that scan all regions.
+func RegionKeyPrefix() string { return regionKeyPrefix }
+
+// DecodeRegion decodes a region stored in etcd. Exported for server-side
+// consumers (the region coordinator) that read raw etcd values.
+func DecodeRegion(data []byte) (Region, bool) { return decodeRegion(data) }
+
 // --- serialization (compact binary, no protobuf) ---
 
 func encodeRegion(r Region) []byte {
-	buf := make([]byte, 0, 32+len(r.StartKey)+len(r.EndKey))
+	buf := make([]byte, 0, 40+len(r.StartKey)+len(r.EndKey))
 	buf = appendUint64(buf, r.ID)
 	buf = appendUint64(buf, r.Epoch)
 	buf = appendUint64(buf, r.Leader)
@@ -254,6 +305,7 @@ func encodeRegion(r Region) []byte {
 	}
 	buf = appendBytesField(buf, r.StartKey)
 	buf = appendBytesField(buf, r.EndKey)
+	buf = appendUint64(buf, r.SizeBytes)
 	return buf
 }
 
@@ -279,9 +331,14 @@ func decodeRegion(b []byte) (Region, bool) {
 	if !ok {
 		return r, false
 	}
-	_, r.EndKey, ok = readBytesField(b)
+	b, r.EndKey, ok = readBytesField(b)
 	if !ok {
 		return r, false
+	}
+	// SizeBytes is appended after EndKey for Phase 4. Older encoded regions
+	// without this field are still valid — they decode as SizeBytes=0.
+	if len(b) >= 8 {
+		r.SizeBytes = binary.BigEndian.Uint64(b[0:8])
 	}
 	return r, true
 }

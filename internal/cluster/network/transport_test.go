@@ -12,6 +12,118 @@ import (
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
+func TestTransportMultiGroupDemux(t *testing.T) {
+	// Two groups (regions) multiplexed over the same peer connection. Frames
+	// carry a group ID; the receiving transport must route each message to
+	// the handler registered for that group.
+	logger := log.NewNoOpLogger()
+
+	type recv struct {
+		mu   sync.Mutex
+		msgs []*pb.Message
+	}
+	groupA, groupB := &recv{}, &recv{}
+	mkHandler := func(r *recv) MessageHandler {
+		return func(msg *pb.Message) {
+			r.mu.Lock()
+			r.msgs = append(r.msgs, msg)
+			r.mu.Unlock()
+		}
+	}
+
+	tr1 := NewTransport("127.0.0.1:0", 1, mkHandler(groupA), logger)
+	tr1.RegisterGroup(1, mkHandler(groupA))
+	tr1.RegisterGroup(2, mkHandler(groupB))
+	if err := tr1.Listen(); err != nil {
+		t.Fatalf("tr1 Listen: %v", err)
+	}
+	defer tr1.Stop()
+
+	tr2 := NewTransport("127.0.0.1:0", 2, mkHandler(groupA), logger)
+	tr2.RegisterGroup(1, mkHandler(groupA))
+	tr2.RegisterGroup(2, mkHandler(groupB))
+	if err := tr2.Listen(); err != nil {
+		t.Fatalf("tr2 Listen: %v", err)
+	}
+	defer tr2.Stop()
+
+	tr1.RegisterPeer(2, tr2.Addr())
+	tr2.RegisterPeer(1, tr1.Addr())
+
+	to2 := uint64(2)
+	for i := 0; i < 3; i++ {
+		typ := pb.MessageType_MsgApp
+		m := &pb.Message{To: &to2, From: uint64Ptr(1), Type: &typ, Term: uint64Ptr(uint64(i + 1))}
+		if err := tr1.SendTo(1, m); err != nil {
+			t.Fatalf("SendTo(1): %v", err)
+		}
+		typ2 := pb.MessageType_MsgHeartbeat
+		m2 := &pb.Message{To: &to2, From: uint64Ptr(1), Type: &typ2, Term: uint64Ptr(uint64(i + 1))}
+		if err := tr1.SendTo(2, m2); err != nil {
+			t.Fatalf("SendTo(2): %v", err)
+		}
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	groupA.mu.Lock()
+	groupB.mu.Lock()
+	defer groupA.mu.Unlock()
+	defer groupB.mu.Unlock()
+	if len(groupA.msgs) != 3 {
+		t.Fatalf("group 1 handler got %d messages, want 3", len(groupA.msgs))
+	}
+	if len(groupB.msgs) != 3 {
+		t.Fatalf("group 2 handler got %d messages, want 3", len(groupB.msgs))
+	}
+	for _, m := range groupA.msgs {
+		if m.GetType() != pb.MessageType_MsgApp {
+			t.Fatalf("group 1 handler received type %v, want MsgApp", m.GetType())
+		}
+	}
+	for _, m := range groupB.msgs {
+		if m.GetType() != pb.MessageType_MsgHeartbeat {
+			t.Fatalf("group 2 handler received type %v, want MsgHeartbeat", m.GetType())
+		}
+	}
+}
+
+func TestTransportUnregisteredGroupDropped(t *testing.T) {
+	// A frame for a group the receiver does not host must be dropped, not
+	// delivered to the wrong handler.
+	logger := log.NewNoOpLogger()
+	var received atomic.Int32
+	handler := func(msg *pb.Message) { received.Add(1) }
+
+	tr1 := NewTransport("127.0.0.1:0", 1, handler, logger)
+	if err := tr1.Listen(); err != nil {
+		t.Fatalf("tr1 Listen: %v", err)
+	}
+	defer tr1.Stop()
+
+	tr2 := NewTransport("127.0.0.1:0", 2, handler, logger)
+	if err := tr2.Listen(); err != nil {
+		t.Fatalf("tr2 Listen: %v", err)
+	}
+	defer tr2.Stop()
+
+	tr1.RegisterPeer(2, tr2.Addr())
+	tr2.RegisterPeer(1, tr1.Addr())
+
+	to2 := uint64(2)
+	typ := pb.MessageType_MsgApp
+	m := &pb.Message{To: &to2, From: uint64Ptr(1), Type: &typ}
+	// tr2 only hosts group 0 (constructor handler), so group 5 must be dropped.
+	if err := tr1.SendTo(5, m); err != nil {
+		t.Fatalf("SendTo(5): %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if got := received.Load(); got != 0 {
+		t.Fatalf("expected 0 messages delivered for unhosted group, got %d", got)
+	}
+}
+
 func TestTransportListenAndStop(t *testing.T) {
 	logger := log.NewNoOpLogger()
 	var received atomic.Int32
@@ -289,13 +401,14 @@ func TestTransportMalformedFrameKillsConnection(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 
-	// Frame: 4-byte length prefix (10 bytes of payload) + garbage payload.
-	// The payload claims 3 messages (count=3) followed by bytes that don't
-	// form valid messages.
+	// Frame: 4-byte length prefix (10 bytes of payload) + 8-byte group ID +
+	// garbage payload. The payload claims 3 messages (count=3) followed by
+	// bytes that don't form valid messages.
 	payload := []byte{3, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}
-	frame := make([]byte, 4+len(payload))
+	frame := make([]byte, 4+8+len(payload))
 	binary.BigEndian.PutUint32(frame, uint32(len(payload)))
-	copy(frame[4:], payload)
+	copy(frame[4:], make([]byte, 8)) // group ID 0
+	copy(frame[4+8:], payload)
 	if _, err := conn.Write(frame); err != nil {
 		t.Fatalf("write garbage: %v", err)
 	}

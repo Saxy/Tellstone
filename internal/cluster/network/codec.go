@@ -7,10 +7,15 @@ raftpb.Message to/from a compact wire format without touching the protobuf
 runtime. This keeps the hot path free of protobuf overhead (reflection,
 descriptor lookups, allocation through protoiface).
 
-Wire format:
+Wire format (Phase 4, multi-group):
 
-	Frame:  [4B big-endian payload_length][payload]
+	Frame:  [4B big-endian payload_length][8B big-endian group_id][payload]
 	Payload:[1B msg_count][msg_1]...[msg_N]
+
+group_id tags the frame with the Raft group (region) the messages belong to.
+The receiving transport demuxes by group ID to the region's handler, letting
+one TCP connection carry consensus traffic for multiple regions (Phase 4
+splits). group_id 0 is the legacy single-group form.
 
 Each message:
 
@@ -45,6 +50,7 @@ Authors:
 package network
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 
@@ -59,6 +65,11 @@ var errCodecFrame = errors.New("cluster network: malformed codec frame")
 // bounds-checked per-byte, so the real constraint is allocation pressure from
 // the msgs slice — 255 * 24 bytes (pointer) ≈6 KiB is negligible.
 const maxBatchCount = 255
+
+// frameGroupIDSize is the size in bytes of the group/region ID written between
+// the 4-byte frame length prefix and the batch payload. Group ID 0 is the
+// legacy single-group identifier.
+const frameGroupIDSize = 8
 
 // Field bitmask positions for the compact message encoding.
 const (
@@ -77,13 +88,66 @@ const (
 	fieldResponses
 )
 
-// EncodeBatch writes a batch of Raft messages into a length-prefixed frame.
-// It returns the complete frame bytes including the 4-byte header. Batches
-// larger than maxBatchCount are rejected: the wire format stores the message
-// count in one byte, so an oversized input would silently wrap and decode as
-// a truncated (or empty) batch on the receiving side. The batching sender
-// flushes before reaching this limit; EncodeBatch is the backstop.
+// EncodeBatch writes a batch of Raft messages into a length-prefixed frame
+// without a group ID (legacy single-group form, group_id=0 on the wire). It
+// returns the complete frame bytes including the 4-byte header. Batches larger
+// than maxBatchCount are rejected: the wire format stores the message count in
+// one byte, so an oversized input would silently wrap and decode as a truncated
+// (or empty) batch on the receiving side. The batching sender flushes before
+// reaching this limit; EncodeBatch is the backstop.
 func EncodeBatch(msgs []*pb.Message) ([]byte, error) {
+	payload, err := encodeBatchPayload(msgs)
+	if err != nil {
+		return nil, err
+	}
+	frame := make([]byte, 4+len(payload))
+	frame[0] = byte(len(payload) >> 24)
+	frame[1] = byte(len(payload) >> 16)
+	frame[2] = byte(len(payload) >> 8)
+	frame[3] = byte(len(payload))
+	copy(frame[4:], payload)
+	return frame[:4+len(payload)], nil
+}
+
+// EncodeGroupFrame writes a batch of Raft messages tagged with gid into a
+// complete wire frame: `[4B payload_length][8B group_id][payload]`. The length
+// prefix covers only the payload (1-byte count + encoded messages); the group
+// ID is the region identifier the receiving transport uses to demux the batch
+// to the correct consensus handler.
+func EncodeGroupFrame(gid uint64, msgs []*pb.Message) ([]byte, error) {
+	payload, err := encodeBatchPayload(msgs)
+	if err != nil {
+		return nil, err
+	}
+	frame := make([]byte, 4+frameGroupIDSize+len(payload))
+	frame[0] = byte(len(payload) >> 24)
+	frame[1] = byte(len(payload) >> 16)
+	frame[2] = byte(len(payload) >> 8)
+	frame[3] = byte(len(payload))
+	binary.BigEndian.PutUint64(frame[4:4+frameGroupIDSize], gid)
+	copy(frame[4+frameGroupIDSize:], payload)
+	return frame, nil
+}
+
+// DecodeFrame parses a full wire frame (length prefix + group ID + payload)
+// and returns the group ID and the decoded messages. It validates the length
+// before slicing so malformed frames cannot index out of bounds.
+func DecodeFrame(frame []byte) (uint64, []*pb.Message, error) {
+	if len(frame) < 4+frameGroupIDSize {
+		return 0, nil, errCodecFrame
+	}
+	length := int(binary.BigEndian.Uint32(frame[0:4]))
+	if length < 1 || 4+frameGroupIDSize+length > len(frame) {
+		return 0, nil, errCodecFrame
+	}
+	gid := binary.BigEndian.Uint64(frame[4 : 4+frameGroupIDSize])
+	msgs, err := DecodeBatch(frame[4+frameGroupIDSize : 4+frameGroupIDSize+length])
+	return gid, msgs, err
+}
+
+// encodeBatchPayload serializes msgs into the batch payload (1-byte count
+// followed by the encoded messages) without a frame header.
+func encodeBatchPayload(msgs []*pb.Message) ([]byte, error) {
 	if len(msgs) > maxBatchCount {
 		return nil, fmt.Errorf("cluster network: batch of %d messages exceeds maxBatchCount %d", len(msgs), maxBatchCount)
 	}
@@ -92,18 +156,13 @@ func EncodeBatch(msgs []*pb.Message) ([]byte, error) {
 		totalPayload += encodedMsgSize(m)
 	}
 
-	frame := make([]byte, 4+totalPayload)
-	frame[0] = byte(totalPayload >> 24)
-	frame[1] = byte(totalPayload >> 16)
-	frame[2] = byte(totalPayload >> 8)
-	frame[3] = byte(totalPayload)
-	frame[4] = byte(len(msgs))
-
-	offset := 5
+	payload := make([]byte, totalPayload)
+	payload[0] = byte(len(msgs))
+	offset := 1
 	for _, m := range msgs {
-		offset = encodeMsg(frame, offset, m)
+		offset = encodeMsg(payload, offset, m)
 	}
-	return frame[:offset], nil
+	return payload[:offset], nil
 }
 
 // DecodeBatch parses a batch payload (after the 4-byte length prefix has been
