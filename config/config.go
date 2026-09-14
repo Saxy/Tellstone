@@ -79,6 +79,9 @@ type Config struct {
 	tsoMinBatch        uint64
 	tsoHeadroomSeconds uint
 	tsoRefillThreshold int
+	// clusterSplitThreshold is the tracked byte size above which a region is
+	// considered too large and a split is triggered (Phase 4).
+	clusterSplitThreshold uint64
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -99,6 +102,12 @@ func getEnv[T any](key string, fallback T) T {
 	case *uint:
 		if u, err := strconv.ParseUint(val, 10, 64); err == nil {
 			*p = uint(u)
+		} else {
+			return fallback
+		}
+	case *uint64:
+		if u, err := strconv.ParseUint(val, 10, 64); err == nil {
+			*p = u
 		} else {
 			return fallback
 		}
@@ -494,6 +503,12 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_TSO_REFILL_THRESHOLD", 20),
 		"Remaining-pool percentage that triggers a refill request (default: 20)",
 	)
+	fs.Uint64Var(
+		&cfg.clusterSplitThreshold,
+		"cluster-split-threshold",
+		getEnv("TSD_CLUSTER_SPLIT_THRESHOLD", uint64(64*1024*1024)),
+		"Region byte size that triggers an automatic split in bytes (default: 67108864)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -808,3 +823,6 @@ func (cfg *Config) GetTSOHeadroom() time.Duration {
 	return time.Duration(cfg.tsoHeadroomSeconds) * time.Second
 }
 func (cfg *Config) GetTSORefillThreshold() int { return cfg.tsoRefillThreshold }
+
+// GetClusterSplitThreshold returns the region byte size that triggers a split.
+func (cfg *Config) GetClusterSplitThreshold() uint64 { return cfg.clusterSplitThreshold }

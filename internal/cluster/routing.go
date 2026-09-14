@@ -22,6 +22,7 @@ import (
 // RegionRoute is one entry in a node's routing table: the key range it covers
 // and the node currently leading that region's Raft group.
 type RegionRoute struct {
+	ID       uint64 // region ID, used by the size tracker resolver
 	StartKey []byte
 	EndKey   []byte
 	Leader   uint64 // node ID of the current region leader
@@ -95,6 +96,7 @@ func (rt *RoutingTable) Snapshot() []RegionRoute {
 
 func regionRouteOf(m Region) RegionRoute {
 	return RegionRoute{
+		ID:       m.ID,
 		StartKey: m.StartKey,
 		EndKey:   m.EndKey,
 		Leader:   m.Leader,

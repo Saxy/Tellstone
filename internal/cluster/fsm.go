@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sync"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
@@ -49,10 +50,23 @@ type Dispatcher interface {
 	Dispatch(key string, op byte, value []byte, ttl time.Duration) error
 }
 
+// RegionResolver maps a key to its owning region ID via the routing table.
+// Returns 0 if no region covers the key (e.g. routing table not yet loaded).
+type RegionResolver func(key string) uint64
+
 // FSM applies committed Raft log entries to local storage via a Dispatcher.
 type FSM struct {
 	dispatcher Dispatcher
 	logger     log.Logger
+	// mu protects tracker and resolver from concurrent access between
+	// SetSizeTracker (called once during startup) and Apply (hot path).
+	mu       sync.RWMutex
+	tracker  *RegionSizeTracker
+	resolver RegionResolver
+	// chunks reassembles chunked SET values (OpChunkSet chains). nil until
+	// the first chunk is seen, at which point it is created once.
+	chunksMu sync.Mutex
+	chunks   *chunkAssembler
 }
 
 // NewFSM creates a new FSM that routes committed entries through the given
@@ -62,6 +76,25 @@ func NewFSM(dispatcher Dispatcher, logger log.Logger) *FSM {
 		dispatcher: dispatcher,
 		logger:     logger,
 	}
+}
+
+// SetSizeTracker attaches a region size tracker and key-to-region resolver to
+// the FSM. When set, every SET/DEL applied through the FSM will update the
+// tracked byte count for the owning region. Both fields may be nil to disable
+// tracking (e.g. single-region startup before the PD is ready).
+func (f *FSM) SetSizeTracker(tracker *RegionSizeTracker, resolver RegionResolver) {
+	f.mu.Lock()
+	f.tracker = tracker
+	f.resolver = resolver
+	f.mu.Unlock()
+}
+
+// trackerSnapshot returns the current tracker and resolver under the read lock.
+func (f *FSM) trackerSnapshot() (*RegionSizeTracker, RegionResolver) {
+	f.mu.RLock()
+	t, r := f.tracker, f.resolver
+	f.mu.RUnlock()
+	return t, r
 }
 
 // maxKeyLen is the largest key the wire format can carry: the key length is
@@ -124,10 +157,17 @@ func DecodeLogEntry(data []byte) (op byte, key string, value []byte, ttl time.Du
 }
 
 // Apply applies a single committed Raft log entry to local storage via the
-// Dispatcher. It decodes the binary payload and dispatches.
+// Dispatcher. It decodes the binary payload and dispatches. When a
+// RegionSizeTracker is configured, the entry's byte impact is reflected in the
+// owning region's tracked size.
 func (f *FSM) Apply(entry *pb.Entry) error {
 	if entry.GetData() == nil {
 		return nil
+	}
+	// Chunked SET values are reassembled across multiple entries and
+	// dispatched as one OpSet once the final chunk arrives.
+	if len(entry.GetData()) > 0 && entry.GetData()[0] == OpChunkSet {
+		return f.applyChunk(entry)
 	}
 	op, key, value, ttl, err := DecodeLogEntry(entry.GetData())
 	if err != nil {
@@ -160,12 +200,63 @@ func (f *FSM) Apply(entry *pb.Entry) error {
 		}
 		return err
 	}
+	// Track per-region byte delta for split decisions.
+	if tracker, resolver := f.trackerSnapshot(); tracker != nil && resolver != nil {
+		if regionID := resolver(key); regionID != 0 {
+			switch op {
+			case OpSet:
+				tracker.TrackSet(regionID, key, value)
+			case OpDel:
+				tracker.TrackDel(regionID, key, value)
+			}
+		}
+	}
 	if f.logger.Enabled(log.LevelDebug) {
 		f.logger.Log(log.LevelDebug, "cluster fsm: dispatch succeeded",
 			log.Uint64("index", entry.GetIndex()),
 			log.String("key", key),
 			log.Uint("op", uint32(op)),
 		)
+	}
+	return nil
+}
+
+// applyChunk feeds one OpChunkSet entry into the assembler and dispatches the
+// reassembled value when the final chunk in the chain arrives.
+func (f *FSM) applyChunk(entry *pb.Entry) error {
+	ce, err := DecodeChunkEntry(entry.GetData())
+	if err != nil {
+		if f.logger.Enabled(log.LevelError) {
+			f.logger.Log(log.LevelError, "cluster fsm: chunk decode error",
+				log.String("error", err.Error()),
+				log.Uint64("index", entry.GetIndex()),
+			)
+		}
+		return err
+	}
+	f.chunksMu.Lock()
+	if f.chunks == nil {
+		f.chunks = newChunkAssembler()
+	}
+	f.chunksMu.Unlock()
+
+	key, value, ttl, complete := f.chunks.add(ce)
+	if !complete {
+		return nil
+	}
+	if f.logger.Enabled(log.LevelDebug) {
+		f.logger.Log(log.LevelDebug, "cluster fsm: chunk chain complete",
+			log.String("key", key),
+			log.Int("value_len", len(value)),
+		)
+	}
+	if err := f.dispatcher.Dispatch(key, OpSet, value, ttl); err != nil {
+		return err
+	}
+	if tracker, resolver := f.trackerSnapshot(); tracker != nil && resolver != nil {
+		if regionID := resolver(key); regionID != 0 {
+			tracker.TrackSet(regionID, key, value)
+		}
 	}
 	return nil
 }

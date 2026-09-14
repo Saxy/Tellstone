@@ -14,6 +14,7 @@ package network
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net"
 	"sync"
 	"testing"
@@ -24,6 +25,56 @@ import (
 
 func uint64Ptr(v uint64) *uint64 { return &v }
 func boolPtr(v bool) *bool       { return &v }
+
+func TestGroupFrameRoundTrip(t *testing.T) {
+	batch := []*pb.Message{
+		{Type: pbTypePtr(pb.MsgHeartbeat), To: uint64Ptr(2), From: uint64Ptr(1), Term: uint64Ptr(5), Commit: uint64Ptr(10)},
+		{Type: pbTypePtr(pb.MsgApp), To: uint64Ptr(3), From: uint64Ptr(1), Term: uint64Ptr(3), LogTerm: uint64Ptr(2), Index: uint64Ptr(4),
+			Entries: []*pb.Entry{{Type: entryTypePtr(pb.EntryNormal), Term: uint64Ptr(1), Index: uint64Ptr(5), Data: []byte("key=val")}}},
+	}
+	for _, gid := range []uint64{0, 1, 42} {
+		frame, err := EncodeGroupFrame(gid, batch)
+		if err != nil {
+			t.Fatalf("EncodeGroupFrame(%d): %v", gid, err)
+		}
+		gotGid, got, err := DecodeFrame(frame)
+		if err != nil {
+			t.Fatalf("DecodeFrame: %v", err)
+		}
+		if gotGid != gid {
+			t.Fatalf("gid = %d, want %d", gotGid, gid)
+		}
+		if len(got) != len(batch) {
+			t.Fatalf("decoded %d messages, want %d", len(got), len(batch))
+		}
+		for i := range batch {
+			assertMessagesEqual(t, batch[i], got[i])
+		}
+	}
+}
+
+func TestDecodeFrameMalformed(t *testing.T) {
+	tests := []struct {
+		name  string
+		frame []byte
+	}{
+		{name: "empty", frame: nil},
+		{name: "header only", frame: make([]byte, 4)},
+		{name: "no group id", frame: make([]byte, 4+8)},
+		{name: "length out of range", frame: func() []byte {
+			f := make([]byte, 100)
+			binary.BigEndian.PutUint32(f, 1000000)
+			return f
+		}()},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, _, err := DecodeFrame(tt.frame); err == nil {
+				t.Fatalf("expected error for %s", tt.name)
+			}
+		})
+	}
+}
 
 func TestCodecRoundTrip(t *testing.T) {
 	entries := []*pb.Entry{
@@ -741,10 +792,11 @@ func TestDecodeMalformedLengthPrefixes(t *testing.T) {
 }
 
 // TestSnapshotBatchingPathRoundTrip encodes a snapshot message through the
-// production batching path (encodeMsgFields → encodeFrame) and decodes it with
-// DecodeBatch. This pins the wire contract between transport.go's append-style
-// encoder and codec.go's decoder: encodeConfStateAppend used to write a
-// presence byte decodeConfState never read, corrupting every encoded snapshot.
+// production batching path (encodeMsgFields → encodeGroupFrame) and decodes it
+// with DecodeFrame. This pins the wire contract between transport.go's
+// append-style encoder and codec.go's decoder: encodeConfStateAppend used to
+// write a presence byte decodeConfState never read, corrupting every encoded
+// snapshot.
 func TestSnapshotBatchingPathRoundTrip(t *testing.T) {
 	msg := &pb.Message{
 		Type: pbTypePtr(pb.MsgSnap),
@@ -766,10 +818,13 @@ func TestSnapshotBatchingPathRoundTrip(t *testing.T) {
 	buf = append(buf, byte(msg.GetType()), byte(bm>>8), byte(bm))
 	buf = encodeMsgFields(buf, msg, bm)
 
-	frame := encodeFrame(buf, 1)
-	got, err := DecodeBatch(frame[4:])
+	frame := encodeGroupFrame(nil, buf, 1, 7)
+	gid, got, err := DecodeFrame(frame)
 	if err != nil {
-		t.Fatalf("DecodeBatch: %v", err)
+		t.Fatalf("DecodeFrame: %v", err)
+	}
+	if gid != 7 {
+		t.Fatalf("gid = %d, want 7", gid)
 	}
 	if len(got) != 1 {
 		t.Fatalf("expected 1 message, got %d", len(got))

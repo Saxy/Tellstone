@@ -11,8 +11,13 @@ This is critical for SDN environments with per-packet overhead.
 
 Wire format (from codec.go):
 
-	Frame:  [4B big-endian payload_length][payload]
+	Frame:  [4B big-endian payload_length][8B big-endian group_id][payload]
 	Payload:[1B msg_count][msg_1]...[msg_N]
+
+The group ID (a Phase 4 region ID) lets one peer connection multiplex consensus
+traffic for multiple Raft groups: frames are demuxed by group ID to the region's
+handler on the receiving side. A flush may emit one frame per non-empty group
+present. Group ID 0 is the legacy single-group form.
 
 Authors:
 
@@ -82,6 +87,13 @@ type Transport struct {
 	wg      sync.WaitGroup
 	stopped atomic.Bool
 
+	// groups maps a Raft group (region) ID to its inbound message handler.
+	// The constructor handler is registered under group 0 (the legacy
+	// single-group ID); additional groups are bound via RegisterGroup. A
+	// frame whose group ID has no handler is dropped — it belongs to a region
+	// this process does not host.
+	groups sync.Map
+
 	// listener is stored so Stop() can close it to unblock the accept loop.
 	listener net.Listener
 
@@ -119,14 +131,38 @@ func (t *Transport) ClusterMessagesRecv() int64 { return t.stats.MessagesRecv.Lo
 func (t *Transport) ClusterFramesRecv() int64   { return t.stats.FramesRecv.Load() }
 
 // NewTransport creates a new Raft TCP transport bound to the given address.
+// The handler is registered as the group-0 (legacy single-group) handler.
 func NewTransport(addr string, nodeID uint64, handler MessageHandler, logger log.Logger) *Transport {
-	return &Transport{
+	t := &Transport{
 		addr:    addr,
 		nodeID:  nodeID,
 		handler: handler,
 		logger:  logger,
 		stopCh:  make(chan struct{}),
 	}
+	if handler != nil {
+		t.groups.Store(uint64(0), handler)
+	}
+	return t
+}
+
+// RegisterGroup binds a message handler to a Raft group (region) ID. Inbound
+// frames tagged with gid are delivered to this handler, allowing one transport
+// to carry consensus traffic for multiple regions over the same peer
+// connections. Registering group 0 replaces the constructor handler.
+func (t *Transport) RegisterGroup(gid uint64, handler MessageHandler) {
+	if handler != nil {
+		t.groups.Store(gid, handler)
+	}
+}
+
+// handlerFor returns the handler bound to a group ID, or nil when the group is
+// not hosted. Group 0 always resolves to the constructor handler when present.
+func (t *Transport) handlerFor(gid uint64) MessageHandler {
+	if v, ok := t.groups.Load(gid); ok {
+		return v.(MessageHandler)
+	}
+	return nil
 }
 
 // Listen starts the TCP listener for inbound connections. Non-blocking:
@@ -246,6 +282,7 @@ func (t *Transport) readLoop(conn net.Conn) {
 		}
 	}()
 	hdr := make([]byte, headerSize)
+	var gidBuf [frameGroupIDSize]byte
 	for {
 		// Read the 4-byte big-endian length prefix.
 		if _, err := io.ReadFull(conn, hdr); err != nil {
@@ -257,6 +294,11 @@ func (t *Transport) readLoop(conn net.Conn) {
 			// allocating based on an adversarial length.
 			return
 		}
+		// Read the 8-byte group (region) ID that follows the length prefix.
+		if _, err := io.ReadFull(conn, gidBuf[:]); err != nil {
+			return
+		}
+		gid := binary.BigEndian.Uint64(gidBuf[:])
 		// Reuse a pooled buffer when possible. The pool New func creates
 		// 32 KiB buffers; we only use a pooled buffer if its capacity is
 		// large enough for the declared frame length. Buffers larger than
@@ -304,18 +346,31 @@ func (t *Transport) readLoop(conn net.Conn) {
 		}
 		t.stats.FramesRecv.Add(1)
 		t.stats.MessagesRecv.Add(int64(len(msgs)))
+		handler := t.handlerFor(gid)
+		if handler == nil {
+			// Group not hosted on this process (e.g. a region that has not
+			// been created here yet). Drop the batch — a future frame from
+			// a host will be taken over after the region is instantiated.
+			continue
+		}
 		for _, msg := range msgs {
-			t.handler(msg)
+			handler(msg)
 		}
 	}
 }
 
 // ---------------------------------------------------------------------------
-// Send - single message (backward compat with node.go)
+// Send - single message
 // ---------------------------------------------------------------------------
 
-// Send queues a single raft message for delivery to the peer.
+// Send queues a single raft message for the legacy single-group (group 0).
 func (t *Transport) Send(msg *pb.Message) error {
+	return t.SendTo(0, msg)
+}
+
+// SendTo queues a single raft message in the given group (region) for delivery
+// to the peer identified by msg.To.
+func (t *Transport) SendTo(gid uint64, msg *pb.Message) error {
 	if t.stopped.Load() {
 		return errTransportStopped
 	}
@@ -328,12 +383,19 @@ func (t *Transport) Send(msg *pb.Message) error {
 		return err
 	}
 	t.stats.MessagesSent.Add(1)
-	return bc.send([]*pb.Message{msg})
+	return bc.send(gid, []*pb.Message{msg})
 }
 
-// SendBatch queues a batch of raft messages for the same peer. All messages
-// are written as a single TCP frame on the next flush.
+// SendBatch queues a batch of raft messages for the same peer (group 0). All
+// messages are written as a single TCP frame on the next flush.
 func (t *Transport) SendBatch(msgs []*pb.Message) error {
+	return t.SendBatchTo(0, msgs)
+}
+
+// SendBatchTo queues a batch of raft messages for the same peer. All messages
+// share the given group (region) ID and are written as a single group-tagged
+// TCP frame on the next flush.
+func (t *Transport) SendBatchTo(gid uint64, msgs []*pb.Message) error {
 	if t.stopped.Load() {
 		return errTransportStopped
 	}
@@ -349,7 +411,7 @@ func (t *Transport) SendBatch(msgs []*pb.Message) error {
 		return err
 	}
 	t.stats.MessagesSent.Add(int64(len(msgs)))
-	return bc.send(msgs)
+	return bc.send(gid, msgs)
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +465,14 @@ func (t *Transport) lookupPeerAddr(id uint64) string {
 // batchConn - per-peer batching sender
 // ---------------------------------------------------------------------------
 
+// groupBatch carries a set of messages for one Raft group (region) through the
+// peer's send channel. Every message in the batch shares the same destination
+// (SendBatchTo derives it from msgs[0]) and the same group ID.
+type groupBatch struct {
+	gid  uint64
+	msgs []*pb.Message
+}
+
 type batchConn struct {
 	conn   net.Conn
 	logger log.Logger
@@ -413,7 +483,7 @@ type batchConn struct {
 	// of reusing the dead one. Nil in tests that build a batchConn directly.
 	onDead func()
 
-	sendCh chan []*pb.Message
+	sendCh chan groupBatch
 	closed atomic.Bool
 }
 
@@ -423,15 +493,18 @@ func newBatchConn(conn net.Conn, logger log.Logger, stopCh <-chan struct{}, stat
 		logger: logger,
 		stopCh: stopCh,
 		stats:  stats,
-		sendCh: make(chan []*pb.Message, 256),
+		sendCh: make(chan groupBatch, 256),
 	}
 }
 
 // run is the sender goroutine. It accumulates messages from sendCh and flushes
 // them as batched TCP frames on a timer, when the buffer fills, or when the
-// message count reaches the wire format's one-byte limit. It exits after the
-// first failed flush — the connection is dead at that point and retrying
-// writes against it would drop every later batch too.
+// message count reaches the wire format's one-byte limit. A frame carries a
+// single group ID, so one connection multiplexes regions by emitting one frame
+// per non-empty group on each flush — groups on the same peer never corrupt
+// each other's demux. It exits after the first failed flush — the connection is
+// dead at that point and retrying writes against it would drop every later
+// batch too.
 func (bc *batchConn) run(done func()) {
 	defer done()
 	defer bc.conn.Close()
@@ -439,8 +512,12 @@ func (bc *batchConn) run(done func()) {
 	ticker := time.NewTicker(batchFlushInterval)
 	defer ticker.Stop()
 
-	var buf []byte
+	// Per-group payload buffers and message counts, so each frame carries
+	// exactly one group ID.
+	bufByGroup := make(map[uint64][]byte)
+	countByGroup := make(map[uint64]int)
 	msgCount := 0
+	byteCount := 0
 
 	// flush writes the pending batch. Returns false when the write failed;
 	// the caller must stop using the connection.
@@ -448,8 +525,16 @@ func (bc *batchConn) run(done func()) {
 		if msgCount == 0 {
 			return true
 		}
-		frame := encodeFrame(buf, msgCount)
-		n, err := bc.conn.Write(frame)
+		frames := 0
+		var out []byte
+		for gid, payload := range bufByGroup {
+			if len(payload) == 0 {
+				continue
+			}
+			frames++
+			out = encodeGroupFrame(out, payload, countByGroup[gid], gid)
+		}
+		n, err := bc.conn.Write(out)
 		if err != nil {
 			if bc.logger.Enabled(log.LevelWarn) {
 				bc.logger.Log(log.LevelWarn, "cluster transport: batch write failed",
@@ -462,10 +547,14 @@ func (bc *batchConn) run(done func()) {
 			}
 			return false
 		}
-		bc.stats.FramesSent.Add(1)
+		bc.stats.FramesSent.Add(int64(frames))
 		bc.stats.BytesSent.Add(int64(n))
-		buf = buf[:0]
+		for gid := range bufByGroup {
+			bufByGroup[gid] = bufByGroup[gid][:0]
+			countByGroup[gid] = 0
+		}
 		msgCount = 0
+		byteCount = 0
 		return true
 	}
 
@@ -474,20 +563,21 @@ func (bc *batchConn) run(done func()) {
 		case <-bc.stopCh:
 			flush()
 			return
-		case batch := <-bc.sendCh:
-			for _, m := range batch {
+		case gb := <-bc.sendCh:
+			for _, m := range gb.msgs {
+				payload := bufByGroup[gb.gid]
+				before := len(payload)
 				bm := fieldBitmask(m)
-				var mid [3]byte
-				mid[0] = byte(m.GetType())
-				mid[1] = byte(bm >> 8)
-				mid[2] = byte(bm)
-				buf = append(buf, mid[:]...)
-				buf = encodeMsgFields(buf, m, bm)
-				msgCount++
+				payload = append(payload, byte(m.GetType()), byte(bm>>8), byte(bm))
+				payload = encodeMsgFields(payload, m, bm)
+				bufByGroup[gb.gid] = payload
+				countByGroup[gb.gid]++
+				byteCount += len(payload) - before
 			}
+			msgCount += len(gb.msgs)
 			// Flush before msgCount exceeds maxBatchCount (255): the frame
 			// stores the count in a single byte and would silently wrap.
-			if len(buf) >= batchMaxBytes || msgCount >= maxBatchCount {
+			if byteCount >= batchMaxBytes || msgCount >= maxBatchCount {
 				if !flush() {
 					return
 				}
@@ -500,12 +590,12 @@ func (bc *batchConn) run(done func()) {
 	}
 }
 
-func (bc *batchConn) send(msgs []*pb.Message) error {
+func (bc *batchConn) send(gid uint64, msgs []*pb.Message) error {
 	if bc.closed.Load() {
 		return errConnectionClosed
 	}
 	select {
-	case bc.sendCh <- msgs:
+	case bc.sendCh <- groupBatch{gid: gid, msgs: msgs}:
 		return nil
 	default:
 		if bc.logger.Enabled(log.LevelWarn) {
@@ -525,17 +615,25 @@ func (bc *batchConn) close() {
 // Frame encoding helpers (used by the batch sender)
 // ---------------------------------------------------------------------------
 
-// encodeFrame wraps a payload buffer into a length-prefixed frame.
-func encodeFrame(payload []byte, msgCount int) []byte {
+// encodeGroupFrame appends a complete length-prefixed, group-tagged frame to
+// out: `[4B payload_length][8B group_id][1B msg_count][msg payload]`. The
+// length covers only the payload (count byte + messages); the group ID sits
+// between the length prefix and the payload so the reader can demux by group
+// before decoding the batch.
+func encodeGroupFrame(out, payload []byte, msgCount int, gid uint64) []byte {
 	totalPayload := 1 + len(payload) // 1 byte for msg_count
-	frame := make([]byte, 4+totalPayload)
-	frame[0] = byte(totalPayload >> 24)
-	frame[1] = byte(totalPayload >> 16)
-	frame[2] = byte(totalPayload >> 8)
-	frame[3] = byte(totalPayload)
-	frame[4] = byte(msgCount)
-	copy(frame[5:], payload)
-	return frame
+	out = append(out,
+		byte(totalPayload>>24),
+		byte(totalPayload>>16),
+		byte(totalPayload>>8),
+		byte(totalPayload),
+	)
+	var gb [frameGroupIDSize]byte
+	binary.BigEndian.PutUint64(gb[:], gid)
+	out = append(out, gb[:]...)
+	out = append(out, byte(msgCount))
+	out = append(out, payload...)
+	return out
 }
 
 // encodeMsgFields appends the fields of a message to buf given the bitmask

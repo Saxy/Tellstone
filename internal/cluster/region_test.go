@@ -49,20 +49,48 @@ func startRegionTest(t *testing.T) (*clientv3.Client, context.Context, context.C
 
 func TestRegionEncodeDecode(t *testing.T) {
 	r := Region{
-		ID:       42,
-		StartKey: []byte("user:aaa"),
-		EndKey:   []byte("user:zzz"),
-		Peers:    []uint64{1, 2, 3},
-		Leader:   2,
-		Epoch:    7,
+		ID:        42,
+		StartKey:  []byte("user:aaa"),
+		EndKey:    []byte("user:zzz"),
+		Peers:     []uint64{1, 2, 3},
+		Leader:    2,
+		Epoch:     7,
+		SizeBytes: 123456,
 	}
 	got, ok := decodeRegion(encodeRegion(r))
 	if !ok {
 		t.Fatal("decode failed")
 	}
 	if got.ID != r.ID || got.Epoch != r.Epoch || got.Leader != r.Leader || len(got.Peers) != 3 ||
-		string(got.StartKey) != "user:aaa" || string(got.EndKey) != "user:zzz" {
+		string(got.StartKey) != "user:aaa" || string(got.EndKey) != "user:zzz" || got.SizeBytes != 123456 {
 		t.Fatalf("roundtrip mismatch: %+v", got)
+	}
+}
+
+// TestRegionEncodeDecodeBackwardCompat verifies that a region encoded without
+// the Phase 4 SizeBytes trailer (an older reader's format) still decodes: the
+// trailer is optional, and its absence yields SizeBytes=0.
+func TestRegionEncodeDecodeBackwardCompat(t *testing.T) {
+	r := Region{
+		ID:       9,
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Peers:    []uint64{1},
+		Leader:   1,
+		Epoch:    2,
+	}
+	b := encodeRegion(r)
+	// Rewrite the encoding as if SizeBytes were absent (drop the trailer).
+	b = b[:len(b)-8]
+	got, ok := decodeRegion(b)
+	if !ok {
+		t.Fatal("decode (without trailer) failed")
+	}
+	if got.SizeBytes != 0 {
+		t.Fatalf("SizeBytes without trailer = %d, want 0", got.SizeBytes)
+	}
+	if got.ID != 9 || got.Epoch != 2 || got.Leader != 1 || string(got.StartKey) != "a" || string(got.EndKey) != "z" {
+		t.Fatalf("roundtrip mismatch without trailer: %+v", got)
 	}
 }
 

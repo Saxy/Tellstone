@@ -22,6 +22,7 @@ import (
 	"encoding/binary"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // proposalIDSize is the 8-byte prefix prepended to tagged proposals.
@@ -33,6 +34,7 @@ const proposalIDSize = 8
 type proposalTracker struct {
 	nextID  atomic.Uint64
 	pending sync.Map // map[uint64]chan error
+	count   atomic.Int64
 }
 
 // newProposalTracker creates a new proposal tracker.
@@ -47,6 +49,7 @@ func (pt *proposalTracker) add() (uint64, chan error) {
 	id := pt.nextID.Add(1)
 	ch := make(chan error, 1)
 	pt.pending.Store(id, ch)
+	pt.count.Add(1)
 	return id, ch
 }
 
@@ -55,6 +58,7 @@ func (pt *proposalTracker) add() (uint64, chan error) {
 // unknown IDs (no-op).
 func (pt *proposalTracker) complete(id uint64, err error) {
 	if v, ok := pt.pending.LoadAndDelete(id); ok {
+		pt.count.Add(-1)
 		ch := v.(chan error)
 		ch <- err
 		close(ch)
@@ -65,7 +69,22 @@ func (pt *proposalTracker) complete(id uint64, err error) {
 // is deleted but NOT closed — the readyLoop may still send to it, and
 // receiving from a closed channel returns the zero value, which is safe.
 func (pt *proposalTracker) remove(id uint64) {
-	pt.pending.Delete(id)
+	if _, loaded := pt.pending.LoadAndDelete(id); loaded {
+		pt.count.Add(-1)
+	}
+}
+
+// drain blocks until all in-flight proposals complete or timeout expires.
+// Returns true when all proposals have drained.
+func (pt *proposalTracker) drain(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for pt.count.Load() > 0 {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
 }
 
 // tagProposal prepends the 8-byte proposal ID to the data payload.

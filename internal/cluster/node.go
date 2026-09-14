@@ -55,6 +55,7 @@ const (
 // NodeConfig holds the parameters for creating a new Raft node.
 type NodeConfig struct {
 	NodeID        uint64
+	GroupID       uint64 // Raft group (region) ID for transport demux; 0 = legacy single-group
 	PeerAddr      string
 	Peers         []Peer
 	ElectionTick  int
@@ -62,6 +63,14 @@ type NodeConfig struct {
 	TickInterval  time.Duration
 	Dispatcher    Dispatcher
 	Logger        log.Logger
+	// Transport, when non-nil, reuses an existing transport instead of
+	// creating a new listener. This is how a process hosts multiple Raft
+	// groups (regions) over one TCP endpoint: each group node registers its
+	// GroupID with the shared transport. SharedTransport must be true when
+	// Transport is set so the node neither listens nor stops the shared
+	// transport.
+	Transport       *network.Transport
+	SharedTransport bool
 }
 
 // Node wraps a raft.Node with its transport, storage, and FSM.
@@ -78,6 +87,16 @@ type Node struct {
 	// is tagged with a unique ID; the readyLoop signals completion when
 	// the corresponding committed entry is applied.
 	proposals *proposalTracker
+	// chunkMu serializes ProposeChunked so one chunk chain's entries are
+	// proposed contiguously in the raft log. Without this, concurrent calls
+	// (two followers forwarding chains on different connections, or two local
+	// large SETs) interleave raftNode.Propose per chunk; the assembler's
+	// writeSeq supersede logic then resets both chains and neither assembles,
+	// yet the final chunk still reports a nil apply error — silent data loss.
+	chunkMu sync.Mutex
+	// quiesced, when true, rejects all new proposals (ProposeAndWait,
+	// ForwardWrite) so in-flight proposals can drain during a region split.
+	quiesced atomic.Bool
 	// stopOnce ensures Stop is idempotent — safe to call multiple times.
 	stopOnce sync.Once
 	// appliedIndex is the highest Raft log index applied to the FSM. Updated
@@ -96,6 +115,10 @@ type Node struct {
 	// peerAddrs resolves a peer node ID to its configured address (used by
 	// routing/forwarding to target the region leader).
 	peerAddrs map[uint64]string
+	// ownsTransport is true when this node created its own transport (the
+	// standalone case). Nodes sharing another node's transport (config
+	// Transport set) neither listen nor Stop it.
+	ownsTransport bool
 }
 
 // NewNode creates a new Raft node but does not start it. Call Start() to
@@ -149,13 +172,36 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	n.raftNode = raft.StartNode(&raftCfg, peers)
 
 	// Build the TCP transport. The handler feeds received messages into the
-	// raft node via Step().
-	n.transport = network.NewTransport(cfg.PeerAddr, cfg.NodeID, n.handleMessage, cfg.Logger)
+	// raft node via Step(). The node's raft group (region) ID is registered
+	// so inbound frames demux to this node's group — group 0 is the legacy
+	// single-group mapping and behaves exactly as before.
+	//
+	// A node may instead reuse an existing transport (RegionCoordinator
+	// spawning per-region group nodes): the shared transport already listens
+	// and is owned by the bootstrap node.
+	if cfg.Transport != nil {
+		n.transport = cfg.Transport
+		n.ownsTransport = false
+		if cfg.SharedTransport {
+			// Multi-group node: register our group handler with the shared
+			// transport so inbound frames demux to this region.
+			cfg.Transport.RegisterGroup(cfg.GroupID, n.handleMessage)
+		}
+	} else {
+		n.transport = network.NewTransport(cfg.PeerAddr, cfg.NodeID, n.handleMessage, cfg.Logger)
+		n.ownsTransport = true
+		n.transport.RegisterGroup(cfg.GroupID, n.handleMessage)
+	}
 
-	// Register all peers so the transport can dial them.
-	for _, p := range cfg.Peers {
-		if p.ID != cfg.NodeID {
-			n.transport.RegisterPeer(p.ID, p.Addr)
+	// Register all peers so the transport can dial them. Nodes sharing the
+	// bootstrap node's transport skip this: the owning node already maps peer
+	// IDs to their (real) addresses, and re-registering from config could
+	// clobber addresses with placeholders in dev/test.
+	if n.ownsTransport {
+		for _, p := range cfg.Peers {
+			if p.ID != cfg.NodeID {
+				n.transport.RegisterPeer(p.ID, p.Addr)
+			}
 		}
 	}
 
@@ -163,10 +209,13 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 }
 
 // Start begins the transport listener and the raft processing loop. It is
-// non-blocking: the loop runs in background goroutines.
+// non-blocking: the loop runs in background goroutines. Nodes sharing another
+// node's transport skip the Listen call (the owning node already listens).
 func (n *Node) Start() error {
-	if err := n.transport.Listen(); err != nil {
-		return err
+	if n.ownsTransport {
+		if err := n.transport.Listen(); err != nil {
+			return err
+		}
 	}
 	n.wg.Add(2)
 	go n.tickLoop()
@@ -175,12 +224,16 @@ func (n *Node) Start() error {
 }
 
 // Stop shuts down the raft node, transport, and processing loops. It waits
-// for all goroutines to exit. Safe to call multiple times.
+// for all goroutines to exit. Safe to call multiple times. A shared-transport
+// node stops only its own raft lifecycle; the owning node's transport is left
+// running for the remaining region groups.
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
 		close(n.stopCh)
 		n.raftNode.Stop()
-		n.transport.Stop()
+		if n.ownsTransport {
+			n.transport.Stop()
+		}
 		n.wg.Wait()
 		close(n.stopped)
 	})
@@ -190,12 +243,47 @@ func (n *Node) Stop() {
 // the metrics.ClusterMetrics interface structurally (no import required).
 func (n *Node) Transport() *network.Transport { return n.transport }
 
+// FSM returns the node's finite state machine. Used by the server to attach
+// region-size tracking after the node starts.
+func (n *Node) FSM() *FSM { return n.fsm }
+
+// NodeID returns this node's Raft node ID.
+func (n *Node) NodeID() uint64 { return n.cfg.NodeID }
+
+// GroupID returns the Raft group (region) ID this node's transport messages
+// are tagged with.
+func (n *Node) GroupID() uint64 { return n.cfg.GroupID }
+
+// ErrQuiesced is returned by ProposeAndWait when the node is quiesced
+// (briefly paused during a region split).
+var ErrQuiesced = errors.New("cluster: node quiesced (region split in progress)")
+
+// Quiesce sets the quiesced flag and drains all in-flight proposals so
+// the region split can proceed with no concurrent writes. It returns true
+// when all proposals have drained within the timeout.
+func (n *Node) Quiesce(timeout time.Duration) bool {
+	n.quiesced.Store(true)
+	return n.proposals.drain(timeout)
+}
+
+// Resume clears the quiesced flag so new proposals are accepted again.
+func (n *Node) Resume() {
+	n.quiesced.Store(false)
+}
+
+// IsQuiesced reports whether the node is currently quiesced.
+func (n *Node) IsQuiesced() bool {
+	return n.quiesced.Load()
+}
+
 // ProposeAndWait submits data to the Raft log and blocks until the entry is
 // committed and applied locally. It returns nil on success, an error on
-// FSM apply failure, timeout, or ErrNotLeader if this node is not the
-// current leader. The data is tagged with a proposal ID so the readyLoop
-// can signal completion.
+// FSM apply failure, timeout, ErrNotLeader if this node is not the current
+// leader, or ErrQuiesced if the node is quiesced during a split.
 func (n *Node) ProposeAndWait(ctx context.Context, data []byte) error {
+	if n.quiesced.Load() {
+		return ErrQuiesced
+	}
 	if !n.IsLeader() {
 		return ErrNotLeader
 	}
@@ -213,6 +301,62 @@ func (n *Node) ProposeAndWait(ctx context.Context, data []byte) error {
 		return ctx.Err()
 	case <-n.stopCh:
 		n.proposals.remove(id)
+		return errors.New("cluster node stopped")
+	}
+}
+
+// ProposeChunked submits a chunk chain (one raft entry per chunk) and blocks
+// until the final chunk has been committed and applied. ProposeChunked calls
+// are serialized so a chain's entries are always contiguous in the log — no
+// other chunk chain can interleave — which keeps the FSM's reassembly
+// deterministic. The FSM reassembles via the write sequence and a retry of
+// the whole chain with the same sequence is safe. Returns the last chunk's
+// apply error.
+func (n *Node) ProposeChunked(ctx context.Context, chunks [][]byte) error {
+	if n.quiesced.Load() {
+		return ErrQuiesced
+	}
+	if !n.IsLeader() {
+		return ErrNotLeader
+	}
+	if len(chunks) == 0 {
+		return nil
+	}
+	// Hold the lock across the entire chain so every chunk reaches the raft
+	// log contiguously; quiesced checks, proposal tracking, and error cleanup
+	// below are unchanged and run inside the locked section.
+	n.chunkMu.Lock()
+	defer n.chunkMu.Unlock()
+	// Register a waiter and propose every chunk immediately. The caller only
+	// waits for the last chunk, which is when the value becomes complete.
+	ids := make([]uint64, 0, len(chunks))
+	dones := make([]chan error, 0, len(chunks))
+	for _, c := range chunks {
+		if n.quiesced.Load() {
+			return ErrQuiesced
+		}
+		id, done := n.proposals.add()
+		ids = append(ids, id)
+		dones = append(dones, done)
+		if err := n.raftNode.Propose(ctx, tagProposal(tagID(id), c)); err != nil {
+			for j := 0; j < len(ids); j++ {
+				n.proposals.remove(ids[j])
+			}
+			return err
+		}
+	}
+	select {
+	case err := <-dones[len(dones)-1]:
+		return err
+	case <-ctx.Done():
+		for _, id := range ids {
+			n.proposals.remove(id)
+		}
+		return ctx.Err()
+	case <-n.stopCh:
+		for _, id := range ids {
+			n.proposals.remove(id)
+		}
 		return errors.New("cluster node stopped")
 	}
 }
@@ -311,7 +455,43 @@ func (n *Node) ForwardWrite(ctx context.Context, leaderID uint64, opData []byte)
 		Context: uint64ToBytes(id),
 		Entries: []*pb.Entry{{Data: opData}},
 	}
-	if err := n.transport.Send(msg); err != nil {
+	if err := n.transport.SendTo(n.cfg.GroupID, msg); err != nil {
+		return err
+	}
+	select {
+	case err := <-ch:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.stopCh:
+		return errors.New("cluster node stopped")
+	}
+}
+
+// ForwardChunks sends a chunk chain (each chunk as one msgForwardWrite entry)
+// to the region leader over the existing transport and waits for the apply
+// result of the final chunk. Used by clusterStore for large values proposed on
+// the leader.
+func (n *Node) ForwardChunks(ctx context.Context, leaderID uint64, chunks [][]byte) error {
+	if leaderID == n.cfg.NodeID {
+		return n.ProposeChunked(ctx, chunks)
+	}
+	id := n.forwardID.Add(1)
+	ch := make(chan error, 1)
+	n.forwardChans.Store(id, ch)
+	defer n.forwardChans.Delete(id)
+	entries := make([]*pb.Entry, 0, len(chunks))
+	for _, c := range chunks {
+		entries = append(entries, &pb.Entry{Data: c})
+	}
+	msg := &pb.Message{
+		Type:    msgForwardType(),
+		From:    &n.cfg.NodeID,
+		To:      &leaderID,
+		Context: uint64ToBytes(id),
+		Entries: entries,
+	}
+	if err := n.transport.SendTo(n.cfg.GroupID, msg); err != nil {
 		return err
 	}
 	select {
@@ -351,17 +531,36 @@ func (n *Node) handleMessage(msg *pb.Message) {
 	_ = n.raftNode.Step(context.Background(), msg)
 }
 
-// handleForwardWrite applies a forwarded write on the leader (the only node
-// that may propose) and replies to the requester. If this node is no longer
-// leader (stale routing), it replies with ErrNotLeader so the caller retries.
+// handleForwardWrite applies forwarded writes on the leader (the only node
+// that may propose) and replies to the requester. A single forwarded message
+// may carry a chunk chain in its Entries; the leader proposes every chunk in
+// order. If this node is no longer leader (stale routing), it replies with
+// ErrNotLeader so the caller retries.
 func (n *Node) handleForwardWrite(msg *pb.Message) {
+	if n.quiesced.Load() {
+		// Quiesced: reply with an error so the follower retries later.
+		resp := &pb.Message{
+			Type:    msgForwardRespType(),
+			From:    &n.cfg.NodeID,
+			To:      msg.From,
+			Context: msg.Context,
+			Entries: []*pb.Entry{{Data: []byte(ErrQuiesced.Error())}},
+		}
+		_ = n.transport.SendTo(n.cfg.GroupID, resp)
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var opData []byte
-	if len(msg.Entries) > 0 {
-		opData = msg.Entries[0].Data
+	var applyErr error
+	if len(msg.Entries) == 1 {
+		applyErr = n.ProposeAndWait(ctx, msg.Entries[0].Data)
+	} else if len(msg.Entries) > 1 {
+		chain := make([][]byte, len(msg.Entries))
+		for i, e := range msg.Entries {
+			chain[i] = e.Data
+		}
+		applyErr = n.ProposeChunked(ctx, chain)
 	}
-	applyErr := n.ProposeAndWait(ctx, opData)
 	var respData []byte
 	if applyErr != nil {
 		respData = []byte(applyErr.Error())
@@ -373,7 +572,7 @@ func (n *Node) handleForwardWrite(msg *pb.Message) {
 		Context: msg.Context,
 		Entries: []*pb.Entry{{Data: respData}},
 	}
-	_ = n.transport.Send(resp)
+	_ = n.transport.SendTo(n.cfg.GroupID, resp)
 }
 
 // uint64ToBytes / bytesToUint64 encode a correlation id for the wire.
@@ -455,7 +654,7 @@ func (n *Node) processReady(rd raft.Ready) {
 			groups[msg.GetTo()] = append(groups[msg.GetTo()], msg)
 		}
 		for _, batch := range groups {
-			if err := n.transport.SendBatch(batch); err != nil && n.cfg.Logger.Enabled(log.LevelWarn) {
+			if err := n.transport.SendBatchTo(n.cfg.GroupID, batch); err != nil && n.cfg.Logger.Enabled(log.LevelWarn) {
 				n.cfg.Logger.Log(log.LevelWarn, "cluster: send batch failed",
 					log.String("error", err.Error()),
 					log.Int("count", len(batch)),

@@ -11,8 +11,10 @@ Authors:
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"math/bits"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -456,5 +458,42 @@ func (e *Engine) ForEach(fn func(key string, value []byte, expiration time.Time)
 	e.mu.RUnlock()
 	for i := range snap {
 		fn(snap[i].key, snap[i].val, snap[i].exp)
+	}
+}
+
+// Scan snapshots all live (non-expired) entries under a read lock, releases
+// the lock, sorts keys lexicographically, then calls fn for every entry whose
+// key satisfies start <= key < end. An empty start means negative infinity; an
+// empty end means positive infinity. The callback may perform arbitrary work
+// without holding the shard lock. Expired entries are skipped (not evicted).
+func (e *Engine) Scan(start, end []byte, fn func(key string, value []byte)) {
+	type entry struct {
+		key string
+		val []byte
+	}
+	now := time.Now()
+	e.mu.RLock()
+	snap := make([]entry, 0, len(e.items))
+	for k, v := range e.items {
+		if !v.Expiration.IsZero() && now.After(v.Expiration) {
+			continue
+		}
+		kb := []byte(k)
+		if len(start) > 0 && bytes.Compare(kb, start) < 0 {
+			continue
+		}
+		if len(end) > 0 && bytes.Compare(kb, end) >= 0 {
+			continue
+		}
+		vc := make([]byte, len(v.Value))
+		copy(vc, v.Value)
+		snap = append(snap, entry{key: k, val: vc})
+	}
+	e.mu.RUnlock()
+	sort.Slice(snap, func(i, j int) bool {
+		return snap[i].key < snap[j].key
+	})
+	for i := range snap {
+		fn(snap[i].key, snap[i].val)
 	}
 }
