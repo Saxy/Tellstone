@@ -1,0 +1,53 @@
+internal/cluster/split_test.go
+  s_d3baf3af8a2d0f::t_1131ec06cdc5fa 173,175
+  s_d3baf3af8a2d0f::t_5d7870e67e02ee 222
+internal/cluster/fsm.go
+  s_d3baf3af8a2d0f::t_e2c64a5f04f642 61-65
+  s_d3baf3af8a2d0f::t_cec4f28856538f 92-97
+  s_d3baf3af8a2d0f::t_897de44a87d57d 204-205,208,210
+  s_d3baf3af8a2d0f::t_14313e071b1ea8 86,89
+  s_d3baf3af8a2d0f::t_21123c58c7e9c5 256-258
+  s_d3baf3af8a2d0f::t_63201228d3abed 90-91
+internal/cluster/split.go
+  s_d3baf3af8a2d0f::t_299edb21aa9afb 193-194,198,204
+internal/cluster/region_size_test.go
+  s_d3baf3af8a2d0f::t_ebf6793653e468 53-81
+  s_d3baf3af8a2d0f::t_7f6a8f362141d9 82-84,101
+internal/cluster/id_alloc_test.go
+  s_d3baf3af8a2d0f::t_f6705fdf25a4fd 10
+  s_d3baf3af8a2d0f::t_60b7cd2d64b9b3 38-39,41,43,47-48,55-59,66
+internal/cluster/region_size.go
+  s_d3baf3af8a2d0f::t_03c637cc149285 28-34,39,43-44,55-57,59,61-84,86-95,98-99
+  s_d3baf3af8a2d0f::t_8c17d7b4608757 38
+  s_d3baf3af8a2d0f::t_98839666e4102a 60
+  s_d3baf3af8a2d0f::t_577e0afa41d7b9 41-42,51
+  s_d3baf3af8a2d0f::t_2c57234da3ef74 85
+  s_d3baf3af8a2d0f::t_77745c787c69fa 40
+config/config.go
+  s_d3baf3af8a2d0f::t_6ca9cbc34ad3c5 108-113
+internal/cluster/chunk.go
+  s_d3baf3af8a2d0f::t_29ada38e5b92ad 155
+  s_d3baf3af8a2d0f::t_6116fcd339a4d2 131
+  s_d3baf3af8a2d0f::t_1e8377c03329e9 145
+internal/cluster/region.go
+  s_d3baf3af8a2d0f::t_8c17d7b4608757 62-63
+  s_d3baf3af8a2d0f::t_a8f44539187757 21
+  s_d3baf3af8a2d0f::t_772332e24db9e5 59-61,64-65
+  s_d3baf3af8a2d0f::t_5c7eef659de0fb 204-208,214-217,220,223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "64e80fade65ccb4d0566b749acc995dcfa401ade",
+  "prompts": {},
+  "sessions": {
+    "s_d3baf3af8a2d0f": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f7b3f19dcffeClwJ4mxjb1S1WP",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
