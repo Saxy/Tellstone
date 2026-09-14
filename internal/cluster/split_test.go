@@ -170,9 +170,9 @@ func TestSplitInvalidSplitKey(t *testing.T) {
 	}
 
 	// Split key before start.
-	_, err = sc.Split(ctx, SplitRequest{RegionID: regionID, SplitKey: []byte("aa")})
+	_, err = sc.Split(ctx, SplitRequest{RegionID: regionID, SplitKey: []byte("`")})
 	if err == nil {
-		t.Fatal("expected error for split key at region start")
+		t.Fatal("expected error for split key before region start")
 	}
 
 	// Split key after end.
@@ -219,6 +219,7 @@ func TestMidpointKey(t *testing.T) {
 		{"prefix range", []byte("user:"), []byte("user;")},
 		{"adjacent bytes", []byte{0x01}, []byte{0x02}},
 		{"long prefix", []byte("key:0000"), []byte("key:9999")},
+		{"prefix true midpoint", []byte(":"), []byte(":\x80")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

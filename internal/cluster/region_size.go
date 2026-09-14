@@ -25,27 +25,78 @@ import (
 // RegionSizeTracker maintains per-region byte counters and periodically pushes
 // them to etcd. It is safe for concurrent use by the FSM apply path and the
 // background report loop.
+//
+// The counters reflect the *current* stored bytes per region, not cumulative
+// writes: every key's live total (key + value bytes) is tracked so a SET
+// overwriting an existing key adjusts by the net delta and a DEL removes
+// exactly the stored bytes. Without this bookkeeping, repeated SETs to the
+// same key would double-count and DEL would under-subtract (the DEL log entry
+// carries no value bytes), inflating region sizes and triggering false splits.
 type RegionSizeTracker struct {
 	mu    sync.RWMutex
 	sizes map[uint64]*atomic.Uint64 // regionID → current byte count
+	keys  map[regionSizeKey]uint64  // (regionID, key) → live stored bytes
+}
+
+// regionSizeKey identifies one key within one region for size bookkeeping.
+type regionSizeKey struct {
+	regionID uint64
+	key      string
 }
 
 // NewRegionSizeTracker creates a tracker ready for use.
 func NewRegionSizeTracker() *RegionSizeTracker {
 	return &RegionSizeTracker{
 		sizes: make(map[uint64]*atomic.Uint64),
+		keys:  make(map[regionSizeKey]uint64),
 	}
 }
 
-// TrackSet increments the byte counter for region by the entry size.
+// TrackSet adjusts the byte counter for region by the net change of storing
+// key with value: total bytes for a new key, or the delta replacing an
+// existing value.
 func (t *RegionSizeTracker) TrackSet(regionID uint64, key string, value []byte) {
-	t.counterFor(regionID).Add(uint64(len(key) + len(value)))
+	total := uint64(len(key) + len(value))
+	ek := regionSizeKey{regionID: regionID, key: key}
+	t.mu.Lock()
+	oldTotal, existed := t.keys[ek]
+	t.keys[ek] = total
+	c := t.sizes[regionID]
+	if c == nil {
+		c = &atomic.Uint64{}
+		t.sizes[regionID] = c
+	}
+	t.mu.Unlock()
+	if existed {
+		if oldTotal > total {
+			subCounter(c, oldTotal-total)
+			return
+		}
+		if total > oldTotal {
+			c.Add(total - oldTotal)
+		}
+		return
+	}
+	c.Add(total)
 }
 
-// TrackDel decrements the byte counter for region by the entry size.
-func (t *RegionSizeTracker) TrackDel(regionID uint64, key string, value []byte) {
-	c := t.counterFor(regionID)
-	n := uint64(len(key) + len(value))
+// TrackDel removes the tracked bytes for key from the region counter.
+func (t *RegionSizeTracker) TrackDel(regionID uint64, key string, _ []byte) {
+	ek := regionSizeKey{regionID: regionID, key: key}
+	t.mu.Lock()
+	oldTotal, existed := t.keys[ek]
+	if existed {
+		delete(t.keys, ek)
+	}
+	c := t.sizes[regionID]
+	t.mu.Unlock()
+	if existed && c != nil {
+		subCounter(c, oldTotal)
+	}
+}
+
+// subCounter decrements c by n, flooring at zero.
+func subCounter(c *atomic.Uint64, n uint64) {
 	for {
 		old := c.Load()
 		if old < n {

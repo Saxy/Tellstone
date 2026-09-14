@@ -190,16 +190,18 @@ func midpointKey(start, end []byte) []byte {
 		}
 	}
 	// One is a prefix of the other — insert a middle byte after the shorter.
+	// The byte is chosen as half the first differing byte of the longer key,
+	// guaranteeing the result is strictly between start and end.
 	if len(s) < len(e) {
 		mid := make([]byte, len(s)+1)
 		copy(mid, s)
-		mid[len(s)] = 0x80
+		mid[len(s)] = e[len(s)] / 2
 		return mid
 	}
 	if len(e) < len(s) {
 		mid := make([]byte, len(e)+1)
 		copy(mid, e)
-		mid[len(e)] = 0x80
+		mid[len(e)] = s[len(e)] / 2
 		return mid
 	}
 	// Same length, all bytes equal — shouldn't happen for a valid range.

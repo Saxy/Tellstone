@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sync"
 	"time"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -55,9 +56,13 @@ type LeadershipProvider interface {
 type RegionManager struct {
 	cli    *clientv3.Client
 	nodeID uint64
-	lp     LeadershipProvider
-	peers  []uint64
-	rt     *RoutingTable
+	// lpMu guards lp: it is set once during startup (SetLeadershipProvider)
+	// after the manager is constructed, while the leadershipLoop may already
+	// be reading it.
+	lpMu  sync.RWMutex
+	lp    LeadershipProvider
+	peers []uint64
+	rt    *RoutingTable
 }
 
 // NewRegionManager creates a manager bound to the PD etcd client and the local
@@ -196,19 +201,26 @@ type RegionLeadershipProvider interface {
 // SetLeadershipProvider swaps the node's leadership signal after creation.
 // Used by the server when per-region Raft group nodes are hosted by a separate
 // coordinator that owns the leadership query, avoiding a construction cycle.
-func (m *RegionManager) SetLeadershipProvider(lp LeadershipProvider) { m.lp = lp }
+func (m *RegionManager) SetLeadershipProvider(lp LeadershipProvider) {
+	m.lpMu.Lock()
+	m.lp = lp
+	m.lpMu.Unlock()
+}
 
 // isLeaderFor reports whether this node is the current Raft leader of the
 // region's group. A plain LeadershipProvider only knows the bootstrap group
 // (region 1); a RegionLeadershipProvider resolves every region.
 func (m *RegionManager) isLeaderFor(regionID uint64) bool {
-	if rlp, ok := m.lp.(RegionLeadershipProvider); ok {
+	m.lpMu.RLock()
+	lp := m.lp
+	m.lpMu.RUnlock()
+	if rlp, ok := lp.(RegionLeadershipProvider); ok {
 		return rlp.IsLeaderFor(regionID)
 	}
-	if m.lp == nil {
+	if lp == nil {
 		return false
 	}
-	return regionID == 1 && m.lp.IsLeader()
+	return regionID == 1 && lp.IsLeader()
 }
 
 // leadershipLoop, on each region's Raft leader, ensures the region's Leader

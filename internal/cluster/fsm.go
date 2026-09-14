@@ -58,8 +58,11 @@ type RegionResolver func(key string) uint64
 type FSM struct {
 	dispatcher Dispatcher
 	logger     log.Logger
-	tracker    *RegionSizeTracker
-	resolver   RegionResolver
+	// mu protects tracker and resolver from concurrent access between
+	// SetSizeTracker (called once during startup) and Apply (hot path).
+	mu       sync.RWMutex
+	tracker  *RegionSizeTracker
+	resolver RegionResolver
 	// chunks reassembles chunked SET values (OpChunkSet chains). nil until
 	// the first chunk is seen, at which point it is created once.
 	chunksMu sync.Mutex
@@ -80,8 +83,18 @@ func NewFSM(dispatcher Dispatcher, logger log.Logger) *FSM {
 // tracked byte count for the owning region. Both fields may be nil to disable
 // tracking (e.g. single-region startup before the PD is ready).
 func (f *FSM) SetSizeTracker(tracker *RegionSizeTracker, resolver RegionResolver) {
+	f.mu.Lock()
 	f.tracker = tracker
 	f.resolver = resolver
+	f.mu.Unlock()
+}
+
+// trackerSnapshot returns the current tracker and resolver under the read lock.
+func (f *FSM) trackerSnapshot() (*RegionSizeTracker, RegionResolver) {
+	f.mu.RLock()
+	t, r := f.tracker, f.resolver
+	f.mu.RUnlock()
+	return t, r
 }
 
 // maxKeyLen is the largest key the wire format can carry: the key length is
@@ -188,13 +201,13 @@ func (f *FSM) Apply(entry *pb.Entry) error {
 		return err
 	}
 	// Track per-region byte delta for split decisions.
-	if f.tracker != nil && f.resolver != nil {
-		if regionID := f.resolver(key); regionID != 0 {
+	if tracker, resolver := f.trackerSnapshot(); tracker != nil && resolver != nil {
+		if regionID := resolver(key); regionID != 0 {
 			switch op {
 			case OpSet:
-				f.tracker.TrackSet(regionID, key, value)
+				tracker.TrackSet(regionID, key, value)
 			case OpDel:
-				f.tracker.TrackDel(regionID, key, value)
+				tracker.TrackDel(regionID, key, value)
 			}
 		}
 	}
@@ -240,9 +253,9 @@ func (f *FSM) applyChunk(entry *pb.Entry) error {
 	if err := f.dispatcher.Dispatch(key, OpSet, value, ttl); err != nil {
 		return err
 	}
-	if f.tracker != nil && f.resolver != nil {
-		if regionID := f.resolver(key); regionID != 0 {
-			f.tracker.TrackSet(regionID, key, value)
+	if tracker, resolver := f.trackerSnapshot(); tracker != nil && resolver != nil {
+		if regionID := resolver(key); regionID != 0 {
+			tracker.TrackSet(regionID, key, value)
 		}
 	}
 	return nil

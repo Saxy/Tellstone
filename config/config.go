@@ -105,6 +105,12 @@ func getEnv[T any](key string, fallback T) T {
 		} else {
 			return fallback
 		}
+	case *uint64:
+		if u, err := strconv.ParseUint(val, 10, 64); err == nil {
+			*p = u
+		} else {
+			return fallback
+		}
 	case *bool:
 		if b, err := strconv.ParseBool(val); err == nil {
 			*p = b

@@ -50,6 +50,38 @@ func TestRegionSizeTrackerSetSizeOverwrite(t *testing.T) {
 	}
 }
 
+func TestRegionSizeTrackerOverwriteNetDelta(t *testing.T) {
+	tr := NewRegionSizeTracker()
+
+	// New key: full key+value counted.
+	tr.TrackSet(1, "k", []byte("12345")) // 1 + 5 = 6
+	if got := tr.GetSize(1); got != 6 {
+		t.Fatalf("GetSize after first set = %d, want 6", got)
+	}
+
+	// Overwrite with a larger value: only the value delta is added.
+	tr.TrackSet(1, "k", []byte("1234567890")) // delta +5 → 11
+	if got := tr.GetSize(1); got != 11 {
+		t.Fatalf("GetSize after larger overwrite = %d, want 11", got)
+	}
+
+	// Overwrite with a smaller value: only the value delta is removed.
+	tr.TrackSet(1, "k", []byte("1")) // delta -9 → 2
+	if got := tr.GetSize(1); got != 2 {
+		t.Fatalf("GetSize after smaller overwrite = %d, want 2", got)
+	}
+
+	// DEL removes exactly the stored bytes even though the operation carries
+	// no value (the real FSM passes an empty value for DEL entries).
+	tr.TrackDel(1, "k", nil)
+	if got := tr.GetSize(1); got != 0 {
+		t.Fatalf("GetSize after del = %d, want 0", got)
+	}
+}
+
+// TrackSet uses net deltas, so 8000 overwrites of the same key/value must
+// leave exactly one live key's bytes tracked (3 + 5 = 8), not cumulative
+// 8000*8.
 func TestRegionSizeTrackerParallel(t *testing.T) {
 	tr := NewRegionSizeTracker()
 	const goroutines = 8
@@ -66,7 +98,7 @@ func TestRegionSizeTrackerParallel(t *testing.T) {
 	for g := 0; g < goroutines; g++ {
 		<-done
 	}
-	want := uint64(goroutines * perGoroutine * 8) // "key"=3 + "value"=5
+	want := uint64(8) // "key"=3 + "value"=5, one live key
 	if got := tr.GetSize(1); got != want {
 		t.Fatalf("parallel tracked size = %d, want %d", got, want)
 	}

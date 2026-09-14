@@ -128,7 +128,7 @@ func DecodeChunkEntry(data []byte) (*chunkEntry, error) {
 // but a shared engine dispatcher may be used by multiple groups).
 type chunkAssembler struct {
 	mu      sync.Mutex
-	pending map[uint64]*chunkState // keyed by fnv64(key): total ordering keeps one chain per key
+	pending map[string]*chunkState // keyed by key: total ordering keeps one chain per key
 }
 
 type chunkState struct {
@@ -142,7 +142,7 @@ type chunkState struct {
 
 // newChunkAssembler creates an empty assembler.
 func newChunkAssembler() *chunkAssembler {
-	return &chunkAssembler{pending: make(map[uint64]*chunkState)}
+	return &chunkAssembler{pending: make(map[string]*chunkState)}
 }
 
 // add feeds one chunk into the assembler. When the chain is complete it
@@ -152,7 +152,7 @@ func newChunkAssembler() *chunkAssembler {
 func (a *chunkAssembler) add(ce *chunkEntry) (key string, value []byte, ttl time.Duration, complete bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	id := fnv64(ce.key)
+	id := ce.key
 	st, ok := a.pending[id]
 	if !ok || st.seq != ce.seq {
 		st = &chunkState{
@@ -182,18 +182,4 @@ func (a *chunkAssembler) add(ce *chunkEntry) (key string, value []byte, ttl time
 	}
 	delete(a.pending, id)
 	return st.key, value, st.ttl, true
-}
-
-// fnv64 returns the FNV-1a 64-bit hash of s, used to key the assembler map.
-func fnv64(s string) uint64 {
-	const (
-		offset = 14695981039346656037
-		prime  = 1099511628211
-	)
-	h := uint64(offset)
-	for i := 0; i < len(s); i++ {
-		h ^= uint64(s[i])
-		h *= prime
-	}
-	return h
 }

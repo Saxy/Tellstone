@@ -7,6 +7,7 @@ Description: Tests for the Phase 4 region ID allocator.
 package cluster
 
 import (
+	"sync"
 	"testing"
 )
 
@@ -34,28 +35,35 @@ func TestRegionIDAllocatorConcurrent(t *testing.T) {
 	const goroutines = 8
 	const perGoroutine = 20
 	seen := make(chan uint64, goroutines*perGoroutine)
+	fail := make(chan error, goroutines)
+	var wg sync.WaitGroup
 	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			for i := 0; i < perGoroutine; i++ {
 				id, err := alloc.NextID(ctx)
 				if err != nil {
-					t.Errorf("NextID: %v", err)
-					continue
+					fail <- err
+					return
 				}
 				seen <- id
 			}
 		}()
 	}
 	ids := make(map[uint64]bool)
-	for g := 0; g < goroutines; g++ {
-		for i := 0; i < perGoroutine; i++ {
-			id := <-seen
+	for i := 0; i < goroutines*perGoroutine; i++ {
+		select {
+		case err := <-fail:
+			t.Fatalf("NextID: %v", err)
+		case id := <-seen:
 			if ids[id] {
 				t.Fatalf("duplicate region ID %d allocated", id)
 			}
 			ids[id] = true
 		}
 	}
+	wg.Wait()
 	want := goroutines * perGoroutine
 	if len(ids) != want {
 		t.Fatalf("got %d unique IDs, want %d", len(ids), want)
