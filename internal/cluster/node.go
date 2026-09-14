@@ -87,6 +87,13 @@ type Node struct {
 	// is tagged with a unique ID; the readyLoop signals completion when
 	// the corresponding committed entry is applied.
 	proposals *proposalTracker
+	// chunkMu serializes ProposeChunked so one chunk chain's entries are
+	// proposed contiguously in the raft log. Without this, concurrent calls
+	// (two followers forwarding chains on different connections, or two local
+	// large SETs) interleave raftNode.Propose per chunk; the assembler's
+	// writeSeq supersede logic then resets both chains and neither assembles,
+	// yet the final chunk still reports a nil apply error — silent data loss.
+	chunkMu sync.Mutex
 	// quiesced, when true, rejects all new proposals (ProposeAndWait,
 	// ForwardWrite) so in-flight proposals can drain during a region split.
 	quiesced atomic.Bool
@@ -299,10 +306,12 @@ func (n *Node) ProposeAndWait(ctx context.Context, data []byte) error {
 }
 
 // ProposeChunked submits a chunk chain (one raft entry per chunk) and blocks
-// until the final chunk has been committed and applied. Every chunk is proposed
-// up front — back-to-back — so interleaving with other writers is minimized;
-// the FSM reassembles via the write sequence and a retry of the whole chain
-// with the same sequence is safe. Returns the last chunk's apply error.
+// until the final chunk has been committed and applied. ProposeChunked calls
+// are serialized so a chain's entries are always contiguous in the log — no
+// other chunk chain can interleave — which keeps the FSM's reassembly
+// deterministic. The FSM reassembles via the write sequence and a retry of
+// the whole chain with the same sequence is safe. Returns the last chunk's
+// apply error.
 func (n *Node) ProposeChunked(ctx context.Context, chunks [][]byte) error {
 	if n.quiesced.Load() {
 		return ErrQuiesced
@@ -313,6 +322,11 @@ func (n *Node) ProposeChunked(ctx context.Context, chunks [][]byte) error {
 	if len(chunks) == 0 {
 		return nil
 	}
+	// Hold the lock across the entire chain so every chunk reaches the raft
+	// log contiguously; quiesced checks, proposal tracking, and error cleanup
+	// below are unchanged and run inside the locked section.
+	n.chunkMu.Lock()
+	defer n.chunkMu.Unlock()
 	// Register a waiter and propose every chunk immediately. The caller only
 	// waits for the last chunk, which is when the value becomes complete.
 	ids := make([]uint64, 0, len(chunks))

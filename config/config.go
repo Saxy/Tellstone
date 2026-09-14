@@ -507,7 +507,7 @@ func LoadConfig(args []string) *Config {
 		&cfg.clusterSplitThreshold,
 		"cluster-split-threshold",
 		getEnv("TSD_CLUSTER_SPLIT_THRESHOLD", uint64(64*1024*1024)),
-		"Region byte size that triggers an automatic split in bytes (e.g. 64MiB; default: 67108864)",
+		"Region byte size that triggers an automatic split in bytes (default: 67108864)",
 	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {

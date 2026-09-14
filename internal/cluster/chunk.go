@@ -26,6 +26,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"sync"
 	"time"
 )
@@ -59,6 +60,9 @@ func EncodeChunkSet(key string, ttl time.Duration, writeSeq uint64, total, idx i
 	}
 	if total < 1 || idx < 0 || idx >= total {
 		return nil, fmt.Errorf("cluster fsm: chunk index %d out of range [0,%d)", idx, total)
+	}
+	if total > math.MaxUint16 {
+		return nil, fmt.Errorf("cluster fsm: chunk total %d exceeds %d", total, math.MaxUint16)
 	}
 	var ttlMs int64
 	if ttl > 0 {
@@ -113,6 +117,9 @@ func DecodeChunkEntry(data []byte) (*chunkEntry, error) {
 	off += 2
 	idx := int(binary.BigEndian.Uint16(data[off : off+2]))
 	off += 2
+	if total < 1 || idx >= total {
+		return nil, ErrChunkMalformed
+	}
 	return &chunkEntry{
 		key:   key,
 		ttl:   time.Duration(ttlMs) * time.Millisecond,
@@ -154,7 +161,10 @@ func (a *chunkAssembler) add(ce *chunkEntry) (key string, value []byte, ttl time
 	defer a.mu.Unlock()
 	id := ce.key
 	st, ok := a.pending[id]
-	if !ok || st.seq != ce.seq {
+	if ok && ce.seq < st.seq {
+		return ce.key, nil, 0, false
+	}
+	if !ok || ce.seq > st.seq {
 		st = &chunkState{
 			key:   ce.key,
 			seq:   ce.seq,

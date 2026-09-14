@@ -66,18 +66,20 @@ func (t *RegionSizeTracker) TrackSet(regionID uint64, key string, value []byte) 
 		c = &atomic.Uint64{}
 		t.sizes[regionID] = c
 	}
-	t.mu.Unlock()
+	// Apply the counter delta while mu is still held so the map mutation and
+	// the byte counter stay atomic with respect to concurrent TrackDel: an
+	// interleaved delete must not observe the new keys entry with the old
+	// counter (or vice versa), which would over- or under-count bytes.
 	if existed {
 		if oldTotal > total {
 			subCounter(c, oldTotal-total)
-			return
-		}
-		if total > oldTotal {
+		} else if total > oldTotal {
 			c.Add(total - oldTotal)
 		}
-		return
+	} else {
+		c.Add(total)
 	}
-	c.Add(total)
+	t.mu.Unlock()
 }
 
 // TrackDel removes the tracked bytes for key from the region counter.
@@ -89,10 +91,10 @@ func (t *RegionSizeTracker) TrackDel(regionID uint64, key string, _ []byte) {
 		delete(t.keys, ek)
 	}
 	c := t.sizes[regionID]
-	t.mu.Unlock()
 	if existed && c != nil {
 		subCounter(c, oldTotal)
 	}
+	t.mu.Unlock()
 }
 
 // subCounter decrements c by n, flooring at zero.
