@@ -32,6 +32,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -102,6 +103,13 @@ type Transport struct {
 	// peer address registry: "addr:<id>" -> "host:port"
 	addrs sync.Map
 
+	// pipe is the process-level app-layer request/response channel (Phase 5).
+	// Lazily created by Pipeline(); docked on the transport so all raft groups
+	// over a shared transport multiplex their forwarded traffic over the same
+	// per-peer connections. Guarded by pipeMu.
+	pipeMu sync.RWMutex
+	pipe   *Pipeline
+
 	// Counters track wire-level activity for observability. Lock-free
 	// atomics so they add zero contention to the hot path.
 	stats TransportStats
@@ -114,6 +122,8 @@ type TransportStats struct {
 	BytesSent    atomic.Int64 // bytes written to peer connections
 	MessagesRecv atomic.Int64 // messages decoded from inbound frames
 	FramesRecv   atomic.Int64 // inbound frames decoded
+	PipeSent     atomic.Int64 // pipeline messages queued to peers
+	PipeRecv     atomic.Int64 // pipeline messages decoded from peers
 }
 
 // Stats returns the transport's wire-level counters. The returned pointer
@@ -196,6 +206,9 @@ func (t *Transport) Stop() {
 		return
 	}
 	close(t.stopCh)
+	if p := t.pipelined(); p != nil {
+		p.Stop()
+	}
 	if t.listener != nil {
 		t.listener.Close()
 	}
@@ -228,6 +241,120 @@ func (t *Transport) ConnectionCount() int {
 		return true
 	})
 	return count
+}
+
+// Pipeline returns the process-level pipeline, creating it on first use. All
+// raft groups sharing this transport share the returned pipeline. The caller
+// provides its node ID and logger once; subsequent calls reuse the existing
+// pipeline.
+func (t *Transport) Pipeline(nodeID uint64, logger log.Logger) *Pipeline {
+	if p := t.pipelined(); p != nil {
+		return p
+	}
+	t.pipeMu.Lock()
+	defer t.pipeMu.Unlock()
+	if t.pipe == nil {
+		t.pipe = NewPipeline(t, nodeID, logger)
+		t.pipe.Start()
+	}
+	return t.pipe
+}
+
+// pipelined returns the existing pipeline or nil when none was created yet.
+func (t *Transport) pipelined() *Pipeline {
+	t.pipeMu.RLock()
+	defer t.pipeMu.RUnlock()
+	return t.pipe
+}
+
+// PipelineStats exposes pipeline counters for metrics collection. It returns
+// nil when no pipeline was ever created (non-cluster transports).
+func (t *Transport) PipelineStats() *PipeStats {
+	if p := t.pipelined(); p != nil {
+		return p.Stats()
+	}
+	return nil
+}
+
+// PeerIDs returns the node IDs of all registered peers with a non-empty
+// address. Used by the pipeline keepalive loop to probe liveness.
+func (t *Transport) PeerIDs() []uint64 {
+	var ids []uint64
+	t.addrs.Range(func(key, value any) bool {
+		id, ok := key.(string)
+		if !ok {
+			return true
+		}
+		const prefix = "addr:"
+		if len(id) > len(prefix) && id[:len(prefix)] == prefix {
+			if addr, ok := value.(string); ok && addr != "" {
+				if n, err := strconv.ParseUint(id[len(prefix):], 10, 64); err == nil {
+					ids = append(ids, n)
+				}
+			}
+		}
+		return true
+	})
+	return ids
+}
+
+// DropPeer closes and forgets the outbound connection to a peer. On the next
+// send the transport redials a fresh connection. Used by the keepalive loop
+// when a peer is deemed unreachable: dropping the stale connection (and its
+// half-open state) is the health remedy, and the reconnect is lazy.
+func (t *Transport) DropPeer(id uint64) {
+	if v, ok := t.conns.LoadAndDelete(id); ok {
+		if bc, ok := v.(*batchConn); ok {
+			bc.onDead = nil
+			bc.close()
+		}
+	}
+}
+
+// sendPipe queues a pipeline message for delivery to a peer. The message is
+// batched with any other traffic destined for that peer by the peer's batch
+// sender and written as a pipeline-tagged TCP frame on the next flush.
+func (t *Transport) sendPipe(peerID uint64, pm pipeMsg) error {
+	if t.stopped.Load() {
+		return errTransportStopped
+	}
+	bc, err := t.getOrCreateConn(peerID)
+	if err != nil {
+		return err
+	}
+	t.stats.PipeSent.Add(1)
+	return bc.sendPipe(pm)
+}
+
+// ClusterPipelineMetrics interface satisfaction — optional extension of
+// metrics.ClusterMetrics. These methods delegate to the pipeline's live
+// counters, returning 0 when no pipeline exists (plain raft transports).
+func (t *Transport) ClusterPipeRequests() int64 {
+	if s := t.PipelineStats(); s != nil {
+		return s.Requests.Load()
+	}
+	return 0
+}
+
+func (t *Transport) ClusterPipeResponses() int64 {
+	if s := t.PipelineStats(); s != nil {
+		return s.Responses.Load()
+	}
+	return 0
+}
+
+func (t *Transport) ClusterPipeTimeouts() int64 {
+	if s := t.PipelineStats(); s != nil {
+		return s.Timeouts.Load()
+	}
+	return 0
+}
+
+func (t *Transport) ClusterPipeReconnects() int64 {
+	if s := t.PipelineStats(); s != nil {
+		return s.Reconnects.Load()
+	}
+	return 0
 }
 
 // ---------------------------------------------------------------------------
@@ -324,6 +451,33 @@ func (t *Transport) readLoop(conn net.Conn) {
 			}
 			return
 		}
+		// Pipeline frames share the length-prefixed header but carry a
+		// different payload encoding, distinguished by the reserved group ID.
+		// Decode them with the pipeline codec and dispatch to the app layer.
+		// The frame must be decoded BEFORE zeroing the pooled buffer, unlike
+		// the raft path which decodes then wipes — DecodePipeBatch copies each
+		// message's payload out of the buffer, so wiping after is safe.
+		if gid == pipelineGroupID {
+			perr := t.handlePipeFrame(payload)
+			if bufPtr != nil {
+				for i := range payload {
+					payload[i] = 0
+				}
+				readBufPool.Put(bufPtr)
+			}
+			if perr != nil {
+				// Framing sync may still be intact (length-prefixed), but the
+				// pipeline codec rejected the payload. Kill the connection to
+				// be consistent with the raft decode-error guardrail.
+				if t.logger.Enabled(log.LevelWarn) {
+					t.logger.Log(log.LevelWarn, "cluster transport: pipeline decode failed, killing connection",
+						log.String("remote", conn.RemoteAddr().String()),
+						log.String("error", perr.Error()))
+				}
+				return
+			}
+			continue
+		}
 		msgs, decErr := DecodeBatch(payload)
 		if bufPtr != nil {
 			// Zero the buffer before returning to pool to avoid retaining
@@ -357,6 +511,33 @@ func (t *Transport) readLoop(conn net.Conn) {
 			handler(msg)
 		}
 	}
+}
+
+// handlePipeFrame decodes a pipeline-tagged frame's payload and hands each
+// message to the process pipeline for dispatch. Frames for transports without
+// a pipeline are dropped (this transport is not part of a cluster). A decode
+// error is returned so the caller kills the connection — framing sync is
+// broken and continuing would deliver garbage at unknown offsets.
+//
+// The decode allocates fresh payload copies, so enqueueing onto the worker
+// pool is safe even though the caller returns the read buffer to the pool
+// afterwards.
+func (t *Transport) handlePipeFrame(payload []byte) error {
+	p := t.pipelined()
+	if p == nil {
+		return nil
+	}
+	msgs, err := DecodePipeBatch(payload)
+	if err != nil {
+		return err
+	}
+	t.stats.FramesRecv.Add(1)
+	t.stats.PipeRecv.Add(int64(len(msgs)))
+	for _, pm := range msgs {
+		p.stats.RecvMsgs.Add(1)
+		p.enqueue(pm)
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------------------
@@ -484,6 +665,11 @@ type batchConn struct {
 	onDead func()
 
 	sendCh chan groupBatch
+	// pipeCh carries pipeline messages to the same peer. They share the
+	// connection with raft traffic and are emitted as a pipelineGroupID-tagged
+	// frame by the same run loop flush, so pipeline and raft messages never
+	// interleave in one frame payload.
+	pipeCh chan pipeMsg
 	closed atomic.Bool
 }
 
@@ -494,6 +680,7 @@ func newBatchConn(conn net.Conn, logger log.Logger, stopCh <-chan struct{}, stat
 		stopCh: stopCh,
 		stats:  stats,
 		sendCh: make(chan groupBatch, 256),
+		pipeCh: make(chan pipeMsg, 256),
 	}
 }
 
@@ -519,10 +706,16 @@ func (bc *batchConn) run(done func()) {
 	msgCount := 0
 	byteCount := 0
 
+	// Pipe batch accumulates pipeline messages destined for this peer. They
+	// are flushed as a single pipelineGroupID-tagged frame alongside the raft
+	// groups.
+	var pipePayload []byte
+	pipeCount := 0
+
 	// flush writes the pending batch. Returns false when the write failed;
 	// the caller must stop using the connection.
 	flush := func() bool {
-		if msgCount == 0 {
+		if msgCount == 0 && pipeCount == 0 {
 			return true
 		}
 		frames := 0
@@ -533,6 +726,10 @@ func (bc *batchConn) run(done func()) {
 			}
 			frames++
 			out = encodeGroupFrame(out, payload, countByGroup[gid], gid)
+		}
+		if pipeCount > 0 {
+			frames++
+			out = encodePipeFrame(out, pipePayload, pipeCount)
 		}
 		n, err := bc.conn.Write(out)
 		if err != nil {
@@ -553,6 +750,8 @@ func (bc *batchConn) run(done func()) {
 			bufByGroup[gid] = bufByGroup[gid][:0]
 			countByGroup[gid] = 0
 		}
+		pipePayload = pipePayload[:0]
+		pipeCount = 0
 		msgCount = 0
 		byteCount = 0
 		return true
@@ -563,6 +762,16 @@ func (bc *batchConn) run(done func()) {
 		case <-bc.stopCh:
 			flush()
 			return
+		case pm := <-bc.pipeCh:
+			before := len(pipePayload)
+			pipePayload = encodePipeMsg(pipePayload, &pm)
+			pipeCount++
+			byteCount += len(pipePayload) - before
+			if byteCount >= batchMaxBytes || pipeCount >= maxBatchCount {
+				if !flush() {
+					return
+				}
+			}
 		case gb := <-bc.sendCh:
 			for _, m := range gb.msgs {
 				payload := bufByGroup[gb.gid]
@@ -591,6 +800,9 @@ func (bc *batchConn) run(done func()) {
 }
 
 func (bc *batchConn) send(gid uint64, msgs []*pb.Message) error {
+	if gid == pipelineGroupID {
+		return errReservedGroupID
+	}
 	if bc.closed.Load() {
 		return errConnectionClosed
 	}
@@ -602,6 +814,23 @@ func (bc *batchConn) send(gid uint64, msgs []*pb.Message) error {
 			bc.logger.Log(log.LevelWarn, "cluster transport: send channel full, dropping messages",
 				log.Int("dropped", len(msgs)))
 		}
+		return errSendQueueFull
+	}
+}
+
+// sendPipe queues a pipeline message on the same peer connection. It shares
+// the batching sender with raft traffic and is written under a dedicated
+// pipelineGroupID frame, so this is non-blocking under load like send; a full
+// pipeCh drops the message (the pump path is best-effort) rather than stalling
+// the caller.
+func (bc *batchConn) sendPipe(pm pipeMsg) error {
+	if bc.closed.Load() {
+		return errConnectionClosed
+	}
+	select {
+	case bc.pipeCh <- pm:
+		return nil
+	default:
 		return errSendQueueFull
 	}
 }
@@ -781,6 +1010,7 @@ var (
 	errDialFailed       = errors.New("cluster network: dial failed")
 	errConnectionClosed = errors.New("cluster network: connection closed")
 	errSendQueueFull    = errors.New("cluster network: send queue full")
+	errReservedGroupID  = errors.New("cluster network: group ID is reserved for the pipeline")
 )
 
 // ---------------------------------------------------------------------------
