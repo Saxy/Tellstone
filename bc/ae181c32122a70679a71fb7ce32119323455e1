@@ -1,0 +1,64 @@
+internal/cluster/network/codec.go
+  s_5f1eeba6c7a318::t_4f358e37126d89 156-316
+  s_5f1eeba6c7a318::t_1fa6f860429d56 56,63-68
+  s_5f1eeba6c7a318::t_3f007ea3cd417d 69
+internal/cluster/network/pipeline.go
+  s_5f1eeba6c7a318::t_9fa2225b62bbe3 1-376
+  s_5f1eeba6c7a318::t_4763357758bebb 377
+internal/cluster/network/pipeline_integration_test.go
+  s_5f1eeba6c7a318::t_7020b2610a1119 26,35-36,58,70,86,102,122
+  s_5f1eeba6c7a318::t_9547682cf516b0 5,27-28
+  s_5f1eeba6c7a318::t_4763357758bebb 143
+  s_5f1eeba6c7a318::t_42d7f29f134a9a 6-7
+  s_5f1eeba6c7a318::t_474eedd991760d 87
+  s_5f1eeba6c7a318::t_8e663abddf16c8 106-107
+  s_5f1eeba6c7a318::t_c6cb91b03ecd14 21
+  s_5f1eeba6c7a318::t_2041f32caa3178 1-4,8-20,22-25,29-34,37-57,59-69,73-85,88-101,103-105,108-121,123-142
+  s_5f1eeba6c7a318::t_2f4a5453f9eae1 71-72
+internal/cluster/manual_test.go
+  s_5f1eeba6c7a318::t_617ec32b3bb9ec 11-16
+  s_5f1eeba6c7a318::t_a08800927ab2e4 23
+  s_5f1eeba6c7a318::t_50b738d4eccc20 43-44
+  s_5f1eeba6c7a318::t_b334971c0bdcfc 547-554
+  s_5f1eeba6c7a318::t_cc613001b72511 670-835
+internal/cluster/network/transport.go
+  s_5f1eeba6c7a318::t_bcf52955954b69 35
+  s_5f1eeba6c7a318::t_a40686a4779e1e 106-112
+  s_5f1eeba6c7a318::t_66b2264483079d 125-126
+  s_5f1eeba6c7a318::t_d370c5e3c43d2c 709-714,718,730-733,753-754,765-774
+  s_5f1eeba6c7a318::t_cd5142260a590c 516-542,836
+  s_5f1eeba6c7a318::t_f2439fc05cb995 803-805,821-833,835
+  s_5f1eeba6c7a318::t_283b21b7a47a0c 209-211
+  s_5f1eeba6c7a318::t_7edd3e9db39aa5 668-672,683
+  s_5f1eeba6c7a318::t_f5e7e4ba786e50 1013
+  s_5f1eeba6c7a318::t_7047d12fcc137d 457-459,461,468-478
+  s_5f1eeba6c7a318::t_03a9fa752889e9 246-359
+  s_5f1eeba6c7a318::t_998dcecaaf1aa8 454-456,460,462-467,479-480
+  s_5f1eeba6c7a318::t_d8059a148770d8 834
+  s_5f1eeba6c7a318::t_61c1db0738ce39 837
+internal/cluster/node.go
+  s_5f1eeba6c7a318::t_1f21ba37c19c6e 196-200
+  s_5f1eeba6c7a318::t_a3dadf7122865e 431-434,442-443,446-449,454-455,458-468,473-479,481-483,487-491,493-506,508-514,516-518,520-536
+internal/metrics/metrics_test.go
+  s_5f1eeba6c7a318::t_72f8ca95c42c08 188-191
+  s_5f1eeba6c7a318::t_f5c915f2266270 148-151,159-166,175-177
+internal/metrics/metrics.go
+  s_5f1eeba6c7a318::t_3788be11a0d7e4 145-150
+  s_5f1eeba6c7a318::t_a731b20b7225ca 246-249
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bcae181c32122a70679a71fb7ce32119323455e1",
+  "prompts": {},
+  "sessions": {
+    "s_5f1eeba6c7a318": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f5c5e25d4ffesRbpCCqLI76boV",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
