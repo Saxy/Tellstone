@@ -84,8 +84,9 @@ type pipeResult struct {
 
 const (
 	// pipeDispatchCap bounds in-flight inbound pipeline messages per process.
-	// Reaching it applies backpressure to the peer connection, bounding memory
-	// under bursts without dropping requests.
+	// Reaching it rejects further messages with errPipelineOverloaded instead of
+	// blocking, so a saturated dispatch never stalls the transport read loop
+	// (which also carries raft message delivery on the same connection).
 	pipeDispatchCap = 1024
 	// keepaliveInterval is how often each registered peer is probed. It bounds
 	// dead-peer detection latency: a dead peer is dropped within two intervals.
@@ -246,12 +247,19 @@ func (p *Pipeline) Call(ctx context.Context, peerID uint64, gid uint64, op OpKin
 	}
 }
 
-// enqueue hands an inbound pipeline message to the worker pool. It blocks when
-// the pool is saturated, applying backpressure to the sending peer.
-func (p *Pipeline) enqueue(pm pipeMsg) {
+// enqueue hands an inbound pipeline message to the worker pool without blocking
+// the transport read loop: a saturated dispatch queue yields
+// errPipelineOverloaded (the message is rejected by the caller) and a shutdown
+// yields errPipelineStopped. Backpressure through the TCP stream was abandoned
+// because it also stalled raft message delivery on the same read loop.
+func (p *Pipeline) enqueue(pm pipeMsg) error {
 	select {
 	case p.dispatchCh <- pm:
+		return nil
 	case <-p.stopCh:
+		return errPipelineStopped
+	default:
+		return errPipelineOverloaded
 	}
 }
 
@@ -330,6 +338,23 @@ func (p *Pipeline) complete(reqID uint64, res pipeResult) {
 	}
 }
 
+// reject answers a request it was not possible to enqueue, carrying the
+// overload error so the follower's Call fails fast and retries immediately
+// instead of waiting for a context timeout.
+func (p *Pipeline) reject(pm pipeMsg, err error) {
+	kind := OpForwardResp
+	if pm.kind == OpPing {
+		kind = OpPong
+	}
+	_ = p.transport.sendPipe(pm.from, pipeMsg{
+		kind:    kind,
+		reqID:   pm.reqID,
+		from:    p.nodeID,
+		gid:     pm.gid,
+		payload: encodePipeResp(nil, err),
+	})
+}
+
 // keepaliveLoop probes every registered peer periodically and drops the peer
 // connection after two consecutive misses — the transport transparently
 // redials (with backoff) on the next send, so the drop itself is the health
@@ -375,3 +400,8 @@ func (p *Pipeline) keepaliveLoop() {
 
 // errPipelineStopped is returned by Call when the pipeline has been stopped.
 var errPipelineStopped = errors.New("cluster network: pipeline stopped")
+
+// errPipelineOverloaded is returned by enqueue when the inbound dispatch queue
+// is saturated. The caller replies to the sending peer with this error so the
+// follower can retry the op instead of stalling the transport read loop.
+var errPipelineOverloaded = errors.New("cluster network: pipeline overloaded")

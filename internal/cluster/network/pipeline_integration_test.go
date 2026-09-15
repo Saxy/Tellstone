@@ -118,7 +118,9 @@ func TestPipelineConcurrentCalls(t *testing.T) {
 	errs := make(chan error, n)
 	for i := 0; i < n; i++ {
 		go func(i int) {
-			payload := []byte{'a' + byte(i%26)}
+			// Unique payload per call for unambiguous response correlation:
+			// two base-26 digits cover the 50 calls without repeating.
+			payload := []byte{'a' + byte(i/26), 'a' + byte(i%26)}
 			resp, err := tr1.Pipeline(1, log.NewNoOpLogger()).Call(ctx, 2, 77, OpForwardWrite, payload)
 			if err != nil {
 				errs <- err

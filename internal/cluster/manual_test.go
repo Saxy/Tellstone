@@ -828,8 +828,10 @@ func TestManualPipeline(t *testing.T) {
 			}
 			conn.Close()
 			t.Logf("  node %d GET %s = %q (read-anywhere) OK", s.id, key, val)
-			checked++
 		}
+		// Count a key only after every node has returned it, so verify is a
+		// count of distinct keys (each checked on all nodes).
+		checked++
 	}
 	t.Log("=== MANUAL PIPELINE (PHASE 5) TEST COMPLETE ===")
 }

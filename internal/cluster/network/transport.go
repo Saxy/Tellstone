@@ -303,9 +303,12 @@ func (t *Transport) PeerIDs() []uint64 {
 // when a peer is deemed unreachable: dropping the stale connection (and its
 // half-open state) is the health remedy, and the reconnect is lazy.
 func (t *Transport) DropPeer(id uint64) {
+	// LoadAndDelete atomically takes the peer's current connection, whatever
+	// its identity, so a concurrent dial cannot hand the closed connection out
+	// afterwards. onDead is left intact: it is identity-conditional and will
+	// no-op for any future connection, so there is nothing to clear.
 	if v, ok := t.conns.LoadAndDelete(id); ok {
 		if bc, ok := v.(*batchConn); ok {
-			bc.onDead = nil
 			bc.close()
 		}
 	}
@@ -535,7 +538,15 @@ func (t *Transport) handlePipeFrame(payload []byte) error {
 	t.stats.PipeRecv.Add(int64(len(msgs)))
 	for _, pm := range msgs {
 		p.stats.RecvMsgs.Add(1)
-		p.enqueue(pm)
+		if err := p.enqueue(pm); err != nil {
+			// Never stall the read loop: a saturated or stopped pipeline drops
+			// the message here. Requests still get an explicit error reply so
+			// the follower's Call fails fast and can retry; responses are
+			// dropped and time out on the caller's own context.
+			if errors.Is(err, errPipelineOverloaded) {
+				p.reject(pm, err)
+			}
+		}
 	}
 	return nil
 }
@@ -621,17 +632,30 @@ func (t *Transport) dial(peerID uint64) (*batchConn, error) {
 		return nil, fmt.Errorf("%w: %v", errDialFailed, err)
 	}
 	bc := newBatchConn(conn, t.logger, t.stopCh, &t.stats)
+	// Initialize onDead BEFORE the connection is published to conns, and make
+	// the removal identity-conditional: a stale connection whose flush fails
+	// must never delete a newer connection that later replaced it under the
+	// same peer ID.
+	bc.onDead = func() { t.dropConn(peerID, bc) }
 	actual, _ := t.conns.LoadOrStore(peerID, bc)
 	if actual != bc {
 		conn.Close()
 		return actual.(*batchConn), nil
 	}
-	// A failed flush must drop this entry from conns so the next send dials
-	// a fresh connection instead of queueing into the dead one forever.
-	bc.onDead = func() { t.conns.Delete(peerID) }
 	t.wg.Add(1)
 	go bc.run(t.wg.Done)
 	return bc, nil
+}
+
+// dropConn removes bc from the peer connection map only if it is still the
+// current connection for peerID. Identity is checked so a dead connection's
+// delayed flush-failure callback cannot evict a freshly dialed replacement.
+func (t *Transport) dropConn(peerID uint64, bc *batchConn) {
+	if v, ok := t.conns.Load(peerID); ok {
+		if cur, ok := v.(*batchConn); ok && cur == bc {
+			t.conns.Delete(peerID)
+		}
+	}
 }
 
 func (t *Transport) lookupPeerAddr(id uint64) string {
