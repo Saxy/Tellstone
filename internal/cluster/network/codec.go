@@ -53,11 +53,19 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 
 	pb "go.etcd.io/raft/v3/raftpb"
 )
 
 var errCodecFrame = errors.New("cluster network: malformed codec frame")
+
+// pipelineGroupID is the reserved frame group ID that marks a frame as a
+// pipeline (app-level request/response) frame instead of a raft batch. Region
+// (raft group) IDs are allocated from 1 upward, so MaxUint64 can never collide
+// with a real region. The payload of a pipeline frame is the pipeline message
+// encoding below, not the raft batch encoding.
+const pipelineGroupID = math.MaxUint64
 
 // maxBatchCount is the maximum number of messages allowed in a single batch
 // frame. The wire format uses a 1-byte count (max 255), but we enforce a
@@ -143,6 +151,167 @@ func DecodeFrame(frame []byte) (uint64, []*pb.Message, error) {
 	gid := binary.BigEndian.Uint64(frame[4 : 4+frameGroupIDSize])
 	msgs, err := DecodeBatch(frame[4+frameGroupIDSize : 4+frameGroupIDSize+length])
 	return gid, msgs, err
+}
+
+// maxPipeBatchCount caps the number of pipeline messages in a single pipeline
+// frame. The wire format stores the count in one byte (max 255), so a larger
+// input would silently wrap on encode and decode as an empty batch on the
+// receiving side. The batching sender flushes before reaching this limit.
+const maxPipeBatchCount = 255
+
+// pipeHeaderSize is the fixed per-message header:
+// [1B kind][8B req_id][8B from][8B group_id][4B payload_len] = 29 bytes.
+const pipeHeaderSize = 29
+
+// EncodePipeFrame writes a full pipeline frame: `[4B payload_length][8B
+// group_id=pipelineGroupID][1B count][pipe msgs]`. The group ID distinguishes
+// it from raft frames so the receiving transport demuxes it to the pipeline
+// dispatcher instead of a region handler. Exported for tests.
+func EncodePipeFrame(msgs []pipeMsg) ([]byte, error) {
+	if len(msgs) > maxPipeBatchCount {
+		return nil, fmt.Errorf("cluster network: batch of %d pipeline messages exceeds maxPipeBatchCount %d", len(msgs), maxPipeBatchCount)
+	}
+	payload := make([]byte, 1)
+	payload[0] = byte(len(msgs))
+	for i := range msgs {
+		payload = encodePipeMsg(payload, &msgs[i])
+	}
+	frame := make([]byte, 4+frameGroupIDSize+len(payload))
+	frame[0] = byte(len(payload) >> 24)
+	frame[1] = byte(len(payload) >> 16)
+	frame[2] = byte(len(payload) >> 8)
+	frame[3] = byte(len(payload))
+	binary.BigEndian.PutUint64(frame[4:4+frameGroupIDSize], pipelineGroupID)
+	copy(frame[4+frameGroupIDSize:], payload)
+	return frame, nil
+}
+
+// DecodePipeBatch parses a pipeline frame payload (after the length prefix and
+// group ID have been consumed) and returns the decoded pipeline messages. It
+// validates the declared count and, per message, the fixed header and payload
+// bounds, so malformed frames cannot index out of range or trigger oversized
+// allocations. Payloads are copied out of the input buffer — the caller may
+// reuse (or pool) the raw frame bytes immediately.
+func DecodePipeBatch(payload []byte) ([]pipeMsg, error) {
+	if len(payload) < 1 {
+		return nil, errCodecFrame
+	}
+	count := int(payload[0])
+	if count == 0 {
+		return nil, nil
+	}
+	if count > maxPipeBatchCount {
+		return nil, errCodecFrame
+	}
+	msgs := make([]pipeMsg, count)
+	off := 1
+	for i := 0; i < count; i++ {
+		pm, n, err := decodePipeMsg(payload[off:])
+		if err != nil {
+			return nil, err
+		}
+		if n == 0 {
+			return nil, errCodecFrame
+		}
+		msgs[i] = pm
+		off += n
+	}
+	return msgs, nil
+}
+
+// encodePipeMsg appends one pipeline message to dst in the pipeline wire
+// format. It returns the extended buffer.
+func encodePipeMsg(dst []byte, pm *pipeMsg) []byte {
+	dst = append(dst, byte(pm.kind))
+	dst = binary.BigEndian.AppendUint64(dst, pm.reqID)
+	dst = binary.BigEndian.AppendUint64(dst, pm.from)
+	dst = binary.BigEndian.AppendUint64(dst, pm.gid)
+	dst = binary.BigEndian.AppendUint32(dst, uint32(len(pm.payload)))
+	dst = append(dst, pm.payload...)
+	return dst
+}
+
+// decodePipeMsg decodes one pipeline message from data, returning the message
+// and the number of bytes consumed. The payload is copied so the caller may
+// keep it beyond the lifetime of the source buffer (e.g. the transport's
+// pooled read buffer).
+func decodePipeMsg(data []byte) (pipeMsg, int, error) {
+	if len(data) < pipeHeaderSize {
+		return pipeMsg{}, 0, errCodecFrame
+	}
+	pm := pipeMsg{
+		kind:  OpKind(data[0]),
+		reqID: binary.BigEndian.Uint64(data[1:9]),
+		from:  binary.BigEndian.Uint64(data[9:17]),
+		gid:   binary.BigEndian.Uint64(data[17:25]),
+	}
+	plen := binary.BigEndian.Uint32(data[25:29])
+	if int(plen) > len(data)-pipeHeaderSize {
+		return pipeMsg{}, 0, errCodecFrame
+	}
+	payload := make([]byte, plen)
+	copy(payload, data[pipeHeaderSize:pipeHeaderSize+int(plen)])
+	pm.payload = payload
+	return pm, pipeHeaderSize + int(plen), nil
+}
+
+// encodePipeResp frames a pipeline response payload: `[1B flags][4B
+// payload_len][payload]`. Flag bit 0 (pipeRespErrFlag) marks the payload as an
+// error string — the requested operation failed. A zero-length payload with
+// flags 0 is a successful response carrying no data.
+func encodePipeResp(data []byte, rerr error) []byte {
+	flags := byte(0)
+	if rerr != nil {
+		flags = pipeRespErrFlag
+		data = []byte(rerr.Error())
+	}
+	out := make([]byte, 5+len(data))
+	out[0] = flags
+	binary.BigEndian.PutUint32(out[1:5], uint32(len(data)))
+	copy(out[5:], data)
+	return out
+}
+
+// decodePipeResp parses a framed pipeline response into (payload, error). A
+// payload whose flags mark it as an error is returned as a non-nil error whose
+// text is the payload. Malformed frames return errCodecFrame.
+func decodePipeResp(b []byte) ([]byte, error) {
+	if len(b) < 5 {
+		return nil, errCodecFrame
+	}
+	flags := b[0]
+	l := binary.BigEndian.Uint32(b[1:5])
+	if int(l) > len(b)-5 {
+		return nil, errCodecFrame
+	}
+	p := make([]byte, l)
+	copy(p, b[5:5+int(l)])
+	if flags&pipeRespErrFlag != 0 {
+		return nil, errors.New(string(p))
+	}
+	return p, nil
+}
+
+// pipeRespErrFlag marks a pipeline response payload as an error string.
+const pipeRespErrFlag byte = 1 << 0
+
+// encodePipeFrame appends a complete pipeline frame to out using the payload
+// already accumulated by the batching sender. It mirrors encodeGroupFrame but
+// tags the frame with pipelineGroupID. Used by the batchConn sender.
+func encodePipeFrame(out []byte, payload []byte, count int) []byte {
+	totalPayload := 1 + len(payload)
+	out = append(out,
+		byte(totalPayload>>24),
+		byte(totalPayload>>16),
+		byte(totalPayload>>8),
+		byte(totalPayload),
+	)
+	var gb [frameGroupIDSize]byte
+	binary.BigEndian.PutUint64(gb[:], pipelineGroupID)
+	out = append(out, gb[:]...)
+	out = append(out, byte(count))
+	out = append(out, payload...)
+	return out
 }
 
 // encodeBatchPayload serializes msgs into the batch payload (1-byte count

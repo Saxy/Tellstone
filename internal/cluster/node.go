@@ -31,15 +31,6 @@ import (
 // current Raft leader. Callers should redirect the client to the leader.
 var ErrNotLeader = errors.New("cluster: not leader")
 
-// Application-level message types carried over the existing network.Transport
-// (D3: no protobuf/gRPC for Phase 3). They use out-of-range raftpb.MessageType
-// codes and are intercepted in handleMessage before being passed to
-// raftNode.Step, so raft never sees them.
-const (
-	msgForwardWrite pb.MessageType = 100
-	msgForwardResp  pb.MessageType = 101
-)
-
 const (
 	// logCompactionThreshold compacts the local raft log once this many
 	// entries have been applied since the previous compaction. The storage
@@ -109,9 +100,6 @@ type Node struct {
 	// the committed index to wait for.
 	readIndexID    atomic.Uint64
 	readIndexChans sync.Map // correlation id (uint64) -> chan uint64
-	// forwardChans maps a forwarded-write correlation id to its result waiter.
-	forwardID    atomic.Uint64
-	forwardChans sync.Map // correlation id (uint64) -> chan error
 	// peerAddrs resolves a peer node ID to its configured address (used by
 	// routing/forwarding to target the region leader).
 	peerAddrs map[uint64]string
@@ -204,6 +192,11 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 			}
 		}
 	}
+
+	// Bind this group's forwarded-write handler on the pipeline. On a shared
+	// transport each group node registers its own group ID; the pipeline
+	// demultiplexes inbound opts to the node owning that group.
+	n.transport.Pipeline(cfg.NodeID, cfg.Logger).RegisterHandler(cfg.GroupID, n.handleForwardOp)
 
 	return n, nil
 }
@@ -435,8 +428,10 @@ func (n *Node) LinearizableRead(ctx context.Context) error {
 }
 
 // ForwardWrite sends an already-encoded FSM operation to the region leader
-// (identified by leaderID) over the existing transport and waits for the
-// apply result. Used by clusterStore when this node is not the leader (D3).
+// (identified by leaderID) over the pipeline and waits for the apply result.
+// Used by clusterStore when this node is not the leader (D3). The response
+// error is the leader's apply error (or ErrNotLeader when the routing table is
+// stale and the target can no longer propose).
 func (n *Node) ForwardWrite(ctx context.Context, leaderID uint64, opData []byte) error {
 	// Routing may resolve to this node (e.g. it just became leader and the
 	// table is briefly stale), or the caller may already be the leader. In
@@ -444,135 +439,101 @@ func (n *Node) ForwardWrite(ctx context.Context, leaderID uint64, opData []byte)
 	if leaderID == n.cfg.NodeID {
 		return n.ProposeAndWait(ctx, opData)
 	}
-	id := n.forwardID.Add(1)
-	ch := make(chan error, 1)
-	n.forwardChans.Store(id, ch)
-	defer n.forwardChans.Delete(id)
-	msg := &pb.Message{
-		Type:    msgForwardType(),
-		From:    &n.cfg.NodeID,
-		To:      &leaderID,
-		Context: uint64ToBytes(id),
-		Entries: []*pb.Entry{{Data: opData}},
-	}
-	if err := n.transport.SendTo(n.cfg.GroupID, msg); err != nil {
-		return err
-	}
-	select {
-	case err := <-ch:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-n.stopCh:
-		return errors.New("cluster node stopped")
-	}
+	_, err := n.pipeline().Call(ctx, leaderID, n.cfg.GroupID, network.OpForwardWrite, opData)
+	return err
 }
 
-// ForwardChunks sends a chunk chain (each chunk as one msgForwardWrite entry)
-// to the region leader over the existing transport and waits for the apply
-// result of the final chunk. Used by clusterStore for large values proposed on
-// the leader.
+// ForwardChunks sends a chunk chain (OpForwardChunks) to the region leader over
+// the pipeline and waits for the apply result of the chain. Used by clusterStore
+// for large values proposed on the leader. The chain is serialized into the
+// request payload; the leader reassembles and proposes it via ProposeChunked.
 func (n *Node) ForwardChunks(ctx context.Context, leaderID uint64, chunks [][]byte) error {
 	if leaderID == n.cfg.NodeID {
 		return n.ProposeChunked(ctx, chunks)
 	}
-	id := n.forwardID.Add(1)
-	ch := make(chan error, 1)
-	n.forwardChans.Store(id, ch)
-	defer n.forwardChans.Delete(id)
-	entries := make([]*pb.Entry, 0, len(chunks))
-	for _, c := range chunks {
-		entries = append(entries, &pb.Entry{Data: c})
-	}
-	msg := &pb.Message{
-		Type:    msgForwardType(),
-		From:    &n.cfg.NodeID,
-		To:      &leaderID,
-		Context: uint64ToBytes(id),
-		Entries: entries,
-	}
-	if err := n.transport.SendTo(n.cfg.GroupID, msg); err != nil {
-		return err
-	}
-	select {
-	case err := <-ch:
-		return err
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-n.stopCh:
-		return errors.New("cluster node stopped")
-	}
+	_, err := n.pipeline().Call(ctx, leaderID, n.cfg.GroupID, network.OpForwardChunks, encodeChunks(chunks))
+	return err
 }
 
-// handleMessage is called by the transport for every inbound message.
-// Application-level forward messages are handled locally; everything else is
-// delivered to the raft node via Step().
+// pipeline returns the process pipeline for this node's transport, creating it
+// on first use. All nodes sharing a transport share the returned pipeline and
+// demultiplex forwarded operations by group ID.
+func (n *Node) pipeline() *network.Pipeline {
+	return n.transport.Pipeline(n.cfg.NodeID, n.cfg.Logger)
+}
+
+// handleMessage is called by the transport for every inbound message. Raft
+// messages are delivered to the raft node via Step(). Forwarded writes arrive
+// as pipeline ops (handled on the pipeline worker pool), never as raft
+// messages, so there is nothing to intercept here.
 func (n *Node) handleMessage(msg *pb.Message) {
-	switch msg.GetType() {
-	case msgForwardWrite:
-		n.handleForwardWrite(msg)
-		return
-	case msgForwardResp:
-		if len(msg.Context) == 8 {
-			if v, ok := n.forwardChans.Load(bytesToUint64(msg.Context)); ok {
-				ch := v.(chan error)
-				var rerr error
-				if len(msg.Entries) > 0 && len(msg.Entries[0].Data) > 0 {
-					rerr = errors.New(string(msg.Entries[0].Data))
-				}
-				select {
-				case ch <- rerr:
-				default:
-				}
-			}
-		}
-		return
-	}
 	_ = n.raftNode.Step(context.Background(), msg)
 }
 
-// handleForwardWrite applies forwarded writes on the leader (the only node
-// that may propose) and replies to the requester. A single forwarded message
-// may carry a chunk chain in its Entries; the leader proposes every chunk in
-// order. If this node is no longer leader (stale routing), it replies with
-// ErrNotLeader so the caller retries.
-func (n *Node) handleForwardWrite(msg *pb.Message) {
+// handleForwardOp applies a forwarded write on the leader (the only node that
+// may propose) and returns the apply result, which the pipeline frames as the
+// response. A single forwarded op may carry a chunk chain in its payload; the
+// leader proposes every chunk in order via ProposeChunked. If this node is no
+// longer leader (stale routing), ProposeAndWait returns ErrNotLeader and the
+// caller retries via the routing table.
+func (n *Node) handleForwardOp(op network.OpKind, payload []byte) ([]byte, error) {
 	if n.quiesced.Load() {
-		// Quiesced: reply with an error so the follower retries later.
-		resp := &pb.Message{
-			Type:    msgForwardRespType(),
-			From:    &n.cfg.NodeID,
-			To:      msg.From,
-			Context: msg.Context,
-			Entries: []*pb.Entry{{Data: []byte(ErrQuiesced.Error())}},
-		}
-		_ = n.transport.SendTo(n.cfg.GroupID, resp)
-		return
+		// Quiesced: reply with an error so the follower retries later. The
+		// response is framed as an error by the pipeline.
+		return nil, ErrQuiesced
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	var applyErr error
-	if len(msg.Entries) == 1 {
-		applyErr = n.ProposeAndWait(ctx, msg.Entries[0].Data)
-	} else if len(msg.Entries) > 1 {
-		chain := make([][]byte, len(msg.Entries))
-		for i, e := range msg.Entries {
-			chain[i] = e.Data
+	switch op {
+	case network.OpForwardChunks:
+		chain, err := decodeChunks(payload)
+		if err != nil {
+			return nil, err
 		}
-		applyErr = n.ProposeChunked(ctx, chain)
+		return nil, n.ProposeChunked(ctx, chain)
+	default:
+		return nil, n.ProposeAndWait(ctx, payload)
 	}
-	var respData []byte
-	if applyErr != nil {
-		respData = []byte(applyErr.Error())
+}
+
+// encodeChunks serializes a chunk chain into a single payload for the pipeline.
+// Layout: [4B count][per chunk: 4B length][data].
+func encodeChunks(chunks [][]byte) []byte {
+	out := make([]byte, 4)
+	binary.BigEndian.PutUint32(out, uint32(len(chunks)))
+	for _, c := range chunks {
+		out = binary.BigEndian.AppendUint32(out, uint32(len(c)))
+		out = append(out, c...)
 	}
-	resp := &pb.Message{
-		Type:    msgForwardRespType(),
-		From:    &n.cfg.NodeID,
-		To:      msg.From,
-		Context: msg.Context,
-		Entries: []*pb.Entry{{Data: respData}},
+	return out
+}
+
+// decodeChunks parses a chunk chain payload produced by encodeChunks.
+func decodeChunks(payload []byte) ([][]byte, error) {
+	if len(payload) < 4 {
+		return nil, errors.New("cluster node: malformed chunk chain payload")
 	}
-	_ = n.transport.SendTo(n.cfg.GroupID, resp)
+	count := int(binary.BigEndian.Uint32(payload))
+	if count < 0 || count > 64*1024 {
+		return nil, errors.New("cluster node: implausible chunk count")
+	}
+	chain := make([][]byte, 0, count)
+	off := 4
+	for i := 0; i < count; i++ {
+		if len(payload)-off < 4 {
+			return nil, errors.New("cluster node: malformed chunk chain payload")
+		}
+		l := int(binary.BigEndian.Uint32(payload[off:]))
+		off += 4
+		if l < 0 || len(payload)-off < l {
+			return nil, errors.New("cluster node: malformed chunk chain payload")
+		}
+		c := make([]byte, l)
+		copy(c, payload[off:off+l])
+		chain = append(chain, c)
+		off += l
+	}
+	return chain, nil
 }
 
 // uint64ToBytes / bytesToUint64 encode a correlation id for the wire.
@@ -587,19 +548,6 @@ func bytesToUint64(b []byte) uint64 {
 		return 0
 	}
 	return binary.BigEndian.Uint64(b)
-}
-
-// msgForwardType / msgForwardRespType return pointers to the application-level
-// message types for use in raftpb.Message struct literals (which take pointer
-// fields).
-func msgForwardType() *pb.MessageType {
-	t := msgForwardWrite
-	return &t
-}
-
-func msgForwardRespType() *pb.MessageType {
-	t := msgForwardResp
-	return &t
 }
 
 // tickLoop advances the raft node's logical clock at the configured interval.

@@ -142,6 +142,12 @@ type ClusterMetrics interface {
 	ClusterBytesSent() int64
 	ClusterMessagesRecv() int64
 	ClusterFramesRecv() int64
+	// Pipeline (Phase 5 app-level request/response layer) counters. Transports
+	// without a pipeline report all zeros.
+	ClusterPipeRequests() int64
+	ClusterPipeResponses() int64
+	ClusterPipeTimeouts() int64
+	ClusterPipeReconnects() int64
 }
 
 // TLSMetrics exposes process-level certificate rotation state without coupling
@@ -237,6 +243,10 @@ func (ac *AggregateCollector) WritePrometheus(w io.Writer) {
 		writeRaw("tellstone_cluster_bytes_sent_total", "counter", "Bytes written to peer connections.", uint64(ac.clusterMetrics.ClusterBytesSent()))
 		writeRaw("tellstone_cluster_messages_recv_total", "counter", "Raft messages received from peers.", uint64(ac.clusterMetrics.ClusterMessagesRecv()))
 		writeRaw("tellstone_cluster_frames_recv_total", "counter", "TCP frames received from peers.", uint64(ac.clusterMetrics.ClusterFramesRecv()))
+		writeRaw("tellstone_cluster_pipe_requests_total", "counter", "App-level requests sent to peers over the pipeline.", uint64(ac.clusterMetrics.ClusterPipeRequests()))
+		writeRaw("tellstone_cluster_pipe_responses_total", "counter", "App-level responses sent to peers over the pipeline.", uint64(ac.clusterMetrics.ClusterPipeResponses()))
+		writeRaw("tellstone_cluster_pipe_timeouts_total", "counter", "Pipeline requests that timed out before a response.", uint64(ac.clusterMetrics.ClusterPipeTimeouts()))
+		writeRaw("tellstone_cluster_pipe_reconnects_total", "counter", "Peer connections dropped by the pipeline keepalive.", uint64(ac.clusterMetrics.ClusterPipeReconnects()))
 	}
 }
 
