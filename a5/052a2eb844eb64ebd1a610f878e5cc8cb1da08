@@ -1,0 +1,30 @@
+internal/cluster/network/pipeline_integration_test.go
+  s_5f1eeba6c7a318::t_d6e419b09ceca2 17-18,26-29
+  s_5f1eeba6c7a318::t_c702bab05122d5 91,98-102
+  s_5f1eeba6c7a318::t_c9ee3458c9b7e2 30
+internal/cluster/network/transport.go
+  s_5f1eeba6c7a318::t_71e51f5e698c07 205-208,210,213-214,216
+  s_5f1eeba6c7a318::t_7391d2cbf04099 256-259,263-264,266-274
+  s_5f1eeba6c7a318::t_bcf45db770e373 342-344,346
+  s_5f1eeba6c7a318::t_faeae3d4497894 559-563,565
+internal/cluster/network/pipeline.go
+  s_5f1eeba6c7a318::t_e46e3ae47e8961 405-412
+  s_5f1eeba6c7a318::t_e4d37bf68b991b 328-356,365-379
+  s_5f1eeba6c7a318::t_2ecf5c310165c9 289,293,295
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a5052a2eb844eb64ebd1a610f878e5cc8cb1da08",
+  "prompts": {},
+  "sessions": {
+    "s_5f1eeba6c7a318": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f5c5e25d4ffesRbpCCqLI76boV",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
