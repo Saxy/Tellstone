@@ -286,26 +286,13 @@ func (p *Pipeline) deliver(pm pipeMsg) {
 	case OpPing:
 		// Protocol-level: reply immediately without a handler.
 		p.stats.Responses.Add(1)
-		_ = p.transport.sendPipe(pm.from, pipeMsg{
-			kind:    OpPong,
-			reqID:   pm.reqID,
-			from:    p.nodeID,
-			gid:     pm.gid,
-			payload: encodePipeResp(nil, nil),
-		})
+		p.respond(pm, OpPong, encodePipeResp(nil, nil))
 	case OpForwardWrite, OpForwardChunks:
 		respPayload, aerr := p.handleForward(pm)
 		p.stats.Responses.Add(1)
-		_ = p.transport.sendPipe(pm.from, pipeMsg{
-			kind:    OpForwardResp,
-			reqID:   pm.reqID,
-			from:    p.nodeID,
-			gid:     pm.gid,
-			payload: encodePipeResp(respPayload, aerr),
-		})
+		p.respond(pm, OpForwardResp, encodePipeResp(respPayload, aerr))
 	case OpPong, OpForwardResp:
-		payload, rerr := decodePipeResp(pm.payload)
-		p.complete(pm.reqID, pipeResult{payload: payload, err: rerr})
+		p.completeInline(pm)
 	default:
 		if p.logger.Enabled(log.LevelWarn) {
 			p.logger.Log(log.LevelWarn, "cluster pipeline: dropping unknown inbound op",
@@ -338,6 +325,35 @@ func (p *Pipeline) complete(reqID uint64, res pipeResult) {
 	}
 }
 
+// completeInline finishes an inbound response without going through the
+// dispatch queue. decodePipeResp and complete are non-blocking, so it is safe
+// on the transport read loop and is used as the saturation fallback.
+func (p *Pipeline) completeInline(pm pipeMsg) {
+	payload, rerr := decodePipeResp(pm.payload)
+	p.complete(pm.reqID, pipeResult{payload: payload, err: rerr})
+}
+
+// respond queues a response frame to the peer that sent the request. sendPipe
+// is a bounded, non-blocking queue (a saturated pipeCh yields
+// errSendQueueFull), so response delivery never stalls the read loop or a
+// dispatch worker. Delivery failures are surfaced in the debug log; the peer's
+// pending Call then fails on its own context timeout and the follower retries.
+func (p *Pipeline) respond(pm pipeMsg, kind OpKind, respPayload []byte) {
+	if err := p.transport.sendPipe(pm.from, pipeMsg{
+		kind:    kind,
+		reqID:   pm.reqID,
+		from:    p.nodeID,
+		gid:     pm.gid,
+		payload: respPayload,
+	}); err != nil && p.logger.Enabled(log.LevelDebug) {
+		p.logger.Log(log.LevelDebug, "cluster pipeline: response delivery failed",
+			log.Uint64("req_id", pm.reqID),
+			log.Uint64("peer_id", pm.from),
+			log.String("error", err.Error()),
+		)
+	}
+}
+
 // reject answers a request it was not possible to enqueue, carrying the
 // overload error so the follower's Call fails fast and retries immediately
 // instead of waiting for a context timeout.
@@ -346,13 +362,21 @@ func (p *Pipeline) reject(pm pipeMsg, err error) {
 	if pm.kind == OpPing {
 		kind = OpPong
 	}
-	_ = p.transport.sendPipe(pm.from, pipeMsg{
-		kind:    kind,
-		reqID:   pm.reqID,
-		from:    p.nodeID,
-		gid:     pm.gid,
-		payload: encodePipeResp(nil, err),
-	})
+	p.respond(pm, kind, encodePipeResp(nil, err))
+}
+
+// onOverload handles a message the saturated dispatch queue could not accept.
+// Requests (ping, forwarded ops) get an explicit overload error so the follower
+// fails fast and retries; responses are completed inline so the pending Call
+// gets its result instead of waiting for a context expiry — never fabricating a
+// response for a response.
+func (p *Pipeline) onOverload(pm pipeMsg) {
+	switch pm.kind {
+	case OpPong, OpForwardResp:
+		p.completeInline(pm)
+	default:
+		p.reject(pm, errPipelineOverloaded)
+	}
 }
 
 // keepaliveLoop probes every registered peer periodically and drops the peer
@@ -378,6 +402,14 @@ func (p *Pipeline) keepaliveLoop() {
 				_, err := p.Call(ctx, id, 0, OpPing, nil)
 				cancel()
 				if err != nil {
+					// Queue-full and overload errors mean the peer is alive but
+					// busy — either our own pipe queue is saturated, or the peer
+					// explicitly rejected the ping with an overload response.
+					// Neither is a liveness miss, so neither counts toward
+					// dropping the connection.
+					if errors.Is(err, errSendQueueFull) || errors.Is(err, errPipelineOverloaded) {
+						continue
+					}
 					failures[id]++
 					if failures[id] >= keepaliveFailuresBeforeDrop {
 						if p.logger.Enabled(log.LevelWarn) {

@@ -202,11 +202,18 @@ func (t *Transport) Listen() error {
 // Stop shuts down the transport: stops all batch senders, closes the listener,
 // and waits for goroutines to exit.
 func (t *Transport) Stop() {
+	// Mark stopped and capture the pipeline under pipeMu so a concurrent
+	// Pipeline() cannot publish or start a fresh pipeline after shutdown has
+	// begun (and so the captured pipeline is the one Stop actually tears down).
+	t.pipeMu.Lock()
 	if t.stopped.Swap(true) {
+		t.pipeMu.Unlock()
 		return
 	}
+	p := t.pipe
+	t.pipeMu.Unlock()
 	close(t.stopCh)
-	if p := t.pipelined(); p != nil {
+	if p != nil {
 		p.Stop()
 	}
 	if t.listener != nil {
@@ -246,18 +253,25 @@ func (t *Transport) ConnectionCount() int {
 // Pipeline returns the process-level pipeline, creating it on first use. All
 // raft groups sharing this transport share the returned pipeline. The caller
 // provides its node ID and logger once; subsequent calls reuse the existing
-// pipeline.
+// pipeline. Creation is serialized with Stop under pipeMu so a pipeline is
+// never published or started after shutdown has begun; a late call after Stop
+// instead returns a pipeline already marked stopped (Call fails fast, no
+// workers are launched).
 func (t *Transport) Pipeline(nodeID uint64, logger log.Logger) *Pipeline {
-	if p := t.pipelined(); p != nil {
-		return p
-	}
 	t.pipeMu.Lock()
 	defer t.pipeMu.Unlock()
-	if t.pipe == nil {
-		t.pipe = NewPipeline(t, nodeID, logger)
-		t.pipe.Start()
+	if p := t.pipe; p != nil {
+		return p
 	}
-	return t.pipe
+	if t.stopped.Load() {
+		p := NewPipeline(t, nodeID, logger)
+		p.stopped.Store(true)
+		return p
+	}
+	p := NewPipeline(t, nodeID, logger)
+	t.pipe = p
+	p.Start()
+	return p
 }
 
 // pipelined returns the existing pipeline or nil when none was created yet.
@@ -325,8 +339,11 @@ func (t *Transport) sendPipe(peerID uint64, pm pipeMsg) error {
 	if err != nil {
 		return err
 	}
+	if err := bc.sendPipe(pm); err != nil {
+		return err
+	}
 	t.stats.PipeSent.Add(1)
-	return bc.sendPipe(pm)
+	return nil
 }
 
 // ClusterPipelineMetrics interface satisfaction — optional extension of
@@ -539,12 +556,13 @@ func (t *Transport) handlePipeFrame(payload []byte) error {
 	for _, pm := range msgs {
 		p.stats.RecvMsgs.Add(1)
 		if err := p.enqueue(pm); err != nil {
-			// Never stall the read loop: a saturated or stopped pipeline drops
-			// the message here. Requests still get an explicit error reply so
-			// the follower's Call fails fast and can retry; responses are
-			// dropped and time out on the caller's own context.
+			// Never stall the read loop: a saturated or stopped pipeline
+			// handles the message inline here — requests get an explicit
+			// overload error (follower fails fast and retries), responses are
+			// completed directly, and a shutdown drops it. Only a stopped
+			// pipeline (shutdown) is dropped silently.
 			if errors.Is(err, errPipelineOverloaded) {
-				p.reject(pm, err)
+				p.onOverload(pm)
 			}
 		}
 	}

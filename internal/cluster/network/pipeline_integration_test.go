@@ -14,12 +14,19 @@ package network
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
+
+// errTestHandlerRejected is the distinctive error the error-propagation test
+// makes its handler return, so the test can tell that the *handler's* error
+// crossed the transport (rather than, say, a connection failure).
+var errTestHandlerRejected = errors.New("test: handler explicitly rejected the forward")
 
 func mkPipePair(t *testing.T) (*Transport, *Transport) {
 	t.Helper()
@@ -81,15 +88,18 @@ func TestPipelineErrorResponse(t *testing.T) {
 		tr2.Stop()
 	})
 	tr2.Pipeline(2, logger).RegisterHandler(77, func(op OpKind, payload []byte) ([]byte, error) {
-		return nil, errConnectionClosed
+		return nil, errTestHandlerRejected
 	})
 	tr1.RegisterPeer(2, tr2.Addr())
 	tr2.RegisterPeer(1, tr1.Addr())
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_, err := tr1.Pipeline(1, logger).Call(ctx, 2, 77, OpForwardWrite, []byte("x"))
-	if err == nil {
-		t.Fatal("expected handler error to propagate")
+	// Handler errors travel as text in the framed response (decodePipeResp),
+	// so the plain sentinel identity no longer survives the wire — assert the
+	// returned error contains the distinctive message.
+	if err == nil || !strings.Contains(err.Error(), errTestHandlerRejected.Error()) {
+		t.Fatalf("expected handler error to propagate, got %v", err)
 	}
 }
 
