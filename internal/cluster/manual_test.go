@@ -8,14 +8,19 @@ sends binary protocol SET/GET/DEL through the leader to verify
 replication. TestManualPDTSO boots the same 3-node --cluster-mode cluster
 and proves the phase 2 Placement Driver + Timestamp Oracle is live by
 dialing each node's embedded etcd and asserting globally disjoint
-timestamp grants. Every step is logged in detail.
+timestamp grants. TestManualPipeline is the phase 5 proof: it drives
+concurrent forwarded writes against every node (each non-leader write is
+serialized as a pipeline request/response multiplexed over the shared
+per-peer TCP connection to the region leader), verifies read-anywhere
+replication, and reports end-to-end throughput. Every step is logged in
+detail.
 
 These tests are skipped unless explicitly requested via
 TELLSTONE_MANUAL_TEST=1, so plain go test runs (including CI) stay green.
 Execute with:
 
 	TELLSTONE_MANUAL_TEST=1 go test -v -count=1 \
-	    -run='TestManual|TestManualPDTSO' ./internal/cluster/ -timeout=120s
+	    -run='TestManual|TestManualPDTSO|TestManualPipeline' ./internal/cluster/ -timeout=180s
 
 Authors:
 
@@ -35,6 +40,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -537,14 +544,14 @@ func TestManualPDTSO(t *testing.T) {
 				cli.Close()
 				t.Fatalf("node %d: grant %d: %v", s.id, k, err)
 			}
-		if lo == 0 || hi < lo {
-			cli.Close()
-			t.Fatalf("node %d: grant %d returned bad range [%d,%d]", s.id, k, lo, hi)
-		}
-		if hi-lo+1 != 100 {
-			cli.Close()
-			t.Fatalf("node %d: grant %d returned bad size %d (want 100)", s.id, k, hi-lo+1)
-		}
+			if lo == 0 || hi < lo {
+				cli.Close()
+				t.Fatalf("node %d: grant %d returned bad range [%d,%d]", s.id, k, lo, hi)
+			}
+			if hi-lo+1 != 100 {
+				cli.Close()
+				t.Fatalf("node %d: grant %d returned bad size %d (want 100)", s.id, k, hi-lo+1)
+			}
 			t.Logf("  node %d granted [%d,%d] (%d timestamps)", s.id, lo, hi, hi-lo+1)
 			grants = append(grants, grant{node: uint64(s.id), lo: lo, hi: hi})
 		}
@@ -659,4 +666,172 @@ func TestManualRouting(t *testing.T) {
 	}
 
 	t.Log("=== MANUAL ROUTING TEST COMPLETE ===")
+}
+
+// TestManualPipeline is the manual end-to-end proof for phase 5 pipeline
+// streams. It boots a real 3-node --cluster-mode Tellstone cluster and drives
+// concurrent forwarded writes against every node: each non-leader node
+// serializes its SET as a pipeline request/response multiplexed over the
+// shared per-peer TCP connection to the region leader (mesh-X RAFT + pipeline
+// streams, request-ID mux on one connection), so the run exercises
+// concurrent in-flight pipeline calls, batch flushes, the per-peer
+// worker-pool dispatch, and per-request error delivery. The test verifies
+// every write replicated to all three replicas (read-anywhere, D1) and
+// reports end-to-end throughput (the count is printed for comparison against
+// the per-request gRPC baseline described in the phase 5 plan).
+//
+// Scale knobs (env):
+//
+//	TELLSTONE_PHASE5_OPS      total forwarded SETs            (default 2000)
+//	TELLSTONE_PHASE5_WORKERS  concurrent client connections   (default 32)
+//	TELLSTONE_PHASE5_VERIFY   GETs per node for D1 check      (default 200)
+//
+// Run with:
+//
+//	TELLSTONE_MANUAL_TEST=1 go test -v -count=1 \
+//	    -run=TestManualPipeline ./internal/cluster/ -timeout=180s
+func TestManualPipeline(t *testing.T) {
+	if testing.Short() {
+		t.Skip("manual cluster test requested only for non-short runs")
+	}
+	if os.Getenv("TELLSTONE_MANUAL_TEST") == "" {
+		t.Skip("manual cluster test: set TELLSTONE_MANUAL_TEST=1 to run")
+	}
+
+	ops := 2000
+	workers := 32
+	verify := 200
+	if v := os.Getenv("TELLSTONE_PHASE5_OPS"); v != "" {
+		if n, err := fmt.Sscanf(v, "%d", &ops); err != nil || n != 1 || ops <= 0 {
+			t.Fatalf("TELLSTONE_PHASE5_OPS=%q: want a positive integer", v)
+		}
+	}
+	if v := os.Getenv("TELLSTONE_PHASE5_WORKERS"); v != "" {
+		if n, err := fmt.Sscanf(v, "%d", &workers); err != nil || n != 1 || workers <= 0 {
+			t.Fatalf("TELLSTONE_PHASE5_WORKERS=%q: want a positive integer", v)
+		}
+	}
+	if v := os.Getenv("TELLSTONE_PHASE5_VERIFY"); v != "" {
+		if n, err := fmt.Sscanf(v, "%d", &verify); err != nil || n != 1 || verify <= 0 {
+			t.Fatalf("TELLSTONE_PHASE5_VERIFY=%q: want a positive integer", v)
+		}
+	}
+
+	t.Log("=== MANUAL PIPELINE (PHASE 5) TEST ===")
+	t.Logf("  plan: %d concurrent forwarded SETs, %d client connections, %d GETs/node", ops, workers, verify)
+	bin := manualBuild(t)
+	servers := manualStartCluster(t, 3, bin)
+	defer manualStopCluster(t, servers)
+	t.Log("Waiting for Raft election + region claim...")
+	time.Sleep(3 * time.Second)
+
+	// Phase 5D: drive concurrent pipelined forwarded writes against all nodes.
+	// Workers keep one connection per node open and reuse it across SETs so the
+	// pipeline's per-peer streams are genuinely multiplexed. A failed attempt
+	// drops and reopens the connection (stale responses can never be consumed
+	// by a later retry).
+	t.Log("Driving concurrent forwarded writes over the pipeline...")
+	jobs := make(chan int, ops)
+	for i := 0; i < ops; i++ {
+		jobs <- i
+	}
+	close(jobs)
+
+	var (
+		wg     sync.WaitGroup
+		done   atomic.Int64
+		failed atomic.Int64
+	)
+
+	start := time.Now()
+	wg.Add(workers)
+	for w := 0; w < workers; w++ {
+		go func(w int) {
+			defer wg.Done()
+			addr := fmt.Sprintf("127.0.0.1:%d", servers[w%len(servers)].binaryPort)
+			var conn net.Conn
+			for idx := range jobs {
+				key := fmt.Sprintf("phase5-%06d", idx)
+				val := fmt.Sprintf("v%d", idx)
+				for attempt := 0; ; attempt++ {
+					if attempt == 30 {
+						failed.Add(1)
+						t.Errorf("worker %d: SET %s never succeeded after 30 attempts", w, key)
+						conn = nil
+						break
+					}
+					if conn == nil {
+						c, err := connectTo(addr)
+						if err != nil {
+							time.Sleep(100 * time.Millisecond)
+							continue
+						}
+						conn = c
+					}
+					if _, err := binarySet(conn, key, val, 0); err != nil {
+						conn.Close()
+						conn = nil
+						time.Sleep(100 * time.Millisecond)
+						continue
+					}
+					break
+				}
+				done.Add(1)
+			}
+			if conn != nil {
+				conn.Close()
+			}
+		}(w)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	if failed.Load() > 0 {
+		t.Fatalf("%d forwarded SETs permanently failed", failed.Load())
+	}
+	if got := done.Load(); got != int64(ops) {
+		t.Fatalf("completed %d SETs, want %d", got, ops)
+	}
+	rate := float64(ops) / elapsed.Seconds()
+	t.Logf("  %d forwarded SETs in %s (%.0f ops/sec end-to-end)", ops, elapsed, rate)
+	t.Logf("  (compare against the per-request gRPC baseline in docs/MULTI-CLUSTER-PLAN.md phase 5)")
+
+	// D1: read-anywhere. Sample verify keys and GET each on all three nodes.
+	t.Log("Waiting for replication to propagate...")
+	time.Sleep(2 * time.Second)
+	stride := ops / verify
+	if stride < 1 {
+		stride = 1
+	}
+	checked := 0
+	for idx := 0; idx < ops && checked < verify; idx += stride {
+		key := fmt.Sprintf("phase5-%06d", idx)
+		want := fmt.Sprintf("v%d", idx)
+		for _, s := range servers {
+			addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
+			conn, err := connectTo(addr)
+			if err != nil {
+				t.Fatalf("connect node %d (%s): %v", s.id, addr, err)
+			}
+			val, msgType, err := binaryGet(conn, key)
+			if err != nil {
+				conn.Close()
+				t.Fatalf("node %d GET %s: %v", s.id, key, err)
+			}
+			if msgType == 0x07 {
+				conn.Close()
+				t.Fatalf("node %d GET %s: NOT_FOUND (want forwarded value)", s.id, key)
+			}
+			if val != want {
+				conn.Close()
+				t.Fatalf("node %d GET %s = %q, want %q", s.id, key, val, want)
+			}
+			conn.Close()
+			t.Logf("  node %d GET %s = %q (read-anywhere) OK", s.id, key, val)
+		}
+		// Count a key only after every node has returned it, so verify is a
+		// count of distinct keys (each checked on all nodes).
+		checked++
+	}
+	t.Log("=== MANUAL PIPELINE (PHASE 5) TEST COMPLETE ===")
 }

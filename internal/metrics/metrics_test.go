@@ -145,6 +145,10 @@ type fakeClusterMetrics struct {
 	bytesSent    int64
 	messagesRecv int64
 	framesRecv   int64
+	pipeRequests int64
+	pipeResps    int64
+	pipeTimeouts int64
+	pipeReconns  int64
 }
 
 func (m fakeClusterMetrics) ClusterMessagesSent() int64 { return m.messagesSent }
@@ -152,6 +156,14 @@ func (m fakeClusterMetrics) ClusterFramesSent() int64   { return m.framesSent }
 func (m fakeClusterMetrics) ClusterBytesSent() int64    { return m.bytesSent }
 func (m fakeClusterMetrics) ClusterMessagesRecv() int64 { return m.messagesRecv }
 func (m fakeClusterMetrics) ClusterFramesRecv() int64   { return m.framesRecv }
+func (m fakeClusterMetrics) ClusterPipeRequests() int64 { return m.pipeRequests }
+func (m fakeClusterMetrics) ClusterPipeResponses() int64 {
+	return m.pipeResps
+}
+func (m fakeClusterMetrics) ClusterPipeTimeouts() int64 { return m.pipeTimeouts }
+func (m fakeClusterMetrics) ClusterPipeReconnects() int64 {
+	return m.pipeReconns
+}
 
 func TestAggregateCollectorClusterMetrics(t *testing.T) {
 	collector := NewAggregateCollector(nil, nil, nil, nil, fakeClusterMetrics{
@@ -160,6 +172,9 @@ func TestAggregateCollectorClusterMetrics(t *testing.T) {
 		bytesSent:    2048,
 		messagesRecv: 95,
 		framesRecv:   9,
+		pipeRequests: 7,
+		pipeResps:    7,
+		pipeTimeouts: 1,
 	})
 	var output bytes.Buffer
 	collector.WritePrometheus(&output)
@@ -170,6 +185,10 @@ func TestAggregateCollectorClusterMetrics(t *testing.T) {
 		"tellstone_cluster_bytes_sent_total 2048",
 		"tellstone_cluster_messages_recv_total 95",
 		"tellstone_cluster_frames_recv_total 9",
+		"tellstone_cluster_pipe_requests_total 7",
+		"tellstone_cluster_pipe_responses_total 7",
+		"tellstone_cluster_pipe_timeouts_total 1",
+		"tellstone_cluster_pipe_reconnects_total 0",
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing cluster metric %q in output:\n%s", want, got)
