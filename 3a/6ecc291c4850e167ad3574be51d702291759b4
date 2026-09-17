@@ -1,0 +1,51 @@
+internal/cluster/geo.go
+  s_0c4de50d9ec3a2::t_c101aecf006030 356
+  s_0c4de50d9ec3a2::t_7ff14f9f5eb44b 108-114,123
+  s_0c4de50d9ec3a2::t_5dae86e45baa59 313-326
+  s_0c4de50d9ec3a2::t_b186a41b4c0aa7 28-29
+internal/cluster/node.go
+  s_0c4de50d9ec3a2::t_a08c1d507f2505 251-267
+  s_0c4de50d9ec3a2::t_70d44adefbcf7d 99-102
+  s_0c4de50d9ec3a2::t_a934f4ee1af1a6 146
+internal/cluster/region.go
+  s_0c4de50d9ec3a2::t_9e9f55d90874fa 290-295,298-306
+  s_0c4de50d9ec3a2::t_5ddd250c82c83f 414-415,417,419-420
+internal/cluster/split.go
+  s_0c4de50d9ec3a2::t_21a67b4ab64e5a 122,127
+  s_0c4de50d9ec3a2::t_c101aecf006030 57
+  s_0c4de50d9ec3a2::t_ea0d4d9ad6c260 25
+  s_0c4de50d9ec3a2::t_c9129e97daaa6c 58-60
+  s_0c4de50d9ec3a2::t_a6a04abf95e1fb 71-72,74,76
+internal/cluster/geo_test.go
+  s_0c4de50d9ec3a2::t_97b6d4273ecca9 153-156
+  s_0c4de50d9ec3a2::t_c101aecf006030 312
+  s_0c4de50d9ec3a2::t_be12eaddbd8eae 138-141
+internal/cluster/routing.go
+  s_0c4de50d9ec3a2::t_73045a68026220 50-56
+server/server.go
+  s_0c4de50d9ec3a2::t_2618ccefcb6f3a 197-205
+internal/cluster/geo_manager.go
+  s_0c4de50d9ec3a2::t_e420362a83317c 240
+  s_0c4de50d9ec3a2::t_a60acc6304d212 65-68,70-99
+  s_0c4de50d9ec3a2::t_6ddc3b1760cd9f 187-189,192,195,201-207,210
+  s_0c4de50d9ec3a2::t_c101aecf006030 309
+  s_0c4de50d9ec3a2::t_878ad72ff43cb9 105-108,110-112,114-119,123-126,129-131,134-137
+server/region_coordinator.go
+  s_0c4de50d9ec3a2::t_da398217a5e2f1 172-174,177,179-191
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3a6ecc291c4850e167ad3574be51d702291759b4",
+  "prompts": {},
+  "sessions": {
+    "s_0c4de50d9ec3a2": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f514db508ffeniRQs06UL2cjoQ",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
