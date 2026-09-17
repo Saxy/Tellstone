@@ -1,0 +1,20 @@
+internal/cluster/geo_manager.go
+  s_f5d6d563da84c0::t_f00fdee3f032b1 131-136,140,150,157
+  s_f5d6d563da84c0::t_5138339e290c87 175,183-187,219-220
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c1dcc68bb18120fc69f35d7308fa632086ce1f9b",
+  "prompts": {},
+  "sessions": {
+    "s_f5d6d563da84c0": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f573805baffeml1OitRlFd4QS4",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
