@@ -27,6 +27,13 @@ type RegionRoute struct {
 	EndKey   []byte
 	Leader   uint64 // node ID of the current region leader
 	Epoch    uint64
+	// Peers are the region's Raft member node IDs, used for zone-aware read
+	// routing (prefer a same-zone replica) and diagnostics.
+	Peers []uint64
+	// PreferredZone is the region's geo-pinned zone (empty = none, "*" =
+	// global). Used by zone-aware read routing to prefer leader/replicas in
+	// the client's zone (Phase 6).
+	PreferredZone string
 }
 
 // RoutingTable is a concurrency-safe, node-local cache of region metadata.
@@ -39,6 +46,31 @@ type RoutingTable struct {
 
 // NewRoutingTable returns an empty routing table.
 func NewRoutingTable() *RoutingTable { return &RoutingTable{} }
+
+// FindInZone returns the route covering key, preferring a route whose leader
+// sits in clientZone when the region is zone-pinned. With no pinning or an
+// unknown client zone it behaves exactly like Find. This lets a node route a
+// read to the leader closest to the client that issued it (Phase 6, ADR-006
+// §Read Routing).
+func (rt *RoutingTable) FindInZone(key []byte, clientZone string, zones *NodeZones) *RegionRoute {
+	route := rt.Find(key)
+	if route == nil || clientZone == "" || zones == nil {
+		return route
+	}
+	if route.PreferredZone != "" && route.PreferredZone != GeoZoneGlobal &&
+		ZoneOf(zones, route.Leader) != clientZone {
+		// The current leader is in the wrong zone for this client. Prefer a
+		// same-zone member of the same region.
+		for _, peer := range route.Peers {
+			if ZoneOf(zones, peer) == clientZone {
+				cp := *route
+				cp.Leader = peer
+				return &cp
+			}
+		}
+	}
+	return route
+}
 
 // Find returns the route whose [StartKey, EndKey) contains key. An empty
 // StartKey matches negative infinity; an empty EndKey matches positive
@@ -96,10 +128,12 @@ func (rt *RoutingTable) Snapshot() []RegionRoute {
 
 func regionRouteOf(m Region) RegionRoute {
 	return RegionRoute{
-		ID:       m.ID,
-		StartKey: m.StartKey,
-		EndKey:   m.EndKey,
-		Leader:   m.Leader,
-		Epoch:    m.Epoch,
+		ID:            m.ID,
+		StartKey:      m.StartKey,
+		EndKey:        m.EndKey,
+		Leader:        m.Leader,
+		Epoch:         m.Epoch,
+		Peers:         m.Peers,
+		PreferredZone: m.PreferredZone,
 	}
 }

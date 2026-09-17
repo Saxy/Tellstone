@@ -54,12 +54,19 @@ type SplitResult struct {
 // and the local transport (new raft group registration).
 type SplitCoordinator struct {
 	mgr    *RegionManager
+	geo    GeoPolicyProvider // optional; nil falls back to the default policy
 	logger log.Logger
 }
 
 // NewSplitCoordinator wraps a region manager.
 func NewSplitCoordinator(mgr *RegionManager, logger log.Logger) *SplitCoordinator {
 	return &SplitCoordinator{mgr: mgr, logger: logger}
+}
+
+// SetGeoPolicyProvider wires the coordinator to a geo policy source so new
+// regions get a PreferredZone pinned by the operator rules (Phase 6).
+func (sc *SplitCoordinator) SetGeoPolicyProvider(g GeoPolicyProvider) {
+	sc.geo = g
 }
 
 // Split executes a region split. It:
@@ -105,13 +112,18 @@ func (sc *SplitCoordinator) Split(ctx context.Context, req SplitRequest) (*Split
 	}
 
 	// 4. Create right region [splitKey, endKey) in etcd.
+	policy := DefaultGeoPolicy()
+	if sc.geo != nil {
+		policy = sc.geo.Policy()
+	}
 	right := Region{
-		ID:       newID,
-		StartKey: splitKey,
-		EndKey:   cur.EndKey,
-		Peers:    cur.Peers,
-		Leader:   0, // claimed by the new raft group after bootstrap
-		Epoch:    cur.Epoch + 1,
+		ID:            newID,
+		StartKey:      splitKey,
+		EndKey:        cur.EndKey,
+		Peers:         cur.Peers,
+		Leader:        0, // claimed by the new raft group after bootstrap
+		Epoch:         cur.Epoch + 1,
+		PreferredZone: PreferredZoneOf(policy, splitKey),
 	}
 	if regionExceedsWireLimit(right) {
 		return nil, fmt.Errorf("split: right region exceeds wire limit")
@@ -131,12 +143,13 @@ func (sc *SplitCoordinator) Split(ctx context.Context, req SplitRequest) (*Split
 	// a stale routing entry from the old single-region cannot roll back the
 	// split (RoutingTable drops lower-or-equal epochs).
 	left := Region{
-		ID:       cur.ID,
-		StartKey: cur.StartKey,
-		EndKey:   splitKey,
-		Peers:    cur.Peers,
-		Leader:   cur.Leader,
-		Epoch:    cur.Epoch + 2,
+		ID:            cur.ID,
+		StartKey:      cur.StartKey,
+		EndKey:        splitKey,
+		Peers:         cur.Peers,
+		Leader:        cur.Leader,
+		Epoch:         cur.Epoch + 2,
+		PreferredZone: PreferredZoneOf(policy, cur.StartKey),
 	}
 	if regionExceedsWireLimit(left) {
 		return nil, fmt.Errorf("split: left region exceeds wire limit")

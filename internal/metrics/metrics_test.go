@@ -42,7 +42,7 @@ func (m fakeRBACMetrics) DeniedCommands() uint64               { return m.denied
 func (m fakeRBACMetrics) RoleCommandCounts() map[string]uint64 { return m.roleCounts }
 
 func TestAggregateCollectorTLSMetrics(t *testing.T) {
-	collector := NewAggregateCollector(nil, nil, fakeTLSMetrics{reloads: 2, errors: 1, expiry: 1234}, nil, nil)
+	collector := NewAggregateCollector(nil, nil, fakeTLSMetrics{reloads: 2, errors: 1, expiry: 1234}, nil, nil, nil)
 	var output bytes.Buffer
 	collector.WritePrometheus(&output)
 	got := output.String()
@@ -57,7 +57,7 @@ func TestAggregateCollectorTLSMetrics(t *testing.T) {
 	}
 
 	output.Reset()
-	NewAggregateCollector(nil, nil, nil, nil, nil).WritePrometheus(&output)
+	NewAggregateCollector(nil, nil, nil, nil, nil, nil).WritePrometheus(&output)
 	if strings.Contains(output.String(), "tellstone_tls_") {
 		t.Fatalf("TLS metrics must be omitted when rotation is disabled:\n%s", output.String())
 	}
@@ -68,7 +68,7 @@ func TestAggregateCollectorRBACMetrics(t *testing.T) {
 		authFailures:   3,
 		deniedCommands: 7,
 		roleCounts:     map[string]uint64{"admin": 10, "readonly": 2},
-	}, nil)
+	}, nil, nil)
 	var output bytes.Buffer
 	collector.WritePrometheus(&output)
 	got := output.String()
@@ -94,7 +94,7 @@ func TestAggregateCollectorRBACMetrics(t *testing.T) {
 	}
 
 	output.Reset()
-	NewAggregateCollector(nil, nil, nil, nil, nil).WritePrometheus(&output)
+	NewAggregateCollector(nil, nil, nil, nil, nil, nil).WritePrometheus(&output)
 	if strings.Contains(output.String(), "tellstone_rbac_") {
 		t.Fatalf("RBAC metrics must be omitted when RBAC is disabled:\n%s", output.String())
 	}
@@ -175,7 +175,7 @@ func TestAggregateCollectorClusterMetrics(t *testing.T) {
 		pipeRequests: 7,
 		pipeResps:    7,
 		pipeTimeouts: 1,
-	})
+	}, nil)
 	var output bytes.Buffer
 	collector.WritePrometheus(&output)
 	got := output.String()
@@ -196,7 +196,7 @@ func TestAggregateCollectorClusterMetrics(t *testing.T) {
 	}
 
 	output.Reset()
-	NewAggregateCollector(nil, nil, nil, nil, nil).WritePrometheus(&output)
+	NewAggregateCollector(nil, nil, nil, nil, nil, nil).WritePrometheus(&output)
 	if strings.Contains(output.String(), "tellstone_cluster_") {
 		t.Fatalf("cluster metrics must be omitted when cluster mode is disabled:\n%s", output.String())
 	}

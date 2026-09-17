@@ -158,6 +158,15 @@ type TLSMetrics interface {
 	CertificateExpirySeconds() int64
 }
 
+// GeoForwardMetrics exposes Phase 6 geo write-forward rate and latency
+// without coupling the metrics package to the concrete cluster store. The
+// store satisfies this structurally; nodes without geo routing report zeros.
+type GeoForwardMetrics interface {
+	GeoCrossZoneForwards() uint64
+	GeoCrossZoneForwardLatencyNanosTotal() uint64
+	GeoSameZoneForwards() uint64
+}
+
 // RBACMetrics exposes authorization counters without coupling the metrics
 // package to the concrete policy store — mirrors TLSMetrics above. The role
 // counts map allocates at scrape time, never on the request path.
@@ -168,20 +177,22 @@ type RBACMetrics interface {
 }
 
 type AggregateCollector struct {
-	shardCollectors []*Collector
-	networkServer   *network.Server
-	tlsMetrics      TLSMetrics
-	rbacMetrics     RBACMetrics
-	clusterMetrics  ClusterMetrics
+	shardCollectors  []*Collector
+	networkServer    *network.Server
+	tlsMetrics       TLSMetrics
+	rbacMetrics      RBACMetrics
+	clusterMetrics   ClusterMetrics
+	geoForwardMetrics GeoForwardMetrics
 }
 
-func NewAggregateCollector(shardCollectors []*Collector, netSrv *network.Server, tlsMetrics TLSMetrics, rbacMetrics RBACMetrics, clusterMetrics ClusterMetrics) *AggregateCollector {
+func NewAggregateCollector(shardCollectors []*Collector, netSrv *network.Server, tlsMetrics TLSMetrics, rbacMetrics RBACMetrics, clusterMetrics ClusterMetrics, geoForwardMetrics GeoForwardMetrics) *AggregateCollector {
 	return &AggregateCollector{
-		shardCollectors: shardCollectors,
-		networkServer:   netSrv,
-		tlsMetrics:      tlsMetrics,
-		rbacMetrics:     rbacMetrics,
-		clusterMetrics:  clusterMetrics,
+		shardCollectors:   shardCollectors,
+		networkServer:     netSrv,
+		tlsMetrics:        tlsMetrics,
+		rbacMetrics:       rbacMetrics,
+		clusterMetrics:    clusterMetrics,
+		geoForwardMetrics: geoForwardMetrics,
 	}
 }
 
@@ -247,6 +258,15 @@ func (ac *AggregateCollector) WritePrometheus(w io.Writer) {
 		writeRaw("tellstone_cluster_pipe_responses_total", "counter", "App-level responses sent to peers over the pipeline.", uint64(ac.clusterMetrics.ClusterPipeResponses()))
 		writeRaw("tellstone_cluster_pipe_timeouts_total", "counter", "Pipeline requests that timed out before a response.", uint64(ac.clusterMetrics.ClusterPipeTimeouts()))
 		writeRaw("tellstone_cluster_pipe_reconnects_total", "counter", "Peer connections dropped by the pipeline keepalive.", uint64(ac.clusterMetrics.ClusterPipeReconnects()))
+	}
+	if ac.geoForwardMetrics != nil {
+		cc := ac.geoForwardMetrics.GeoCrossZoneForwards()
+		writeRaw("tellstone_geo_cross_zone_forwards_total", "counter", "Writes forwarded to a region leader in a different zone.", cc)
+		if cc > 0 {
+			avgNs := ac.geoForwardMetrics.GeoCrossZoneForwardLatencyNanosTotal() / cc
+			writeRaw("tellstone_geo_cross_zone_forward_latency_avg_ns", "gauge", "Average latency of cross-zone write forwards (ns).", avgNs)
+		}
+		writeRaw("tellstone_geo_same_zone_forwards_total", "counter", "Writes forwarded to a region leader in the same zone.", ac.geoForwardMetrics.GeoSameZoneForwards())
 	}
 }
 

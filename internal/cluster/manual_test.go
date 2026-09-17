@@ -61,6 +61,7 @@ type manualServer struct {
 	binaryPort int // RESP port
 	raftPort   int // Raft transport port
 	dataDir    string
+	zone       string // geo availability zone ("" = unset, Phase 6)
 	started    bool
 }
 
@@ -139,6 +140,9 @@ func manualStartCluster(t *testing.T, n int, bin string) []*manualServer {
 			"--pd-members", pdStr,
 			"--addr", fmt.Sprintf("127.0.0.1:%d", s.binaryPort),
 			"--log-level", "info",
+		}
+		if s.zone != "" {
+			args = append(args, "--zone", s.zone)
 		}
 
 		cmd := exec.Command(bin, args...)
@@ -834,4 +838,305 @@ func TestManualPipeline(t *testing.T) {
 		checked++
 	}
 	t.Log("=== MANUAL PIPELINE (PHASE 5) TEST COMPLETE ===")
+}
+
+// GEO_SENTINEL_4242 marker
+
+// TestManualGeoRouting is the manual end-to-end proof for Phase 6 geo routing.
+// It boots a real 3-node --cluster-mode Tellstone cluster, each node in a
+// distinct availability zone, pushes an operator geo policy into the embedded
+// PD etcd, and asserts:
+//
+//  1. Zone registration: every node's /tellstone/nodes/<id> entry carries
+//     the zone passed via --zone.
+//
+//  2. Policy convergence: the policy stored at /tellstone/geo/rules matches
+//     the expected rules and PreferredZoneOf resolves the right zones.
+//
+//  3. Read-anywhere: a SET on every node followed by a GET on every node
+//     succeeds across all three zones after geo routing is active.
+//
+// Run with:
+//
+//	TELLSTONE_MANUAL_TEST=1 go test -v -count=1 \
+//	    -run=TestManualGeoRouting ./internal/cluster/ -timeout=180s
+func TestManualGeoRouting(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping manual test in short mode")
+	}
+	if os.Getenv("TELLSTONE_MANUAL_TEST") == "" {
+		t.Skip("manual geo routing test only runs with TELLSTONE_MANUAL_TEST=1")
+	}
+
+	t.Log("=== MANUAL GEO ROUTING (PHASE 6) TEST ===")
+	bin := manualBuild(t)
+
+	zones := []string{"us-east-1", "eu-west-1", "ap-southeast-1"}
+	servers := manualStartZonedCluster(t, 3, bin, zones)
+	defer manualStopCluster(t, servers)
+
+	// Wait for leader election + geo registration + region bootstrap.
+	t.Log("Waiting for leader election + geo registration...")
+	time.Sleep(5 * time.Second)
+
+	// --- Step 1: verify zone registration in the embedded PD etcd ---
+	t.Log("")
+	t.Log("=== STEP 1: ZONE REGISTRATION ===")
+	leaderIdx := -1
+	for i, s := range servers {
+		pdAddr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort+10000)
+		cli, err := clientv3.New(clientv3.Config{
+			Endpoints:   []string{pdAddr},
+			DialTimeout: 5 * time.Second,
+		})
+		if err != nil {
+			t.Logf("  node %d: dial PD at %s: %v (may still be starting)", s.id, pdAddr, err)
+			continue
+		}
+		// Check that this node has registered its zone.
+		resp, err := cli.Get(context.Background(), NodesKeyPrefix(), clientv3.WithPrefix())
+		cli.Close()
+		if err != nil {
+			t.Logf("  node %d: get nodes: %v", s.id, err)
+			continue
+		}
+		if resp.Count == 0 {
+			t.Logf("  node %d: no nodes registered yet", s.id)
+			continue
+		}
+		t.Logf("  node %d PD has %d node registrations:", s.id, resp.Count)
+		registeredZones := make(map[string]int)
+		for _, kv := range resp.Kvs {
+			info, ok := decodeNodeInfo(kv.Value)
+			if !ok {
+				t.Errorf("  node %d: corrupt NodeInfo at %s", s.id, string(kv.Key))
+				continue
+			}
+			t.Logf("    %s → zone=%s addr=%s", string(kv.Key), info.Zone, info.Addr)
+			registeredZones[info.Zone]++
+		}
+		for _, z := range zones {
+			if registeredZones[z] == 0 {
+				t.Errorf("  node %d: zone %q not registered (got zones: %v)", s.id, z, registeredZones)
+			}
+		}
+		if leaderIdx == -1 {
+			leaderIdx = i
+		}
+	}
+	if leaderIdx == -1 {
+		t.Fatal("no PD client responded; cannot continue")
+	}
+	t.Logf("  zone registration: PASS (all %d zones present)", len(zones))
+
+	// --- Step 2: push a geo policy and verify convergence ---
+	t.Log("")
+	t.Log("=== STEP 2: GEO POLICY ===")
+	pdAddr := fmt.Sprintf("127.0.0.1:%d", servers[leaderIdx].binaryPort+10000)
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{pdAddr},
+		DialTimeout: 5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("dial PD at %s: %v", pdAddr, err)
+	}
+	defer cli.Close()
+
+	policy := GeoPolicy{Rules: []GeoRule{
+		{Prefix: "user:eu:", Zone: "eu-west-1", Replicas: 3},
+		{Prefix: "user:us:", Zone: "us-east-1", Replicas: 3},
+		{Prefix: "", Zone: GeoZoneGlobal, Replicas: 3},
+	}}
+	if err := SetGeoPolicy(context.Background(), cli, policy); err != nil {
+		t.Fatalf("SetGeoPolicy: %v", err)
+	}
+
+	// Verify by reading it back.
+	got, err := GetGeoPolicy(context.Background(), cli)
+	if err != nil {
+		t.Fatalf("GetGeoPolicy: %v", err)
+	}
+	if len(got.Rules) != 3 {
+		t.Fatalf("policy rules = %d, want 3", len(got.Rules))
+	}
+	t.Logf("  policy stored with %d rules (version %d)", len(got.Rules), got.Version)
+
+	// Verify PreferredZoneOf for each prefix.
+	type zoneTest struct {
+		key  string
+		want string
+	}
+	for _, zt := range []zoneTest{
+		{"user:eu:alice", "eu-west-1"},
+		{"user:us:bob", "us-east-1"},
+		{"global:data", GeoZoneGlobal},
+	} {
+		got := PreferredZoneOf(got, []byte(zt.key))
+		if got != zt.want {
+			t.Errorf("  PreferredZoneOf(%q) = %q, want %q", zt.key, got, zt.want)
+		}
+		t.Logf("  PreferredZoneOf(%q) = %q ✓", zt.key, got)
+	}
+	t.Log("  geo policy: PASS")
+
+	// --- Step 3: read-anywhere with zone routing active ---
+	t.Log("")
+	t.Log("=== STEP 3: READ-ANYWHERE (zone-pinned keys) ===")
+	type writeOp struct {
+		key   string
+		value string
+	}
+	writes := []writeOp{
+		{"user:eu:alice", "eu-data-1"},
+		{"user:us:bob", "us-data-1"},
+		{"global:shared", "shared-data"},
+	}
+
+	// Find leader for writes.
+	var leaderConn net.Conn
+	for i, s := range servers {
+		addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
+		conn, err := connectTo(addr)
+		if err != nil {
+			t.Logf("  connect node %d: %v", s.id, err)
+			continue
+		}
+		_, err = binarySet(conn, "__geo_probe__", "1", 0)
+		if err == nil {
+			t.Logf("  node %d is leader", s.id)
+			leaderIdx = i
+			leaderConn = conn
+			break
+		}
+		conn.Close()
+	}
+	if leaderConn == nil {
+		t.Fatal("no leader found for writes")
+	}
+
+	// Write through the leader.
+	for _, w := range writes {
+		resp, err := binarySet(leaderConn, w.key, w.value, 0)
+		if err != nil {
+			t.Fatalf("SET %s failed: %v", w.key, err)
+		}
+		t.Logf("  SET %s = %q → %s", w.key, w.value, resp)
+	}
+	leaderConn.Close()
+
+	t.Log("  waiting for replication...")
+	time.Sleep(2 * time.Second)
+
+	// Read from ALL nodes (read-anywhere via the zone-aware GET path).
+	for _, s := range servers {
+		addr := fmt.Sprintf("127.0.0.1:%d", s.binaryPort)
+		conn, err := connectTo(addr)
+		if err != nil {
+			t.Errorf("  node %d: connect failed: %v", s.id, err)
+			continue
+		}
+		for _, w := range writes {
+			val, msgType, err := binaryGet(conn, w.key)
+			if err != nil {
+				t.Errorf("  node %d GET %s: %v", s.id, w.key, err)
+				continue
+			}
+			if msgType == 0x07 {
+				t.Errorf("  node %d GET %s: NOT_FOUND", s.id, w.key)
+				continue
+			}
+			if val != w.value {
+				t.Errorf("  node %d GET %s = %q, want %q", s.id, w.key, val, w.value)
+				continue
+			}
+			t.Logf("  node %d GET %s = %q ✓", s.id, w.key, val)
+		}
+		conn.Close()
+	}
+
+	t.Log("")
+	t.Log("=== MANUAL GEO ROUTING (PHASE 6) TEST COMPLETE ===")
+}
+
+// manualStartZonedCluster starts n Tellstone processes with --cluster-mode,
+// assigning each a distinct availability zone from the provided slice.
+func manualStartZonedCluster(t *testing.T, n int, bin string, zones []string) []*manualServer {
+	t.Helper()
+
+	peers := make([]string, n)
+	pdMembers := make([]string, n)
+	servers := make([]*manualServer, n)
+
+	for i := 0; i < n; i++ {
+		servers[i] = &manualServer{
+			id:         i + 1,
+			binaryPort: manualBasePort + i*10,
+			raftPort:   manualBasePort + 9 + i*10,
+		}
+		if i < len(zones) {
+			servers[i].zone = zones[i]
+		}
+		peers[i] = fmt.Sprintf("%d@127.0.0.1:%d", i+1, servers[i].raftPort)
+		pdMembers[i] = fmt.Sprintf("%d@127.0.0.1:%d", i+1, servers[i].binaryPort)
+	}
+
+	peerStr := ""
+	for _, p := range peers {
+		if peerStr != "" {
+			peerStr += ","
+		}
+		peerStr += p
+	}
+	pdStr := ""
+	for _, p := range pdMembers {
+		if pdStr != "" {
+			pdStr += ","
+		}
+		pdStr += p
+	}
+
+	for _, s := range servers {
+		dir := filepath.Join(os.TempDir(), fmt.Sprintf("tellstone-geo-%d", s.id))
+		os.MkdirAll(dir, 0o755)
+		s.dataDir = dir
+
+		args := []string{
+			"--cluster-mode",
+			"--node-role", "hybrid",
+			"--node-id", fmt.Sprintf("%d", s.id),
+			"--peer-addr", fmt.Sprintf("127.0.0.1:%d", s.raftPort),
+			"--peers", peerStr,
+			"--pd-members", pdStr,
+			"--addr", fmt.Sprintf("127.0.0.1:%d", s.binaryPort),
+			"--log-level", "info",
+		}
+		if s.zone != "" {
+			args = append(args, "--zone", s.zone)
+		}
+
+		cmd := exec.Command(bin, args...)
+		cmd.Dir = dir
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+
+		stdoutPipe, _ := cmd.StdoutPipe()
+		stderrPipe, _ := cmd.StderrPipe()
+
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start node %d: %v", s.id, err)
+		}
+		s.cmd = cmd
+		s.started = true
+
+		go pipeToTestLog(t, fmt.Sprintf("geo%d-stdout", s.id), stdoutPipe)
+		go pipeToTestLog(t, fmt.Sprintf("geo%d-stderr", s.id), stderrPipe)
+
+		t.Logf("started node %d: zone=%s binary=127.0.0.1:%d raft=127.0.0.1:%d",
+			s.id, s.zone, s.binaryPort, s.raftPort)
+	}
+
+	t.Log("waiting for geo cluster to elect leader...")
+	time.Sleep(3 * time.Second)
+
+	return servers
 }

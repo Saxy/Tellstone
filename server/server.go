@@ -137,6 +137,13 @@ type Server struct {
 	// a shared transport) and runs auto-splits. Nil when --cluster-mode is
 	// disabled.
 	regionCoord *RegionCoordinator
+	// geoMgr is the Phase 6 geo registry (node zones + operator geo policy),
+	// kept converged via etcd Watch. Nil when --cluster-mode is disabled.
+	geoMgr *cluster.GeoManager
+	// geoCancel stops the GeoManager Run goroutine on shutdown.
+	geoCancel context.CancelFunc
+	// geoDone is closed once the GeoManager Run goroutine has returned.
+	geoDone chan struct{}
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -403,6 +410,14 @@ func (s *Server) shutdown(ctx context.Context) {
 	if s.regionDone != nil {
 		<-s.regionDone
 	}
+	// Stop the geo manager, which cancels its watches, before the PD node
+	// closes its etcd client.
+	if s.geoCancel != nil {
+		s.geoCancel()
+	}
+	if s.geoDone != nil {
+		<-s.geoDone
+	}
 	// Stop non-bootstrap region nodes before the bootstrap raft node, which
 	// owns the shared transport they use.
 	if s.regionCoord != nil {
@@ -603,7 +618,13 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 	if s.raftNode != nil {
 		clusterMetrics = s.raftNode.Transport()
 	}
-	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics, rbacMetrics, clusterMetrics)
+	// Phase 6: cross-zone write-forward rate/latency. Nil when geo routing is
+	// not active (single node or non-cluster mode).
+	var geoForwardMetrics metrics.GeoForwardMetrics
+	if cs, ok := s.store.(*clusterStore); ok {
+		geoForwardMetrics = cs
+	}
+	aggregateCollector := metrics.NewAggregateCollector(shardCollectors, srv, tlsMetrics, rbacMetrics, clusterMetrics, geoForwardMetrics)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -802,6 +823,13 @@ func (s *Server) initCluster() error {
 		s.pdNode.Stop()
 		return fmt.Errorf("bootstrap default region: %w", err)
 	}
+	// Bootstrap the default geo policy (everything global) so the operator
+	// policy key exists and every node converges the same way.
+	if _, err = cluster.BootstrapGeoPolicy(bootCtx, s.pdNode.Client()); err != nil {
+		s.raftNode.Stop()
+		s.pdNode.Stop()
+		return fmt.Errorf("bootstrap geo policy: %w", err)
+	}
 	rmCtx, rmCancel := context.WithCancel(context.Background())
 	s.regionMgr = rm
 	s.regionCancel = rmCancel
@@ -856,6 +884,47 @@ func (s *Server) initCluster() error {
 	// region (not just the bootstrap group).
 	rm.SetLeadershipProvider(coord.LeadershipProvider())
 	go coord.Run(rmCtx)
+
+	// Phase 6: geo-aware placement. Register this node's zone so the PD and
+	// peers can resolve it, then watch the node registry and geo policy so
+	// routing and placement stay converged without restarts.
+	s.geoMgr = cluster.NewGeoManager(s.pdNode.Client(), cfg.GetNodeID())
+	geoRegCtx, geoRegCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	if err := s.geoMgr.RegisterNode(geoRegCtx, cfg.GetZone(), cfg.GetAddr()); err != nil {
+		geoRegCancel()
+		coord.Stop()
+		s.raftNode.Stop()
+		s.pdNode.Stop()
+		return fmt.Errorf("register geo node: %w", err)
+	}
+	geoRegCancel()
+	geoCtx, geoCancel := context.WithCancel(context.Background())
+	s.geoCancel = geoCancel
+	s.geoDone = make(chan struct{})
+	go func() {
+		if gerr := s.geoMgr.Run(geoCtx); gerr != nil && logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "server: geo manager stopped",
+				log.String("error", gerr.Error()),
+			)
+		}
+		close(s.geoDone)
+	}()
+
+	// Phase 6 placement: pin region zones (and re-pin on policy changes) via
+	// the geo manager's live policy. RegionManager reconciles on its leader
+	// publication loop; the split coordinator pins zones at creation time.
+	rm.SetGeoPolicyProvider(s.geoMgr)
+	s.regionCoord.SetGeoPolicyProvider(s.geoMgr)
+	// Phase 6 leader preference: nodes out of a region's preferred zone get a
+	// longer raft election timeout so same-zone followers win elections.
+	s.regionCoord.SetZone(cfg.GetZone())
+	// Phase 6 read routing: route GETs through the zone-aware lookup so a
+	// client connected to this node is served by the owning region's member
+	// that sits in this zone (ADR-006 §Read Routing), when the region is
+	// zone-pinned. Falls back to plain Find when geo is not configured.
+	if cs, ok := s.store.(*clusterStore); ok {
+		cs.SetGeo(s.geoMgr, cfg.GetZone())
+	}
 
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "server: cluster mode enabled",
