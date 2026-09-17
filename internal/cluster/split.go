@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/log"
@@ -53,7 +54,10 @@ type SplitResult struct {
 // It runs on the Raft leader and coordinates via etcd (region metadata)
 // and the local transport (new raft group registration).
 type SplitCoordinator struct {
-	mgr    *RegionManager
+	mgr *RegionManager
+	// geoMu guards geo: it is set once during startup (SetGeoPolicyProvider)
+	// while Split (automatic or manual) may already be reading it.
+	geoMu  sync.RWMutex
 	geo    GeoPolicyProvider // optional; nil falls back to the default policy
 	logger log.Logger
 }
@@ -64,9 +68,12 @@ func NewSplitCoordinator(mgr *RegionManager, logger log.Logger) *SplitCoordinato
 }
 
 // SetGeoPolicyProvider wires the coordinator to a geo policy source so new
-// regions get a PreferredZone pinned by the operator rules (Phase 6).
+// regions get a PreferredZone pinned by the operator rules (Phase 6). Safe to
+// call concurrently with Split.
 func (sc *SplitCoordinator) SetGeoPolicyProvider(g GeoPolicyProvider) {
+	sc.geoMu.Lock()
 	sc.geo = g
+	sc.geoMu.Unlock()
 }
 
 // Split executes a region split. It:
@@ -112,10 +119,12 @@ func (sc *SplitCoordinator) Split(ctx context.Context, req SplitRequest) (*Split
 	}
 
 	// 4. Create right region [splitKey, endKey) in etcd.
+	sc.geoMu.RLock()
 	policy := DefaultGeoPolicy()
 	if sc.geo != nil {
 		policy = sc.geo.Policy()
 	}
+	sc.geoMu.RUnlock()
 	right := Region{
 		ID:            newID,
 		StartKey:      splitKey,

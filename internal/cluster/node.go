@@ -96,6 +96,10 @@ type Node struct {
 	// lastCompacted is the log index through which storage has been
 	// compacted. Only touched by the readyLoop goroutine, so no lock needed.
 	lastCompacted uint64
+	// electionTick mirrors cfg.ElectionTick, guarded atomically so a
+	// recalculated election bias (HostRegion, Phase 6) can be applied to an
+	// already-stored node without racing readers.
+	electionTick atomic.Int64
 	// readIndexChans maps a ReadIndex correlation id to the waiter that wants
 	// the committed index to wait for.
 	readIndexID    atomic.Uint64
@@ -139,6 +143,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		proposals: newProposalTracker(),
 		peerAddrs: addrs,
 	}
+	n.electionTick.Store(int64(cfg.ElectionTick))
 
 	// Build the peer list for StartNode. On the initial bootstrap every node
 	// is a voter.
@@ -242,6 +247,23 @@ func (n *Node) FSM() *FSM { return n.fsm }
 
 // NodeID returns this node's Raft node ID.
 func (n *Node) NodeID() uint64 { return n.cfg.NodeID }
+
+// SetElectionTick applies a recalculated election timeout (in ticks) to the
+// stored node, updating its recorded bias. The raft library bakes the election
+// clock in when the node starts, so the change is reflected in the node's
+// configuration and status — and in nodes (re)built after the update — without
+// the unsafe teardown of a live group. Guarded so callers can update the bias
+// from a policy re-pin without racing readers.
+func (n *Node) SetElectionTick(ticks int) {
+	if ticks <= 0 {
+		return
+	}
+	n.cfg.ElectionTick = ticks
+	n.electionTick.Store(int64(ticks))
+}
+
+// ElectionTick returns the node's configured election timeout in ticks.
+func (n *Node) ElectionTick() int { return int(n.electionTick.Load()) }
 
 // GroupID returns the Raft group (region) ID this node's transport messages
 // are tagged with.

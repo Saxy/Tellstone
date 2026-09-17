@@ -62,33 +62,78 @@ func GetGeoPolicy(ctx context.Context, cli *clientv3.Client) (GeoPolicy, error) 
 // SetGeoPolicy writes the operator policy to etcd, bumping its version so
 // every node's watcher converges on the new rules. The version is taken from
 // the current stored policy (or the default when none exists) plus one, so
-// concurrent writers cannot roll rules back.
+// concurrent writers cannot roll rules back. Version allocation and the write
+// happen in a read-modify-write transaction comparing the observed revision of
+// the policy key; when another writer lands first the compare fails and the
+// operation retries from the updated value, so no two writers reuse a version.
 func SetGeoPolicy(ctx context.Context, cli *clientv3.Client, p GeoPolicy) error {
-	cur, err := GetGeoPolicy(ctx, cli)
-	if err != nil {
-		return err
+	for {
+		resp, err := cli.Get(ctx, geoPolicyKey)
+		if err != nil {
+			return err
+		}
+		cur := DefaultGeoPolicy()
+		var modRev int64
+		if len(resp.Kvs) > 0 {
+			if decoded, ok := decodeGeoPolicy(resp.Kvs[0].Value); ok {
+				cur = decoded
+			}
+			modRev = resp.Kvs[0].ModRevision
+		}
+		p.Version = cur.Version + 1
+		enc, err := encodeGeoPolicy(p)
+		if err != nil {
+			return err
+		}
+		tresp, err := cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(geoPolicyKey), "=", modRev)).
+			Then(clientv3.OpPut(geoPolicyKey, string(enc))).
+			Commit()
+		if err != nil {
+			return err
+		}
+		if tresp.Succeeded {
+			return nil
+		}
+		// Another writer committed first; re-read and retry so the version
+		// keeps incrementing instead of being reused.
 	}
-	p.Version = cur.Version + 1
-	_, err = cli.Put(ctx, geoPolicyKey, string(encodeGeoPolicy(p)))
-	return err
 }
 
 // BootstrapGeoPolicy ensures a policy exists in etcd, creating the default
 // (everything global) when the key is absent. Safe to call concurrently from
-// every node; the first writer wins. Returns the effective policy.
+// every node; the first writer wins. Returns the effective policy. The
+// presence of the key is decided by a raw-key read, not by whether the stored
+// rules are non-empty: an existing policy with zero rules is preserved instead
+// of being mistaken for an absent key.
 func BootstrapGeoPolicy(ctx context.Context, cli *clientv3.Client) (GeoPolicy, error) {
-	// Fast path: a policy already exists.
-	if p, err := GetGeoPolicy(ctx, cli); err != nil {
+	// Existence check: a stored policy (even one with zero rules) is final.
+	resp, err := cli.Get(ctx, geoPolicyKey)
+	if err != nil {
 		return GeoPolicy{}, err
-	} else if len(p.Rules) > 0 {
+	}
+	if len(resp.Kvs) > 0 {
+		p, ok := decodeGeoPolicy(resp.Kvs[0].Value)
+		if !ok {
+			return GeoPolicy{}, fmt.Errorf("cluster: stored geo policy is corrupt")
+		}
 		return p, nil
 	}
 	def := DefaultGeoPolicy()
+	enc, err := encodeGeoPolicy(def)
+	if err != nil {
+		return GeoPolicy{}, err
+	}
 	txn := cli.Txn(ctx).
 		If(clientv3.Compare(clientv3.CreateRevision(geoPolicyKey), "=", 0)).
-		Then(clientv3.OpPut(geoPolicyKey, string(encodeGeoPolicy(def))))
-	if _, err := txn.Commit(); err != nil {
+		Then(clientv3.OpPut(geoPolicyKey, string(enc)))
+	tresp, err := txn.Commit()
+	if err != nil {
 		return GeoPolicy{}, err
+	}
+	if !tresp.Succeeded {
+		// Another node bootstrapped first; reuse whatever it stored.
+		return GetGeoPolicy(ctx, cli)
 	}
 	return def, nil
 }
@@ -139,21 +184,30 @@ func (m *GeoManager) seed(ctx context.Context) (nodeRev, policyRev int64, err er
 	if err != nil {
 		return 0, 0, err
 	}
+	// Rebuild the registry from the full read: nodes omitted from the
+	// response are gone and must be dropped, not merged on top of the cache.
+	nodes := make([]NodeInfo, 0, len(nresp.Kvs))
 	for _, kv := range nresp.Kvs {
 		if n, ok := decodeNodeInfo(kv.Value); ok {
-			m.zones.Update(n)
+			nodes = append(nodes, n)
 		}
 	}
+	m.zones.Replace(nodes)
 	// Geo policy (single key).
 	presp, err := m.cli.Get(ctx, geoPolicyKey)
 	if err != nil {
 		return 0, 0, err
 	}
-	for _, kv := range presp.Kvs {
-		if p, ok := decodeGeoPolicy(kv.Value); ok {
-			m.applyPolicy(p)
+	// Replace the cached policy; when no policy has been stored the default
+	// (everything global) applies.
+	m.policyMu.Lock()
+	m.policy = DefaultGeoPolicy()
+	if len(presp.Kvs) > 0 {
+		if p, ok := decodeGeoPolicy(presp.Kvs[0].Value); ok {
+			m.policy = p
 		}
 	}
+	m.policyMu.Unlock()
 	return nresp.Header.Revision + 1, presp.Header.Revision + 1, nil
 }
 
@@ -183,7 +237,7 @@ func (m *GeoManager) Run(ctx context.Context) error {
 		// Fan in both watch sources into one channel. Each watcher starts at
 		// the revision of its own seed Get so a write landing between the two
 		// Gets is never skipped.
-		nodeCh := m.cli.Watch(ctx, nodesKeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(nodeRev))
+		nodeCh := m.cli.Watch(ctx, nodesKeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(nodeRev), clientv3.WithPrevKV())
 		policyCh := m.cli.Watch(ctx, geoPolicyKey, clientv3.WithRev(policyRev))
 		recreate := false
 		for !recreate {

@@ -194,7 +194,15 @@ func (s *Server) Run() error {
 	}
 	s.store = &s.rs
 	if s.raftNode != nil {
-		s.store = newClusterStore(&s.rs, s.raftNode, s.routingTable, s.regionMgr, s.regionCoord, s.app.GetLogger())
+		cs := newClusterStore(&s.rs, s.raftNode, s.routingTable, s.regionMgr, s.regionCoord, s.app.GetLogger())
+		// Phase 6 read routing: wire the geo sources into the cluster store so
+		// GETs resolve the owning region zone-aware. This runs after
+		// initCluster constructed the GeoManager, so conditionally skipping
+		// non-cluster stores keeps their plain Find path intact.
+		if s.geoMgr != nil {
+			cs.SetGeo(s.geoMgr, cfg.GetZone())
+		}
+		s.store = cs
 	}
 	s.netSrv = network.NewServer(
 		cfg.GetAddr(),
@@ -918,13 +926,6 @@ func (s *Server) initCluster() error {
 	// Phase 6 leader preference: nodes out of a region's preferred zone get a
 	// longer raft election timeout so same-zone followers win elections.
 	s.regionCoord.SetZone(cfg.GetZone())
-	// Phase 6 read routing: route GETs through the zone-aware lookup so a
-	// client connected to this node is served by the owning region's member
-	// that sits in this zone (ADR-006 §Read Routing), when the region is
-	// zone-pinned. Falls back to plain Find when geo is not configured.
-	if cs, ok := s.store.(*clusterStore); ok {
-		cs.SetGeo(s.geoMgr, cfg.GetZone())
-	}
 
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "server: cluster mode enabled",

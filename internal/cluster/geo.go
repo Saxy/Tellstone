@@ -25,6 +25,8 @@ package cluster
 
 import (
 	"encoding/binary"
+	"fmt"
+	"math"
 	"sync"
 )
 
@@ -103,8 +105,13 @@ type GeoPolicy struct {
 	Rules   []GeoRule
 }
 
-// encodeGeoPolicy serializes a policy into compact binary form.
-func encodeGeoPolicy(p GeoPolicy) []byte {
+// encodeGeoPolicy serializes a policy into compact binary form. It returns an
+// error when the rule count exceeds the uint16 wire field so an oversized
+// policy is never persisted with a wrapped count.
+func encodeGeoPolicy(p GeoPolicy) ([]byte, error) {
+	if len(p.Rules) > math.MaxUint16 {
+		return nil, fmt.Errorf("cluster: geo policy has %d rules, wire format supports at most %d", len(p.Rules), math.MaxUint16)
+	}
 	buf := make([]byte, 0, 16)
 	buf = appendUint64(buf, p.Version)
 	buf = appendUint16(buf, uint16(len(p.Rules)))
@@ -113,7 +120,7 @@ func encodeGeoPolicy(p GeoPolicy) []byte {
 		buf = appendBytesField(buf, []byte(r.Zone))
 		buf = appendUint64(buf, uint64(r.Replicas))
 	}
-	return buf
+	return buf, nil
 }
 
 // decodeGeoPolicy parses a policy value. Returns ok=false on truncated data.
@@ -301,6 +308,20 @@ func (z *NodeZones) Remove(id uint64) {
 	z.mu.Lock()
 	defer z.mu.Unlock()
 	delete(z.zones, id)
+}
+
+// Replace atomically swaps the registry contents, preserving the receiver so
+// callers holding the pointer observe the new state. Used by the seed path to
+// rebuild the cache from a full registry read so nodes omitted from the read
+// are dropped.
+func (z *NodeZones) Replace(nodes []NodeInfo) {
+	repl := make(map[uint64]string, len(nodes))
+	for _, n := range nodes {
+		repl[n.ID] = n.Zone
+	}
+	z.mu.Lock()
+	z.zones = repl
+	z.mu.Unlock()
 }
 
 // Zone returns the zone for a node ID, or "" when unknown.

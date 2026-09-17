@@ -135,7 +135,10 @@ func TestEncodeDecodeGeoPolicy(t *testing.T) {
 			{Prefix: "", Zone: "*", Replicas: 5},
 		},
 	}
-	enc := encodeGeoPolicy(p)
+	enc, err := encodeGeoPolicy(p)
+	if err != nil {
+		t.Fatalf("encodeGeoPolicy: %v", err)
+	}
 	got, ok := decodeGeoPolicy(enc)
 	if !ok {
 		t.Fatal("decodeGeoPolicy returned ok=false")
@@ -147,7 +150,10 @@ func TestEncodeDecodeGeoPolicy(t *testing.T) {
 
 func TestDecodeGeoPolicyTruncated(t *testing.T) {
 	p := GeoPolicy{Rules: []GeoRule{{Prefix: "x", Zone: "z", Replicas: 3}}}
-	enc := encodeGeoPolicy(p)
+	enc, err := encodeGeoPolicy(p)
+	if err != nil {
+		t.Fatalf("encodeGeoPolicy: %v", err)
+	}
 	for _, cut := range []int{0, 2, 9, 11, len(enc) - 4, len(enc) - 1} {
 		if got, ok := decodeGeoPolicy(enc[:cut]); ok {
 			t.Errorf("decodeGeoPolicy(%d bytes) unexpectedly ok: %+v", cut, got)

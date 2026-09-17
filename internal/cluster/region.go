@@ -284,21 +284,27 @@ func (m *RegionManager) leadershipLoop(ctx context.Context) {
 				if !ok {
 					continue
 				}
-				if cur.Leader == m.nodeID {
-					continue
-				}
 				if !m.isLeaderFor(cur.ID) {
 					continue
 				}
-				// Phase 6 zone reconciliation: pin (or re-pin) the region's
-				// PreferredZone. Bumping epoch invalidates stale routing
-				// entries so the zone change propagates to every node.
-				if zone, changed := reconcileZone(cur, policy); changed {
+				// Phase 6 zone reconciliation runs for the current leader too,
+				// so a policy re-pin repins regions this node already leads.
+				// The region is persisted only when the PreferredZone or the
+				// leader actually changes; unchanged regions stay silent.
+				changed := false
+				if zone, zchange := reconcileZone(cur, policy); zchange {
 					cur.PreferredZone = zone
 					cur.Epoch++
+					changed = true
 				}
-				cur.Leader = m.nodeID
-				cur.Epoch++
+				if cur.Leader != m.nodeID {
+					cur.Leader = m.nodeID
+					cur.Epoch++
+					changed = true
+				}
+				if !changed {
+					continue
+				}
 				if regionExceedsWireLimit(cur) {
 					continue
 				}
@@ -405,11 +411,13 @@ func decodeRegion(b []byte) (Region, bool) {
 	}
 	// PreferredZone is appended after SizeBytes for Phase 6. Older encoded
 	// regions without this trailer are still valid — they decode as
-	// PreferredZone="".
+	// PreferredZone="". A trailer whose field length cannot be decoded is
+	// corrupt and must be rejected, not silently treated as an empty zone.
 	if len(b) >= 2 {
-		if zb, z, ok := readBytesField(b); ok {
+		if _, z, ok := readBytesField(b); ok {
 			r.PreferredZone = string(z)
-			b = zb
+		} else {
+			return r, false
 		}
 	}
 	return r, true

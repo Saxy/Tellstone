@@ -47,27 +47,17 @@ type RoutingTable struct {
 // NewRoutingTable returns an empty routing table.
 func NewRoutingTable() *RoutingTable { return &RoutingTable{} }
 
-// FindInZone returns the route covering key, preferring a route whose leader
-// sits in clientZone when the region is zone-pinned. With no pinning or an
-// unknown client zone it behaves exactly like Find. This lets a node route a
-// read to the leader closest to the client that issued it (Phase 6, ADR-006
-// §Read Routing).
+// FindInZone returns the route covering key. The read path it feeds
+// (clusterStore.Get) selects the region group via route.ID and serves the
+// value from the local engine after a linearizable read, so the returned
+// route always preserves the actual Raft leader: rewriting Leader to a
+// same-zone member would present a follower as the region leader to any
+// callers that forward writes via route.Leader. With no pinning or an
+// unknown client zone it behaves exactly like Find.
 func (rt *RoutingTable) FindInZone(key []byte, clientZone string, zones *NodeZones) *RegionRoute {
 	route := rt.Find(key)
 	if route == nil || clientZone == "" || zones == nil {
 		return route
-	}
-	if route.PreferredZone != "" && route.PreferredZone != GeoZoneGlobal &&
-		ZoneOf(zones, route.Leader) != clientZone {
-		// The current leader is in the wrong zone for this client. Prefer a
-		// same-zone member of the same region.
-		for _, peer := range route.Peers {
-			if ZoneOf(zones, peer) == clientZone {
-				cp := *route
-				cp.Leader = peer
-				return &cp
-			}
-		}
 	}
 	return route
 }
