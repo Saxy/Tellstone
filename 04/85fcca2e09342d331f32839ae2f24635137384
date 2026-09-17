@@ -1,0 +1,27 @@
+server/region_coordinator.go
+  s_0c4de50d9ec3a2::t_caca91fb34f163 175
+  s_0c4de50d9ec3a2::t_738abf663074c1 172-174,177,179-183
+internal/cluster/region.go
+  s_0c4de50d9ec3a2::t_c99bebe6546815 347-348,350-366
+  s_0c4de50d9ec3a2::t_be9777e58883ce 244-248,253,255
+  s_0c4de50d9ec3a2::t_1ae779ca22a425 341-342,345
+  s_0c4de50d9ec3a2::t_28871db2c8dcdf 283,296,318,320-322,326-332,334-339,343-344
+  s_0c4de50d9ec3a2::t_f038d6fea53099 292-293,302-317,319,323-325,333,340,346
+  s_0c4de50d9ec3a2::t_78ee2a55714b0a 349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "0485fcca2e09342d331f32839ae2f24635137384",
+  "prompts": {},
+  "sessions": {
+    "s_0c4de50d9ec3a2": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f514db508ffeniRQs06UL2cjoQ",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
