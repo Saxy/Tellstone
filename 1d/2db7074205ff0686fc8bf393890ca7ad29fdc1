@@ -1,0 +1,94 @@
+server/region_coordinator.go
+  s_f5d6d563da84c0::t_944edc7bff20dd 65-68
+  s_f5d6d563da84c0::t_aec93a188eaa5b 139-145
+  s_f5d6d563da84c0::t_68cd6165ce8eb6 154-169
+  s_f5d6d563da84c0::t_7eec901be7eec4 185
+  s_f5d6d563da84c0::t_7be80a4a8966a1 37-47
+  s_f5d6d563da84c0::t_3ce94b4a541451 133-138
+server/server.go
+  s_f5d6d563da84c0::t_004e4e2a83e7a7 918-920
+  s_f5d6d563da84c0::t_ea988f650fb4bd 921-927
+  s_f5d6d563da84c0::t_cda9cf6b9003b9 888-912
+  s_f5d6d563da84c0::t_5843e7fe483b06 413-420
+  s_f5d6d563da84c0::t_b363398ab3dd65 913-917,928
+  s_f5d6d563da84c0::t_746e517a716547 140-146
+  s_f5d6d563da84c0::t_e0c699384f390e 621-627
+  s_f5d6d563da84c0::t_1920e55d9ae461 826-832
+internal/cluster/routing.go
+  s_f5d6d563da84c0::t_66d2b1f6511aaf 50-62,66,68-74
+  s_f5d6d563da84c0::t_729c377f0afadf 30-32
+  s_f5d6d563da84c0::t_43aa6c6e1a170e 63-65,67
+  s_f5d6d563da84c0::t_bfd1b742c5191a 131-137
+  s_f5d6d563da84c0::t_c97d881a42cda9 33-36
+internal/cluster/region.go
+  s_f5d6d563da84c0::t_f9fcb9e06f50b1 356,367-370
+  s_f5d6d563da84c0::t_7261ba5a347368 281,293-298
+  s_f5d6d563da84c0::t_03c8a549457511 428-429
+  s_f5d6d563da84c0::t_242cc650120ba2 404-413
+  s_f5d6d563da84c0::t_6dc278cd76a847 70-74
+  s_f5d6d563da84c0::t_d563bc1f5bcc1d 235-263
+  s_f5d6d563da84c0::t_5ee9f1a2f6a3d4 37-40
+  s_f5d6d563da84c0::t_f71f527fb82c33 299
+internal/cluster/manual_test.go
+  s_f5d6d563da84c0::t_62706c8b22ba17 842-843
+  s_f5d6d563da84c0::t_0f09a98a51eef8 844-1142
+  s_f5d6d563da84c0::t_406ac688f6eb2e 144-146
+  s_f5d6d563da84c0::t_abd39394221015 64
+config/config.go
+  s_f5d6d563da84c0::t_697463105093f9 516-521
+  s_f5d6d563da84c0::t_250a475e5b9686 839-841
+  s_f5d6d563da84c0::t_3b169c2bf54382 85-88
+server/cluster.go
+  s_f5d6d563da84c0::t_7a45622ffb9034 110-133
+  s_f5d6d563da84c0::t_1d01f67d530074 259
+  s_f5d6d563da84c0::t_6e8e50fa3e14a8 19
+  s_f5d6d563da84c0::t_9f7f7547d33ed7 294-310
+  s_f5d6d563da84c0::t_b1a086cbce91fb 248-258,260-261
+  s_f5d6d563da84c0::t_40b005ed370987 102-108,140-149,167-173
+internal/metrics/metrics_test.go
+  s_f5d6d563da84c0::t_da4b5ee5ea5c86 45,60
+  s_f5d6d563da84c0::t_645ba183f32c27 178
+  s_f5d6d563da84c0::t_ba98f035320853 199
+  s_f5d6d563da84c0::t_b2c9d68aa568e4 71
+  s_f5d6d563da84c0::t_b4a6fe8508e89f 97
+internal/cluster/geo.go
+  s_f5d6d563da84c0::t_232a70d2fb12dd 130,132,137,142
+  s_f5d6d563da84c0::t_ffbb9f68fec9e5 223-274
+  s_f5d6d563da84c0::t_5e45c4c6ee061d 1-129,131,133-136,138-141,143-164,166-193,195-222,275-335
+  s_f5d6d563da84c0::t_8381ceb17e2df3 165
+  s_f5d6d563da84c0::t_6ac3145c154be5 194
+internal/metrics/metrics.go
+  s_f5d6d563da84c0::t_34203dcb6e0657 180-185,188,190-195
+  s_f5d6d563da84c0::t_b0640674b7c658 161-169
+  s_f5d6d563da84c0::t_a20f3205a2e38c 262-270
+internal/cluster/split.go
+  s_f5d6d563da84c0::t_2fe21ed26022c7 57,66-69
+  s_f5d6d563da84c0::t_2bf37af5f6a8df 115-118,120-126
+  s_f5d6d563da84c0::t_f01a6d7a717337 146-152
+  s_f5d6d563da84c0::t_593192a57337b7 70-71
+internal/cluster/geo_test.go
+  s_f5d6d563da84c0::t_fc50cd732d1137 195-305
+  s_f5d6d563da84c0::t_f7308913eef695 1-15,17-18,20-194,306
+  s_f5d6d563da84c0::t_375bbcfff9307b 16,19
+internal/cluster/geo_manager.go
+  s_f5d6d563da84c0::t_51849ccb0a04ed 170-173,183-185,191-203,213,228-232
+  s_f5d6d563da84c0::t_5cd2fc46d9e183 37-95
+  s_f5d6d563da84c0::t_68fdb3651712d2 20
+  s_f5d6d563da84c0::t_25d2198ba49a22 1-19,21-36,96-169,174-182,186-190,204-212,214-227,233-253
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1d2db7074205ff0686fc8bf393890ca7ad29fdc1",
+  "prompts": {},
+  "sessions": {
+    "s_f5d6d563da84c0": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f573805baffeml1OitRlFd4QS4",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
