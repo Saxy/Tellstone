@@ -1,0 +1,20 @@
+internal/cluster/region.go
+  s_0c4de50d9ec3a2::t_efe1763143dcc6 322-326,331,333,345-348
+  s_0c4de50d9ec3a2::t_0d7076eacb420f 349-350
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "48160689c547dc8ef751afb5da009146b5f2067d",
+  "prompts": {},
+  "sessions": {
+    "s_0c4de50d9ec3a2": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f514db508ffeniRQs06UL2cjoQ",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
