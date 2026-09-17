@@ -241,16 +241,18 @@ func (m *RegionManager) SetGeoPolicyProvider(g GeoPolicyProvider) {
 	m.geoMu.Unlock()
 }
 
-// geoPolicy returns the current geo policy, or the default when no provider
-// is wired.
-func (m *RegionManager) geoPolicy() GeoPolicy {
+// geoPolicy returns the current geo policy and whether a provider is wired.
+// The bool is false when no provider is set, letting callers skip zone
+// reconciliation: without a real policy they would otherwise re-pin every
+// region to the default global zone and bump its epoch for no reason.
+func (m *RegionManager) geoPolicy() (GeoPolicy, bool) {
 	m.geoMu.RLock()
 	g := m.geo
 	m.geoMu.RUnlock()
 	if g == nil {
-		return DefaultGeoPolicy()
+		return GeoPolicy{}, false
 	}
-	return g.Policy()
+	return g.Policy(), true
 }
 
 // reconcileZone computes the region's PreferredZone from the geo policy and
@@ -278,7 +280,7 @@ func (m *RegionManager) leadershipLoop(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			policy := m.geoPolicy()
+			policy, hasGeo := m.geoPolicy()
 			for _, kv := range resp.Kvs {
 				cur, ok := decodeRegion(kv.Value)
 				if !ok {
@@ -287,33 +289,79 @@ func (m *RegionManager) leadershipLoop(ctx context.Context) {
 				if !m.isLeaderFor(cur.ID) {
 					continue
 				}
-				// Phase 6 zone reconciliation runs for the current leader too,
-				// so a policy re-pin repins regions this node already leads.
-				// The region is persisted only when the PreferredZone or the
-				// leader actually changes; unchanged regions stay silent.
-				changed := false
-				if zone, zchange := reconcileZone(cur, policy); zchange {
-					cur.PreferredZone = zone
-					cur.Epoch++
-					changed = true
-				}
-				if cur.Leader != m.nodeID {
-					cur.Leader = m.nodeID
-					cur.Epoch++
-					changed = true
-				}
-				if !changed {
+				cur, changed := m.reconcileLeadership(cur, policy, hasGeo)
+				if !changed || regionExceedsWireLimit(cur) {
 					continue
 				}
-				if regionExceedsWireLimit(cur) {
-					continue
-				}
-				if _, err := m.cli.Put(ctx, regionKey(cur.ID), string(encodeRegion(cur))); err != nil {
-					continue
-				}
+				m.persistLeadership(ctx, cur, kv.ModRevision)
 			}
 		}
 	}
+}
+
+// reconcileLeadership applies the current geo policy and this node's
+// leadership to a region record. The PreferredZone is reconciled only when a
+// real geo provider is wired: the provider-less default policy would otherwise
+// pin every region to the global zone and bump its epoch for no reason.
+// It reports whether the record actually changed.
+func (m *RegionManager) reconcileLeadership(cur Region, policy GeoPolicy, hasGeo bool) (Region, bool) {
+	changed := false
+	if zone, zchange := reconcileZone(cur, policy); hasGeo && zchange {
+		cur.PreferredZone = zone
+		cur.Epoch++
+		changed = true
+	}
+	if cur.Leader != m.nodeID {
+		cur.Leader = m.nodeID
+		cur.Epoch++
+		changed = true
+	}
+	return cur, changed
+}
+
+// persistLeadership conditionally writes a reconciled region record. The etcd
+// txn compares the ModRevision seen by the leadership scan so a competing
+// leader (or any other writer) that updated the record in between can never be
+// overwritten: on conflict the record is reloaded and reconciliation is
+// retried against the fresh revision.
+func (m *RegionManager) persistLeadership(ctx context.Context, cur Region, modRev int64) {
+	for {
+		txn := m.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(regionKey(cur.ID)), "=", modRev)).
+			Then(clientv3.OpPut(regionKey(cur.ID), string(encodeRegion(cur))))
+		tresp, err := txn.Commit()
+		if err != nil || tresp.Succeeded {
+			return
+		}
+		fresh, freshRev, err := m.getRegionRev(ctx, cur.ID)
+		if err != nil || fresh == nil {
+			return
+		}
+		policy, hasGeo := m.geoPolicy()
+		reconciled, changed := m.reconcileLeadership(*fresh, policy, hasGeo)
+		if !changed || regionExceedsWireLimit(reconciled) {
+			return
+		}
+		cur = reconciled
+		modRev = freshRev
+	}
+}
+
+// getRegionRev reads a single region from etcd along with its ModRevision, so
+// a conditional leader write can compare against the very record it read.
+func (m *RegionManager) getRegionRev(ctx context.Context, id uint64) (*Region, int64, error) {
+	resp, err := m.cli.Get(ctx, regionKey(id))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, 0, nil
+	}
+	r, ok := decodeRegion(resp.Kvs[0].Value)
+	if !ok {
+		return nil, 0, nil
+	}
+	return &r, resp.Kvs[0].ModRevision, nil
 }
 
 // getRegion reads a single region from etcd.

@@ -169,26 +169,18 @@ func (rc *RegionCoordinator) electionTickFor(r cluster.Region) int {
 
 // HostRegion creates and starts a local Raft group node for region r, sharing
 // the bootstrap node's transport. Idempotent: hosting an already-hosted region
-// re-applies the recalculated election bias so a PreferredZone change (policy
-// re-pin) updates the stored node instead of being ignored. Safe to call from
-// any goroutine.
-func (rc *RegionCoordinator) HostRegion(ctx context.Context, r cluster.Region) error {
+// is a no-op, because the raft library bakes the election clock in when the
+// node starts, so a PreferredZone change can only affect region nodes built
+// after the update. Safe to call from any goroutine.
+func (rc *RegionCoordinator) HostRegion(_ context.Context, r cluster.Region) error {
 	rc.mu.Lock()
-	if n, ok := rc.regionNodes[r.ID]; ok {
+	if _, ok := rc.regionNodes[r.ID]; ok {
 		rc.mu.Unlock()
-		// The region node already exists: an updated PreferredZone must still
-		// apply the recalculated ElectionTick to the stored node. cluster.Node
-		// mutates its bias safely in place, so no node recreation is needed.
-		tick := rc.electionTickFor(r)
-		if n.ElectionTick() != tick {
-			n.SetElectionTick(tick)
-			if rc.logger.Enabled(log.LevelInfo) {
-				rc.logger.Log(log.LevelInfo, "region coordinator: updated region election bias",
-					log.Uint64("region_id", r.ID),
-					log.Int("election_tick", tick),
-				)
-			}
-		}
+		// The region node already exists. Its election tick was fixed at
+		// creation time (cluster.Node has no post-start mutable bias: raft
+		// bakes the election clock in at StartNode). A policy re-pin that
+		// changes the preferred zone therefore affects only nodes created
+		// for this region after the update, not one already running.
 		return nil
 	}
 	rc.mu.Unlock()
