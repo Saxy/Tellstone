@@ -128,12 +128,16 @@ func (m *GeoManager) RegisterNode(ctx context.Context, zone, addr string) error 
 }
 
 // seed reads the full node registry and geo policy from etcd and populates
-// the local caches, returning the next revision to watch from.
-func (m *GeoManager) seed(ctx context.Context) (int64, error) {
+// the local caches, returning the next revision to watch from for each source
+// individually. Separate revisions are required: node registrations and the
+// policy are read in two Gets, and a node write landing between them must not
+// be skipped by the node watcher just because the policy Get returned a newer
+// revision (the classic etcd get-then-watch gap).
+func (m *GeoManager) seed(ctx context.Context) (nodeRev, policyRev int64, err error) {
 	// Node registry.
 	nresp, err := m.cli.Get(ctx, nodesKeyPrefix, clientv3.WithPrefix())
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	for _, kv := range nresp.Kvs {
 		if n, ok := decodeNodeInfo(kv.Value); ok {
@@ -143,18 +147,14 @@ func (m *GeoManager) seed(ctx context.Context) (int64, error) {
 	// Geo policy (single key).
 	presp, err := m.cli.Get(ctx, geoPolicyKey)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	for _, kv := range presp.Kvs {
 		if p, ok := decodeGeoPolicy(kv.Value); ok {
 			m.applyPolicy(p)
 		}
 	}
-	rev := nresp.Header.Revision
-	if presp.Header.Revision > rev {
-		rev = presp.Header.Revision
-	}
-	return rev + 1, nil
+	return nresp.Header.Revision + 1, presp.Header.Revision + 1, nil
 }
 
 // applyPolicy stores a policy if it is newer than the current cache.
@@ -172,7 +172,7 @@ func (m *GeoManager) applyPolicy(p GeoPolicy) {
 // Watches are recreated on interruption so no updates are missed
 // (compaction-safe, same as RegionManager).
 func (m *GeoManager) Run(ctx context.Context) error {
-	rev, err := m.seed(ctx)
+	nodeRev, policyRev, err := m.seed(ctx)
 	if err != nil {
 		return err
 	}
@@ -180,9 +180,11 @@ func (m *GeoManager) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		// Fan in both watch sources into one channel.
-		nodeCh := m.cli.Watch(ctx, nodesKeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(rev))
-		policyCh := m.cli.Watch(ctx, geoPolicyKey, clientv3.WithRev(rev))
+		// Fan in both watch sources into one channel. Each watcher starts at
+		// the revision of its own seed Get so a write landing between the two
+		// Gets is never skipped.
+		nodeCh := m.cli.Watch(ctx, nodesKeyPrefix, clientv3.WithPrefix(), clientv3.WithRev(nodeRev))
+		policyCh := m.cli.Watch(ctx, geoPolicyKey, clientv3.WithRev(policyRev))
 		recreate := false
 		for !recreate {
 			select {
@@ -214,11 +216,11 @@ func (m *GeoManager) Run(ctx context.Context) error {
 				}
 			}
 		}
-		newRev, rerr := m.seed(ctx)
+		var rerr error
+		nodeRev, policyRev, rerr = m.seed(ctx)
 		if rerr != nil {
 			return rerr
 		}
-		rev = newRev
 	}
 }
 
