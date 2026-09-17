@@ -319,13 +319,18 @@ func (m *RegionManager) reconcileLeadership(cur Region, policy GeoPolicy, hasGeo
 	return cur, changed
 }
 
+// leadershipRetryLimit bounds how many times persistLeadership retries after
+// repeated etcd compare conflicts before giving up for this scan cycle, so a
+// persistently contended region can never wedge the leadership scan.
+const leadershipRetryLimit = 3
+
 // persistLeadership conditionally writes a reconciled region record. The etcd
 // txn compares the ModRevision seen by the leadership scan so a competing
 // leader (or any other writer) that updated the record in between can never be
 // overwritten: on conflict the record is reloaded and reconciliation is
-// retried against the fresh revision.
+// retried against the fresh revision, bounded by leadershipRetryLimit.
 func (m *RegionManager) persistLeadership(ctx context.Context, cur Region, modRev int64) {
-	for {
+	for attempt := 0; attempt < leadershipRetryLimit; attempt++ {
 		txn := m.cli.Txn(ctx).
 			If(clientv3.Compare(clientv3.ModRevision(regionKey(cur.ID)), "=", modRev)).
 			Then(clientv3.OpPut(regionKey(cur.ID), string(encodeRegion(cur))))
@@ -335,6 +340,12 @@ func (m *RegionManager) persistLeadership(ctx context.Context, cur Region, modRe
 		}
 		fresh, freshRev, err := m.getRegionRev(ctx, cur.ID)
 		if err != nil || fresh == nil {
+			return
+		}
+		// Leadership may have changed while the record was contended; only a
+		// current leader may claim the region. Abort the conflict path when
+		// this node no longer leads and let the (new) leader reconcile.
+		if !m.isLeaderFor(cur.ID) {
 			return
 		}
 		policy, hasGeo := m.geoPolicy()
