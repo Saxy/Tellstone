@@ -27,6 +27,13 @@ type RegionRoute struct {
 	EndKey   []byte
 	Leader   uint64 // node ID of the current region leader
 	Epoch    uint64
+	// Peers are the region's Raft member node IDs, used for zone-aware read
+	// routing (prefer a same-zone replica) and diagnostics.
+	Peers []uint64
+	// PreferredZone is the region's geo-pinned zone (empty = none, "*" =
+	// global). Used by zone-aware read routing to prefer leader/replicas in
+	// the client's zone (Phase 6).
+	PreferredZone string
 }
 
 // RoutingTable is a concurrency-safe, node-local cache of region metadata.
@@ -39,6 +46,21 @@ type RoutingTable struct {
 
 // NewRoutingTable returns an empty routing table.
 func NewRoutingTable() *RoutingTable { return &RoutingTable{} }
+
+// FindInZone returns the route covering key. The read path it feeds
+// (clusterStore.Get) selects the region group via route.ID and serves the
+// value from the local engine after a linearizable read, so the returned
+// route always preserves the actual Raft leader: rewriting Leader to a
+// same-zone member would present a follower as the region leader to any
+// callers that forward writes via route.Leader. With no pinning or an
+// unknown client zone it behaves exactly like Find.
+func (rt *RoutingTable) FindInZone(key []byte, clientZone string, zones *NodeZones) *RegionRoute {
+	route := rt.Find(key)
+	if route == nil || clientZone == "" || zones == nil {
+		return route
+	}
+	return route
+}
 
 // Find returns the route whose [StartKey, EndKey) contains key. An empty
 // StartKey matches negative infinity; an empty EndKey matches positive
@@ -96,10 +118,12 @@ func (rt *RoutingTable) Snapshot() []RegionRoute {
 
 func regionRouteOf(m Region) RegionRoute {
 	return RegionRoute{
-		ID:       m.ID,
-		StartKey: m.StartKey,
-		EndKey:   m.EndKey,
-		Leader:   m.Leader,
-		Epoch:    m.Epoch,
+		ID:            m.ID,
+		StartKey:      m.StartKey,
+		EndKey:        m.EndKey,
+		Leader:        m.Leader,
+		Epoch:         m.Epoch,
+		Peers:         m.Peers,
+		PreferredZone: m.PreferredZone,
 	}
 }

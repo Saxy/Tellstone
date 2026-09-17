@@ -34,6 +34,17 @@ const regionCooldown = 30 * time.Second
 // drain before aborting a split.
 const splitCooldownTimeout = 5 * time.Second
 
+// electionTickDefault is the Raft election timeout in ticks used on the
+// region's preferred zone. A shorter timeout means the raft node campaigns
+// sooner and typically wins when the leader dies (ADR-006 soft preference).
+const electionTickDefault = 10
+
+// electionTickOffZone is the election timeout used on nodes outside the
+// region's preferred zone. Doubling the timeout makes cross-zone nodes
+// unlikely to become leader while a same-zone follower is alive, keeping
+// leaders close to their data's "home" zone.
+const electionTickOffZone = 20
+
 // RegionCoordinator owns the per-region Raft group nodes on this process. It
 // is cheap to run once per process; every region node shares the bootstrap
 // node's TCP transport and the same local shard dispatcher (the engine is
@@ -51,6 +62,10 @@ type RegionCoordinator struct {
 	tracker    *cluster.RegionSizeTracker
 	resolver   cluster.RegionResolver
 	logger     log.Logger
+	// zone is this process's availability zone (--zone). When non-empty it
+	// biases per-region raft election timeouts: nodes in a region's preferred
+	// zone campaign first, so the leader stays in the data's "home" zone.
+	zone string
 
 	mu          sync.Mutex
 	regionNodes map[uint64]*cluster.Node
@@ -115,6 +130,19 @@ func (rc *RegionCoordinator) LeadershipProvider() cluster.LeadershipProvider {
 	return regionLeadershipProvider{coord: rc}
 }
 
+// SetGeoPolicyProvider wires the coordinator's split logic to the geo policy
+// source so split-created regions get zone-pinned placement (Phase 6).
+func (rc *RegionCoordinator) SetGeoPolicyProvider(g cluster.GeoPolicyProvider) {
+	rc.splitter.SetGeoPolicyProvider(g)
+}
+
+// SetZone sets this process's availability zone. When set, the coordinator
+// biases per-region raft election timeouts so same-zone followers win leader
+// elections (ADR-006 soft preference). Safe to call once before Run.
+func (rc *RegionCoordinator) SetZone(zone string) {
+	rc.zone = zone
+}
+
 // NodeForRegion returns the local Raft group node hosting region, or nil when
 // this process does not host that region yet.
 func (rc *RegionCoordinator) NodeForRegion(id uint64) *cluster.Node {
@@ -123,13 +151,36 @@ func (rc *RegionCoordinator) NodeForRegion(id uint64) *cluster.Node {
 	return rc.regionNodes[id]
 }
 
+// electionTickFor returns the raft election timeout (in ticks) for a region
+// hosted on this process. Soft zone preference: a node inside the region's
+// preferred zone keeps the fast default tick so it campaigns and wins first;
+// a node outside the preferred zone gets a doubled timeout and is unlikely to
+// become leader while a same-zone follower is alive (ADR-006). Global or
+// unknown zones get no bias.
+func (rc *RegionCoordinator) electionTickFor(r cluster.Region) int {
+	if rc.zone == "" || r.PreferredZone == "" || r.PreferredZone == cluster.GeoZoneGlobal {
+		return electionTickDefault
+	}
+	if rc.zone == r.PreferredZone {
+		return electionTickDefault
+	}
+	return electionTickOffZone
+}
+
 // HostRegion creates and starts a local Raft group node for region r, sharing
 // the bootstrap node's transport. Idempotent: hosting an already-hosted region
-// is a no-op. Safe to call from any goroutine.
-func (rc *RegionCoordinator) HostRegion(ctx context.Context, r cluster.Region) error {
+// is a no-op, because the raft library bakes the election clock in when the
+// node starts, so a PreferredZone change can only affect region nodes built
+// after the update. Safe to call from any goroutine.
+func (rc *RegionCoordinator) HostRegion(_ context.Context, r cluster.Region) error {
 	rc.mu.Lock()
 	if _, ok := rc.regionNodes[r.ID]; ok {
 		rc.mu.Unlock()
+		// The region node already exists. Its election tick was fixed at
+		// creation time (cluster.Node has no post-start mutable bias: raft
+		// bakes the election clock in at StartNode). A policy re-pin that
+		// changes the preferred zone therefore affects only nodes created
+		// for this region after the update, not one already running.
 		return nil
 	}
 	rc.mu.Unlock()
@@ -138,7 +189,7 @@ func (rc *RegionCoordinator) HostRegion(ctx context.Context, r cluster.Region) e
 		NodeID:          rc.nodeID,
 		GroupID:         r.ID,
 		Peers:           rc.peers,
-		ElectionTick:    10,
+		ElectionTick:    rc.electionTickFor(r),
 		HeartbeatTick:   1,
 		TickInterval:    50 * time.Millisecond,
 		Dispatcher:      rc.dispatcher,

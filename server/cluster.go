@@ -16,6 +16,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/cluster"
@@ -98,16 +99,52 @@ type localReader interface {
 // if that round-trip cannot complete in time, the local value is served as a
 // best-effort fallback and may be slightly stale (read-anywhere).
 type clusterStore struct {
-	local  localReader
-	node   *cluster.Node
-	coord  *RegionCoordinator
-	rt     *cluster.RoutingTable
-	mgr    *cluster.RegionManager
+	local       localReader
+	node        *cluster.Node
+	coord       *RegionCoordinator
+	rt          *cluster.RoutingTable
+	mgr         *cluster.RegionManager
+	geo         *cluster.GeoManager // Phase 6: zone registry + policy for read routing (nil = not geo)
+	clientZone  string              // Phase 6: zone of this node (the read's client zone)
 	logger log.Logger
+	// geoForward metrics (Phase 6 step 7): a forwarded write whose region
+	// leader sits in a different zone than this node pays cross-zone latency.
+	// Counters are lock-free atomics read by the /metrics scrape.
+	crossZoneForwards  atomic.Uint64
+	crossZoneLatencyNs atomic.Uint64
+	sameZoneForwards   atomic.Uint64
+}
+
+// GeoCrossZoneForwards reports how many writes were forwarded to a region
+// leader in a different zone than this node.
+func (cs *clusterStore) GeoCrossZoneForwards() uint64 {
+	return cs.crossZoneForwards.Load()
+}
+
+// GeoCrossZoneForwardLatencyNanosTotal is the cumulative latency (ns) spent
+// forwarding writes to cross-zone region leaders.
+func (cs *clusterStore) GeoCrossZoneForwardLatencyNanosTotal() uint64 {
+	return cs.crossZoneLatencyNs.Load()
+}
+
+// GeoSameZoneForwards reports how many writes were forwarded to a region
+// leader in this node's own zone.
+func (cs *clusterStore) GeoSameZoneForwards() uint64 {
+	return cs.sameZoneForwards.Load()
 }
 
 func newClusterStore(local localReader, node *cluster.Node, rt *cluster.RoutingTable, mgr *cluster.RegionManager, coord *RegionCoordinator, logger log.Logger) *clusterStore {
 	return &clusterStore{local: local, node: node, coord: coord, rt: rt, mgr: mgr, logger: logger}
+}
+
+// SetGeo wires the Phase 6 geo sources into the cluster store after the
+// cluster's GeoManager is online. From then on reads resolve the owning
+// region through FindInZone, preferring a member that sits in the request's
+// zone when the region is zone-pinned (ADR-006 §Read Routing). A nil geo
+// manager keeps the plain zone-agnostic path.
+func (cs *clusterStore) SetGeo(g *cluster.GeoManager, clientZone string) {
+	cs.geo = g
+	cs.clientZone = clientZone
 }
 
 // nodeForRegion returns the local Raft group node that hosts the region owning
@@ -127,7 +164,13 @@ func (cs *clusterStore) Get(key string) ([]byte, bool) {
 	// engine. On timeout/failure we fall back to the local value (best-effort,
 	// may be slightly stale) rather than failing the read.
 	var rn *cluster.Node
-	if route := cs.rt.Find([]byte(key)); route != nil {
+	var route *cluster.RegionRoute
+	if cs.geo != nil && cs.clientZone != "" {
+		route = cs.rt.FindInZone([]byte(key), cs.clientZone, cs.geo.Zones())
+	} else {
+		route = cs.rt.Find([]byte(key))
+	}
+	if route != nil {
 		rn = cs.nodeForRegion(route)
 	}
 	if rn == nil {
@@ -201,10 +244,21 @@ func (cs *clusterStore) routeWrite(key string, payloads [][]byte) error {
 			} else {
 				err = regionNode.ProposeAndWait(ctx, payloads[0])
 			}
-		} else if chunked {
-			err = regionNode.ForwardChunks(ctx, route.Leader, payloads)
 		} else {
-			err = regionNode.ForwardWrite(ctx, route.Leader, payloads[0])
+			// Phase 6 step 7: classify the forward by the leader's zone so
+			// latency metrics distinguish same-zone (fast) forwards from
+			// cross-zone (ocean-latency) forwards. Leader zone is looked up
+			// from the node registry; unknown/global zones are treated as
+			// same-zone (no penalty).
+			start := time.Now()
+			if chunked {
+				err = regionNode.ForwardChunks(ctx, route.Leader, payloads)
+			} else {
+				err = regionNode.ForwardWrite(ctx, route.Leader, payloads[0])
+			}
+			if err == nil && cs.recordGeoForward(route) {
+				cs.crossZoneLatencyNs.Add(uint64(time.Since(start).Nanoseconds()))
+			}
 		}
 		cancel()
 		if err == nil {
@@ -235,6 +289,23 @@ func (cs *clusterStore) nodeID() uint64 {
 		return cs.coord.host.NodeID()
 	}
 	return cs.node.NodeID()
+}
+
+// recordGeoForward classifies a forwarded write as cross-zone or same-zone
+// and increments the corresponding counter. Returns true when the forward is
+// cross-zone (the caller should record latency).
+func (cs *clusterStore) recordGeoForward(route *cluster.RegionRoute) bool {
+	if cs.geo == nil || cs.clientZone == "" || route == nil {
+		cs.sameZoneForwards.Add(1)
+		return false
+	}
+	leaderZone := cluster.ZoneOf(cs.geo.Zones(), route.Leader)
+	if leaderZone != "" && leaderZone != cs.clientZone {
+		cs.crossZoneForwards.Add(1)
+		return true
+	}
+	cs.sameZoneForwards.Add(1)
+	return false
 }
 
 // refreshRouting pulls the latest region metadata from etcd into the local

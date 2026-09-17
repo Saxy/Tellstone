@@ -82,6 +82,10 @@ type Config struct {
 	// clusterSplitThreshold is the tracked byte size above which a region is
 	// considered too large and a split is triggered (Phase 4).
 	clusterSplitThreshold uint64
+	// zone is the geographic availability zone this node belongs to
+	// (Phase 6, ADR-006). It is self-declared at startup and reported to
+	// the PD for geo-aware region placement.
+	zone string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -509,6 +513,12 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_CLUSTER_SPLIT_THRESHOLD", uint64(64*1024*1024)),
 		"Region byte size that triggers an automatic split in bytes (default: 67108864)",
 	)
+	fs.StringVar(
+		&cfg.zone,
+		"zone",
+		getEnv("TSD_ZONE", ""),
+		"Geographic availability zone for geo-aware placement; empty means unknown (default: none)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -826,3 +836,6 @@ func (cfg *Config) GetTSORefillThreshold() int { return cfg.tsoRefillThreshold }
 
 // GetClusterSplitThreshold returns the region byte size that triggers a split.
 func (cfg *Config) GetClusterSplitThreshold() uint64 { return cfg.clusterSplitThreshold }
+
+// GetZone returns the node's declared availability zone (empty when unset).
+func (cfg *Config) GetZone() string { return cfg.zone }

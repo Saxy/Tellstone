@@ -34,6 +34,10 @@ type Region struct {
 	Leader    uint64   // current leader node ID (0 until first leader claims it)
 	Epoch     uint64   // bumped on every split/move/leadership change
 	SizeBytes uint64   // tracked byte count for split decisions (Phase 4)
+	// PreferredZone is the geo zone the region should be pinned to by the
+	// routing table and leader election (Phase 6, ADR-006). Empty means no
+	// pinning; GeoZoneGlobal ("*") means replicated everywhere.
+	PreferredZone string
 }
 
 const regionKeyPrefix = "/tellstone/regions/"
@@ -63,6 +67,11 @@ type RegionManager struct {
 	lp    LeadershipProvider
 	peers []uint64
 	rt    *RoutingTable
+	// geoMu guards geo; it is set once during startup (SetGeoPolicyProvider)
+	// after the manager is constructed, while the leadershipLoop may already
+	// be reading it. When nil, region PreferredZone is never reconciled.
+	geoMu sync.RWMutex
+	geo   GeoPolicyProvider
 }
 
 // NewRegionManager creates a manager bound to the PD etcd client and the local
@@ -223,6 +232,37 @@ func (m *RegionManager) isLeaderFor(regionID uint64) bool {
 	return regionID == 1 && lp.IsLeader()
 }
 
+// SetGeoPolicyProvider wires the region manager to a geo policy source so the
+// leadership loop can pin region zones (Phase 6). Optional: without it regions
+// keep whatever PreferredZone they were created with.
+func (m *RegionManager) SetGeoPolicyProvider(g GeoPolicyProvider) {
+	m.geoMu.Lock()
+	m.geo = g
+	m.geoMu.Unlock()
+}
+
+// geoPolicy returns the current geo policy and whether a provider is wired.
+// The bool is false when no provider is set, letting callers skip zone
+// reconciliation: without a real policy they would otherwise re-pin every
+// region to the default global zone and bump its epoch for no reason.
+func (m *RegionManager) geoPolicy() (GeoPolicy, bool) {
+	m.geoMu.RLock()
+	g := m.geo
+	m.geoMu.RUnlock()
+	if g == nil {
+		return GeoPolicy{}, false
+	}
+	return g.Policy(), true
+}
+
+// reconcileZone computes the region's PreferredZone from the geo policy and
+// reports whether it differs, so the leadership loop can pin (or re-pin) it
+// when the operator changes the rules.
+func reconcileZone(cur Region, policy GeoPolicy) (string, bool) {
+	want := PreferredZoneOf(policy, cur.StartKey)
+	return want, want != cur.PreferredZone
+}
+
 // leadershipLoop, on each region's Raft leader, ensures the region's Leader
 // field points at this node. It scans all region metadata and only writes when
 // the field is stale, so non-leaders are silent and each region's single
@@ -240,28 +280,99 @@ func (m *RegionManager) leadershipLoop(ctx context.Context) {
 			if err != nil {
 				continue
 			}
+			policy, hasGeo := m.geoPolicy()
 			for _, kv := range resp.Kvs {
 				cur, ok := decodeRegion(kv.Value)
 				if !ok {
 					continue
 				}
-				if cur.Leader == m.nodeID {
-					continue
-				}
 				if !m.isLeaderFor(cur.ID) {
 					continue
 				}
-				cur.Leader = m.nodeID
-				cur.Epoch++
-				if regionExceedsWireLimit(cur) {
+				cur, changed := m.reconcileLeadership(cur, policy, hasGeo)
+				if !changed || regionExceedsWireLimit(cur) {
 					continue
 				}
-				if _, err := m.cli.Put(ctx, regionKey(cur.ID), string(encodeRegion(cur))); err != nil {
-					continue
-				}
+				m.persistLeadership(ctx, cur, kv.ModRevision)
 			}
 		}
 	}
+}
+
+// reconcileLeadership applies the current geo policy and this node's
+// leadership to a region record. The PreferredZone is reconciled only when a
+// real geo provider is wired: the provider-less default policy would otherwise
+// pin every region to the global zone and bump its epoch for no reason.
+// It reports whether the record actually changed.
+func (m *RegionManager) reconcileLeadership(cur Region, policy GeoPolicy, hasGeo bool) (Region, bool) {
+	changed := false
+	if zone, zchange := reconcileZone(cur, policy); hasGeo && zchange {
+		cur.PreferredZone = zone
+		cur.Epoch++
+		changed = true
+	}
+	if cur.Leader != m.nodeID {
+		cur.Leader = m.nodeID
+		cur.Epoch++
+		changed = true
+	}
+	return cur, changed
+}
+
+// leadershipRetryLimit bounds how many times persistLeadership retries after
+// repeated etcd compare conflicts before giving up for this scan cycle, so a
+// persistently contended region can never wedge the leadership scan.
+const leadershipRetryLimit = 3
+
+// persistLeadership conditionally writes a reconciled region record. The etcd
+// txn compares the ModRevision seen by the leadership scan so a competing
+// leader (or any other writer) that updated the record in between can never be
+// overwritten: on conflict the record is reloaded and reconciliation is
+// retried against the fresh revision, bounded by leadershipRetryLimit.
+func (m *RegionManager) persistLeadership(ctx context.Context, cur Region, modRev int64) {
+	for attempt := 0; attempt < leadershipRetryLimit; attempt++ {
+		txn := m.cli.Txn(ctx).
+			If(clientv3.Compare(clientv3.ModRevision(regionKey(cur.ID)), "=", modRev)).
+			Then(clientv3.OpPut(regionKey(cur.ID), string(encodeRegion(cur))))
+		tresp, err := txn.Commit()
+		if err != nil || tresp.Succeeded {
+			return
+		}
+		fresh, freshRev, err := m.getRegionRev(ctx, cur.ID)
+		if err != nil || fresh == nil {
+			return
+		}
+		// Leadership may have changed while the record was contended; only a
+		// current leader may claim the region. Abort the conflict path when
+		// this node no longer leads and let the (new) leader reconcile.
+		if !m.isLeaderFor(cur.ID) {
+			return
+		}
+		policy, hasGeo := m.geoPolicy()
+		reconciled, changed := m.reconcileLeadership(*fresh, policy, hasGeo)
+		if !changed || regionExceedsWireLimit(reconciled) {
+			return
+		}
+		cur = reconciled
+		modRev = freshRev
+	}
+}
+
+// getRegionRev reads a single region from etcd along with its ModRevision, so
+// a conditional leader write can compare against the very record it read.
+func (m *RegionManager) getRegionRev(ctx context.Context, id uint64) (*Region, int64, error) {
+	resp, err := m.cli.Get(ctx, regionKey(id))
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(resp.Kvs) == 0 {
+		return nil, 0, nil
+	}
+	r, ok := decodeRegion(resp.Kvs[0].Value)
+	if !ok {
+		return nil, 0, nil
+	}
+	return &r, resp.Kvs[0].ModRevision, nil
 }
 
 // getRegion reads a single region from etcd.
@@ -307,7 +418,7 @@ func DecodeRegion(data []byte) (Region, bool) { return decodeRegion(data) }
 // --- serialization (compact binary, no protobuf) ---
 
 func encodeRegion(r Region) []byte {
-	buf := make([]byte, 0, 40+len(r.StartKey)+len(r.EndKey))
+	buf := make([]byte, 0, 40+len(r.StartKey)+len(r.EndKey)+len(r.PreferredZone))
 	buf = appendUint64(buf, r.ID)
 	buf = appendUint64(buf, r.Epoch)
 	buf = appendUint64(buf, r.Leader)
@@ -318,6 +429,10 @@ func encodeRegion(r Region) []byte {
 	buf = appendBytesField(buf, r.StartKey)
 	buf = appendBytesField(buf, r.EndKey)
 	buf = appendUint64(buf, r.SizeBytes)
+	// PreferredZone is appended after SizeBytes for Phase 6. Older readers
+	// stop at SizeBytes and ignore the trailer; the zone only affects new
+	// placement decisions.
+	buf = appendBytesField(buf, []byte(r.PreferredZone))
 	return buf
 }
 
@@ -351,6 +466,18 @@ func decodeRegion(b []byte) (Region, bool) {
 	// without this field are still valid — they decode as SizeBytes=0.
 	if len(b) >= 8 {
 		r.SizeBytes = binary.BigEndian.Uint64(b[0:8])
+		b = b[8:]
+	}
+	// PreferredZone is appended after SizeBytes for Phase 6. Older encoded
+	// regions without this trailer are still valid — they decode as
+	// PreferredZone="". A trailer whose field length cannot be decoded is
+	// corrupt and must be rejected, not silently treated as an empty zone.
+	if len(b) >= 2 {
+		if _, z, ok := readBytesField(b); ok {
+			r.PreferredZone = string(z)
+		} else {
+			return r, false
+		}
 	}
 	return r, true
 }
@@ -365,7 +492,8 @@ const maxRegionWireField = 65535
 func regionExceedsWireLimit(r Region) bool {
 	return len(r.Peers) > maxRegionWireField ||
 		len(r.StartKey) > maxRegionWireField ||
-		len(r.EndKey) > maxRegionWireField
+		len(r.EndKey) > maxRegionWireField ||
+		len(r.PreferredZone) > maxRegionWireField
 }
 
 func appendUint64(buf []byte, v uint64) []byte {
