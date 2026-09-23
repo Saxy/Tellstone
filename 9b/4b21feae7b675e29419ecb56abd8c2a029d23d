@@ -1,0 +1,59 @@
+internal/resp/server_test.go
+  s_ec51132ee0d66b::t_fcf4307db07d80 39-45
+internal/command/command.go
+  s_ec51132ee0d66b::t_dd555427b40004 29-33
+server/server.go
+  s_ec51132ee0d66b::t_f3236837e4d43c 946-947,956
+  s_ec51132ee0d66b::t_e3cb579e75a446 55-59
+config/config.go
+  s_ec51132ee0d66b::t_4ac13dc1874bce 754-756
+internal/cluster/federation.go
+  s_ec51132ee0d66b::t_5fc74a5d525ce7 261-264,268
+  s_ec51132ee0d66b::t_1ab4ca25402884 67-69
+  s_ec51132ee0d66b::t_69bade052644ff 309-312,314
+  s_ec51132ee0d66b::t_bc1d3374d73333 187-189,191
+internal/cluster/federation_test.go
+  s_ec51132ee0d66b::t_1d04e85fc2fb84 176-205,207-210
+  s_ec51132ee0d66b::t_4628e0cf8b085c 17,19
+  s_ec51132ee0d66b::t_b65ad19109f841 206
+  s_ec51132ee0d66b::t_01dab2fd2f3cf6 215
+internal/cluster/gateway_test.go
+  s_ec51132ee0d66b::t_8b17343f2ff294 140-144
+internal/cluster/manual_federation_test.go
+  s_ec51132ee0d66b::t_6046f68ddd2a23 227-232
+  s_ec51132ee0d66b::t_5d833166b20ffa 330-333
+internal/cluster/config.go
+  s_ec51132ee0d66b::t_6f72fb41655a15 108-117
+  s_ec51132ee0d66b::t_907b9402976647 17
+internal/resp/server.go
+  s_ec51132ee0d66b::t_e864d0aec8aea1 57-59
+server/cluster.go
+  s_ec51132ee0d66b::t_9a93629cae6216 280-287,322-340,342
+  s_ec51132ee0d66b::t_5ec0d22fe83144 200,202-204,212,225,235,237
+  s_ec51132ee0d66b::t_688a20a71d3dbe 243-245,262
+  s_ec51132ee0d66b::t_d04951ea3b5858 341
+  s_ec51132ee0d66b::t_28fa4161134fbf 343
+internal/command/handlers.go
+  s_ec51132ee0d66b::t_1fcdc91df6cd74 27-31
+internal/command/command_test.go
+  s_ec51132ee0d66b::t_b031426f79faa4 30
+  s_ec51132ee0d66b::t_ff2dbc531a1bc6 167-174
+  s_ec51132ee0d66b::t_000505dab5daf1 42
+  s_ec51132ee0d66b::t_ddb34a18cd30d3 40-41,43-44
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9b4b21feae7b675e29419ecb56abd8c2a029d23d",
+  "prompts": {},
+  "sessions": {
+    "s_ec51132ee0d66b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f32d08b5affeJWDBawZEc06lYo",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
