@@ -508,6 +508,12 @@ func appendUint16(buf []byte, v uint16) []byte {
 	return append(buf, b[:]...)
 }
 
+func appendUint32(buf []byte, v uint32) []byte {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], v)
+	return append(buf, b[:]...)
+}
+
 func appendBytesField(buf, v []byte) []byte {
 	buf = appendUint16(buf, uint16(len(v)))
 	return append(buf, v...)

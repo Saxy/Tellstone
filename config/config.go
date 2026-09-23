@@ -86,6 +86,14 @@ type Config struct {
 	// (Phase 6, ADR-006). It is self-declared at startup and reported to
 	// the PD for geo-aware region placement.
 	zone string
+	// Cross-cluster federation (Phase 7, ADR-011). clusterID is the
+	// federation-wide identity of this cluster (the namespace cross-cluster
+	// gateways are addressed by); gatewayAddr is this node's dedicated
+	// gateway listen address; federationClusters lists the remote
+	// gateways as "clusterid@addr,.." this node dials.
+	clusterID          uint64
+	gatewayAddr        string
+	federationClusters string
 }
 
 func getEnv[T any](key string, fallback T) T {
@@ -178,6 +186,9 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_OAUTH_PROVIDER   - OAuth provider preset (google|stackit|empty for generic OIDC)
 //		TSD_OAUTH_ISSUER	 - OIDC issuer / discovery base URL of the OAuth provider
 //		TSD_OAUTH_CLIENT_ID	 - OAuth2 client ID used as the expected token audience
+//		TSD_CLUSTER_ID		 - federation-wide identity of this cluster (Phase 7)
+//		TSD_GATEWAY_ADDR	 - this node's cross-cluster gateway listen address
+//		TSD_FEDERATION_CLUSTERS – list of remote clusters' gateways ("clusterid@addr,...")
 //
 // args are the command-line arguments to parse (typically os.Args[1:]); pass nil for an
 // environment-only / default configuration. A fresh flag.FlagSet is used, so LoadConfig is
@@ -519,6 +530,25 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_ZONE", ""),
 		"Geographic availability zone for geo-aware placement; empty means unknown (default: none)",
 	)
+	// Cross-cluster federation (phase 7, ADR-011).
+	fs.Uint64Var(
+		&cfg.clusterID,
+		"cluster-id",
+		getEnv("TSD_CLUSTER_ID", uint64(0)),
+		"Federation-wide identity of this cluster; required (non-zero) when the gateway is enabled (default: 0)",
+	)
+	fs.StringVar(
+		&cfg.gatewayAddr,
+		"gateway-addr",
+		getEnv("TSD_GATEWAY_ADDR", ""),
+		"Listen address for this node's cross-cluster gateway transport (default: none, federation disabled)",
+	)
+	fs.StringVar(
+		&cfg.federationClusters,
+		"federation-clusters",
+		getEnv("TSD_FEDERATION_CLUSTERS", ""),
+		"Comma-separated clusterid@host:port list of remote clusters' gateways; symmetric configuration is required (default: none)",
+	)
 	// Custom usage output to guide operators.
 	fs.Usage = func() {
 		println("Tellstone server – high-performance in-memory database")
@@ -603,6 +633,50 @@ func LoadConfig(args []string) *Config {
 		}
 		if !localFound {
 			panic("tellstone: --node-id is not present in --peers; the local node must be part of the bootstrap membership")
+		}
+	}
+
+	// Cross-cluster federation (phase 7, ADR-011). The gateway forwards into
+	// a Raft cluster and converges its policy through the PD etcd, so it only
+	// exists in cluster mode and needs a non-zero --cluster-id (the
+	// federation namespace gateways are addressed by).
+	if cfg.gatewayAddr != "" || cfg.federationClusters != "" {
+		if !cfg.clusterMode {
+			panic("tellstone: --gateway-addr and --federation-clusters require --cluster-mode")
+		}
+		if cfg.clusterID == 0 {
+			panic("tellstone: --cluster-id must be non-zero when the gateway is enabled")
+		}
+	}
+	// A node dialing remote gateways must also listen for their responses —
+	// the gateway transport addresses every peer by cluster ID, so inbound
+	// and outbound are inseparable.
+	if cfg.federationClusters != "" && cfg.gatewayAddr == "" {
+		panic("tellstone: --federation-clusters requires --gateway-addr (the gateway must listen for responses)")
+	}
+	if cfg.gatewayAddr != "" {
+		if _, _, err := hostPort(cfg.gatewayAddr); err != nil {
+			panic(fmt.Sprintf("tellstone: --gateway-addr %q is malformed (need host:port): %v", cfg.gatewayAddr, err))
+		}
+		// A gateway port silently colliding with the data or raft channel
+		// would steal traffic and fail far from the cause (same reasoning as
+		// the derived PD endpoint checks below).
+		for addr, flag := range map[string]string{
+			cfg.addr:     "--addr",
+			cfg.peerAddr: "--peer-addr",
+		} {
+			if pdEndpointsCollide(cfg.gatewayAddr, addr) {
+				panic(fmt.Sprintf("tellstone: --gateway-addr %s collides with %s %s; use a distinct port",
+					cfg.gatewayAddr, flag, addr))
+			}
+		}
+	}
+	if cfg.federationClusters != "" {
+		// Strict parse (explicit cluster IDs) with the same flag-time error
+		// surfacing as --peers, plus the local cluster excluded.
+		_, perr := cluster.ParseFederationClusters(cfg.federationClusters)
+		if perr != nil {
+			panic(fmt.Sprintf("tellstone: --federation-clusters: %v", perr))
 		}
 	}
 
@@ -839,3 +913,14 @@ func (cfg *Config) GetClusterSplitThreshold() uint64 { return cfg.clusterSplitTh
 
 // GetZone returns the node's declared availability zone (empty when unset).
 func (cfg *Config) GetZone() string { return cfg.zone }
+
+// GetClusterID returns the federation-wide cluster identity (0 when this node
+// is not part of a federation).
+func (cfg *Config) GetClusterID() uint64 { return cfg.clusterID }
+
+// GetGatewayAddr returns this node's cross-cluster gateway listen address
+// (empty = federation disabled on this node).
+func (cfg *Config) GetGatewayAddr() string { return cfg.gatewayAddr }
+
+// GetFederationClusters returns the raw --federation-clusters list.
+func (cfg *Config) GetFederationClusters() string { return cfg.federationClusters }
