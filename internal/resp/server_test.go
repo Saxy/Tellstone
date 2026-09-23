@@ -36,6 +36,13 @@ func (f *fakeStore) Get(key string) ([]byte, bool) {
 	return v, ok
 }
 
+func (f *fakeStore) GetErr(key string) ([]byte, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.m[key]
+	return v, ok, nil
+}
+
 func (f *fakeStore) Set(key string, value []byte, _ time.Duration) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

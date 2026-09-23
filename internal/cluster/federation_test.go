@@ -14,7 +14,9 @@ package cluster
 
 import (
 	"context"
+	"math"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,11 +173,46 @@ func TestFederationPolicyBootstrapAndSet(t *testing.T) {
 	}
 }
 
+// TestEncodeFederationPolicyPrefixTooLong verifies a prefix that cannot fit in
+// the uint16 wire length field is rejected before appendBytesField wraps it.
+func TestEncodeFederationPolicyPrefixTooLong(t *testing.T) {
+	if _, err := encodeFederationPolicy(FederationPolicy{
+		Rules: []FederationRule{{Prefix: "x", Cluster: 2}, {Prefix: strings.Repeat("a", math.MaxUint16+1), Cluster: 3}},
+	}); err == nil {
+		t.Fatal("encodeFederationPolicy accepted an over-length prefix")
+	}
+	if _, err := encodeFederationPolicy(FederationPolicy{
+		Rules: []FederationRule{{Prefix: strings.Repeat("a", math.MaxUint16), Cluster: 3}},
+	}); err != nil {
+		t.Fatalf("encodeFederationPolicy rejected a max-length prefix: %v", err)
+	}
+}
+
+// TestSetFederationPolicyCorrupt verifies a corrupt stored policy surfaces as
+// an error instead of being silently overwritten (or treated as absent).
+func TestSetFederationPolicyCorrupt(t *testing.T) {
+	cli, ctx, cancel := startRegionTest(t)
+	defer cancel()
+
+	corrupt := strings.Repeat("x", 32) // not a valid policy frame (version+count read ok, then truncated)
+	if _, err := cli.Put(ctx, federationPolicyKey, corrupt); err != nil {
+		t.Fatalf("Put corrupt policy: %v", err)
+	}
+	if err := SetFederationPolicy(ctx, cli, FederationPolicy{Rules: []FederationRule{{Prefix: "a", Cluster: 2}}}); err == nil {
+		t.Fatal("SetFederationPolicy succeeded over a corrupt stored policy")
+	}
+	// A manager seeded against the corrupt value must report the corruption,
+	// not silently fall back to the all-local default.
+	if _, err := NewFederationManager(cli, 5, DefaultFederationPolicy(5)).seed(ctx); err == nil {
+		t.Fatal("seed succeeded against a corrupt stored policy")
+	}
+}
+
 func TestFederationManagerWatch(t *testing.T) {
 	cli, ctx, cancel := startRegionTest(t)
 	defer cancel()
 
-	mgr := NewFederationManager(cli, 5)
+	mgr := NewFederationManager(cli, 5, DefaultFederationPolicy(5))
 	if got := mgr.Home([]byte("user:eu:alice")); got != 5 {
 		t.Fatalf("pre-watch Home = %d, want 5 (all-local default)", got)
 	}

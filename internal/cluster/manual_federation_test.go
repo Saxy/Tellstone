@@ -224,7 +224,12 @@ func TestManualFederation(t *testing.T) {
 		time.Sleep(1 * time.Second)
 	}
 	if !resumed {
-		t.Skipf("B2 restarted but its gateway did not serve within 60s (possible raft rejoin stall) — Phase 7 gateway-restart claim skip-verified")
+		// The restarted node's binary port is up but its gateway never served.
+		// This is Phase 7's own contract (gateway resume after host restart),
+		// so it must fail rather than skip — unlike the raft rejoin death
+		// above, nothing in the base platform excuses a live-binary-but-dead
+		// gateway here.
+		t.Fatalf("B2 restarted and its binary port is up but its gateway did not serve within 60s — Phase 7 gateway-restart claim FAILED")
 	}
 	if val, msgType, err := fedGetFresh(t, B[0], "user:eu:x"); err != nil {
 		t.Fatalf("  B1 GET user:eu:x after resume: %v", err)
@@ -322,6 +327,10 @@ func startFedCluster(t *testing.T, bin, tag string, clusterID, basePort, gwBase 
 		}
 		s.cmd = cmd
 		s.started = true
+		// Per-node teardown on the shared test context: if a later node fails
+		// to start and t.Fatalf aborts, the caller's cluster-level defer has
+		// not registered yet and this stops the nodes already running.
+		t.Cleanup(func() { manualStopCluster(t, []*manualServer{s}) })
 		go pipeToTestLog(t, fmt.Sprintf("%s%d-stdout", tag, i+1), stdoutPipe)
 		go pipeToTestLog(t, fmt.Sprintf("%s%d-stderr", tag, i+1), stderrPipe)
 		t.Logf("started %s node %d: cluster=%d binary=127.0.0.1:%d raft=127.0.0.1:%d gw=127.0.0.1:%d",

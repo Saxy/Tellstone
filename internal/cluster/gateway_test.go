@@ -137,6 +137,11 @@ func TestParserFederationClusters(t *testing.T) {
 		"2@host:9100,2@x",  // duplicate id
 		"ab@host:9100",     // non-numeric id
 		"2@",               // empty addr
+		"2@host",           // addr missing port
+		"2@host:notaport",  // non-numeric port
+		"2@host:0",         // out-of-range port
+		"2@host:70000",     // out-of-range port
+		"2@:9100",          // empty host
 		"2@host:9100,@x:1", // second entry explicit-id violation
 	} {
 		if _, err := ParseFederationClusters(bad); err == nil {

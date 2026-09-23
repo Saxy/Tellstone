@@ -751,6 +751,9 @@ func LoadConfig(args []string) *Config {
 			cfg.addr:     "--addr",
 			cfg.peerAddr: "--peer-addr",
 		}
+		if cfg.gatewayAddr != "" {
+			configured[cfg.gatewayAddr] = "--gateway-addr"
+		}
 		members, perr := cluster.ParsePeers(cfg.peers)
 		if perr != nil {
 			panic(fmt.Sprintf("tellstone: --peers: %v", perr))

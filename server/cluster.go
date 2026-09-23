@@ -197,10 +197,11 @@ func (cs *clusterStore) routeAnywhere(key string, payloads [][]byte) error {
 	return nil
 }
 
-// xGet reads a key from its home cluster through the gateway. A failed
+// xGetErr reads a key from its home cluster through the gateway. A failed
 // round-trip fails the read (ADR-011 D6): there is no stale fallback across
-// clusters.
-func (cs *clusterStore) xGet(key string, home uint64) ([]byte, bool) {
+// clusters, so the error is surfaced to the caller — the command layer reports
+// it as a storage error instead of a plain miss.
+func (cs *clusterStore) xGetErr(key string, home uint64) ([]byte, bool, error) {
 	if cs.gw == nil {
 		if cs.logger.Enabled(log.LevelError) {
 			cs.logger.Log(log.LevelError, "cluster store: cross-cluster read with no gateway configured",
@@ -208,7 +209,7 @@ func (cs *clusterStore) xGet(key string, home uint64) ([]byte, bool) {
 				log.Uint64("home_cluster", home),
 			)
 		}
-		return nil, false
+		return nil, false, fmt.Errorf("CLUSTERDOWN: key %q belongs to cluster %d but no gateway is configured", key, home)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
@@ -221,7 +222,7 @@ func (cs *clusterStore) xGet(key string, home uint64) ([]byte, bool) {
 				log.String("error", err.Error()),
 			)
 		}
-		return nil, false
+		return nil, false, fmt.Errorf("CLUSTERDOWN: cross-cluster read of key %q in cluster %d failed: %w", key, home, err)
 	}
 	value, present, derr := cluster.DecodeXReadResp(resp)
 	if derr != nil {
@@ -231,16 +232,17 @@ func (cs *clusterStore) xGet(key string, home uint64) ([]byte, bool) {
 				log.String("error", derr.Error()),
 			)
 		}
-		return nil, false
+		return nil, false, fmt.Errorf("CLUSTERDOWN: cross-cluster read of key %q in cluster %d returned a malformed reply: %w", key, home, derr)
 	}
-	return value, present
+	return value, present, nil
 }
 
 // handleCrossClusterOp executes an inbound cross-cluster op forwarded through
 // this node's gateway. It is wired as the gateway's executor in Run once the
 // store exists, so the op runs against this cluster's proven local routing
-// body. cs.Get on the home side resolves the key as local (the home cluster
-// matches this node's cluster ID), so forwarded reads cannot loop.
+// body. A forwarded read uses localRead directly (never full Get routing), so
+// the home side serves it through the linearizable local path and cannot
+// re-enter the gateway and loop.
 func (cs *clusterStore) handleCrossClusterOp(op network.OpKind, payload []byte) ([]byte, error) {
 	switch op {
 	case network.OpXClusterWrite:
@@ -257,7 +259,7 @@ func (cs *clusterStore) handleCrossClusterOp(op network.OpKind, payload []byte) 
 		if err != nil {
 			return nil, fmt.Errorf("cluster gateway: malformed cross-cluster read: %w", err)
 		}
-		value, present := cs.Get(key)
+		value, present := cs.localRead(key)
 		return cluster.EncodeXReadResp(value, present), nil
 	default:
 		return nil, fmt.Errorf("cluster gateway: unsupported cross-cluster op %d", op)
@@ -275,16 +277,14 @@ func (cs *clusterStore) nodeForRegion(route *cluster.RegionRoute) *cluster.Node 
 	return cs.node
 }
 
-func (cs *clusterStore) Get(key string) ([]byte, bool) {
-	// Phase 7: a key whose home cluster is remote reads through the gateway —
-	// the home cluster serves it with the full linearizable read path.
-	if home, remote := cs.homeFor(key); remote {
-		return cs.xGet(key, home)
-	}
-	// Linearizable read: wait (bounded) until this replica has applied at least
-	// the Raft commit index observed by ReadIndex, then serve from the local
-	// engine. On timeout/failure we fall back to the local value (best-effort,
-	// may be slightly stale) rather than failing the read.
+// localRead serves a key through the linearizable local read path: wait
+// (bounded) until this replica has applied at least the Raft commit index
+// observed by ReadIndex, then serve from the local engine. On timeout/failure
+// it falls back to the local value (best-effort, may be slightly stale) rather
+// than failing the read. This is the body both reads and cross-cluster reads
+// land on, so the home side of a forwarded read behaves exactly like a local
+// get without re-entering federation routing.
+func (cs *clusterStore) localRead(key string) ([]byte, bool) {
 	var rn *cluster.Node
 	var route *cluster.RegionRoute
 	if cs.geo != nil && cs.clientZone != "" {
@@ -316,6 +316,28 @@ func (cs *clusterStore) Get(key string) ([]byte, bool) {
 			log.Int("value_len", len(val)),
 		)
 	}
+	return val, ok
+}
+
+// GetErr is the error-surfacing read used by the command layer. A key whose
+// home cluster is remote reads through the gateway, and a failed cross-cluster
+// round-trip returns a CLUSTERDOWN error (ADR-011 D6) instead of an ordinary
+// miss; a local key is served from localRead.
+func (cs *clusterStore) GetErr(key string) ([]byte, bool, error) {
+	// Phase 7: a key whose home cluster is remote reads through the gateway —
+	// the home cluster serves it with the full linearizable read path.
+	if home, remote := cs.homeFor(key); remote {
+		return cs.xGetErr(key, home)
+	}
+	val, ok := cs.localRead(key)
+	return val, ok, nil
+}
+
+// Get reads a key through the full cluster path, masking a failed
+// cross-cluster read as a miss. Kept for callers that only care about
+// presence; the command layer uses GetErr to surface federation failures.
+func (cs *clusterStore) Get(key string) ([]byte, bool) {
+	val, ok, _ := cs.GetErr(key)
 	return val, ok
 }
 

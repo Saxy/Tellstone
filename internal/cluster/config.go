@@ -14,6 +14,7 @@ package cluster
 import (
 	"fmt"
 	"hash/fnv"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -103,6 +104,16 @@ func ParseFederationClusters(raw string) (map[uint64]string, error) {
 		}
 		if addr == "" {
 			return nil, fmt.Errorf("cluster: federation address is empty for cluster %d (entry %q)", id, s)
+		}
+		// The address is dialed as a gateway endpoint, so it must be a usable
+		// host:port: a bare host (missing port) and an out-of-range port would
+		// expire the dial and surface as an opaque CLUSTERDOWN downstream.
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil || host == "" {
+			return nil, fmt.Errorf("cluster: federation address %q for cluster %d must be host:port (entry %q)", addr, id, s)
+		}
+		if port, perr := strconv.Atoi(portStr); perr != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("cluster: federation address %q for cluster %d has invalid port %q (entry %q)", addr, id, portStr, s)
 		}
 		if _, dup := out[id]; dup {
 			return nil, fmt.Errorf("cluster: duplicate federation cluster id %d", id)

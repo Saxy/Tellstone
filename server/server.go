@@ -52,6 +52,11 @@ func (rs *RouterStore) Get(key string) ([]byte, bool) {
 	return resp.Value, resp.OK
 }
 
+func (rs *RouterStore) GetErr(key string) ([]byte, bool, error) {
+	resp := rs.router.Dispatch(shard.CmdGet, key, nil, 0)
+	return resp.Value, resp.OK, resp.Err
+}
+
 func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
 	resp := rs.router.Dispatch(shard.CmdSet, key, value, ttl)
 	return resp.Err
@@ -938,7 +943,8 @@ func (s *Server) initCluster() error {
 	s.regionCoord.SetZone(cfg.GetZone())
 	if cfg.GetGatewayAddr() != "" || cfg.GetFederationClusters() != "" {
 		bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
-		if _, berr := cluster.BootstrapFederationPolicy(bootstrapCtx, s.pdNode.Client(), cfg.GetClusterID()); berr != nil {
+		efpol, berr := cluster.BootstrapFederationPolicy(bootstrapCtx, s.pdNode.Client(), cfg.GetClusterID())
+		if berr != nil {
 			bootstrapCancel()
 			s.regionCoord.Stop()
 			s.raftNode.Stop()
@@ -947,7 +953,7 @@ func (s *Server) initCluster() error {
 		}
 		bootstrapCancel()
 
-		s.fedMgr = cluster.NewFederationManager(s.pdNode.Client(), cfg.GetClusterID())
+		s.fedMgr = cluster.NewFederationManager(s.pdNode.Client(), cfg.GetClusterID(), efpol)
 		fedCtx, fedCancel := context.WithCancel(context.Background())
 		s.fedCancel = fedCancel
 		s.fedDone = make(chan struct{})

@@ -64,6 +64,9 @@ func encodeFederationPolicy(p FederationPolicy) ([]byte, error) {
 	buf = appendUint64(buf, p.Version)
 	buf = appendUint16(buf, uint16(len(p.Rules)))
 	for _, r := range p.Rules {
+		if len(r.Prefix) > math.MaxUint16 {
+			return nil, fmt.Errorf("cluster: federation policy rule prefix length %d exceeds the %d-byte wire field", len(r.Prefix), math.MaxUint16)
+		}
 		buf = appendBytesField(buf, []byte(r.Prefix))
 		buf = appendUint64(buf, r.Cluster)
 	}
@@ -181,9 +184,11 @@ func SetFederationPolicy(ctx context.Context, cli *clientv3.Client, p Federation
 		cur := FederationPolicy{}
 		var modRev int64
 		if len(resp.Kvs) > 0 {
-			if decoded, ok := decodeFederationPolicy(resp.Kvs[0].Value); ok {
-				cur = decoded
+			decoded, ok := decodeFederationPolicy(resp.Kvs[0].Value)
+			if !ok {
+				return errors.New("cluster: stored federation policy is corrupt; refusing to overwrite")
 			}
+			cur = decoded
 			modRev = resp.Kvs[0].ModRevision
 		}
 		p.Version = cur.Version + 1
@@ -253,13 +258,14 @@ type FederationManager struct {
 }
 
 // NewFederationManager creates a federation manager bound to the PD etcd
-// client. policy starts at the default (everything local) until the watcher
-// applies the operator policy.
-func NewFederationManager(cli *clientv3.Client, local uint64) *FederationManager {
+// client. initial seeds the cache — callers pass the bootstrapped (or
+// default) policy so the node routes correctly before its first watch
+// delivery, and the watcher replaces it on the next version.
+func NewFederationManager(cli *clientv3.Client, local uint64, initial FederationPolicy) *FederationManager {
 	return &FederationManager{
 		cli:    cli,
 		local:  local,
-		policy: DefaultFederationPolicy(local),
+		policy: initial,
 	}
 }
 
@@ -300,9 +306,12 @@ func (m *FederationManager) seed(ctx context.Context) (int64, error) {
 	m.policyMu.Lock()
 	m.policy = DefaultFederationPolicy(m.local)
 	if len(resp.Kvs) > 0 {
-		if p, ok := decodeFederationPolicy(resp.Kvs[0].Value); ok {
-			m.policy = p
+		p, ok := decodeFederationPolicy(resp.Kvs[0].Value)
+		if !ok {
+			m.policyMu.Unlock()
+			return 0, errors.New("cluster: stored federation policy is corrupt")
 		}
+		m.policy = p
 	}
 	m.policyMu.Unlock()
 	return resp.Header.Revision + 1, nil
