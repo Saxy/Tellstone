@@ -54,6 +54,9 @@ const (
 // it directly, which keeps this package decoupled and easy to test with a fake.
 type Store interface {
 	Get(key string) ([]byte, bool)
+	// GetErr reads a key, reporting whether it existed and any storage error
+	// (see command.Store.GetErr).
+	GetErr(key string) ([]byte, bool, error)
 	Set(key string, value []byte, ttl time.Duration) error
 	// Delete removes a key and reports whether it existed. A non-nil error
 	// means the deletion did not happen; the boolean is only meaningful

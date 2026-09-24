@@ -26,6 +26,11 @@ import (
 // Store is the storage seam every handler writes to
 type Store interface {
 	Get(key string) ([]byte, bool)
+	// GetErr reads a key, reporting whether it existed and any storage error.
+	// ok is only meaningful when err is nil; a non-nil error must not be
+	// reported as a miss. The cluster store uses it to surface cross-cluster
+	// (federation) read failures instead of masking them as NOT FOUND.
+	GetErr(key string) ([]byte, bool, error)
 	Set(key string, value []byte, ttl time.Duration) error
 	// Delete removes a key and reports whether it existed. A non-nil error
 	// means the deletion did not happen (e.g. not leader in cluster mode);

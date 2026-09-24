@@ -56,13 +56,15 @@ const (
 
 // manualServer holds the state of a single Tellstone process in the cluster.
 type manualServer struct {
-	id         int
-	cmd        *exec.Cmd
-	binaryPort int // RESP port
-	raftPort   int // Raft transport port
-	dataDir    string
-	zone       string // geo availability zone ("" = unset, Phase 6)
-	started    bool
+	id          int
+	cmd         *exec.Cmd
+	args        []string
+	binaryPort  int // RESP port
+	raftPort    int // Raft transport port
+	gatewayPort int // Phase 7 cross-cluster gateway port (0 = none)
+	dataDir     string
+	zone        string // geo availability zone ("" = unset, Phase 6)
+	started     bool
 }
 
 // manualRepoRoot returns the repository root, derived from this file's own
@@ -229,7 +231,11 @@ func sendFrame(conn net.Conn, msgType byte, payload []byte) error {
 }
 
 func readFrame(conn net.Conn) (byte, []byte, error) {
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	return readFrameDeadline(conn, 5*time.Second)
+}
+
+func readFrameDeadline(conn net.Conn, timeout time.Duration) (byte, []byte, error) {
+	conn.SetReadDeadline(time.Now().Add(timeout))
 	hdr := make([]byte, 4)
 	if _, err := io.ReadFull(conn, hdr); err != nil {
 		return 0, nil, fmt.Errorf("read header: %w", err)
@@ -246,6 +252,14 @@ func readFrame(conn net.Conn) (byte, []byte, error) {
 }
 
 func binarySet(conn net.Conn, key, value string, ttlMs int64) (string, error) {
+	return binarySetDeadline(conn, key, value, ttlMs, 5*time.Second)
+}
+
+// binarySetDeadline is binarySet with a caller-chosen client read timeout.
+// Used by the federation test where a dead gateway can take the server's
+// cross-cluster Call budget (~8s) to answer with CLUSTERDOWN, which a 5s
+// default deadline would miss and leave a stale frame on the connection.
+func binarySetDeadline(conn net.Conn, key, value string, ttlMs int64, timeout time.Duration) (string, error) {
 	keyBytes := []byte(key)
 	valBytes := []byte(value)
 	payload := make([]byte, 1+2+8+len(keyBytes)+len(valBytes))
@@ -258,7 +272,7 @@ func binarySet(conn net.Conn, key, value string, ttlMs int64) (string, error) {
 	if err := sendFrame(conn, 0x02, payload); err != nil {
 		return "", fmt.Errorf("send SET: %w", err)
 	}
-	msgType, resp, err := readFrame(conn)
+	msgType, resp, err := readFrameDeadline(conn, timeout)
 	if err != nil {
 		return "", fmt.Errorf("read SET response: %w", err)
 	}
@@ -269,6 +283,10 @@ func binarySet(conn net.Conn, key, value string, ttlMs int64) (string, error) {
 }
 
 func binaryGet(conn net.Conn, key string) (string, byte, error) {
+	return binaryGetDeadline(conn, key, 5*time.Second)
+}
+
+func binaryGetDeadline(conn net.Conn, key string, timeout time.Duration) (string, byte, error) {
 	keyBytes := []byte(key)
 	payload := make([]byte, 1+2+8+len(keyBytes))
 	payload[0] = 0x01 // OpGet
@@ -278,7 +296,7 @@ func binaryGet(conn net.Conn, key string) (string, byte, error) {
 	if err := sendFrame(conn, 0x02, payload); err != nil {
 		return "", 0, fmt.Errorf("send GET: %w", err)
 	}
-	msgType, resp, err := readFrame(conn)
+	msgType, resp, err := readFrameDeadline(conn, timeout)
 	if err != nil {
 		return "", 0, fmt.Errorf("read GET response: %w", err)
 	}

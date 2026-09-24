@@ -52,6 +52,11 @@ func (rs *RouterStore) Get(key string) ([]byte, bool) {
 	return resp.Value, resp.OK
 }
 
+func (rs *RouterStore) GetErr(key string) ([]byte, bool, error) {
+	resp := rs.router.Dispatch(shard.CmdGet, key, nil, 0)
+	return resp.Value, resp.OK, resp.Err
+}
+
 func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
 	resp := rs.router.Dispatch(shard.CmdSet, key, value, ttl)
 	return resp.Err
@@ -144,6 +149,17 @@ type Server struct {
 	geoCancel context.CancelFunc
 	// geoDone is closed once the GeoManager Run goroutine has returned.
 	geoDone chan struct{}
+	// fedMgr is the Phase 7 federation policy manager (home-cluster
+	// resolution for cross-cluster routing), converged via etcd Watch. Nil
+	// when federation is disabled on this node.
+	fedMgr *cluster.FederationManager
+	// fedCancel stops the FederationManager Run goroutine on shutdown.
+	fedCancel context.CancelFunc
+	// fedDone is closed once the FederationManager Run goroutine has returned.
+	fedDone chan struct{}
+	// gateway is this node's Phase 7 cross-cluster gateway transport. Nil
+	// when federation is disabled on this node.
+	gateway *cluster.Gateway
 }
 
 func NewServer(app *tellstone.App) *Server {
@@ -201,6 +217,14 @@ func (s *Server) Run() error {
 		// non-cluster stores keeps their plain Find path intact.
 		if s.geoMgr != nil {
 			cs.SetGeo(s.geoMgr, cfg.GetZone())
+		}
+		// Phase 7 federation (ADR-011): the cluster store routes keys through
+		// the home-cluster policy and forwards remote keys via the gateway.
+		// The gateway's inbound executor is this same store, so cross-cluster
+		// ops land on the proven local routing body.
+		if s.fedMgr != nil && s.gateway != nil {
+			cs.SetFederation(s.fedMgr, s.gateway, cfg.GetClusterID())
+			s.gateway.SetHandler(cs.handleCrossClusterOp)
 		}
 		s.store = cs
 	}
@@ -425,6 +449,18 @@ func (s *Server) shutdown(ctx context.Context) {
 	}
 	if s.geoDone != nil {
 		<-s.geoDone
+	}
+	// Phase 7: stop the gateway transport first so no new cross-cluster ops
+	// are accepted while we tear down, then the federation manager (which
+	// watches etcd) before the PD node closes its client.
+	if s.gateway != nil {
+		s.gateway.Stop()
+	}
+	if s.fedCancel != nil {
+		s.fedCancel()
+	}
+	if s.fedDone != nil {
+		<-s.fedDone
 	}
 	// Stop non-bootstrap region nodes before the bootstrap raft node, which
 	// owns the shared transport they use.
@@ -831,8 +867,6 @@ func (s *Server) initCluster() error {
 		s.pdNode.Stop()
 		return fmt.Errorf("bootstrap default region: %w", err)
 	}
-	// Bootstrap the default geo policy (everything global) so the operator
-	// policy key exists and every node converges the same way.
 	if _, err = cluster.BootstrapGeoPolicy(bootCtx, s.pdNode.Client()); err != nil {
 		s.raftNode.Stop()
 		s.pdNode.Stop()
@@ -851,8 +885,6 @@ func (s *Server) initCluster() error {
 		}
 		close(s.regionDone)
 	}()
-
-	// Phase 4: region size tracking for auto-split decisions.
 	tracker := cluster.NewRegionSizeTracker()
 	s.regionSizeTracker = tracker
 	resolver := func(key string) uint64 {
@@ -870,10 +902,6 @@ func (s *Server) initCluster() error {
 		tracker.ReportLoop(sizeReportCtx, s.pdNode.Client(), 10*time.Second)
 		close(s.sizeReportDone)
 	}()
-
-	// Phase 4: per-region Raft group host + auto-split coordinator. Region 1
-	// (the bootstrap group) is the node we already started; any region created
-	// by a split is hosted as an additional group node sharing the transport.
 	coord := NewRegionCoordinator(
 		s.pdNode.Client(),
 		cfg.GetNodeID(),
@@ -887,18 +915,11 @@ func (s *Server) initCluster() error {
 		resolver,
 	)
 	s.regionCoord = coord
-	// Multi-region leadership: the coordinator hosts one raft node per region,
-	// so the region manager's leader publication must resolve leadership per
-	// region (not just the bootstrap group).
 	rm.SetLeadershipProvider(coord.LeadershipProvider())
 	go coord.Run(rmCtx)
-
-	// Phase 6: geo-aware placement. Register this node's zone so the PD and
-	// peers can resolve it, then watch the node registry and geo policy so
-	// routing and placement stay converged without restarts.
 	s.geoMgr = cluster.NewGeoManager(s.pdNode.Client(), cfg.GetNodeID())
 	geoRegCtx, geoRegCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := s.geoMgr.RegisterNode(geoRegCtx, cfg.GetZone(), cfg.GetAddr()); err != nil {
+	if err = s.geoMgr.RegisterNode(geoRegCtx, cfg.GetZone(), cfg.GetAddr()); err != nil {
 		geoRegCancel()
 		coord.Stop()
 		s.raftNode.Stop()
@@ -917,16 +938,67 @@ func (s *Server) initCluster() error {
 		}
 		close(s.geoDone)
 	}()
-
-	// Phase 6 placement: pin region zones (and re-pin on policy changes) via
-	// the geo manager's live policy. RegionManager reconciles on its leader
-	// publication loop; the split coordinator pins zones at creation time.
 	rm.SetGeoPolicyProvider(s.geoMgr)
 	s.regionCoord.SetGeoPolicyProvider(s.geoMgr)
-	// Phase 6 leader preference: nodes out of a region's preferred zone get a
-	// longer raft election timeout so same-zone followers win elections.
 	s.regionCoord.SetZone(cfg.GetZone())
+	if cfg.GetGatewayAddr() != "" || cfg.GetFederationClusters() != "" {
+		bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		efpol, berr := cluster.BootstrapFederationPolicy(bootstrapCtx, s.pdNode.Client(), cfg.GetClusterID())
+		if berr != nil {
+			bootstrapCancel()
+			s.regionCoord.Stop()
+			s.raftNode.Stop()
+			s.pdNode.Stop()
+			return fmt.Errorf("bootstrap federation policy: %w", berr)
+		}
+		bootstrapCancel()
 
+		s.fedMgr = cluster.NewFederationManager(s.pdNode.Client(), cfg.GetClusterID(), efpol)
+		fedCtx, fedCancel := context.WithCancel(context.Background())
+		s.fedCancel = fedCancel
+		s.fedDone = make(chan struct{})
+		go func() {
+			if ferr := s.fedMgr.Run(fedCtx); ferr != nil && logger.Enabled(log.LevelError) {
+				logger.Log(log.LevelError, "server: federation manager stopped",
+					log.String("error", ferr.Error()),
+				)
+			}
+			close(s.fedDone)
+		}()
+		remotePeers, perr := cluster.ParseFederationClusters(cfg.GetFederationClusters())
+		if perr != nil {
+			logger.Log(log.LevelError, "server: invalid --federation-clusters",
+				log.String("error", perr.Error()),
+			)
+			s.regionCoord.Stop()
+			s.raftNode.Stop()
+			s.pdNode.Stop()
+			return perr
+		}
+		gw, gerr := cluster.NewGateway(cluster.GatewayConfig{
+			ClusterID: cfg.GetClusterID(),
+			Addr:      cfg.GetGatewayAddr(),
+			Peers:     remotePeers,
+			Logger:    logger,
+		})
+		if gerr != nil {
+			s.fedCancel()
+			<-s.fedDone
+			s.regionCoord.Stop()
+			s.raftNode.Stop()
+			s.pdNode.Stop()
+			return gerr
+		}
+		if gerr = gw.Start(); gerr != nil {
+			s.fedCancel()
+			<-s.fedDone
+			s.regionCoord.Stop()
+			s.raftNode.Stop()
+			s.pdNode.Stop()
+			return gerr
+		}
+		s.gateway = gw
+	}
 	if logger.Enabled(log.LevelInfo) {
 		logger.Log(log.LevelInfo, "server: cluster mode enabled",
 			log.Uint64("node_id", cfg.GetNodeID()),

@@ -27,6 +27,7 @@ type fakeStore struct {
 	m       map[string][]byte
 	lastTTL time.Duration
 	setErr  error
+	getErr  error
 }
 
 func newFakeStore() *fakeStore { return &fakeStore{m: make(map[string][]byte)} }
@@ -34,6 +35,11 @@ func newFakeStore() *fakeStore { return &fakeStore{m: make(map[string][]byte)} }
 func (f *fakeStore) Get(key string) ([]byte, bool) {
 	v, ok := f.m[key]
 	return v, ok
+}
+
+func (f *fakeStore) GetErr(key string) ([]byte, bool, error) {
+	v, ok := f.m[key]
+	return v, ok, f.getErr
 }
 
 func (f *fakeStore) Set(key string, value []byte, ttl time.Duration) error {
@@ -157,6 +163,14 @@ func TestGet(t *testing.T) {
 	r, _ = run(store, "GET", "k", "extra")
 	if r.kind != kindError || r.msg != "ERR wrong number of arguments for 'get' command" {
 		t.Fatalf("GET arity = kind %v msg %q, want arity error", r.kind, r.msg)
+	}
+
+	// A storage failure must surface as an error, never as a miss — the
+	// cluster store uses this to report cross-cluster (federation) failures.
+	store.getErr = errors.New("CLUSTERDOWN: cross-cluster read failed")
+	r, _ = run(store, "GET", "k")
+	if r.kind != kindStorageErr || r.msg != store.getErr.Error() {
+		t.Fatalf("GET storage failure = kind %v msg %q, want storage err", r.kind, r.msg)
 	}
 }
 

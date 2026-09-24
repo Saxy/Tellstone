@@ -24,7 +24,11 @@ func get(c *Ctx) {
 		c.Reply.ErrorMsg("ERR wrong number of arguments for 'get' command")
 		return
 	}
-	val, ok := c.Store.Get(alias(c.Args[1]))
+	val, ok, err := c.Store.GetErr(alias(c.Args[1]))
+	if err != nil {
+		c.Reply.StorageErr(err)
+		return
+	}
 	if !ok {
 		c.Reply.Null()
 		return

@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"math"
+	"net"
 	"os"
 	"runtime"
 	"strconv"
@@ -868,4 +869,49 @@ func TestPDMembersAndDirValidation(t *testing.T) {
 			t.Fatalf("explicit dir: got %q, want /fast/ssd", got)
 		}
 	})
+}
+
+// TestPDEndpointsCollide covers the endpoint collision check: equivalent IPv6
+// representations of the same address collide numerically, wildcard binds
+// collide with everything on the same port, and distinct addresses do not.
+func TestPDEndpointsCollide(t *testing.T) {
+	mk := func(h string, port int) string { return net.JoinHostPort(h, strconv.Itoa(port)) }
+
+	collide := []struct{ a, b string }{
+		// Numerically equal IPv6 addresses in different textual forms.
+		{mk("2001:db8::1", 9100), mk("2001:0db8:0:0:0:0:0:1", 9100)},
+		{mk("::1", 9100), mk("0:0:0:0:0:0:0:1", 9100)},
+		// IPv4-mapped IPv6 equals the plain IPv4 address.
+		{mk("::ffff:127.0.0.1", 9100), mk("127.0.0.1", 9100)},
+		{mk("::ffff:192.168.0.10", 9100), mk("192.168.0.10", 9100)},
+		// Fully-expanded wildcard equals the compressed one.
+		{mk("0:0:0:0:0:0:0:0", 9100), mk("::", 9100)},
+		{mk("0.0.0.0", 9100), mk("0:0:0:0:0:0:0:0", 9100)},
+		// Wildcards collide with any host on the same port (unchanged).
+		{mk("0.0.0.0", 9100), mk("127.0.0.1", 9100)},
+		{mk("::", 9100), mk("2001:db8::1", 9100)},
+		{":9100", mk("127.0.0.1", 9100)},
+		// Identical endpoints still collide (hosts and hostnames alike).
+		{mk("127.0.0.1", 9100), mk("127.0.0.1", 9100)},
+		{mk("myhost", 9100), mk("myhost", 9100)},
+	}
+	for _, c := range collide {
+		if !pdEndpointsCollide(c.a, c.b) {
+			t.Errorf("pdEndpointsCollide(%q, %q) = false, want true", c.a, c.b)
+		}
+	}
+
+	distinct := []struct{ a, b string }{
+		{mk("2001:db8::1", 9100), mk("2001:db8::2", 9100)},
+		{mk("::1", 9100), mk("127.0.0.1", 9100)},
+		{mk("127.0.0.1", 9100), mk("127.0.0.2", 9100)},
+		{mk("127.0.0.1", 9100), mk("127.0.0.1", 9101)},
+		{mk("myhost", 9100), mk("otherhost", 9100)},
+		{mk("myhost", 9100), mk("127.0.0.1", 9100)},
+	}
+	for _, c := range distinct {
+		if pdEndpointsCollide(c.a, c.b) {
+			t.Errorf("pdEndpointsCollide(%q, %q) = true, want false", c.a, c.b)
+		}
+	}
 }

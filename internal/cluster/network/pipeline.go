@@ -58,7 +58,31 @@ const (
 	// OpForwardResp is the reply to OpForwardWrite / OpForwardChunks. The
 	// framed payload is empty on success or the apply error text on failure.
 	OpForwardResp OpKind = 5
+	// OpXClusterWrite forwards a federation write (single op payload or a
+	// chunk chain) to the gateway of the key's home cluster. The reply is
+	// OpXClusterResp, mirroring OpForwardResp semantics.
+	OpXClusterWrite OpKind = 6
+	// OpXClusterRead forwards a linearizable read to the gateway of the key's
+	// home cluster. The reply OpXClusterResp carries a framed "present + value"
+	// body so a missing key differs from an empty value (Phase 7, ADR-011).
+	OpXClusterRead OpKind = 7
+	// OpXClusterResp is the reply to OpXClusterWrite / OpXClusterRead. On
+	// error the framed payload holds the error text; on success it holds the
+	// read result body or is empty for a write.
+	OpXClusterResp OpKind = 8
 )
+
+// responseKind returns the reply kind a peer uses for a given request kind.
+func responseKind(req OpKind) OpKind {
+	switch req {
+	case OpPing:
+		return OpPong
+	case OpXClusterWrite, OpXClusterRead:
+		return OpXClusterResp
+	default:
+		return OpForwardResp
+	}
+}
 
 // PipeHandler applies an inbound forwarded operation on the leader. payload is
 // the request body; a non-nil error becomes the framed error response.
@@ -291,7 +315,9 @@ func (p *Pipeline) deliver(pm pipeMsg) {
 		respPayload, aerr := p.handleForward(pm)
 		p.stats.Responses.Add(1)
 		p.respond(pm, OpForwardResp, encodePipeResp(respPayload, aerr))
-	case OpPong, OpForwardResp:
+	case OpXClusterWrite, OpXClusterRead:
+		p.deliverXCluster(pm)
+	case OpPong, OpForwardResp, OpXClusterResp:
 		p.completeInline(pm)
 	default:
 		if p.logger.Enabled(log.LevelWarn) {
@@ -302,6 +328,16 @@ func (p *Pipeline) deliver(pm pipeMsg) {
 			)
 		}
 	}
+}
+
+// deliverXCluster answers an inbound federation op through the gateway
+// handler (registered under the gateway group ID, e.g. the transport's owner
+// node ID via lookups in Gateway). It reuses handleForward so the reply
+// encoding and failure semantics are identical to forwarded writes.
+func (p *Pipeline) deliverXCluster(pm pipeMsg) {
+	respPayload, aerr := p.handleForward(pm)
+	p.stats.Responses.Add(1)
+	p.respond(pm, OpXClusterResp, encodePipeResp(respPayload, aerr))
 }
 
 // handleForward invokes the region handler for a forwarded write request. A
@@ -358,11 +394,7 @@ func (p *Pipeline) respond(pm pipeMsg, kind OpKind, respPayload []byte) {
 // overload error so the follower's Call fails fast and retries immediately
 // instead of waiting for a context timeout.
 func (p *Pipeline) reject(pm pipeMsg, err error) {
-	kind := OpForwardResp
-	if pm.kind == OpPing {
-		kind = OpPong
-	}
-	p.respond(pm, kind, encodePipeResp(nil, err))
+	p.respond(pm, responseKind(pm.kind), encodePipeResp(nil, err))
 }
 
 // onOverload handles a message the saturated dispatch queue could not accept.
@@ -372,7 +404,7 @@ func (p *Pipeline) reject(pm pipeMsg, err error) {
 // response for a response.
 func (p *Pipeline) onOverload(pm pipeMsg) {
 	switch pm.kind {
-	case OpPong, OpForwardResp:
+	case OpPong, OpForwardResp, OpXClusterResp:
 		p.completeInline(pm)
 	default:
 		p.reject(pm, errPipelineOverloaded)

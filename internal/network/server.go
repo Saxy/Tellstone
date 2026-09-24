@@ -177,12 +177,15 @@ func NewServer(
 	return s
 }
 
-// ListenAndServe starts the multi-reactor epoll event loop.
+// ListenAndServe starts the multi-reactor epoll event loop. SO_REUSEADDR is
+// set so a fast restart (e.g. after a crashed or SIGKILLed predecessor) can
+// rebind even while the dead process's lingering TCP tuples on this port are
+// still being reaped; without it the new listen fails with EADDRINUSE.
 func (s *Server) ListenAndServe() error {
 	if s.logger.Enabled(log.LevelInfo) {
 		s.logger.Log(log.LevelInfo, "network: event-driven engine initializing", log.String("address", s.addr))
 	}
-	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true), gnet.WithLogger(log.NewGnetAdapter(s.logger)))
+	return gnet.Run(s, "tcp://"+s.addr, gnet.WithMulticore(true), gnet.WithReuseAddr(true), gnet.WithLogger(log.NewGnetAdapter(s.logger)))
 }
 
 // Shutdown gracefully stops the event loop, waiting for in-flight connections to drain or

@@ -14,6 +14,7 @@ package cluster
 import (
 	"fmt"
 	"hash/fnv"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -72,6 +73,54 @@ func hashAddr(addr string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(addr))
 	return h.Sum64()
+}
+
+// ParseFederationClusters parses --federation-clusters: a comma-separated
+// list of "clusterid@host:port" entries into a map keyed by remote cluster
+// ID (ADR-011 D1/D2). Unlike ParsePeers, an explicit cluster ID is required
+// — the federation namespace is operator-defined, and deriving IDs from
+// addresses would silently misroute keys to the wrong cluster. Duplicate IDs
+// and the zero ID are rejected. Returns nil for an empty string.
+func ParseFederationClusters(raw string) (map[uint64]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	out := make(map[uint64]string)
+	for _, s := range strings.Split(raw, ",") {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		idStr, addr, ok := strings.Cut(s, "@")
+		if !ok {
+			return nil, fmt.Errorf("cluster: federation entry %q must be clusterid@addr (id required)", s)
+		}
+		id, err := strconv.ParseUint(strings.TrimSpace(idStr), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("cluster: invalid federation cluster ID %q: %w", idStr, err)
+		}
+		if id == 0 {
+			return nil, fmt.Errorf("cluster: federation cluster ID must be non-zero (entry %q)", s)
+		}
+		if addr == "" {
+			return nil, fmt.Errorf("cluster: federation address is empty for cluster %d (entry %q)", id, s)
+		}
+		// The address is dialed as a gateway endpoint, so it must be a usable
+		// host:port: a bare host (missing port) and an out-of-range port would
+		// expire the dial and surface as an opaque CLUSTERDOWN downstream.
+		host, portStr, err := net.SplitHostPort(addr)
+		if err != nil || host == "" {
+			return nil, fmt.Errorf("cluster: federation address %q for cluster %d must be host:port (entry %q)", addr, id, s)
+		}
+		if port, perr := strconv.Atoi(portStr); perr != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("cluster: federation address %q for cluster %d has invalid port %q (entry %q)", addr, id, portStr, s)
+		}
+		if _, dup := out[id]; dup {
+			return nil, fmt.Errorf("cluster: duplicate federation cluster id %d", id)
+		}
+		out[id] = addr
+	}
+	return out, nil
 }
 
 // LocalPeer returns the peer entry matching nodeID, or nil if not found.
