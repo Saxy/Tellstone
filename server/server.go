@@ -2,7 +2,7 @@
 Package server
 Tellstone Cloud-Native In-Memory Database
 File: server.go
-Description: Top-level server orchestration: initializes the shared-nothing shards, router, binary-protocol listener, optional RESP/TLS listener, and metrics server. Handles graceful shutdown on SIGINT/SIGTERM.
+Description: Top-level server orchestration: initializes the shared-nothing shards, router, binary-protocol listener, and metrics server. Handles graceful shutdown on SIGINT/SIGTERM.
 
 Authors:
 
@@ -37,10 +37,11 @@ import (
 	"github.com/Saxy/Tellstone/internal/oauth/presets"
 	"github.com/Saxy/Tellstone/internal/persistence"
 	"github.com/Saxy/Tellstone/internal/rbac"
-	"github.com/Saxy/Tellstone/internal/resp"
 	"github.com/Saxy/Tellstone/internal/router"
 	"github.com/Saxy/Tellstone/internal/shard"
+	sqlpkg "github.com/Saxy/Tellstone/internal/sql"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type RouterStore struct {
@@ -86,20 +87,23 @@ type Server struct {
 	rs RouterStore
 	// store is the active Store implementation. In standalone mode it wraps rs
 	// directly; in cluster mode it wraps a clusterStore that routes writes
-	// through Raft consensus. Both the binary and RESP frontends use this.
-	store       command.Store
-	netSrv      *network.Server
-	respSrv     *resp.Server
+	// through Raft consensus. The binary frontend uses this.
+	store  command.Store
+	netSrv *network.Server
+	// pgSrv is the Phase 8 PostgreSQL wire frontend (ADR-012). Nil when
+	// --pg-addr is unset. It shares the store, RBAC policy, OAuth provider and
+	// audit engine with the binary frontend.
+	pgSrv       *sqlpkg.Server
 	metricsSrv  *http.Server
 	tlsConfigs  *tlslib.ConfigStore
 	tlsReloader *tlslib.Reloader
-	// policy is the atomic RBAC policy store shared by the binary and RESP
-	// listeners. nil means RBAC is disabled and both servers keep their
-	// legacy zero-overhead paths. SIGHUP swaps a fresh snapshot into it.
+	// policy is the atomic RBAC policy store shared by the binary listener. nil
+	// means RBAC is disabled and the server keeps its legacy zero-overhead
+	// path. SIGHUP swaps a fresh snapshot into it.
 	policy *rbac.Store
 	// oauth is the configured token-verification provider, built once at
 	// startup from --oauth-provider / --oauth-issuer. nil means token auth is
-	// disabled and both listeners keep their password-only AUTH paths. It is
+	// disabled and the listener keeps its password-only AUTH path. It is
 	// read-only after init, so it can be shared safely across workers.
 	oauth oauth.Provider
 	// audit is the shared audit engine. It is always non-nil: when
@@ -243,8 +247,31 @@ func (s *Server) Run() error {
 	if cfg.MetricsEnabled() {
 		s.startMetricsServer(s.netSrv)
 	}
-	if cfg.RESPEnabled() {
-		s.startRESPServer()
+
+	// Phase 8 PostgreSQL wire frontend (ADR-012). The implicit tellstone table
+	// maps onto the same command.Store the binary frontend uses, so reads and
+	// writes route identically in standalone, cluster and federated modes.
+	if cfg.PGEnabled() {
+		if cfg.PGTLS() && !cfg.TLSEnabled() {
+			return fmt.Errorf("--pg-tls requires --tls-cert and --tls-key")
+		}
+		var passHash []byte
+		if cfg.GetRequirePass() != "" && s.policy == nil {
+			passHash, err = bcrypt.GenerateFromPassword([]byte(cfg.GetRequirePass()), bcrypt.DefaultCost)
+			if err != nil {
+				return fmt.Errorf("invalid --require-pass: %w", err)
+			}
+		}
+		s.pgSrv = sqlpkg.NewServer(cfg.GetPGAddr(), s.store, s.policy, s.oauth, s.audit, passHash, s.tlsConfigs, logger)
+		if _, err := s.pgSrv.Start(); err != nil {
+			return fmt.Errorf("sql listener: %w", err)
+		}
+		if logger.Enabled(log.LevelInfo) {
+			logger.Log(log.LevelInfo, "sql server listening",
+				log.String("addr", cfg.GetPGAddr()),
+				log.Bool("tls", cfg.PGTLS()),
+			)
+		}
 	}
 
 	if s.tlsReloader != nil {
@@ -402,13 +429,6 @@ func (s *Server) reloadRBAC() {
 
 func (s *Server) shutdown(ctx context.Context) {
 	logger := s.app.GetLogger()
-	if s.respSrv != nil {
-		if err := s.respSrv.Shutdown(ctx); err != nil {
-			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "server: resp server shutdown error", log.String("error", err.Error()))
-			}
-		}
-	}
 	if s.metricsSrv != nil {
 		if err := s.metricsSrv.Shutdown(ctx); err != nil {
 			if logger.Enabled(log.LevelError) {
@@ -420,6 +440,9 @@ func (s *Server) shutdown(ctx context.Context) {
 		if logger.Enabled(log.LevelError) {
 			logger.Log(log.LevelError, "server: tcp server shutdown error", log.String("error", err.Error()))
 		}
+	}
+	if s.pgSrv != nil {
+		s.pgSrv.Close()
 	}
 	if s.snapshotDone != nil {
 		select {
@@ -688,31 +711,6 @@ func (s *Server) startMetricsServer(srv *network.Server) {
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			if logger.Enabled(log.LevelError) {
 				logger.Log(log.LevelError, "server: metrics server encountered an error", log.String("error", err.Error()))
-			}
-		}
-	}()
-}
-
-func (s *Server) startRESPServer() {
-	cfg := s.app.GetConfig()
-	logger := s.app.GetLogger()
-	respSrv := resp.NewServer(
-		cfg.GetRESPAddr(),
-		s.store,
-		s.shards,
-		logger,
-		s.tlsConfigs,
-		cfg.GetRequirePass(),
-		cfg.RESPStartTLSEnabled(),
-		s.policy,
-		s.oauth,
-		s.audit,
-	)
-	s.respSrv = respSrv
-	go func() {
-		if err := respSrv.ListenAndServe(); err != nil {
-			if logger.Enabled(log.LevelError) {
-				logger.Log(log.LevelError, "server:resp server encountered an error", log.String("error", err.Error()))
 			}
 		}
 	}()
@@ -1017,7 +1015,10 @@ func (s *Server) initCluster() error {
 // ROLE/ACL admin ops stay transport-specific.
 func (s *Server) networkHandler(msg *network.Message, c *command.Ctx) ([]byte, network.MessageType, error) {
 	if msg.Type == network.MsgPing {
-		return nil, network.MsgPong, nil
+		// Return a non-empty payload: runHandler only writes the response frame
+		// when the payload is non-nil, so a nil reply would hang any client
+		// waiting on PING.
+		return network.ResponseOK, network.MsgPong, nil
 	}
 	switch msg.Op {
 	case network.OpGet:
@@ -1050,9 +1051,8 @@ func (s *Server) networkHandler(msg *network.Message, c *command.Ctx) ([]byte, n
 		return payload, mtype, nil
 	case network.OpRoleCreate, network.OpRoleSetUser, network.OpRoleDelUser,
 		network.OpRoleDelete, network.OpRoleList, network.OpRoleGetUser:
-		// RBAC is disabled without --rbac-config; the RESP layer rejects ROLE
-		// with "RBAC is not enabled" and the binary layer must do the same
-		// instead of panicking on a nil policy store.
+		// RBAC is disabled without --rbac-config; the binary layer must not panic
+		// on a nil policy store.
 		if s.policy == nil {
 			return roleReply(fmt.Errorf("rbac not enabled"))
 		}
@@ -1157,7 +1157,7 @@ func (s *Server) roleList(msg *network.Message) ([]byte, network.MessageType, er
 		entries = append(entries, e)
 	}
 	// Map iteration is unordered; sort by name so identical policies produce
-	// a stable, name-ordered response (mirrors the RESP LIST handler).
+	// a stable, name-ordered response.
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
 	payload, ok := network.EncodeRoleListResponse(entries)
 	if !ok {
@@ -1208,7 +1208,7 @@ func (s *Server) aclDelUser(msg *network.Message) ([]byte, network.MessageType, 
 
 // aclList handles OpACLList, returning one entry per user with the username,
 // bound role, password presence, and the role's commands and namespace
-// whitelist — never a password hash (mirrors the RESP ACL LIST handler).
+// whitelist — never a password hash.
 func (s *Server) aclList(msg *network.Message) ([]byte, network.MessageType, error) {
 	p := s.policy.Load()
 	if p == nil {
@@ -1218,8 +1218,7 @@ func (s *Server) aclList(msg *network.Message) ([]byte, network.MessageType, err
 	for name, u := range p.Users {
 		e := network.ACLUser{Username: name, Role: u.Role, HasPass: len(u.PasswordHash) > 0}
 		// Effective permissions come from RoleFor: the explicit assignment or
-		// the Default role for unassigned / role-deleted users, matching the
-		// RESP ACL LIST handler.
+		// the Default role for unassigned / role-deleted users.
 		if r := p.RoleFor(name); r != nil {
 			e.Commands = r.GrantedCommands()
 			for _, ns := range r.Namespaces {
@@ -1229,7 +1228,7 @@ func (s *Server) aclList(msg *network.Message) ([]byte, network.MessageType, err
 		users = append(users, e)
 	}
 	// Map iteration is unordered; sort by username so identical policies
-	// produce a stable, name-ordered response (mirrors the RESP LIST handler).
+	// produce a stable, name-ordered response.
 	sort.Slice(users, func(i, j int) bool { return users[i].Username < users[j].Username })
 	payload, ok := network.EncodeACLListResponse(users)
 	if !ok {
@@ -1240,8 +1239,8 @@ func (s *Server) aclList(msg *network.Message) ([]byte, network.MessageType, err
 
 // aclLog handles OpACLLog, returning the recent security-event buffer — rejected
 // AUTH attempts and denied commands — in chronological order with timestamp,
-// username, remote address, and reason, the binary twin of the RESP ACL LOG
-// handler. Entries are already ordered by the store, so no sort is needed.
+// username, remote address, and reason. Entries are already ordered by the
+// store, so no sort is needed.
 func (s *Server) aclLog(msg *network.Message) ([]byte, network.MessageType, error) {
 	src := s.policy.AuthLog()
 	entries := make([]network.AuthLogEntry, 0, len(src))

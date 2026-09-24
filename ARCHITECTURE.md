@@ -4,30 +4,29 @@ This document describes Tellstone's internal structure and how requests flow thr
 
 ## Overview
 
-Tellstone is a shared-nothing, in-memory key/value store with two protocol frontends
-(binary and RESP2) feeding into a single storage engine per shard.
+Tellstone is a shared-nothing, in-memory key/value store with a native binary protocol frontend
+feeding into a single storage engine per shard. A PostgreSQL-wire (SQL) frontend is in progress
+(ADR-012); the former Redis-compatible (RESP2) frontend was removed.
 
 ```
                     ┌──────────────────────────────────┐
                     │          Your Application         │
-                    └───────────┬──────────┬────────────┘
-                                │          │
-                         Binary :9988  RESP :6379
-                                │          │
-                    ┌───────────▼──┐  ┌────▼───────────┐
-                    │ network.Server│  │   resp.Server   │
-                    │   (gnet)     │  │    (gnet)       │
-                    └───────┬──────┘  └───────┬─────────┘
-                            │                 │
-                            └────────┬────────┘
-                                     │
-                            ┌────────▼────────┐
-                            │  router.Router   │
-                            │  FNV-1a → shard  │
-                            └────────┬────────┘
-                                     │
-              ┌──────────────────────┼──────────────────────┐
-              │                      │                      │
+                    └───────────┬───────────────────────┘
+                                │
+                         Binary :9988
+                                │
+                    ┌───────────▼──────────┐
+                    │    network.Server    │
+                    │      (gnet)          │
+                    └───────────┬──────────┘
+                                │
+                    ┌───────────▼──────────┐
+                    │    router.Router     │
+                    │  FNV-1a → shard      │
+                    └───────────┬──────────┘
+                                │
+              ┌─────────────────┼─────────────────┐
+              │                 │                 │
      ┌────────▼────────┐  ┌────────▼────────┐  ┌────────▼────────┐
      │   Shard 0       │  │   Shard 1       │  │   Shard N       │
      │ ┌─────────────┐ │  │ ┌─────────────┐ │  │ ┌─────────────┐ │
@@ -59,7 +58,7 @@ Tellstone is a shared-nothing, in-memory key/value store with two protocol front
 | `cmd/tellstone` | `cmd/tellstone/` | Main entry point. Parses flags, configures runtime (GC, memory limits, profiling), creates and starts the server. |
 | `cmd/benchmark` | `cmd/benchmark/` | Standalone native-binary-protocol load generator with Zipfian key distribution. |
 | `cmd/example/client` | `cmd/example/client/` | Minimal example: SET/GET/DELETE via the binary protocol. |
-| `server` | `server/` | Top-level orchestrator. Creates shards, router, listeners (binary + RESP), metrics server. Handles graceful shutdown. |
+| `server` | `server/` | Top-level orchestrator. Creates shards, router, binary listener, metrics server. Handles graceful shutdown. |
 | `config` | `config/` | CLI flags with env-var fallbacks. Includes `ByteSize` parser for human-readable sizes (`16MiB`, `1GiB`). |
 | `logger` | `logger/` | Bridges internal `log.Logger` to Go's `slog`. |
 
@@ -73,8 +72,7 @@ Tellstone is a shared-nothing, in-memory key/value store with two protocol front
 | `shard` | `internal/shard/` | Shared-nothing shard. Owns an engine + persistence + logger. `Execute()` dispatches GET/SET/DEL. Tracks per-shard atomic metrics. |
 | `storage` | `internal/storage/` | Core engine: `map[string]Item` + `sync.RWMutex`. TTL eviction, memory ceiling, at-rest encryption. Also contains the `Chronometer` timing wheel. |
 | `network` | `internal/network/` | Binary protocol server (gnet, edge-triggered epoll). Zero-alloc decode from ring buffer. Wire format codec. Synchronous `Client`. |
-| `resp` | `internal/resp/` | RESP2 server (gnet). Parses multibulk commands. Supports PING, GET, SET (EX/PX), DEL. Pipelining. |
-| `protocol` | `internal/protocol/` | SQL-text-to-KV translator. Parses `SELECT`/`INSERT`/`DELETE` into operations (experimental/frontend path). |
+| `protocol` | `internal/protocol/` | SQL-text-to-KV translator. Parses `SELECT`/`INSERT`/`DELETE` into operations (experimental/frontend path; superseded by the PostgreSQL-wire plan in ADR-012). |
 | `persistence` | `internal/persistence/` | Per-shard append-only WAL. Crash recovery with replay, tombstone deletes, truncation of corrupted tails. |
 | `crypto` | `internal/crypto/` | ChaCha20-Poly1305 encryption. `EncryptInPlace` / `DecryptInPlace`. Pass-through mode when disabled (zero overhead). |
 | `tls` | `internal/tls/` | TLS 1.3/mTLS transport, gnet connection adapter, and automatic certificate/key/CA rotation through a shared atomic config store. |
@@ -102,21 +100,6 @@ Tellstone is a shared-nothing, in-memory key/value store with two protocol front
    - **DEL**: WAL tombstone if persistence enabled → `engine.Delete(key)`
 7. Response flows back up, `Write()` sends it (fast-path coalescing for payloads < 512 bytes).
 
-### RESP2 Protocol (port 6379, optional)
-
-1. Redis client connects via TCP (gnet).
-2. `resp.Server.OnTraffic` fires.
-3. `Parse()` reads multibulk frames directly from the buffer — zero allocations.
-4. Commands dispatched in a loop (all complete commands in one `OnTraffic` are batched):
-   - `PING` → `+PONG`
-   - `GET key` → `store.Get(key)`
-   - `SET key val [EX s|PX ms]` → `store.Set(key, val, ttl)`
-   - `DEL key [key ...]` → `store.Delete(key)` per key
-   - `COMMAND` → empty array (Redis tooling compatibility)
-   - `STARTTLS` → plaintext `+OK`, then TLS 1.3 on the same socket (opt-in)
-5. `server.RouterStore` wraps `router.Dispatch()` to satisfy the `Store` interface.
-6. Same shard path as binary protocol.
-
 ## Key Design Decisions
 
 ### Shared-Nothing Sharding
@@ -127,7 +110,7 @@ via FNV-1a hashing, so the lock is almost never contended. Default shard count e
 
 ### Zero-Allocation Hot Path
 
-- `Decode()` and `Parse()` slice directly into gnet's ring buffer (no copies).
+- `Decode()` slices directly into gnet's ring buffer (no copies).
 - Request buffers use stack-allocated `[N]byte` arrays.
 - `Write()` coalesces header + payload under 512 bytes into a single buffer.
 - GC is disabled by default (`GOGC=-1`), with `debug.SetMemoryLimit` as a safety valve.
@@ -145,11 +128,9 @@ Every optional feature is disabled by default and has zero overhead when off:
 
 | Feature | Flag | Default |
 |---------|------|---------|
-| RESP protocol | `--enable-resp` | off |
 | TLS / mTLS | `--tls-cert`, `--tls-key`, `--tls-ca` | off |
 | RBAC | `--rbac-config` | off |
 | OAuth / OIDC | `--oauth-provider`, `--oauth-issuer` | off |
-| RESP STARTTLS | `--resp-starttls` | off |
 | Encryption | `--enable-encryption` | off |
 | Metrics | `--enable-metrics` | off |
 | Persistence | `--enable-persistence` | off |
@@ -158,9 +139,9 @@ Every optional feature is disabled by default and has zero overhead when off:
 
 ### Role-Based Access Control (RBAC)
 
-Opt-in via `--rbac-config` / `TSD_RBAC_CONFIG`. When a policy file is configured, the RESP and
-binary listeners switch from the shared `--require-pass` password to per-user credentials and
-role-based command gating; without one, both servers keep their legacy zero-overhead paths. The
+Opt-in via `--rbac-config` / `TSD_RBAC_CONFIG`. When a policy file is configured, the binary
+listener switches from the shared `--require-pass` password to per-user credentials and
+role-based command gating; without one, the server keeps its legacy zero-overhead path. The
 file (YAML or JSON) is loaded once at startup and hot-reloaded on SIGHUP with a single atomic
 swap, so a rejected file never half-applies and running connections keep their pinned sessions.
 
@@ -208,9 +189,9 @@ role permissions (most restrictive wins).
 ### Audit Logging
 
 Opt-in via `--enable-audit` / `TSD_ENABLE_AUDIT`. One shared `audit.LogEngine` is built in
-`server` and passed to both the binary and RESP listeners. It is **always non-nil**: without the
+`server` and passed to the binary listener. It is **always non-nil**: without the
 flag it is a disabled no-op whose `Record()` returns on a single bool comparison — no writer, no
-encoder, no allocation — so the listeners call it unconditionally with no `nil` guard on the
+encoder, no allocation — so the listener calls it unconditionally with no `nil` guard on the
 dispatch path.
 
 **Event types.** `connect`, `disconnect`, `auth_success`, `auth_failure`, `acl_deny`, and
@@ -220,8 +201,8 @@ per-command dispatch overhead and is off by default. Each line is one JSON objec
 `"level":"AUDIT"`, distinguishing it from operational INFO/WARN/ERROR logs.
 
 **Concurrency.** `Record()` and `Close()` are serialized by a mutex, so a gnet event loop never
-races file rotation or shutdown. `Close()` runs at the end of `server.shutdown()`, only after both
-listeners are stopped, so no in-flight write can race the file close.
+races file rotation or shutdown. `Close()` runs at the end of `server.shutdown()`, only after the
+listener is stopped, so no in-flight write can race the file close.
 
 **Zero-copy keys.** Command and key strings alias the gnet buffer via the same `unsafe`
 slice-header pattern used on the dispatch paths, consumed synchronously by the encoder before the
@@ -235,7 +216,7 @@ flushed. A failed file open falls back to stdout with an error log.
 
 ### Event-Driven Networking
 
-Both protocol servers use **gnet** (edge-triggered epoll), not `net.Conn` per-goroutine.
+The binary protocol server uses **gnet** (edge-triggered epoll), not `net.Conn` per-goroutine.
 This gives Linux-level performance with multi-reactor multicore support
 (`gnet.WithMulticore(true)`).
 
@@ -243,16 +224,10 @@ This gives Linux-level performance with multi-reactor multicore support
 
 When TLS is configured, one filesystem watcher monitors the distinct parent directories of the
 certificate, private key, and optional client CA. A complete replacement config is validated and
-published through a shared atomic pointer after a 500 ms debounce. Binary and implicit-TLS RESP
-listeners load the pointer when accepting a connection. With `--resp-starttls`, the RESP listener
-instead loads it when processing the upgrade, before writing plaintext `+OK` and before reading the
-client's TLS handshake. Established TLS connections retain their original state while later accepts
-or upgrades use the rotated material. Parent-directory watching detects direct writes, atomic
+published through a shared atomic pointer after a 500 ms debounce. The listener loads the pointer
+when accepting a connection. Established TLS connections retain their original state while later
+accepts use the rotated material. Parent-directory watching detects direct writes, atomic
 renames, and Kubernetes projected Secret `..data` symlink swaps.
-
-STARTTLS is accepted before authentication so credentials can be sent only after encryption. The
-server rejects a transition sharing an inbound buffer with any other plaintext command or bytes;
-otherwise those bytes could cross the transport-security boundary without TLS integrity.
 
 ### Persistence (WAL)
 

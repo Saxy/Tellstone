@@ -59,7 +59,7 @@ type manualServer struct {
 	id          int
 	cmd         *exec.Cmd
 	args        []string
-	binaryPort  int // RESP port
+	binaryPort  int // binary listener port
 	raftPort    int // Raft transport port
 	gatewayPort int // Phase 7 cross-cluster gateway port (0 = none)
 	dataDir     string

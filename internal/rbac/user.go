@@ -3,7 +3,7 @@ Package rbac
 Tellstone Role-Based Access Control
 File: user.go
 Description: Defines the User type — a username bound to a role plus an optional bcrypt password
-hash — and the SETUSER password-option parser shared by the RESP and binary protocol layers.
+hash — and the SETUSER password-option parser shared by the command layers.
 
 Authors:
 

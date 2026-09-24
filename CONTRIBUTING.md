@@ -10,7 +10,7 @@ Every contribution should align with Tellstone's design philosophy. Keep these i
 |-----------|---------------|
 | **Zero Allocation** | The hot path must not allocate. Reuse buffers, use stack-allocated types, avoid `make()` in request handling. |
 | **Shared-Nothing First** | Data lives in per-shard maps. No cross-shard coordination, no shared mutable state. |
-| **Opt-In Everything** | Features like encryption, metrics, persistence, and RESP are disabled by default. Don't force overhead on users who don't need it. |
+| **Opt-In Everything** | Features like encryption, metrics, and persistence are disabled by default. Don't force overhead on users who don't need it. |
 | **Single Binary** | No external dependencies at runtime. The binary is self-contained. |
 | **Minimal Third-Party Dependencies** | Prefer the standard library. Every dependency is a liability — security surface, build complexity, license risk. Justify any new dep. |
 | **Security by Default** | When a feature is enabled, it should be secure out of the box. No weak defaults. |
@@ -48,7 +48,7 @@ This adds a `Signed-off-by: Your Name <your@email.com>` line to the commit, cert
 ### Codebase Overview
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a full description of the package structure,
-request flow (binary and RESP), key types, and design decisions.
+request flow (binary protocol), key types, and design decisions.
 
 ### Setup
 
@@ -65,7 +65,7 @@ task test         # verify everything passes
 task check        # vet + race tests — run before every commit
 task fmt          # auto-format
 task test:race    # race detector tests
-task bench:resp   # benchmark (for performance-sensitive changes)
+task bench:native # benchmark (for performance-sensitive changes)
 ```
 
 ## Making Changes
@@ -75,7 +75,7 @@ task bench:resp   # benchmark (for performance-sensitive changes)
 Use descriptive branch names:
 
 ```
-feat/resp-pipeline-support
+feat/pg-fetch-batch
 fix/shard-hash-collision
 perf/wal-zero-alloc-write
 docs/benchmark-methodology
@@ -194,14 +194,14 @@ For any change touching the hot path (storage, router, shard execution, protocol
 1. Run benchmarks **before** and **after** your change.
 2. Include before/after numbers in your PR description.
 3. Ensure zero new allocations on the hot path (`go test -benchmem`).
-4. Pin server and load generator to disjoint cores for accurate numbers (see `task bench:resp`).
+4. Pin server and load generator to disjoint cores for accurate numbers (see `task bench:native`).
 
 ```bash
 # Quick allocation check
 go test -bench=BenchmarkYourThing -benchmem ./path/to/pkg
 
 # Full benchmark with core pinning
-task bench:resp
+task bench:native
 ```
 
 ## Pull Request Process

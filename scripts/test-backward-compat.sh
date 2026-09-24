@@ -13,12 +13,17 @@
 #
 # This proves the plaintext-to-encrypted WAL migration path works end-to-end.
 #
-# Prerequisites: redis-cli, go, git
+# Note: the legacy RESP/redis-cli frontend was removed in v2 (ADR-012), so this
+# harness drives both servers through the native binary protocol via the
+# scripts/tools/manualcompat helper.
+#
+# Prerequisites: go, git
 set -euo pipefail
 
 OLD_BIN="./bin/tellstone-v1.2.0"
 NEW_BIN="./bin/tellstone-dev"
-RESP_PORT=11998
+MC_CMD="./bin/manualcompat"
+PORT=11998
 
 # 32-byte key, base64-encoded for TSD_ENCRYPTION_KEY
 ENCRYPT_KEY="MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="  # "01234567890123456789012345678901" base64
@@ -35,13 +40,25 @@ pass() { echo -e "  ${GREEN}PASS${NC} $1"; PASS_COUNT=$((PASS_COUNT+1)); }
 fail() { echo -e "  ${RED}FAIL${NC} $1"; FAIL_COUNT=$((FAIL_COUNT+1)); }
 section() { echo; echo -e "${BOLD}${CYAN}=== $1 ===${NC}"; }
 
+tsd() { "127.0.0.1:${PORT}"; }
+
+mc_ping() {
+    "${MC_CMD}" ping "$(tsd)" >/dev/null 2>&1
+}
+
+mc_set() {
+    "${MC_CMD}" set "$(tsd)" "$1" "$2" >/dev/null 2>&1
+}
+
+mc_get() {
+    "${MC_CMD}" get "$(tsd)" "$1" 2>/dev/null || true
+}
+
 start_server() {
     # BIN env var selects which binary to run
     # ENCRYPTION flag controls whether encryption is enabled
     local -a env_args=(
-        "TSD_ENABLE_RESP=true"
-        "TSD_RESP_ADDR=127.0.0.1:${RESP_PORT}"
-        "TSD_ADDR=127.0.0.1:0"
+        "TSD_ADDR=127.0.0.1:${PORT}"
         "TSD_NUM_SHARDS=1"
         "TSD_ENABLE_PERSISTENCE=true"
         "TSD_PERSISTENCE_DIR=${DATA_DIR}"
@@ -53,7 +70,7 @@ start_server() {
     env "${env_args[@]}" "${BIN}" >/tmp/tellstone-manual-test.log 2>&1 &
     SRV_PID=$!
     for i in $(seq 1 50); do
-        if redis-cli -p "$RESP_PORT" PING 2>/dev/null | grep -q PONG; then
+        if mc_ping; then
             return 0
         fi
         sleep 0.1
@@ -76,7 +93,7 @@ cleanup() {
 trap cleanup EXIT
 
 # ======================================================================
-section "Build both binaries"
+section "Build all three binaries"
 # ======================================================================
 
 DATA_DIR=$(mktemp -d)
@@ -91,6 +108,9 @@ git stash pop 2>/dev/null || true
 
 echo "  Building dev build from HEAD (no ldflags, default version)..."
 go build -o "$NEW_BIN" ./cmd/tellstone
+
+echo "  Building native binary-protocol test helper..."
+go build -o "$MC_CMD" ./scripts/tools/manualcompat
 
 echo
 echo "  v1.2.0 binary:  $(${OLD_BIN} --version 2>&1)"
@@ -129,12 +149,12 @@ pass "v1.2.0 server started ($(${OLD_BIN} --version 2>&1))"
 echo "  Writing 50 keys..."
 WRITE_OK=true
 for i in $(seq 0 49); do
-    redis-cli -p "$RESP_PORT" SET "legacy:${i}" "val-${i}" >/dev/null 2>&1
+    mc_set "legacy:${i}" "val-${i}"
 done
 
 echo "  Verifying writes..."
 for i in 0 1 24 25 49; do
-    got=$(redis-cli -p "$RESP_PORT" GET "legacy:${i}" 2>/dev/null || true)
+    got=$(mc_get "legacy:${i}")
     if [ "$got" != "val-${i}" ]; then
         echo "    legacy:${i}: got '$got', want 'val-${i}'"
         WRITE_OK=false
@@ -196,7 +216,7 @@ pass "dev (0.0.0-dev) server started with encryption ($(${NEW_BIN} --version 2>&
 echo "  Checking all 50 legacy keys created by v1.2.0..."
 LEGACY_OK=true
 for i in $(seq 0 49); do
-    got=$(redis-cli -p "$RESP_PORT" GET "legacy:${i}" 2>/dev/null || true)
+    got=$(mc_get "legacy:${i}")
     if [ "$got" != "val-${i}" ]; then
         echo "    legacy:${i}: got '$got', want 'val-${i}'"
         LEGACY_OK=false
@@ -238,13 +258,13 @@ ENCRYPTION_ON="true"
 start_server
 
 for i in $(seq 0 49); do
-    redis-cli -p "$RESP_PORT" SET "fresh:${i}" "new-${i}" >/dev/null 2>&1
+    mc_set "fresh:${i}" "new-${i}"
 done
 
 echo "  Checking fresh writes from dev (0.0.0-dev)..."
 FRESH_OK=true
 for i in 0 1 24 25 49; do
-    got=$(redis-cli -p "$RESP_PORT" GET "fresh:${i}" 2>/dev/null || true)
+    got=$(mc_get "fresh:${i}")
     if [ "$got" != "new-${i}" ]; then
         echo "    fresh:${i}: got '$got', want 'new-${i}'"
         FRESH_OK=false
@@ -260,7 +280,7 @@ fi
 echo "  Checking legacy v1.2.0 keys still present..."
 LEGACY2_OK=true
 for i in 0 1 24 25 49; do
-    got=$(redis-cli -p "$RESP_PORT" GET "legacy:${i}" 2>/dev/null || true)
+    got=$(mc_get "legacy:${i}")
     if [ "$got" != "val-${i}" ]; then
         echo "    legacy:${i}: got '$got', want 'val-${i}'"
         LEGACY2_OK=false
@@ -283,7 +303,7 @@ pass "dev (0.0.0-dev) restarted with encryption"
 echo "  Checking v1.2.0 legacy keys after restart..."
 L3_OK=true
 for i in 0 1 24 25 49; do
-    got=$(redis-cli -p "$RESP_PORT" GET "legacy:${i}" 2>/dev/null || true)
+    got=$(mc_get "legacy:${i}")
     if [ "$got" != "val-${i}" ]; then
         echo "    legacy:${i}: got '$got', want 'val-${i}'"
         L3_OK=false
@@ -298,7 +318,7 @@ fi
 echo "  Checking dev fresh keys after restart..."
 F3_OK=true
 for i in 0 1 24 25 49; do
-    got=$(redis-cli -p "$RESP_PORT" GET "fresh:${i}" 2>/dev/null || true)
+    got=$(mc_get "fresh:${i}")
     if [ "$got" != "new-${i}" ]; then
         echo "    fresh:${i}: got '$got', want 'new-${i}'"
         F3_OK=false
@@ -316,13 +336,13 @@ echo "  dev writes, SIGKILL, restart -- all should survive."
 # ======================================================================
 
 for i in $(seq 0 9); do
-    redis-cli -p "$RESP_PORT" SET "crash:${i}" "boom-${i}" >/dev/null 2>&1
+    mc_set "crash:${i}" "boom-${i}"
 done
 
 echo "  Verifying crash keys before kill..."
 CRASH_OK=true
 for i in 0 5 9; do
-    got=$(redis-cli -p "$RESP_PORT" GET "crash:${i}" 2>/dev/null || true)
+    got=$(mc_get "crash:${i}")
     if [ "$got" != "boom-${i}" ]; then
         echo "    crash:${i}: got '$got', want 'boom-${i}'"
         CRASH_OK=false
@@ -346,21 +366,21 @@ pass "dev (0.0.0-dev) recovered after SIGKILL"
 echo "  Verifying all keys survived SIGKILL..."
 RECOVERY_OK=true
 for i in 0 1 24 25 49; do
-    got=$(redis-cli -p "$RESP_PORT" GET "legacy:${i}" 2>/dev/null || true)
+    got=$(mc_get "legacy:${i}")
     if [ "$got" != "val-${i}" ]; then
         echo "    legacy:${i}: got '$got', want 'val-${i}'"
         RECOVERY_OK=false
     fi
 done
 for i in 0 1 24 25 49; do
-    got=$(redis-cli -p "$RESP_PORT" GET "fresh:${i}" 2>/dev/null || true)
+    got=$(mc_get "fresh:${i}")
     if [ "$got" != "new-${i}" ]; then
         echo "    fresh:${i}: got '$got', want 'new-${i}'"
         RECOVERY_OK=false
     fi
 done
 for i in 0 5 9; do
-    got=$(redis-cli -p "$RESP_PORT" GET "crash:${i}" 2>/dev/null || true)
+    got=$(mc_get "crash:${i}")
     if [ "$got" != "boom-${i}" ]; then
         echo "    crash:${i}: got '$got', want 'boom-${i}'"
         RECOVERY_OK=false
@@ -384,15 +404,13 @@ echo "  Writing 25 keys with dev (encryption OFF)..."
 BIN="$NEW_BIN"
 ENCRYPTION_ON=""
 TSD_PERSISTENCE_DIR="${DEV_DATA_DIR}" \
-    TSD_ENABLE_RESP=true \
-    TSD_RESP_ADDR="127.0.0.1:${RESP_PORT}" \
-    TSD_ADDR="127.0.0.1:0" \
+    TSD_ADDR="127.0.0.1:${PORT}" \
     TSD_NUM_SHARDS=1 \
     TSD_ENABLE_PERSISTENCE=true \
     "${BIN}" >/tmp/tellstone-manual-test.log 2>&1 &
 SRV_PID=$!
 for i in $(seq 1 50); do
-    if redis-cli -p "$RESP_PORT" PING 2>/dev/null | grep -q PONG; then
+    if mc_ping; then
         break
     fi
     sleep 0.1
@@ -400,10 +418,10 @@ done
 
 DEV_PLAIN_OK=true
 for i in $(seq 0 24); do
-    redis-cli -p "$RESP_PORT" SET "dp:${i}" "plain-${i}" >/dev/null 2>&1
+    mc_set "dp:${i}" "plain-${i}"
 done
 for i in 0 12 24; do
-    got=$(redis-cli -p "$RESP_PORT" GET "dp:${i}" 2>/dev/null || true)
+    got=$(mc_get "dp:${i}")
     if [ "$got" != "plain-${i}" ]; then
         echo "    dp:${i}: got '$got', want 'plain-${i}'"
         DEV_PLAIN_OK=false
@@ -433,7 +451,7 @@ pass "dev restarted with encryption"
 echo "  Checking 25 plaintext keys after migration..."
 DEV_MIG_OK=true
 for i in $(seq 0 24); do
-    got=$(redis-cli -p "$RESP_PORT" GET "dp:${i}" 2>/dev/null || true)
+    got=$(mc_get "dp:${i}")
     if [ "$got" != "plain-${i}" ]; then
         echo "    dp:${i}: got '$got', want 'plain-${i}'"
         DEV_MIG_OK=false

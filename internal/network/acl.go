@@ -100,9 +100,9 @@ func DecodeACLListResponse(payload []byte) ([]ACLUser, bool) {
 	return users, pos == len(payload)
 }
 
-// AuthLogEntry is one ACL LOG record. Timestamp is an RFC3339 string, the same
-// rendering the RESP ACL LOG handler emits, so both protocols expose identical
-// log content.
+// AuthLogEntry is one ACL LOG record. Timestamp is an RFC3339 string matching
+// the ACL LOG handler's rendering, so all frontends expose identical log
+// content.
 type AuthLogEntry struct {
 	Timestamp  string
 	Username   string

@@ -2,10 +2,10 @@
 Package command
 Tellstone Shared Command Layer
 File: command.go
-Description: The data-command core shared by both frontends (binary and RESP). GET,
-SET and DEL live here exactly once: argument validation, optional EX/PX TTL parsing,
-the RBAC gate, the per-role command count, the audit hooks and the storage access.
-Each protocol only supplies Reply and its own calling conventions;
+Description: The data-command core feeding the binary frontend. GET, SET and DEL
+live here exactly once: argument validation, optional EX/PX TTL parsing, the RBAC
+gate, the per-role command count, the audit hooks and the storage access.
+The frontend only supplies Reply and its own calling conventions;
 
 Authors:
 
@@ -205,7 +205,7 @@ func alias(b []byte) string {
 }
 
 // equalFoldASCII compares a against the ASCII literal b case-insensitively,
-// mirroring the RESP EqualFold so command matching is Redis-compatible.
+// mirroring Redis's case-insensitive command matching.
 func equalFoldASCII(a []byte, b string) bool {
 	if len(a) != len(b) {
 		return false

@@ -479,8 +479,7 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 // marked to close after the reply.
 func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType MessageType, respPayload []byte, skipHandler bool, writeError string) gnet.Action {
 	if !skipHandler {
-		// PING is not gated by RBAC and never counted as a role command, keeping
-		// per-role counts symmetric with the RESP data commands.
+		// PING is not gated by RBAC and never counted as a role command.
 		if s.policy != nil && st.sessionCtx != nil && msg.Type != MsgPing {
 			st.sessionCtx.CountCommand()
 		}
@@ -644,10 +643,8 @@ func (s *Server) handleAuthMessage(c gnet.Conn, st *connState, value []byte) aut
 	if s.policy != nil {
 		p := s.policy.Load()
 		if p == nil {
-			// Recorded like any other rejection rather than returned bare: this
-			// is still a failed AUTH, so it belongs in ACL LOG and the audit
-			// trail and must count against the per-connection limit. The RESP
-			// listener reports it under the same reason.
+			// in ACL LOG and the audit trail and must count against the
+			// per-connection limit.
 			return authResult{respPayload: s.authFailed(st, string(username), "policy not loaded"), respType: MsgAuthErr}
 		}
 		name = "default"
@@ -814,7 +811,7 @@ func (s *Server) opAuthorized(msg Message, st *connState) bool {
 	}
 	switch msg.Op {
 	// ROLE admin ops are keyless: the namespace whitelist must not be
-	// consulted, only the command bit (mirrors RESP's authorizedCmd).
+	// consulted, only the command bit.
 	case OpRoleCreate, OpRoleSetUser, OpRoleDelUser, OpRoleDelete, OpRoleList, OpRoleGetUser:
 		return st.sessionCtx.AllowsCommand(rbac.CmdRole)
 	// ACL admin ops gate on the ACL command bit, a sibling of ROLE: a role

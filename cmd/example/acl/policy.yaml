@@ -1,7 +1,7 @@
 # Example RBAC policy for cmd/example/acl. Run the ACL example against a
 # server started with this file:
 #
-#   ./bin/tellstone --rbac-config cmd/example/acl/policy.yaml --enable-resp
+#   ./bin/tellstone --rbac-config cmd/example/acl/policy.yaml
 #
 # The admin user below is required: the example authenticates as
 # admin/adminsecret before issuing ACL commands. There is no "default" user,

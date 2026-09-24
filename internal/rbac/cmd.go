@@ -46,8 +46,8 @@ var AllCommands = []uint16{
 	CmdUser, CmdGrant, CmdRevoke,
 }
 
-// commandNames maps command names to their IDs for the rule parser. RESP
-// command names are matched case-insensitively; stored uppercase.
+// commandNames maps command names to their IDs for the rule parser. Command
+// names are matched case-insensitively; stored uppercase.
 var commandNames = map[string]uint16{
 	"GET": CmdGet, "SET": CmdSet, "DEL": CmdDel, "PING": CmdPing,
 	"COMMAND": CmdCommand, "AUTH": CmdAuth, "ROLE": CmdRole, "ACL": CmdACL,
@@ -106,8 +106,9 @@ func Category(name string) []uint16 {
 // CategoriesForCommand returns the names of the built-in categories that grant
 // the command, sorted alphabetically for deterministic output, or nil when id
 // is not registered. The implicit "all" grant is reported; the empty "none"
-// grant never matches. Used by the RESP COMMAND family so introspection stays
-// in step with the authorization model instead of duplicating it.
+// grant never matches. Used by the COMMAND introspection family so
+// introspection stays in step with the authorization model instead of
+// duplicating it.
 func CategoriesForCommand(id uint16) []string {
 	var names []string
 	for name, ids := range categories {

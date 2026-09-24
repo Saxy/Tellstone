@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# memtier driver for the cloud-SDN benchmark tables in README.md. Tellstone's
+# Redis-compatible (RESP) frontend was removed in v2 (ADR-012), so this covers
+# only the reference engines.
+
 # Configuration
 DEFAULT_IP="127.0.0.1"
 PORT="6379"
@@ -18,7 +22,7 @@ TARGET_IP="$DEFAULT_IP"
 # Parse arguments cleanly (handles flags in any order)
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --redis|--valkey|--dragonfly|--tellstone)
+    --redis|--valkey|--dragonfly)
       TARGET="$1"
       shift
       ;;
@@ -51,9 +55,8 @@ case "$TARGET" in
   --redis) NAME="redis" ;;
   --valkey) NAME="valkey" ;;
   --dragonfly) NAME="dragonfly" ;;
-  --tellstone) NAME="tellstone" ;;
   *)
-    echo "Usage: $0 [--redis | --valkey | --dragonfly | --tellstone] [--ip target_ip] [threads] [clients]"
+    echo "Usage: $0 [--redis | --valkey | --dragonfly] [--ip target_ip] [threads] [clients]"
     echo "Example: $0 --redis --ip 192.168.1.50 4 16"
     echo "Default IP: $DEFAULT_IP"
     exit 1

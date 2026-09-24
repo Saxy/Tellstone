@@ -18,9 +18,8 @@ vars:
     -X github.com/Saxy/Tellstone/internal/version.Date={{.DATE}}
 
   # Ports — the binary listener uses a non-default port so it won't clash with an
-  # IDE-launched instance on :9988. RESP uses the standard Redis port.
+  # IDE-launched instance on :9988.
   BIN_PORT: '{{.BIN_PORT | default "19988"}}'
-  RESP_PORT: '{{.RESP_PORT | default "6379"}}'
 
   # Core isolation settings (used on Linux)
   SRV_CORES: '{{.SRV_CORES | default "0-15"}}'
@@ -30,14 +29,6 @@ vars:
   # CROSS-PLATFORM MAGIC: Only prepend taskset if running on Linux
   TASKSET_SRV: '{{if eq OS "linux"}}taskset -c {{.SRV_CORES}}{{else}}{{end}}'
   TASKSET_BENCH: '{{if eq OS "linux"}}taskset -c {{.BENCH_CORES}}{{else}}{{end}}'
-
-  # memtier workload knobs (override on the CLI, e.g. `task bench:resp PIPELINE=16`).
-  THREADS: '{{.THREADS | default "4"}}'
-  CONNS: '{{.CONNS | default "25"}}'
-  DURATION: '{{.DURATION | default "10"}}'
-  PIPELINE: '{{.PIPELINE | default "1"}}'
-  RATIO: '{{.RATIO | default "1:10"}}'
-  KEYSPACE: '{{.KEYSPACE | default "200000"}}'
 
 tasks:
   default:
@@ -102,17 +93,11 @@ tasks:
     cmds:
       - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} ./{{.BIN}}
 
-  run:resp:
-    desc: Run the server in the foreground with the RESP listener enabled
-    deps: [build]
-    cmds:
-      - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} ./{{.BIN}}
-
   # ---------- process management ----------
   kill:
-    desc: "Find and kill stray Tellstone server processes, by port and by name. Linux + macOS (lsof/pgrep/pkill, no OS-specific tools). Vars: PORTS (default: 19988 6379 6060 — binary/RESP/pprof), NAME (default: bin/tellstone — deliberately specific, a bare 'tellstone' pattern would also match unrelated commands mentioning the project path)"
+    desc: "Find and kill stray Tellstone server processes, by port and by name. Linux + macOS (lsof/pgrep/pkill, no OS-specific tools). Vars: PORTS (default: 19988 6060 — binary/pprof), NAME (default: bin/tellstone — deliberately specific, a bare 'tellstone' pattern would also match unrelated commands mentioning the project path)"
     vars:
-      PORTS: '{{.PORTS | default "19988 6379 6060"}}'
+      PORTS: '{{.PORTS | default "19988 6060"}}'
       NAME: '{{.NAME | default "bin/tellstone"}}'
     cmds:
       - |
@@ -165,114 +150,6 @@ tasks:
         
         {{.TASKSET_BENCH}} ./{{.BENCH_BIN}} -addr 127.0.0.1:{{.BIN_PORT}} \
           -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
-  bench:resp:
-    desc: "RESP latency benchmark via memtier. Vars: THREADS CONNS DURATION PIPELINE RATIO KEYSPACE"
-    deps: [ build ]
-    cmds:
-      - |
-        set -e
-        command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
-        {{.TASKSET_SRV}} env GOMAXPROCS={{.SRV_PROCS}} TSD_LOG_LEVEL=error \
-          TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
-          ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
-        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
-
-        echo "Waiting for Tellstone RESP (Port {{.RESP_PORT}})..."
-        for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
-        nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
-
-        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
-          -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
-          --ratio={{.RATIO}} --key-maximum={{.KEYSPACE}} --hide-histogram
-  bench:resp:pipeline:
-      desc: RESP throughput-ceiling benchmark (pipeline=16)
-      cmds:
-        - task: bench:resp
-          vars: { PIPELINE: '16' }
-  bench:resp:hits:
-      desc: Realistic cache benchmark — preload the keyspace, then read-heavy (~100% hits)
-      deps: [ build ]
-      cmds:
-        - |
-          set -e
-          command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
-          {{.TASKSET_SRV}} env GOMAXPROCS={{.SRV_PROCS}} TSD_LOG_LEVEL=error \
-            TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
-            ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
-          SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
-          echo "Waiting for Tellstone RESP (Port {{.RESP_PORT}})..."
-          for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
-          nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
-          echo "== preload {{.KEYSPACE}} keys =="
-          {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
-            -t 1 -c 1 -n {{.KEYSPACE}} --ratio=1:0 --key-pattern=S:S \
-            --key-minimum=1 --key-maximum={{.KEYSPACE}} --hide-histogram | grep -E "Sets|Totals"
-          echo "== read-heavy (expect near-zero miss rate) =="
-          {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
-            -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
-            --ratio=0:1 --key-maximum={{.KEYSPACE}} --hide-histogram
-  bench:resp:precise:
-    desc: "Reproducible baseline benchmark: 8 threads, 100 conns, pipeline 8, 90/10 read/write, with preload. Mirrors the pre-SN comparison table."
-    deps: [ build ]
-    cmds:
-      - |
-        set -e
-        command -v memtier_benchmark >/dev/null || { echo "memtier_benchmark not installed"; exit 1; }
-        {{.TASKSET_SRV}} env GOMAXPROCS=16 TSD_LOG_LEVEL=error \
-          TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} \
-          ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1 &
-        SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
-        echo "Waiting for Tellstone RESP (Port {{.RESP_PORT}})..."
-        for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.1; done
-        nc -z 127.0.0.1 {{.RESP_PORT}} || { echo "Server failed to start:"; cat /tmp/tellstone-bench.log; exit 1; }
-
-        echo "== preload 200000 keys =="
-        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
-          -t 1 -c 1 -n 200000 --ratio=1:0 --key-pattern=S:S \
-          --key-minimum=1 --key-maximum=200000 --hide-histogram | grep -E "Sets|Totals"
-
-        echo "== read-heavy (expect near-zero miss rate) =="
-        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
-          -t 8 -c 100 --test-time=10 --pipeline=8 \
-          --ratio=1:9 --key-maximum=200000 --key-pattern=G:G \
-          --key-stddev=50000 --hide-histogram
-
-  bench:compare:
-    desc: "Compare databases. Usage: task bench:compare TARGET=redis|valkey|tellstone [THREADS=...]"
-    vars:
-      TARGET: '{{.TARGET | default "tellstone"}}'
-    cmds:
-      - |
-        set -e
-        # Server startup logic
-        case "{{.TARGET}}" in
-          tellstone)
-            echo "--- Starting Tellstone ---"
-           sh -c 'export TSD_ADDR=127.0.0.1:{{.BIN_PORT}}; \
-                   export TSD_ENABLE_RESP=true; \
-                   export TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}}; \
-                   ./{{.BIN}} >/tmp/tellstone-bench.log 2>&1' &
-            SRV=$! ;;
-          redis)
-            echo "--- Starting Redis ---"
-            redis-server --port {{.RESP_PORT}} --save "" --appendonly no >/tmp/redis-bench.log 2>&1 &
-            SRV=$! ;;
-          valkey)
-            echo "--- Starting Valkey ---"
-            valkey-server --port {{.RESP_PORT}} --save "" --appendonly no >/tmp/valkey-bench.log 2>&1 &
-            SRV=$! ;;
-          *) echo "Unknown target: {{.TARGET}}"; exit 1 ;;
-        esac
-        
-        trap "kill $SRV 2>/dev/null || true" EXIT
-      
-        # Wait for port to be ready
-        for i in {1..30}; do nc -z 127.0.0.1 {{.RESP_PORT}} && break; sleep 0.5; done
-        
-        echo "Running memtier against {{.TARGET}}..."
-        {{.TASKSET_BENCH}} memtier_benchmark -s 127.0.0.1 -p {{.RESP_PORT}} --protocol=redis \
-          -t {{.THREADS}} -c {{.CONNS}} --test-time={{.DURATION}} --pipeline={{.PIPELINE}} \
-          --ratio={{.RATIO}} --key-maximum={{.KEYSPACE}} --hide-histogram
 
   # ---------- profiling ----------
   # Two independent workflows, both driven by the stock Go toolchain (pprof / trace). Nothing
@@ -281,7 +158,7 @@ tasks:
   #
   #   1) profile:pkg + profile:view   — profile a package's Go benchmarks directly, no server.
   #   2) run:profiling + profile:live — profile the actual running server under real load
-  #      generated from a second terminal (task bench:*, bin/benchmark, memtier_benchmark, ...).
+  #      generated from a second terminal (task bench:*, bin/benchmark, ...).
   profile:pkg:
     desc: "Benchmark a package with CPU+mem profiling. Vars: PKG (default ./internal/storage/...), BENCH, COUNT, OUT"
     vars:
@@ -311,7 +188,7 @@ tasks:
     desc: "Run the server in the foreground with live pprof enabled (mutex+block sampling, /debug/pprof on :6060). Generate load against it from a second terminal, then use profile:live."
     deps: [ build ]
     cmds:
-      - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_RESP=true TSD_RESP_ADDR=127.0.0.1:{{.RESP_PORT}} TSD_ENABLE_PROFILING=1 ./{{.BIN}}
+      - TSD_ADDR=127.0.0.1:{{.BIN_PORT}} TSD_ENABLE_PROFILING=1 ./{{.BIN}}
 
   profile:live:
     desc: "Pull a profile from a server started via run:profiling and open it in the browser. Vars: KIND (cpu|heap|mutex|block|goroutine|allocs, default cpu), SECONDS (cpu only, default 30), PPROF_ADDR (default 127.0.0.1:6060), PORT (default 8081)"
@@ -369,7 +246,6 @@ tasks:
         podman run -d --name tellstone-dev
         --rm
         -p 9988:9988
-        -p 6379:6379
         -v ./data:/data:Z
         -e TSD_DATA_DIR=/data
         ghcr.io/saxy/tellstone:{{.TAG}}

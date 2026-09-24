@@ -38,7 +38,6 @@ In scope:
 - Tellstone server binary (`cmd/tellstone`)
 - All packages under `internal/`
 - Binary protocol (`internal/network`)
-- RESP2 protocol (`internal/resp`)
 - Storage engine, persistence, crypto, metrics, tracing
 
 Out of scope:
