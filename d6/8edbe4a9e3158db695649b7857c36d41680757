@@ -1,0 +1,24 @@
+config/config_test.go
+  s_ec51132ee0d66b::t_59b47c7214e472 878
+  s_ec51132ee0d66b::t_c0a076f4320a1b 873-877,879-917
+  s_ec51132ee0d66b::t_d3cfa39147c8f6 8
+config/config.go
+  s_ec51132ee0d66b::t_dde07a11e8bd5c 848-860,864-866
+  s_ec51132ee0d66b::t_96a44650a83f0c 867
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d68edbe4a9e3158db695649b7857c36d41680757",
+  "prompts": {},
+  "sessions": {
+    "s_ec51132ee0d66b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f32d08b5affeJWDBawZEc06lYo",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
