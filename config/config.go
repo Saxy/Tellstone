@@ -845,10 +845,25 @@ func pdEndpointsCollide(a, b string) bool {
 	if errA != nil || errB != nil {
 		return false // malformed addresses are rejected at their own flag site
 	}
-	wildcard := func(h string) bool { return h == "" || h == "0.0.0.0" || h == "::" }
-	sameHost := ha == hb || wildcard(ha) || wildcard(hb)
+	sameHost := ha == hb
+	// A wildcard bind (unspecified IP or empty host) collides with any address
+	// on the same port, matching the raw-socket reality regardless of whether
+	// the other side names a bare IP or a hostname.
+	wildcard := func(h string) bool { return h == "" || wildcardIP(net.ParseIP(h)) }
+	if ipa, ipb := net.ParseIP(ha), net.ParseIP(hb); ipa != nil && ipb != nil {
+		// Both hosts are bare IPs: compare numerically so textually distinct
+		// but equivalent representations (IPv6 zero compression, IPv4-mapped)
+		// collide like the OS socket bind would.
+		sameHost = ipa.Equal(ipb) || ipa.IsUnspecified() || ipb.IsUnspecified()
+	} else if wildcard(ha) || wildcard(hb) {
+		sameHost = true
+	}
 	return sameHost && pa == pb
 }
+
+// wildcardIP reports whether a parsed IP is the unspecified (0.0.0.0/::) bind
+// wildcard, which includes fully-expanded forms like "0:0:0:0:0:0:0:0".
+func wildcardIP(ip net.IP) bool { return ip != nil && ip.IsUnspecified() }
 
 func (cfg *Config) GetAddr() string                   { return cfg.addr }
 func (cfg *Config) MetricsEnabled() bool              { return cfg.enableMetrics }
