@@ -1,0 +1,149 @@
+.github/ISSUE_TEMPLATE/profiling.yml
+  s_d4dcb9cea6b725::t_2263f987cf8bbc 60-62
+internal/sql/auth.go
+  s_c2c23bbc940964::t_11516d7d390a51 92
+  s_c2c23bbc940964::t_3cac3a7f342a34 42
+  s_c2c23bbc940964::t_874d0aa1266858 1-9
+internal/sql/integration_test.go
+  s_c2c23bbc940964::t_a51f25d7c2d580 778,783
+  s_c2c23bbc940964::t_e35d047fab0441 652-666,668-675,677-684,686-777,779-782,784-813,815-834
+  s_c2c23bbc940964::t_90fab82396c2d0 930
+  s_c2c23bbc940964::t_b51698a5e82d99 990-991,998-999
+  s_c2c23bbc940964::t_11516d7d390a51 155
+  s_c2c23bbc940964::t_d33da2844214e1 667,676,685,814
+  s_c2c23bbc940964::t_00dbeb31ca71e3 352
+  s_c2c23bbc940964::t_cb997d99362792 598,610-616,618-620,629-635,637-639,641-644
+  s_c2c23bbc940964::t_21b9fe1265ebec 628,636
+  s_c2c23bbc940964::t_703a3fefd5b1d1 67-86
+  s_c2c23bbc940964::t_f39fe091fb6cb2 378
+  s_c2c23bbc940964::t_a29bb0522fcc3e 908-929,931-989,992-997,1000-1003
+server/server.go
+  s_c2c23bbc940964::t_14a8f7ec908986 66-84
+  s_c2c23bbc940964::t_2e8236a5c6f0d3 277-283,291
+internal/command/command_test.go
+  s_c2c23bbc940964::t_7e2c49ca0d5090 51-64
+README.md
+  s_d4dcb9cea6b725::t_21c9a7a200d77b 244
+  s_d4dcb9cea6b725::t_0bef7e54b81d36 514-515
+  s_d4dcb9cea6b725::t_48514be5fc4db2 542-544
+server/cluster.go
+  s_c2c23bbc940964::t_5cb71113ff6dfd 85,538-541,543-573
+  s_c2c23bbc940964::t_1d989e5cc0c1f9 52-55,80-84
+  s_c2c23bbc940964::t_43bb342633d46f 542
+internal/sql/translate.go
+  s_c2c23bbc940964::t_e17e2039270918 1-10
+  s_c2c23bbc940964::t_a4da1cf4abb248 73-77,80-93
+  s_c2c23bbc940964::t_118a713cfdb801 284-290,299-309,314-333,354-355,358-366,368-372,375,377-378
+  s_c2c23bbc940964::t_a7872819565f59 205,291,295,405
+  s_c2c23bbc940964::t_a6e41113357eca 310-313,334-347,349-353,356-357,367,373-374,376,379-381
+  s_c2c23bbc940964::t_375016e9e1b4a6 165-168,176-178
+  s_c2c23bbc940964::t_801d1123bd60d1 348
+  s_c2c23bbc940964::t_4302316e6bcc11 94
+go.mod
+  s_d4dcb9cea6b725::t_207643e5f815db 10
+internal/cluster/fsm_test.go
+  s_c2c23bbc940964::t_0014fa72670027 16
+  s_c2c23bbc940964::t_186a4c437bc55a 268-337
+docs/adr/012-postgresql-wire-phase8.md
+  s_d4dcb9cea6b725::t_ae3e50f2674b85 58-59,61-65
+  s_d4dcb9cea6b725::t_22ef50764f7422 72-75
+  s_d4dcb9cea6b725::t_ecda9d844dd3fb 44-49
+  s_c2c23bbc940964::t_27e5b4359cab34 90-95,98-113
+  s_d4dcb9cea6b725::t_6db8ca6304e322 153-154
+  s_c2c23bbc940964::t_910e70afc10d02 114
+scripts/tools/pgwire-smoketest.sh
+  s_ec51132ee0d66b::t_1196001f5188a8 81
+  s_d4dcb9cea6b725::t_fc842c01a919ec 70
+  s_ec51132ee0d66b::t_80958f0cccb841 18-22
+internal/sql/exec.go
+  s_c2c23bbc940964::t_fa132887c994d0 41
+  s_c2c23bbc940964::t_592865498c1e8e 1-10
+  s_c2c23bbc940964::t_e79d3106f861b9 16-17,28-40,42-51,68-78,84,89,93,110-139,173-185,189-202,205,218-222,225-227,258,278-282
+internal/storage/engine_test.go
+  s_c2c23bbc940964::t_787ad5c9f9fd00 313-395
+  s_c2c23bbc940964::t_7080f7af70137f 5
+internal/command/command.go
+  s_c2c23bbc940964::t_09482deda0abe3 35-43
+internal/sql/pgwire.go
+  s_c2c23bbc940964::t_c4b0e417afd58e 1-10
+  s_c2c23bbc940964::t_165b77096bb42e 338-340
+  s_c2c23bbc940964::t_82ee9a0931b60e 291-301
+  s_c2c23bbc940964::t_8533c54865a287 24
+  s_c2c23bbc940964::t_283f34b08e3927 256-259,261-264
+  s_c2c23bbc940964::t_da95d2b521e211 316-324
+  s_c2c23bbc940964::t_a299a37dca6fc7 711-714,718-730
+  s_c2c23bbc940964::t_a3171001ffa31a 89-106
+  s_c2c23bbc940964::t_7f452cf8cbd63d 170-173,179
+  s_c2c23bbc940964::t_4940572cc4fd73 273-278
+  s_c2c23bbc940964::t_2df37e869f87d2 153
+  s_c2c23bbc940964::t_3656a9854b60e5 285
+  s_c2c23bbc940964::t_ab5a84b3f04762 781-785,787,797-799
+  s_c2c23bbc940964::t_11516d7d390a51 308,467,483
+  s_c2c23bbc940964::t_e0189f45803968 731,925-929,937,948-954,961
+internal/sql/store.go
+  s_c2c23bbc940964::t_9c77278eaece3a 2-10
+  s_c2c23bbc940964::t_a83780b43c85fd 23-30
+internal/sql/translate_test.go
+  s_c2c23bbc940964::t_cfd87cfcd73efa 85-91
+  s_c2c23bbc940964::t_a33c24c752a412 23,25-39,50-51
+  s_c2c23bbc940964::t_97eda977ca765e 1-8
+  s_c2c23bbc940964::t_02a3a16bc66a0a 52
+internal/cluster/fsm.go
+  s_c2c23bbc940964::t_41beb4ddc7db0a 43-49,54-69
+  s_c2c23bbc940964::t_0fdde32e532f0b 136-152,162,172
+  s_c2c23bbc940964::t_a333b68f1df822 240
+  s_c2c23bbc940964::t_ece7af5ceeaa90 30
+  s_c2c23bbc940964::t_e2613d5c4a8d98 70
+scripts/tools/manualcompat/main.go
+  s_c2c23bbc940964::t_3fa3de5de43fa6 1-17
+container/Containerfile.dev
+  s_d4dcb9cea6b725::t_d2d8a72dbd098f 6,19-22,34
+internal/shard/runner.go
+  s_c2c23bbc940964::t_5316d98a6a49bd 170-182,185-186,188,190-197,199-205
+  s_c2c23bbc940964::t_c8795d9ee16937 33-34
+  s_c2c23bbc940964::t_717fc79f455174 183-184,187,189
+  s_c2c23bbc940964::t_870a9dfcc02d93 198
+.github/ISSUE_TEMPLATE/bug_report.yml
+  s_d4dcb9cea6b725::t_8ea68dbdc14523 84
+  s_d4dcb9cea6b725::t_be62a304c2fa69 26
+internal/storage/engine.go
+  s_c2c23bbc940964::t_ae59485718a364 230
+  s_c2c23bbc940964::t_ab2841cd9dea3e 176
+  s_c2c23bbc940964::t_d722dc30d6856e 109-143
+  s_c2c23bbc940964::t_23a5ef3f7f732c 160
+  s_c2c23bbc940964::t_f4709b09c989c0 189-199
+scripts/test-backward-compat.sh
+  s_d4dcb9cea6b725::t_6a712b066b5c59 43
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3c51560f517155c3b77f4c370327ec70b3be975e",
+  "prompts": {},
+  "sessions": {
+    "s_c2c23bbc940964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f21084331ffeWdPwPcacLO1zfT",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    },
+    "s_d4dcb9cea6b725": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f28e02cccffeV3MNMqp6A94u8i",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    },
+    "s_ec51132ee0d66b": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f32d08b5affeJWDBawZEc06lYo",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
