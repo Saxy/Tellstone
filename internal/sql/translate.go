@@ -1,3 +1,13 @@
+/*
+Package sql
+Tellstone PostgreSQL Wire Frontend
+File: translate.go
+Description: Maps a single SQL statement onto the implicit tellstone table. The
+PostgreSQL parser (pg_query_go) turns the statement into a protobuf parse tree,
+which is then narrowed to the supported shapes: single-row CRUD with an equality
+predicate on the key column, and BEGIN/COMMIT/ROLLBACK. Anything outside those
+shapes is rejected explicitly rather than approximated.
+*/
 package sql
 
 import (
@@ -60,10 +70,27 @@ type Plan struct {
 	Key  ValRef
 	Val  ValRef
 	Tag  string // CommandComplete tag for transaction statements
-	// OnConflict is true when an INSERT carries an ON CONFLICT clause, opting
-	// into the upsert the store performs instead of a duplicate-key error.
-	OnConflict bool
+	// Conflict selects the INSERT's conflict behavior, carried from the
+	// ON CONFLICT clause: bare/insert-only raises a duplicate-key error,
+	// ConflictDoNothing leaves the existing row alone, and ConflictDoUpdate
+	// overwrites it.
+	Conflict ConflictAction
 }
+
+// ConflictAction is the INSERT conflict behavior the translator extracted from
+// the ON CONFLICT clause.
+type ConflictAction uint8
+
+const (
+	// ConflictRaise is the default: a plain INSERT on an existing key is a
+	// duplicate-key violation.
+	ConflictRaise ConflictAction = iota
+	// ConflictDoNothing is ON CONFLICT DO NOTHING: an existing row is
+	// preserved and the statement still reports success.
+	ConflictDoNothing
+	// ConflictDoUpdate is ON CONFLICT DO UPDATE SET value = excluded.value.
+	ConflictDoUpdate
+)
 
 // Translate parses a single SQL statement and maps it onto the implicit
 // tellstone table. Exactly one statement is accepted so the simple-query path
@@ -135,8 +162,10 @@ func columnRef(node *pg_query.Node) (string, bool) {
 	return sv.GetSval(), true
 }
 
-// valueRef extracts a literal or parameter reference from a node.
-func valueRef(node *pg_query.Node) (ValRef, error) {
+// valueRef extracts a literal or parameter reference from a node. column names
+// the column the value feeds, so a NULL literal can be reported as the
+// not-null violation it is rather than as an unsupported expression.
+func valueRef(node *pg_query.Node, column string) (ValRef, error) {
 	if node == nil {
 		return ValRef{}, errUnsupported
 	}
@@ -144,6 +173,9 @@ func valueRef(node *pg_query.Node) (ValRef, error) {
 		return ValRef{Param: int(pr.GetNumber())}, nil
 	}
 	if ac := node.GetAConst(); ac != nil {
+		if ac.GetIsnull() {
+			return ValRef{}, &pgError{code: errNotNullViolation, msg: fmt.Sprintf("null value in column %q violates not-null constraint", column)}
+		}
 		sv := ac.GetSval()
 		if sv == nil {
 			return ValRef{}, fmt.Errorf("%w: only string expressions are supported", errUnsupported)
@@ -170,7 +202,7 @@ func keyPredicate(where *pg_query.Node) (ValRef, error) {
 	if n, _ := columnRef(ae.GetLexpr()); n != colKey {
 		return ValRef{}, fmt.Errorf("%w: only the key column may be filtered", errUnsupported)
 	}
-	return valueRef(ae.GetRexpr())
+	return valueRef(ae.GetRexpr(), colKey)
 }
 
 func translateSelect(ss *pg_query.SelectStmt) (*Plan, error) {
@@ -249,18 +281,104 @@ func translateInsert(is *pg_query.InsertStmt) (*Plan, error) {
 	if len(items) != 2 {
 		return nil, fmt.Errorf("%w: INSERT must provide exactly key and value", errUnsupported)
 	}
-	// ON CONFLICT is honored as a flag: ON CONFLICT opts into the upsert the
-	// store performs, while a bare INSERT keeps duplicate-key enforcement.
-	onConflict := is.GetOnConflictClause() != nil
-	key, err := valueRef(items[keyPos])
+	// ON CONFLICT is translated by action, because the two forms mean opposite
+	// things on the store: DO NOTHING must preserve the existing row, while DO
+	// UPDATE must overwrite it.
+	conflict, err := translateOnConflict(is.GetOnConflictClause())
 	if err != nil {
 		return nil, err
 	}
-	val, err := valueRef(items[valPos])
+	key, err := valueRef(items[keyPos], colKey)
 	if err != nil {
 		return nil, err
 	}
-	return &Plan{Kind: StmtInsert, Key: key, Val: val, OnConflict: onConflict}, nil
+	val, err := valueRef(items[valPos], colValue)
+	if err != nil {
+		return nil, err
+	}
+	return &Plan{Kind: StmtInsert, Key: key, Val: val, Conflict: conflict}, nil
+}
+
+// translateOnConflict maps an ON CONFLICT clause onto a ConflictAction. Only
+// DO NOTHING and the canonical DO UPDATE SET value = excluded.value are
+// supported; anything else is rejected rather than silently downgraded to a
+// plain overwrite, which would corrupt rows the statement promised to keep.
+func translateOnConflict(oc *pg_query.OnConflictClause) (ConflictAction, error) {
+	if oc == nil {
+		return ConflictRaise, nil
+	}
+	// The arbiter only has to name the one primary key; a named constraint or
+	// any other column has no corresponding index on the implicit table.
+	if err := checkConflictTarget(oc.GetInfer()); err != nil {
+		return ConflictRaise, err
+	}
+	switch oc.GetAction() {
+	case pg_query.OnConflictAction_ONCONFLICT_NOTHING:
+		if oc.GetWhereClause() != nil {
+			return ConflictRaise, fmt.Errorf("%w: ON CONFLICT DO NOTHING with a WHERE clause is not supported", errUnsupported)
+		}
+		return ConflictDoNothing, nil
+	case pg_query.OnConflictAction_ONCONFLICT_UPDATE:
+		if oc.GetWhereClause() != nil {
+			return ConflictRaise, fmt.Errorf("%w: ON CONFLICT DO UPDATE with a WHERE clause is not supported", errUnsupported)
+		}
+		if err := checkExcludedUpsert(oc.GetTargetList()); err != nil {
+			return ConflictRaise, err
+		}
+		return ConflictDoUpdate, nil
+	default:
+		return ConflictRaise, fmt.Errorf("%w: unsupported ON CONFLICT action %s", errUnsupported, oc.GetAction())
+	}
+}
+
+// checkConflictTarget accepts an absent arbiter or one naming the key column,
+// which is the only conflict target the implicit table has. A nil infer clause
+// carries no target, so nothing is checked.
+func checkConflictTarget(infer *pg_query.InferClause) error {
+	if infer == nil {
+		return nil
+	}
+	if infer.GetConname() != "" {
+		return fmt.Errorf("%w: ON CONFLICT ON CONSTRAINT is not supported on %s", errUnsupported, tableName)
+	}
+	elems := infer.GetIndexElems()
+	if len(elems) == 0 {
+		return nil
+	}
+	if len(elems) != 1 || elems[0].GetIndexElem().GetName() != colKey {
+		return fmt.Errorf("%w: ON CONFLICT supports only the key column as conflict target", errUnsupported)
+	}
+	return nil
+}
+
+// checkExcludedUpsert accepts only SET value = excluded.value: an assignment
+// that reads another column or a literal would not behave like an upsert of the
+// proposed row. The parser spells excluded.value as a two-field column
+// reference, "excluded" then "value".
+func checkExcludedUpsert(targets []*pg_query.Node) error {
+	if len(targets) != 1 {
+		return fmt.Errorf("%w: ON CONFLICT DO UPDATE must assign exactly the value column", errUnsupported)
+	}
+	rt := targets[0].GetResTarget()
+	if rt == nil || rt.GetName() != colValue {
+		return fmt.Errorf("%w: ON CONFLICT DO UPDATE may only assign the value column", errUnsupported)
+	}
+	cb := rt.GetVal().GetColumnRef()
+	if cb == nil || !isExcludedValue(cb) {
+		return fmt.Errorf("%w: ON CONFLICT DO UPDATE supports only value = excluded.value", errUnsupported)
+	}
+	return nil
+}
+
+// isExcludedValue reports whether a column reference is excluded.value.
+func isExcludedValue(cb *pg_query.ColumnRef) bool {
+	fields := cb.GetFields()
+	if len(fields) != 2 {
+		return false
+	}
+	first, second := fields[0].GetString_(), fields[1].GetString_()
+	return first != nil && second != nil &&
+		first.GetSval() == "excluded" && second.GetSval() == colValue
 }
 
 func translateUpdate(us *pg_query.UpdateStmt) (*Plan, error) {
@@ -284,7 +402,7 @@ func translateUpdate(us *pg_query.UpdateStmt) (*Plan, error) {
 		if set {
 			return nil, fmt.Errorf("%w: multiple value assignments are unsupported", errUnsupported)
 		}
-		if val, err = valueRef(rt.GetVal()); err != nil {
+		if val, err = valueRef(rt.GetVal(), colValue); err != nil {
 			return nil, err
 		}
 		set = true

@@ -1,3 +1,12 @@
+/*
+Package sql
+Tellstone PostgreSQL Wire Frontend
+File: auth.go
+Description: The PG startup authentication exchange and the SQLSTATE catalog.
+Credentials reuse the existing identity stack: roles carry bcrypt hashes and SSO
+tokens are verified by the OAuth provider, so the only password exchange that
+can validate them is cleartext over TLS (ADR-012).
+*/
 package sql
 
 import (
@@ -30,6 +39,7 @@ const (
 	errSyntax                   = "42601"
 	errUndefinedTable           = "42P01"
 	errDuplicateKey             = "23505"
+	errNotNullViolation         = "23502"
 	errProtocolViolation        = "08P01"
 	errAdminShutdown            = "57P01"
 	errTooManyConnections       = "53300"
@@ -79,7 +89,7 @@ func (s *Server) authenticate(c *pgConn, params map[string]string) (*authState, 
 	if err := sendMessage(c, msgAuthentication, frameAuthCleartext()); err != nil {
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}
-	typ, payload, err := readFrame(c.r)
+	typ, payload, err := readFrame(c.r, maxPasswordFrameSize)
 	if err != nil {
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}

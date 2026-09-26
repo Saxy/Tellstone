@@ -15,6 +15,11 @@
 
 set -u
 
+# Resolve the repo root so the script works from any directory
+# (e.g. run from scripts/tools/ with ./pgwire-smoketest.sh).
+script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo=$(git -C "$script_dir" rev-parse --show-toplevel 2>/dev/null || dirname "$script_dir")
+
 mode="${1:-single}"
 bin="${TELLSTONE_BIN:-}"
 work=$(mktemp -d /tmp/pgwire-smoketest.XXXXXX)
@@ -62,7 +67,7 @@ cleanup() {
 	wait 2>/dev/null
 	rm -rf "$work"
 	printf '\n%d pass, %d fail\n' "$pass" "$fail"
-	[ "$fail" -eq 0 ]
+	[ "$fail" -gt 0 ] && exit 1
 }
 
 if ! command -v psql >/dev/null 2>&1 || ! command -v pg_isready >/dev/null 2>&1; then
@@ -73,7 +78,7 @@ fi
 [ -n "$bin" ] && [ -x "$bin" ] || {
 	bin="$work/tellstone"
 	log "building ./cmd/tellstone"
-	go build -o "$bin" ./cmd/tellstone || { echo "build failed" >&2; exit 1; }
+	(cd "$repo" && go build -o "$bin" ./cmd/tellstone) || { echo "build failed" >&2; exit 1; }
 }
 
 trap cleanup EXIT

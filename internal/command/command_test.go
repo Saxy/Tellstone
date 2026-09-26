@@ -48,6 +48,20 @@ func (f *fakeStore) Set(key string, value []byte, ttl time.Duration) error {
 	return f.setErr
 }
 
+func (f *fakeStore) SetIfAbsent(key string, value []byte, ttl time.Duration) (bool, error) {
+	if _, ok := f.m[key]; ok {
+		return false, f.setErr
+	}
+	return true, f.Set(key, value, ttl)
+}
+
+func (f *fakeStore) SetIfPresent(key string, value []byte, ttl time.Duration) (bool, error) {
+	if _, ok := f.m[key]; !ok {
+		return false, f.setErr
+	}
+	return true, f.Set(key, value, ttl)
+}
+
 func (f *fakeStore) Delete(key string) (bool, error) {
 	_, ok := f.m[key]
 	delete(f.m, key)

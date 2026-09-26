@@ -23,8 +23,7 @@ body:
       description: Which protocol does this bug affect?
       options:
         - Binary protocol
-        - RESP2 (Redis-compatible)
-        - Both
+        - PostgreSQL wire (SQL)
         - N/A
     validations:
       required: true
@@ -82,7 +81,7 @@ body:
       description: "Paste the flags or environment variables used to start Tellstone."
       render: bash
       placeholder: |
-        task run -- --enable-metrics
+        TSD_ENABLE_METRICS=true ./bin/tellstone --enable-metrics
 
   - type: textarea
     id: context

@@ -63,6 +63,25 @@ func (rs *RouterStore) Set(key string, value []byte, ttl time.Duration) error {
 	return resp.Err
 }
 
+// SetIfAbsent and SetIfPresent carry the write precondition down to the engine,
+// which evaluates it and the write under a single lock. The boolean reports
+// whether the write was applied.
+func (rs *RouterStore) SetIfAbsent(key string, value []byte, ttl time.Duration) (bool, error) {
+	resp := rs.router.Dispatch(shard.CmdSetNX, key, value, ttl)
+	if resp.Err != nil {
+		return false, resp.Err
+	}
+	return resp.OK, nil
+}
+
+func (rs *RouterStore) SetIfPresent(key string, value []byte, ttl time.Duration) (bool, error) {
+	resp := rs.router.Dispatch(shard.CmdSetXX, key, value, ttl)
+	if resp.Err != nil {
+		return false, resp.Err
+	}
+	return resp.OK, nil
+}
+
 func (rs *RouterStore) Delete(key string) (bool, error) {
 	resp := rs.router.Dispatch(shard.CmdDel, key, nil, 0)
 	return resp.OK, resp.Err
@@ -255,6 +274,13 @@ func (s *Server) Run() error {
 		if cfg.PGTLS() && !cfg.TLSEnabled() {
 			return fmt.Errorf("--pg-tls requires --tls-cert and --tls-key")
 		}
+		// The PG startup exchange carries a cleartext password validated against
+		// a bcrypt hash; there is no SCRAM/md5 fallback (ADR-012). Accepting a
+		// credential over a plaintext listener would put it on the wire in the
+		// clear, so refuse to start rather than run a listener that invites it.
+		if !cfg.PGTLS() && (cfg.GetRequirePass() != "" || s.policy != nil) {
+			return fmt.Errorf("--pg-addr with password or RBAC authentication requires --pg-tls")
+		}
 		var passHash []byte
 		if cfg.GetRequirePass() != "" && s.policy == nil {
 			passHash, err = bcrypt.GenerateFromPassword([]byte(cfg.GetRequirePass()), bcrypt.DefaultCost)
@@ -262,7 +288,7 @@ func (s *Server) Run() error {
 				return fmt.Errorf("invalid --require-pass: %w", err)
 			}
 		}
-		s.pgSrv = sqlpkg.NewServer(cfg.GetPGAddr(), s.store, s.policy, s.oauth, s.audit, passHash, s.tlsConfigs, logger)
+		s.pgSrv = sqlpkg.NewServer(cfg.GetPGAddr(), s.store, s.policy, s.oauth, s.audit, passHash, s.tlsConfigs, logger, cfg.PGTLS())
 		if _, err := s.pgSrv.Start(); err != nil {
 			return fmt.Errorf("sql listener: %w", err)
 		}

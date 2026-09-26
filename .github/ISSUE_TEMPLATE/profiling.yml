@@ -57,7 +57,9 @@ body:
       description: How did you generate the profile or observe the performance issue?
       placeholder: |
         1. Start server with `task run:profiling`
-        2. Run `task bench:native` in a second terminal
+        2. Build the load generator with `task build:bench`, then in a second
+           terminal run `./bin/benchmark -addr 127.0.0.1:19988 -c 32 -n 1000000
+           -read-ratio 0.95 -skew 1.5`
         3. Pull profile with `task profile:live`
     validations:
       required: true

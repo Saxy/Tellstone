@@ -1,3 +1,13 @@
+/*
+Package sql
+Tellstone PostgreSQL Wire Frontend
+File: pgwire.go
+Description: The frontend/backend protocol version 3.0 listener. One goroutine
+per connection drives the simple and extended query flows, the startup and
+authentication handshakes, the TLS gate, and the frame/message codecs. Frame
+sizes are bounded and the pre-authentication phase is deadline-bound so an
+unauthenticated client cannot pin resources.
+*/
 package sql
 
 import (
@@ -11,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Saxy/Tellstone/internal/audit"
 	"github.com/Saxy/Tellstone/internal/log"
@@ -75,6 +86,24 @@ const (
 // rejected rather than buffered.
 const maxFrameSize = 64 << 20
 
+// maxStartupFrameSize is PostgreSQL's own limit on a startup packet. It is
+// enforced strictly because the packet arrives before authentication, so an
+// unauthenticated client must not be able to make the server allocate an
+// arbitrary frame.
+const maxStartupFrameSize = 10000
+
+// maxPasswordFrameSize bounds the PasswordMessage a pre-auth client may send.
+// A password is a short scalar, so this is generous to real clients while
+// keeping the pre-auth allocation surface small.
+const maxPasswordFrameSize = 1 << 16
+
+// authReadTimeout bounds how long a connection may stall during startup and
+// authentication. Both are unauthenticated windows, so a client that connects
+// and then goes silent must not be able to pin a goroutine and a file
+// descriptor indefinitely. It is cleared once the session is authenticated,
+// after which idle time is normal and unconstrained.
+const authReadTimeout = 30 * time.Second
+
 // resultFormatText is the only result/parameter format Phase 8 speaks: column
 // data rides as text (bytea hex-encoded), mirroring libpq's default.
 const resultFormatText = 0
@@ -121,6 +150,7 @@ type Server struct {
 	store           Store
 	logger          log.Logger
 	tlsConfigs      *tlslib.ConfigStore
+	requireTLS      bool
 	policy          *rbac.Store
 	oauth           oauth.Provider
 	requirePassHash []byte
@@ -137,13 +167,16 @@ type Server struct {
 
 // NewServer wires the PG listener to the shared store and identity stack.
 // requirePassHash may be nil; policy/oauth may be nil (trust or single-password
-// modes). tlsConfigs may be nil (no TLS advertised).
-func NewServer(addr string, store Store, policy *rbac.Store, oauthProvider oauth.Provider, auditEngine *audit.LogEngine, requirePassHash []byte, tlsConfigs *tlslib.ConfigStore, logger log.Logger) *Server {
+// modes). tlsConfigs may be nil (no TLS advertised). requireTLS rejects any
+// connection that does not complete an SSLRequest, so a listener configured
+// with a credential can never be reached over plaintext.
+func NewServer(addr string, store Store, policy *rbac.Store, oauthProvider oauth.Provider, auditEngine *audit.LogEngine, requirePassHash []byte, tlsConfigs *tlslib.ConfigStore, logger log.Logger, requireTLS bool) *Server {
 	return &Server{
 		addr:            addr,
 		store:           store,
 		logger:          logger,
 		tlsConfigs:      tlsConfigs,
+		requireTLS:      requireTLS,
 		policy:          policy,
 		oauth:           oauthProvider,
 		requirePassHash: requirePassHash,
@@ -220,7 +253,15 @@ func (s *Server) serveConn(raw net.Conn) {
 		portals:    map[string]*portalState{},
 	}
 	defer raw.Close()
+	// Close walks s.conns to interrupt every live connection, so a connection
+	// registered after that walk would never be closed. Checking closing while
+	// still holding the lock closes the window: either Close sees this
+	// connection, or this goroutine observes closing and bails out.
 	s.connsMu.Lock()
+	if s.closing.Load() {
+		s.connsMu.Unlock()
+		return
+	}
 	s.conns[c] = struct{}{}
 	s.connsMu.Unlock()
 	defer func() {
@@ -229,14 +270,32 @@ func (s *Server) serveConn(raw net.Conn) {
 		s.connsMu.Unlock()
 	}()
 
+	// Startup and authentication both happen before the client has proved who
+	// it is, so bound how long each may take. An authenticated session is
+	// allowed to idle, hence the deadline is cleared on the way out.
+	if err := c.raw.SetReadDeadline(time.Now().Add(authReadTimeout)); err != nil {
+		return
+	}
 	if err := c.startup(); err != nil {
 		if pe, ok := err.(*pgError); ok {
 			_ = s.sendError(c, pe, "FATAL")
 		}
 		return
 	}
+	c.setReadDeadline(time.Time{})
 	if err := c.messageLoop(); err != nil {
 		return
+	}
+}
+
+// setReadDeadline applies a read deadline to whichever connection is currently
+// being read from. An SSLRequest replaces the reader with the TLS connection,
+// so the deadline has to follow it or the pre-auth bound would silently stop
+// applying halfway through the handshake.
+func (c *pgConn) setReadDeadline(t time.Time) {
+	_ = c.raw.SetReadDeadline(t)
+	if c.tlsConn != nil {
+		_ = c.tlsConn.SetReadDeadline(t)
 	}
 }
 
@@ -246,7 +305,7 @@ func (s *Server) serveConn(raw net.Conn) {
 func (c *pgConn) startup() error {
 	s := c.srv
 	for {
-		body, err := readStartupFrame(c.r)
+		body, err := readStartupFrame(c.r, maxStartupFrameSize)
 		if err != nil {
 			return err
 		}
@@ -254,6 +313,15 @@ func (c *pgConn) startup() error {
 			return &pgError{code: errProtocolViolation, msg: "truncated startup frame"}
 		}
 		code := int32(binary.BigEndian.Uint32(body[:4]))
+		// A client that skips the SSLRequest and goes straight to the startup
+		// packet is reaching the listener in plaintext. When TLS is mandatory
+		// the connection is refused here, before any credential is read.
+		if s.requireTLS && code != sslRequestCode && c.tlsConn == nil {
+			return &pgError{
+				code: errInvalidAuthorizationSpec,
+				msg:  "SSL is required on this connection (server refuses non-TLS clients)",
+			}
+		}
 		switch code {
 		case sslRequestCode:
 			if cfg := s.loadTLSConfig(); cfg != nil {
@@ -267,6 +335,9 @@ func (c *pgConn) startup() error {
 				c.tlsConn = tc
 				c.r = bufio.NewReaderSize(c.tlsConn, 32<<10)
 				c.w = bufio.NewWriterSize(c.tlsConn, 32<<10)
+				// The reads now come from the TLS connection, so the pre-auth
+				// deadline has to be re-armed on it.
+				c.setReadDeadline(time.Now().Add(authReadTimeout))
 			} else {
 				if err := c.writeRaw([]byte{'N'}); err != nil {
 					return err
@@ -393,7 +464,7 @@ func parseStartupParams(b []byte) (map[string]string, error) {
 func (c *pgConn) messageLoop() error {
 	for {
 		if c.inError {
-			t, _, err := readFrame(c.r)
+			t, _, err := readFrame(c.r, -1)
 			if err != nil {
 				return normalizeIO(err)
 			}
@@ -409,7 +480,7 @@ func (c *pgConn) messageLoop() error {
 			}
 			continue
 		}
-		t, p, err := readFrame(c.r)
+		t, p, err := readFrame(c.r, -1)
 		if err != nil {
 			return normalizeIO(err)
 		}
@@ -637,9 +708,26 @@ func (c *pgConn) handleBind(payload []byte) error {
 		params[i].val = append([]byte(nil), rest[:n]...)
 		rest = rest[n:]
 	}
-	// Result column formats: accepted, only text is honored.
+	// Result column formats: Phase 8 emits column data as text only. Silently
+	// accepting a binary request would let the portal claim a format that
+	// sendRowDescription and the DataRow writer never honor, so the client
+	// would decode hex text as raw bytes.
 	if len(rest) < 2 {
 		return &pgError{code: errProtocolViolation, msg: "malformed Bind message"}
+	}
+	nrf := int(binary.BigEndian.Uint16(rest[:2]))
+	rest = rest[2:]
+	for i := 0; i < nrf; i++ {
+		if len(rest) < 2 {
+			return &pgError{code: errProtocolViolation, msg: "malformed Bind message"}
+		}
+		if f := int16(binary.BigEndian.Uint16(rest[:2])); f != resultFormatText {
+			return &pgError{
+				code: errFeatureNotSupported,
+				msg:  fmt.Sprintf("binary result format %d is not supported; only text format is spoken", f),
+			}
+		}
+		rest = rest[2:]
 	}
 	c.portals[portalName] = &portalState{plan: plan, params: params}
 	var buf msgBuilder
@@ -690,14 +778,13 @@ func (c *pgConn) handleDescribe(payload []byte) error {
 	}
 }
 
-// sendStatementParamDesc emits ParameterDescription (1 per referenced
-// parameter, in ascending $n order, text-typed by target column). Postgres
-// only sends it when the statement references parameters, so none is emitted
-// for literal-only statements.
+// sendStatementParamDesc emits ParameterDescription, one OID per referenced
+// parameter in ascending $n order, typed by the column the parameter feeds
+// (text for the key, bytea for the value). A literal-only statement has no
+// parameters, and the message is still sent with a count of zero: the protocol
+// expects it after every Describe of a prepared statement.
 func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
-	if maxParam(plan) == 0 {
-		return nil
-	}
+	n := maxParam(plan)
 	types := map[int]int32{}
 	if plan.Key.Param > 0 {
 		types[plan.Key.Param] = oidText
@@ -707,9 +794,9 @@ func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
 	}
 	var buf msgBuilder
 	buf.begin(msgParameterDesc)
-	buf.int16(int16(len(types)))
-	for n := 1; n <= maxParam(plan); n++ {
-		if oid, ok := types[n]; ok {
+	buf.int16(int16(n))
+	for i := 1; i <= n; i++ {
+		if oid, ok := types[i]; ok {
 			buf.int32(oid)
 		} else {
 			buf.int32(oidText)
@@ -835,7 +922,11 @@ func (c *pgConn) emitOutcome(out *execOutcome) error {
 
 // ---- frame helpers ----
 
-func readStartupFrame(r io.Reader) ([]byte, error) {
+// readStartupFrame reads one untyped startup-phase frame (StartupMessage,
+// SSLRequest, GSSENCRequest, CancelRequest). limit bounds the allocation an
+// unauthenticated client can request, so PostgreSQL's own 10 kB startup
+// maximum is applied rather than the general frame ceiling.
+func readStartupFrame(r io.Reader, limit int) ([]byte, error) {
 	var hdr [4]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return nil, normalizeIO(err)
@@ -843,7 +934,7 @@ func readStartupFrame(r io.Reader) ([]byte, error) {
 	n := int(binary.BigEndian.Uint32(hdr[:]))
 	// The length counts the whole frame including the length field itself, so
 	// the body is n-4 bytes. A startup/cancel/SSL frame always carries its code.
-	if n < 8 || n > maxFrameSize {
+	if n < 8 || n > limit {
 		return nil, errFrameTooLarge
 	}
 	body := make([]byte, n-4)
@@ -854,15 +945,20 @@ func readStartupFrame(r io.Reader) ([]byte, error) {
 }
 
 // readFrame reads one typed backend-format frame. The returned payload
-// excludes the type byte and the 4-byte length.
-func readFrame(r io.Reader) (byte, []byte, error) {
+// excludes the type byte and the 4-byte length. A limit below zero selects the
+// general frame ceiling; pass a smaller value to constrain a frame read during
+// an unauthenticated phase.
+func readFrame(r io.Reader, limit int) (byte, []byte, error) {
+	if limit < 0 {
+		limit = maxFrameSize
+	}
 	var hdr [5]byte
 	if _, err := io.ReadFull(r, hdr[:]); err != nil {
 		return 0, nil, normalizeIO(err)
 	}
 	typ := hdr[0]
 	n := int(binary.BigEndian.Uint32(hdr[1:])) // includes the length field
-	if n < 4 || n > maxFrameSize {
+	if n < 4 || n > limit {
 		return 0, nil, errFrameTooLarge
 	}
 	body := make([]byte, n-4)

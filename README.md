@@ -241,7 +241,7 @@ it emits SHA-512-crypt, not bcrypt. `ROLE SETUSER` accepts a raw `>password` and
 server-side, so runtime-created users need no tooling.
 
 ```bash
-./bin/tellstone --rbac-config policy.yaml --require-pass
+./bin/tellstone --rbac-config policy.yaml
 # then authenticate with the binary client, e.g. cmd/example/role:
 #   c.AuthUser("admin", "adminsecret")
 #   c.RoleCreate("operator", ["+get", "~users:*"])
@@ -511,8 +511,8 @@ Benchmarks are not run automatically on every push due to resource constraints.
 Run them locally with `task bench:native`.
 
 ### Observability
-* **Metrics:** `task run` with `--enable-metrics` exposes Prometheus text at
-  `http://<metrics-addr>/metrics` (default `:9100`).
+* **Metrics:** `TSD_ENABLE_METRICS=true ./bin/tellstone --enable-metrics` exposes Prometheus
+  text at `http://<metrics-addr>/metrics` (default `:9100`).
 * **Audit logging:** `--enable-audit` writes structured security events (see
   [Audit logging](#audit-logging)); run with `--audit-events all` to capture every event type.
 
@@ -539,9 +539,9 @@ task run:profiling                    # foreground server, live pprof on :6060
 ```
 
 ```bash
-# in a second terminal, generate load, e.g.:
-task bench:native
-# or: ./bin/benchmark -addr 127.0.0.1:19988 -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
+# in a second terminal, generate load against the running server (client only):
+task build:bench
+./bin/benchmark -addr 127.0.0.1:19988 -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
 ```
 
 ```bash

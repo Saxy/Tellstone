@@ -32,6 +32,15 @@ type Store interface {
 	// (federation) read failures instead of masking them as NOT FOUND.
 	GetErr(key string) ([]byte, bool, error)
 	Set(key string, value []byte, ttl time.Duration) error
+	// SetIfAbsent writes a key only when it is currently absent, and reports
+	// whether the write was applied. The precondition and the write are
+	// evaluated as one atomic step, so a caller cannot be raced into creating a
+	// key that already exists. Used by the SQL frontend's INSERT.
+	SetIfAbsent(key string, value []byte, ttl time.Duration) (bool, error)
+	// SetIfPresent writes a key only when it already exists, and reports
+	// whether the write was applied, atomically with the existence check.
+	// Used by the SQL frontend's UPDATE.
+	SetIfPresent(key string, value []byte, ttl time.Duration) (bool, error)
 	// Delete removes a key and reports whether it existed. A non-nil error
 	// means the deletion did not happen (e.g. not leader in cluster mode);
 	// the boolean is only meaningful when err is nil.

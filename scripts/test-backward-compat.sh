@@ -40,7 +40,7 @@ pass() { echo -e "  ${GREEN}PASS${NC} $1"; PASS_COUNT=$((PASS_COUNT+1)); }
 fail() { echo -e "  ${RED}FAIL${NC} $1"; FAIL_COUNT=$((FAIL_COUNT+1)); }
 section() { echo; echo -e "${BOLD}${CYAN}=== $1 ===${NC}"; }
 
-tsd() { "127.0.0.1:${PORT}"; }
+tsd() { printf '127.0.0.1:%s\n' "${PORT}"; }
 
 mc_ping() {
     "${MC_CMD}" ping "$(tsd)" >/dev/null 2>&1

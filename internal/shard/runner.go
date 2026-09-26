@@ -30,6 +30,8 @@ import (
 const (
 	CmdGet     string = "GET"
 	CmdSet     string = "SET"
+	CmdSetNX   string = "SETNX"
+	CmdSetXX   string = "SETXX"
 	CmdDel     string = "DEL"
 	CmdPing    string = "PING"
 	CmdCommand string = "COMMAND"
@@ -163,6 +165,42 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 				}
 			}
 			return Response{Err: err}
+		}
+		return Response{OK: true}
+	case CmdSetNX, CmdSetXX:
+		// Conditional writes. The engine evaluates the precondition and the
+		// write under one lock, which is what makes the pair atomic; the
+		// caller learns the outcome from Response.OK.
+		//
+		// The durability record is written only after the engine accepted the
+		// write, so a rejected conditional leaves nothing for replay to
+		// resurrect. A failure there is compensated exactly like CmdSet's:
+		// only a key that did not exist beforehand can be rolled back.
+		var expiration time.Time
+		if ttl > 0 {
+			expiration = time.Now().Add(ttl)
+		}
+		_, keyExisted := s.Engine.Get(key)
+		var applied bool
+		var err error
+		if op == CmdSetNX {
+			applied, err = s.Engine.SetIfAbsent(key, value, ttl)
+		} else {
+			applied, err = s.Engine.SetIfPresent(key, value, ttl)
+		}
+		if err != nil {
+			return Response{Err: err}
+		}
+		if !applied {
+			return Response{}
+		}
+		if s.Persistence.Enabled() {
+			if err = s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
+				if !keyExisted {
+					s.Engine.Delete(key)
+				}
+				return Response{Err: err}
+			}
 		}
 		return Response{OK: true}
 	case CmdDel:

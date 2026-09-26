@@ -64,6 +64,26 @@ func (s *testStore) Set(key string, value []byte, _ time.Duration) error {
 	return nil
 }
 
+func (s *testStore) SetIfAbsent(key string, value []byte, _ time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[key]; ok {
+		return false, nil
+	}
+	s.data[key] = append([]byte(nil), value...)
+	return true, nil
+}
+
+func (s *testStore) SetIfPresent(key string, value []byte, _ time.Duration) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data[key]; !ok {
+		return false, nil
+	}
+	s.data[key] = append([]byte(nil), value...)
+	return true, nil
+}
+
 func (s *testStore) Delete(key string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -132,7 +152,7 @@ func (cl *tclient) send(typ byte, payload []byte) {
 
 func (cl *tclient) recv() frame {
 	cl.t.Helper()
-	typ, p, err := readFrame(cl.r)
+	typ, p, err := readFrame(cl.r, -1)
 	if err != nil {
 		cl.t.Fatalf("read frame: %v", err)
 	}
@@ -329,6 +349,7 @@ type srvOpts struct {
 	requirePass string
 	policy      *rbac.Store
 	withTLS     bool
+	requireTLS  bool
 }
 
 func newTestServer(t *testing.T, o srvOpts) (*Server, *testStore) {
@@ -354,7 +375,7 @@ func newTestServer(t *testing.T, o srvOpts) (*Server, *testStore) {
 			t.Fatalf("new config store: %v", err)
 		}
 	}
-	srv := NewServer("127.0.0.1:0", store, o.policy, nil, nil, passHash, tlsConfigs, testLogger())
+	srv := NewServer("127.0.0.1:0", store, o.policy, nil, nil, passHash, tlsConfigs, testLogger(), o.requireTLS)
 	addr, err := srv.Start()
 	if err != nil {
 		t.Fatalf("start sql server: %v", err)
@@ -574,7 +595,7 @@ func TestSimpleErrors(t *testing.T) {
 }
 
 func TestTransactions(t *testing.T) {
-	srv, _ := newTestServer(t, srvOpts{})
+	srv, store := newTestServer(t, srvOpts{})
 
 	sess := dialServer(t, srv.Addr())
 	sess.startupTrust("default")
@@ -586,9 +607,17 @@ func TestTransactions(t *testing.T) {
 	if f := findFrame(frames, msgReadyForQuery); f != nil && len(f.val) > 0 && f.val[0] != 'T' {
 		t.Fatalf("BEGIN must leave tx state 'T', got %q", f.val[0])
 	}
-	if tag := findTag(sess.query(`INSERT INTO tellstone (key, value) VALUES ('tx', 'ok')`)); tag != "INSERT 0 1" {
-		t.Fatalf("insert in txn tag = %q", tag)
+
+	// A write inside a transaction block is refused: the store has no
+	// enclosing transaction, so such a write would already be committed by the
+	// time ROLLBACK ran and the block's promise could not be kept.
+	frames = sess.query(`INSERT INTO tellstone (key, value) VALUES ('tx', 'ok')`)
+	if code, _, ok := findError(frames); !ok || code != errFeatureNotSupported {
+		t.Fatalf("write inside a transaction block: code = %q ok = %v, want %s", code, ok, errFeatureNotSupported)
 	}
+
+	// Nothing was written, so the ROLLBACK reports success honestly and the
+	// row it claimed to roll back is genuinely absent.
 	frames = sess.query(`ROLLBACK`)
 	if tag := findTag(frames); tag != "ROLLBACK" {
 		t.Fatalf("ROLLBACK tag = %q", tag)
@@ -596,15 +625,211 @@ func TestTransactions(t *testing.T) {
 	if f := findFrame(frames, msgReadyForQuery); f != nil && f.val[0] != 'I' {
 		t.Fatalf("ROLLBACK must leave tx state 'I', got %q", f.val[0])
 	}
+	if _, ok, _ := store.GetErr("tx"); ok {
+		t.Fatalf("row written inside the rolled-back transaction block survived")
+	}
+
+	// Outside a transaction the same INSERT applies and can be read back.
+	if tag := findTag(sess.query(`INSERT INTO tellstone (key, value) VALUES ('tx', 'ok')`)); tag != "INSERT 0 1" {
+		t.Fatalf("autocommit insert tag = %q", tag)
+	}
+	if _, ok, _ := store.GetErr("tx"); !ok {
+		t.Fatalf("autocommit insert did not land")
+	}
+	// A second block still tracks the transaction status across statements.
 	frames = sess.query(`BEGIN`)
-	sess.query(`INSERT INTO tellstone (key, value) VALUES ('tx', 'ok')`)
-	frames = sess.query(`COMMIT`)
-	if tag := findTag(frames); tag != "COMMIT" {
+	if code, _, ok := findError(frames); ok {
+		t.Fatalf("BEGIN failed: %s", code)
+	}
+	if tag := findTag(sess.query(`COMMIT`)); tag != "COMMIT" {
 		t.Fatalf("COMMIT tag = %q", tag)
 	}
 	if tag := findTag(sess.query(`DELETE FROM tellstone WHERE key = 'tx'`)); tag != "DELETE 1" {
 		t.Fatalf("committed row missing: tag = %q", tag)
 	}
+}
+
+func TestOnConflictActions(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	if tag := findTag(sess.query(`INSERT INTO tellstone (key, value) VALUES ('u', 'first')`)); tag != "INSERT 0 1" {
+		t.Fatalf("seed insert tag = %q", tag)
+	}
+
+	// DO NOTHING must preserve the existing row, not overwrite it.
+	frames := sess.query(`INSERT INTO tellstone (key, value) VALUES ('u', 'clobber') ON CONFLICT DO NOTHING`)
+	if tag := findTag(frames); tag != "INSERT 0 0" {
+		t.Fatalf("DO NOTHING tag = %q, want INSERT 0 0", tag)
+	}
+	if got := selectValue(t, sess, "u"); got != string(encodeByteaText([]byte("first"))) {
+		t.Fatalf("DO NOTHING overwrote the row: value = %q", got)
+	}
+
+	// DO UPDATE SET value = excluded.value replaces the row.
+	frames = sess.query(`INSERT INTO tellstone (key, value) VALUES ('u', 'second') ON CONFLICT (key) DO UPDATE SET value = excluded.value`)
+	if tag := findTag(frames); tag != "INSERT 0 1" {
+		t.Fatalf("DO UPDATE tag = %q", tag)
+	}
+	if got := selectValue(t, sess, "u"); got != string(encodeByteaText([]byte("second"))) {
+		t.Fatalf("DO UPDATE did not overwrite: value = %q", got)
+	}
+
+	// DO UPDATE on an absent key creates the row.
+	frames = sess.query(`INSERT INTO tellstone (key, value) VALUES ('brandnew', 'v') ON CONFLICT (key) DO UPDATE SET value = excluded.value`)
+	if tag := findTag(frames); tag != "INSERT 0 1" {
+		t.Fatalf("DO UPDATE on absent key tag = %q", tag)
+	}
+	if got := selectValue(t, sess, "brandnew"); got != string(encodeByteaText([]byte("v"))) {
+		t.Fatalf("DO UPDATE on absent key: value = %q", got)
+	}
+}
+
+func TestAtomicConditionalWrites(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	if tag := findTag(sess.query(`INSERT INTO tellstone (key, value) VALUES ('race', 'a')`)); tag != "INSERT 0 1" {
+		t.Fatalf("seed insert tag = %q", tag)
+	}
+
+	// Concurrent plain INSERTs of the same key: exactly one may create the row
+	// and the rest must be duplicate-key violations. That is only possible if
+	// the existence check and the write are one atomic store operation.
+	const writers = 8
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	dupes, created := 0, 0
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			s := dialServer(t, srv.Addr())
+			s.startupTrust("default")
+			frames := s.query(fmt.Sprintf(`INSERT INTO tellstone (key, value) VALUES ('concurrent', 'w%d')`, i))
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case findTag(frames) == "INSERT 0 1":
+				created++
+			default:
+				if code, _, ok := findError(frames); !ok || code != errDuplicateKey {
+					t.Errorf("concurrent INSERT: want %s, got code=%q ok=%v frames=%s", errDuplicateKey, code, ok, frameTypes(frames))
+				}
+				dupes++
+			}
+		}(i)
+	}
+	wg.Wait()
+	if created != 1 || dupes != writers-1 {
+		t.Fatalf("concurrent INSERTs: created=%d dupes=%d, want 1 and %d", created, dupes, writers-1)
+	}
+
+	// UPDATE only touches rows that exist, so the affected-row count stays
+	// honest under concurrency too.
+	var upd sync.WaitGroup
+	applied := 0
+	for i := 0; i < writers; i++ {
+		upd.Add(1)
+		go func(i int) {
+			defer upd.Done()
+			s := dialServer(t, srv.Addr())
+			s.startupTrust("default")
+			frames := s.query(fmt.Sprintf(`UPDATE tellstone SET value = 'u%d' WHERE key = 'race'`, i))
+			mu.Lock()
+			defer mu.Unlock()
+			if findTag(frames) == "UPDATE 1" {
+				applied++
+			}
+		}(i)
+	}
+	upd.Wait()
+	if applied != writers {
+		t.Fatalf("UPDATE of an existing row: applied=%d, want %d", applied, writers)
+	}
+}
+
+func TestNullParametersRejected(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	if tag := findTag(sess.query(`INSERT INTO tellstone (key, value) VALUES ('nn', 'v')`)); tag != "INSERT 0 1" {
+		t.Fatalf("seed insert tag = %q", tag)
+	}
+
+	// A NULL value cannot be stored: the store signals presence, not nullness,
+	// so a NULL would read back as an empty payload. It is reported as the
+	// not-null violation it is.
+	nullVal := int32(-1)
+	cases := []struct {
+		name  string
+		query string
+		bind  []byte
+	}{
+		{
+			"insert null value",
+			`INSERT INTO tellstone (key, value) VALUES ($1, $2)`,
+			concat(cstring(""), cstring(""), two(0), two(2), four(2), []byte("kk"), four(nullVal), two(0)),
+		},
+		{
+			"insert null key",
+			`INSERT INTO tellstone (key, value) VALUES ($1, $2)`,
+			concat(cstring(""), cstring(""), two(0), two(2), four(nullVal), four(2), []byte("vv"), two(0)),
+		},
+		{
+			"update to null",
+			`UPDATE tellstone SET value = $1 WHERE key = $2`,
+			concat(cstring(""), cstring(""), two(0), two(2), four(nullVal), four(2), []byte("nn"), two(0)),
+		},
+		{
+			"select by null key",
+			`SELECT value FROM tellstone WHERE key = $1`,
+			concat(cstring(""), cstring(""), two(0), two(1), four(nullVal), two(0)),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sess.send(msgParse, concat(cstring(""), cstring(tc.query), two(0)))
+			sess.expectLine(msgParseComplete)
+			sess.send(msgBind, tc.bind)
+			sess.expectLine(msgBindComplete)
+			sess.send(msgExecute, concat(cstring(""), four(0)))
+			ef := sess.expectLine(msgErrorResponse)
+			code, _, ok := findError([]frame{ef})
+			if !ok || code != errNotNullViolation {
+				t.Fatalf("code = %q (ok=%v), want %s", code, ok, errNotNullViolation)
+			}
+			sess.send(msgSync, nil)
+			sess.expectLine(msgReadyForQuery)
+		})
+	}
+
+	// The rejected statements must not have changed the row.
+	if got := selectValue(t, sess, "nn"); got != string(encodeByteaText([]byte("v"))) {
+		t.Fatalf("rejected NULL statements changed the row: value = %q", got)
+	}
+}
+
+// selectValue runs a key lookup and returns the text-formatted value cell.
+func selectValue(t *testing.T, sess *tclient, key string) string {
+	t.Helper()
+	frames := sess.query(fmt.Sprintf(`SELECT value FROM tellstone WHERE key = '%s'`, key))
+	if f := findFrame(frames, msgDataRow); f != nil {
+		cells, err := parseDataRow(f.val)
+		if err != nil {
+			t.Fatalf("parse DataRow: %v", err)
+		}
+		if len(cells) == 1 && cells[0] != nil {
+			return string(cells[0])
+		}
+	}
+	return ""
 }
 
 func TestExtendedProtocol(t *testing.T) {
@@ -678,6 +903,102 @@ func assertParameterDescription(t *testing.T, payload []byte, oids []int32) {
 		}
 		b = b[4:]
 	}
+}
+
+func TestParameterDescriptionAlwaysSent(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	// A literal-only statement references no parameters, but Describe of a
+	// prepared statement must still answer with a ParameterDescription.
+	sess.send(msgParse, concat(cstring("lit"), cstring(`SELECT key, value FROM tellstone WHERE key = 'a'`), two(0)))
+	sess.expectLine(msgParseComplete)
+	sess.send(msgDescribe, concat([]byte{'S'}, cstring("lit")))
+	assertParameterDescription(t, sess.expectLine(msgParameterDesc).val, nil)
+	sess.expectLine(msgRowDescription)
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+
+	// The declared count must match the number of OIDs actually written. Only
+	// $2 is referenced here, so the description spans both parameters.
+	sess.send(msgParse, concat(cstring("gap"), cstring(`SELECT value FROM tellstone WHERE key = $2`), two(0)))
+	sess.expectLine(msgParseComplete)
+	sess.send(msgDescribe, concat([]byte{'S'}, cstring("gap")))
+	assertParameterDescription(t, sess.expectLine(msgParameterDesc).val, []int32{oidText, oidText})
+	sess.expectLine(msgRowDescription)
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+}
+
+func TestBindRejectsBinaryResultFormat(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	sess.send(msgParse, concat(cstring("s"), cstring(`SELECT value FROM tellstone WHERE key = $1`), two(0)))
+	sess.expectLine(msgParseComplete)
+	// Result format code 1 = binary. Accepting it silently would hand the
+	// client a portal whose RowDescription and DataRow bytes do not match.
+	sess.send(msgBind, concat(cstring(""), cstring("s"), two(0), two(1), four(1), []byte("a"), two(1), two(1)))
+	code, _, ok := findError([]frame{sess.recv()})
+	if !ok || code != errFeatureNotSupported {
+		t.Fatalf("binary result format: code=%q ok=%v, want %s", code, ok, errFeatureNotSupported)
+	}
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+
+	// An explicit text result format is accepted.
+	sess.send(msgBind, concat(cstring(""), cstring("s"), two(0), two(1), four(1), []byte("a"), two(1), two(0)))
+	sess.expectLine(msgBindComplete)
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+}
+
+func TestRequireTLSRejectsPlaintext(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{withTLS: true, requireTLS: true})
+
+	// Going straight to the StartupMessage skips the SSLRequest.
+	cl := dialServer(t, srv.Addr())
+	cl.sendStartup(startupBody(protocolVersionNumber, "user", "default"))
+	f := cl.recv()
+	if f.typ != msgErrorResponse {
+		t.Fatalf("expected ErrorResponse, got %q", f.typ)
+	}
+	code, msg, ok := findError([]frame{f})
+	if !ok || code != errInvalidAuthorizationSpec {
+		t.Fatalf("plaintext startup: code=%q msg=%q ok=%v, want %s", code, msg, ok, errInvalidAuthorizationSpec)
+	}
+	if !strings.Contains(msg, "SSL") {
+		t.Fatalf("message should mention SSL, got %q", msg)
+	}
+
+	// The same client succeeds once it negotiates TLS.
+	tls := dialServer(t, srv.Addr())
+	tls.startTLS()
+	tls.sendStartup(startupBody(protocolVersionNumber, "user", "default"))
+	tls.recvUntil(msgReadyForQuery)
+}
+
+func TestStartupFrameSizeLimit(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+
+	// PostgreSQL caps a startup packet at 10 kB. A larger declared length must
+	// be refused rather than allocated, since it arrives pre-authentication.
+	// The length is not trusted, so the server drops the connection instead of
+	// framing a reply it cannot vouch for.
+	cl := dialServer(t, srv.Addr())
+	var hdr [4]byte
+	binary.BigEndian.PutUint32(hdr[:], uint32(maxStartupFrameSize+1))
+	if _, err := cl.cn.Write(hdr[:]); err != nil {
+		t.Fatalf("write header: %v", err)
+	}
+	if _, err := cl.cn.Read(make([]byte, 1)); err == nil {
+		t.Fatal("oversized startup frame must not be served")
+	}
+	srv.Close()
 }
 
 func two(v uint16) []byte {
