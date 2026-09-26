@@ -40,9 +40,6 @@ type Config struct {
 	traceRatio        float64
 	maxMsgSize        uint64
 	maxMemBytes       uint64
-	enableRESP        bool
-	respAddr          string
-	respStartTLS      bool
 	shutdownTimeout   time.Duration
 	numShards         int
 	enablePersistence bool
@@ -58,8 +55,13 @@ type Config struct {
 	oauthProvider     string
 	oauthIssuer       string
 	oauthClientID     string
-	snapshotInterval  time.Duration
-	snapshotBytes     uint64
+	// PostgreSQL wire frontend (Phase 8, ADR-012). pgAddr is the listen
+	// address; pgTLS gates cleartext password auth to TLS-negotiated
+	// connections.
+	pgAddr           string
+	pgTLS            bool
+	snapshotInterval time.Duration
+	snapshotBytes    uint64
 	// Cluster mode (Raft consensus per region).
 	clusterMode bool
 	nodeID      uint64
@@ -165,9 +167,6 @@ func getEnv[T any](key string, fallback T) T {
 //		TSD_MAX_MSG_SIZE	- optional parameter to define the maximum msg size
 //		TSD_METRICS_ADDR    – Prometheus HTTP exporter address (e.g. ":9100")
 //		TSD_MAX_MEM_BYTES   – optional engine memory ceiling (e.g. "512MiB"; 0 = unlimited)
-//		TSD_ENABLE_RESP     – boolean to enable the Redis-compatible RESP listener (default: false)
-//		TSD_RESP_ADDR       – RESP listener address (default 127.0.0.1:6379)
-//		TSD_RESP_STARTTLS   – allow RESP clients to upgrade plaintext connections to TLS
 //		TSD_ENABLE_METRICS  – boolean to activate the Prometheus exporter (default: false)
 //	 	TSD_ENABLE_ENCRYPTION  – boolean to enforce data-at-rest encryption (default: false)
 //	 	TSD_ENABLE_ENVELOPE    – boolean to enable envelope encryption (KEK wraps a per-shard DEK; default: false)
@@ -301,25 +300,6 @@ func LoadConfig(args []string) *Config {
 		"max-mem-bytes",
 		"Total engine memory ceiling (e.g. 512MiB, 4GiB, 0 = unlimited)",
 	)
-	// Optional RESP2 (Redis-compatible) listener for benchmarking against Redis/Dragonfly/etc.
-	fs.BoolVar(
-		&cfg.enableRESP,
-		"enable-resp",
-		getEnv("TSD_ENABLE_RESP", false),
-		"Enable the Redis-compatible RESP listener (default: false)",
-	)
-	fs.StringVar(
-		&cfg.respAddr,
-		"resp-addr",
-		getEnv("TSD_RESP_ADDR", "127.0.0.1:6379"),
-		"RESP listener address (default: 127.0.0.1:6379)",
-	)
-	fs.BoolVar(
-		&cfg.respStartTLS,
-		"resp-starttls",
-		getEnv("TSD_RESP_STARTTLS", false),
-		"Allow RESP clients to upgrade plaintext connections with STARTTLS (default: false)",
-	)
 	// Maximum time graceful shutdown waits for in-flight connections to drain after
 	// SIGINT/SIGTERM before forcing termination.
 	fs.DurationVar(
@@ -367,7 +347,7 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_TLS_CA", ""),
 		"Path to watched CA certificate for client verification (PEM); enables mTLS when set",
 	)
-	// Optional server password enforced via the RESP AUTH command.
+	// Optional server password enforced via the AUTH command.
 	fs.StringVar(
 		&cfg.requirePass,
 		"require-pass",
@@ -422,6 +402,21 @@ func LoadConfig(args []string) *Config {
 		"oauth-client-id",
 		getEnv("TSD_OAUTH_CLIENT_ID", ""),
 		"OAuth2 client ID; expected token audience (default: none)",
+	)
+	// PostgreSQL wire frontend (Phase 8, ADR-012). pg-tls is a hard gate:
+	// cleartext-only credential verification must never cross a plaintext
+	// socket, so without TLS configured the listener is effectively trust-only.
+	fs.StringVar(
+		&cfg.pgAddr,
+		"pg-addr",
+		getEnv("TSD_PG_ADDR", ""),
+		"PostgreSQL wire listen address (Phase 8, e.g. 127.0.0.1:5432); empty disables the frontend (default: none)",
+	)
+	fs.BoolVar(
+		&cfg.pgTLS,
+		"pg-tls",
+		getEnv("TSD_PG_TLS", false),
+		"Require TLS on the PostgreSQL frontend (cleartext passwords may only ride TLS), requires --tls-cert/--tls-key (default: false)",
 	)
 	fs.DurationVar(
 		&cfg.snapshotInterval,
@@ -577,9 +572,6 @@ func LoadConfig(args []string) *Config {
 	// mTLS requires a valid TLS base (cert + key).
 	if cfg.tlsCA != "" && cfg.tlsCert == "" {
 		panic("tellstone: --tls-ca requires --tls-cert and --tls-key")
-	}
-	if cfg.respStartTLS && cfg.tlsCert == "" {
-		panic("tellstone: --resp-starttls requires --tls-cert and --tls-key")
 	}
 	// The raw key and file-sourced key are alternative KeyProvider backends;
 	// supplying both leaves the intended source ambiguous.
@@ -878,9 +870,6 @@ func (cfg *Config) GetEncryptionKeyFile() string      { return cfg.encryptionKey
 func (cfg *Config) GetTraceRatio() float64            { return cfg.traceRatio }
 func (cfg *Config) GetMaxMsgSize() uint64             { return cfg.maxMsgSize }
 func (cfg *Config) GetMaxMemBytes() uint64            { return cfg.maxMemBytes }
-func (cfg *Config) RESPEnabled() bool                 { return cfg.enableRESP }
-func (cfg *Config) GetRESPAddr() string               { return cfg.respAddr }
-func (cfg *Config) RESPStartTLSEnabled() bool         { return cfg.respStartTLS }
 func (cfg *Config) GetShutdownTimeout() time.Duration { return cfg.shutdownTimeout }
 func (cfg *Config) GetNumShards() int                 { return cfg.numShards }
 func (cfg *Config) PersistenceEnabled() bool          { return cfg.enablePersistence }
@@ -900,6 +889,9 @@ func (cfg *Config) AuditLogEvents() []string           { return strings.Split(cf
 func (cfg *Config) GetOAuthProvider() string           { return cfg.oauthProvider }
 func (cfg *Config) GetOAuthIssuer() string             { return cfg.oauthIssuer }
 func (cfg *Config) GetOAuthClientID() string           { return cfg.oauthClientID }
+func (cfg *Config) GetPGAddr() string                  { return cfg.pgAddr }
+func (cfg *Config) PGEnabled() bool                    { return cfg.pgAddr != "" }
+func (cfg *Config) PGTLS() bool                        { return cfg.pgTLS }
 func (cfg *Config) GetSnapshotInterval() time.Duration { return cfg.snapshotInterval }
 func (cfg *Config) GetSnapshotBytes() uint64           { return cfg.snapshotBytes }
 func (cfg *Config) ClusterMode() bool                  { return cfg.clusterMode }

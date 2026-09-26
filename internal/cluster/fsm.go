@@ -27,6 +27,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,9 +40,33 @@ const (
 	OpSet byte = 0x01
 	// OpDel is the log entry opcode for DEL operations.
 	OpDel byte = 0x02
+	// OpSetNX is the log entry opcode for a conditional SET that only creates
+	// the key. It is the replication-safe form of an INSERT: the log orders
+	// the check and the write, so two racing inserts cannot both apply.
+	OpSetNX byte = 0x04
+	// OpSetXX is the log entry opcode for a conditional SET that only
+	// overwrites an already-present key, the replication-safe UPDATE.
+	OpSetXX byte = 0x05
 	// opHeaderSize is the fixed header: 1B op + 8B TTL + 2B keyLen = 11 bytes.
 	opHeaderSize = 11
 )
+
+// ErrConditionNotMet is what a Dispatcher reports for a conditional log entry
+// (OpSetNX/OpSetXX) whose precondition is unsatisfied. It travels back to the
+// proposer as the proposal's apply error, so a failed INSERT reads as a
+// duplicate key rather than a successful write.
+var ErrConditionNotMet = errors.New("cluster fsm: write condition not met")
+
+// IsConditionNotMet reports whether err signals an unsatisfied write
+// precondition. The Raft proposal path preserves the sentinel, but the
+// pipelined follower-forward and cross-cluster gateway hops rebuild the error
+// from its wire text, so the message is matched as a fallback.
+func IsConditionNotMet(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrConditionNotMet) || strings.Contains(err.Error(), ErrConditionNotMet.Error())
+}
 
 // Dispatcher routes a decoded operation to the correct local shard engine.
 // Implementations must use the same FNV-1a routing as the normal request
@@ -108,6 +133,23 @@ var ErrKeyTooLarge = errors.New("cluster fsm: key exceeds wire format maximum of
 
 // EncodeSet creates a Raft log entry payload for a SET operation.
 func EncodeSet(key string, value []byte, ttl time.Duration) ([]byte, error) {
+	return encodeEntry(OpSet, key, value, ttl)
+}
+
+// EncodeSetNX creates a Raft log entry payload for a conditional SET that only
+// applies when the key is absent.
+func EncodeSetNX(key string, value []byte, ttl time.Duration) ([]byte, error) {
+	return encodeEntry(OpSetNX, key, value, ttl)
+}
+
+// EncodeSetXX creates a Raft log entry payload for a conditional SET that only
+// applies when the key is present.
+func EncodeSetXX(key string, value []byte, ttl time.Duration) ([]byte, error) {
+	return encodeEntry(OpSetXX, key, value, ttl)
+}
+
+// encodeEntry lays out the 11-byte header followed by the key and the value.
+func encodeEntry(op byte, key string, value []byte, ttl time.Duration) ([]byte, error) {
 	keyBytes := []byte(key)
 	if len(keyBytes) > maxKeyLen {
 		return nil, ErrKeyTooLarge
@@ -117,7 +159,7 @@ func EncodeSet(key string, value []byte, ttl time.Duration) ([]byte, error) {
 		ttlMs = ttl.Milliseconds()
 	}
 	buf := make([]byte, opHeaderSize+len(keyBytes)+len(value))
-	buf[0] = OpSet
+	buf[0] = op
 	binary.BigEndian.PutUint64(buf[1:9], uint64(ttlMs))
 	binary.BigEndian.PutUint16(buf[9:11], uint16(len(keyBytes)))
 	copy(buf[11:11+len(keyBytes)], keyBytes)
@@ -127,16 +169,7 @@ func EncodeSet(key string, value []byte, ttl time.Duration) ([]byte, error) {
 
 // EncodeDel creates a Raft log entry payload for a DEL operation.
 func EncodeDel(key string) ([]byte, error) {
-	keyBytes := []byte(key)
-	if len(keyBytes) > maxKeyLen {
-		return nil, ErrKeyTooLarge
-	}
-	buf := make([]byte, opHeaderSize+len(keyBytes))
-	buf[0] = OpDel
-	binary.BigEndian.PutUint64(buf[1:9], 0)
-	binary.BigEndian.PutUint16(buf[9:11], uint16(len(keyBytes)))
-	copy(buf[11:11+len(keyBytes)], keyBytes)
-	return buf, nil
+	return encodeEntry(OpDel, key, nil, 0)
 }
 
 // DecodeLogEntry parses a log entry payload into its components.
@@ -204,7 +237,7 @@ func (f *FSM) Apply(entry *pb.Entry) error {
 	if tracker, resolver := f.trackerSnapshot(); tracker != nil && resolver != nil {
 		if regionID := resolver(key); regionID != 0 {
 			switch op {
-			case OpSet:
+			case OpSet, OpSetNX, OpSetXX:
 				tracker.TrackSet(regionID, key, value)
 			case OpDel:
 				tracker.TrackDel(regionID, key, value)

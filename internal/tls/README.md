@@ -2,7 +2,7 @@
 
 ## What
 
-TLS 1.3 transport encryption for Tellstone's binary and RESP2 listeners. This is a
+TLS 1.3 transport encryption for Tellstone's binary listener. This is a
 stripped fork of [gnet-io/tls](https://github.com/gnet-io/tls) (itself a fork of
 Go's `crypto/tls`) optimized for gnet's epoll-based event-loop I/O model.
 
@@ -22,9 +22,7 @@ TLS is not optional in production. This package provides:
 ```text
 Tellstone binary
   └─ server.Server
-       ├─ internal/network.Server   (binary protocol — gnet event-loop)
-       │    └─ tls.NewGnetConnAdapter(conn)  → tls.Server / tls.Client
-       └─ internal/resp.Server      (RESP2 protocol — gnet event-loop)
+       └─ internal/network.Server   (binary protocol — gnet event-loop)
             └─ tls.NewGnetConnAdapter(conn)  → tls.Server / tls.Client
 ```
 

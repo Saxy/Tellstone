@@ -5,15 +5,16 @@
 [![License](https://img.shields.io/badge/License-Apache--2.0-green)](LICENSE)
 
 **Tellstone** is an ultra‑high‑performance, cloud‑native **in‑memory key/value store** written
-entirely in **Go**. It speaks two protocols over TCP — a compact custom **binary protocol** and
-a **Redis‑compatible (RESP2)** protocol — on top of a **shared-nothing (SN) storage engine**
-with optional TTL eviction, at‑rest encryption, and write-ahead log persistence.
+entirely in **Go**. It speaks a compact custom **binary protocol** over TCP on top of a
+**shared-nothing (SN) storage engine** with optional TTL eviction, at‑rest encryption, and
+write-ahead log persistence. The PostgreSQL wire protocol (SQL) is being introduced as the
+primary interface (ADR-007/012).
 
 ```
        +---------------------------------------------+
        |             Your K8s Cluster                |
        |                                             |
-       |  [App Pod] --( binary :9988 / RESP :6379 )->|
+       |  [App Pod] --( binary :9988 )->|            |
        |                                             |
        |     +---------------------------------+     |
        |     |        TELLSTONE CORE           |     |
@@ -30,8 +31,6 @@ Many managed databases (PostgreSQL, MySQL, …) become bottlenecks under high‑
 workloads. Tellstone offers a **lean, modern, memory‑efficient buffer** that:
 
 * **Zero‑Copy Binary Protocol** – Direct binary messages avoid text parsing / Protobuf overhead.
-* **Redis‑Compatible** – An optional RESP2 listener lets you drive Tellstone with `redis-cli`,
-  `redis-benchmark`, `memtier_benchmark`, and existing Redis client libraries (GET/SET/PING/DEL).
 * **Shared-Nothing Engine** – N independent shards, each containing one `map[string]Item` plus a
   `sync.RWMutex`. Keys are pinned to a shard via FNV-1a hashing so the lock is almost never
   contended. No cross-shard coordination, no channel round-trips, no per-request allocations.
@@ -49,7 +48,6 @@ see [ARCHITECTURE.md](ARCHITECTURE.md).
 | Layer | Package | Notes                                                                                                                                 |
 |---|---|---------------------------------------------------------------------------------------------------------------------------------------|
 | Binary protocol | `internal/network` | `MsgRequest`/`MsgResponse` frames (`GET`/`SET`/`DEL`, TTL, key, value)                                                                |
-| RESP2 protocol | `internal/resp` | Redis‑compatible listener reusing the same engine                                                                                     |
 | Request router | `internal/router` | FNV‑1a hash → O(1) shard dispatch                                                                                                     |
 | Shard runner | `internal/shard` | Shared‑nothing shard: synchronous `Execute()`, per‑shard `sync.RWMutex`                                                               |
 | Storage engine | `internal/storage` | Single‑map engine, TTL eviction via timing wheel                                                                                      |
@@ -102,21 +100,20 @@ task build          # → ./bin/tellstone   (or: go build -o bin/tellstone ./cmd
 
 ```bash
 task run            # binary protocol on 127.0.0.1:9988
-task run:resp       # binary on :9988  +  Redis-compatible RESP on :6379
 ```
 
 Or run the binary directly with flags / environment variables:
 
 ```bash
-./bin/tellstone --addr 127.0.0.1:9988 --enable-resp --resp-addr 127.0.0.1:6379
-TSD_ADDR=127.0.0.1:9988 TSD_ENABLE_RESP=true ./bin/tellstone
+./bin/tellstone --addr 127.0.0.1:9988
+TSD_ADDR=127.0.0.1:9988 ./bin/tellstone
 ```
 
 If a previous run got killed uncleanly and left a server stuck on a port (`address already in
 use`), find and stop it with:
 
 ```bash
-task kill                          # checks :19988, :6379, :6060 and any bin/tellstone process
+task kill                          # checks :19988, :6060 and any bin/tellstone process
 task kill PORTS="9988" NAME=myapp  # override the ports/name to search for
 ```
 
@@ -129,9 +126,6 @@ Every option is available as a flag and an environment variable.
 | Flag                  | Env                     | Default          | Description                                              |
 |-----------------------|-------------------------|------------------|----------------------------------------------------------|
 | `--addr`              | `TSD_ADDR`              | `127.0.0.1:9988` | Binary‑protocol listen address                           |
-| `--enable-resp`       | `TSD_ENABLE_RESP`       | `false`          | Enable the Redis‑compatible RESP listener                |
-| `--resp-addr`         | `TSD_RESP_ADDR`         | `127.0.0.1:6379` | RESP listen address                                      |
-| `--resp-starttls`     | `TSD_RESP_STARTTLS`     | `false`          | Allow RESP plaintext connections to upgrade with TLS     |
 | `--shards`            | `TSD_NUM_SHARDS`        | `0` (auto = CPU) | Number of shared-nothing shards                          |
 | `--max-msg-size`      | `TSD_MAX_MSG_SIZE`      | `16MiB`          | Per‑message size limit                                   |
 | `--max-mem-bytes`     | `TSD_MAX_MEM_BYTES`     | `0` (unlimited)  | Total engine memory ceiling                              |
@@ -152,6 +146,8 @@ Every option is available as a flag and an environment variable.
 | `--tls-ca`            | `TSD_TLS_CA`             | _(none)_         | Client CA path for mTLS; watched for automatic rotation  |
 | `--require-pass`      | `TSD_REQUIRE_PASS`       | _(none)_         | Single password required via `AUTH`; empty disables it   |
 | `--rbac-config`       | `TSD_RBAC_CONFIG`        | _(none)_         | YAML/JSON RBAC policy file (roles, users, default role); hot-reloaded on SIGHUP |
+ | `--pg-addr`           | `TSD_PG_ADDR`            | _(none)_         | PostgreSQL wire listen address (e.g. `127.0.0.1:5432`); empty disables the SQL frontend |
+ | `--pg-tls`            | `TSD_PG_TLS`             | `false`          | Require TLS on the SQL frontend; cleartext passwords ride TLS only, requires `--tls-cert`/`--tls-key` |
 | `--oauth-provider`    | `TSD_OAUTH_PROVIDER`     | _(none)_         | OAuth preset (`google`\|`stackit`); empty + `--oauth-issuer` → generic OIDC |
 | `--oauth-issuer`      | `TSD_OAUTH_ISSUER`       | _(none)_         | OIDC issuer / discovery base URL of the identity provider |
 | `--oauth-client-id`   | `TSD_OAUTH_CLIENT_ID`    | _(none)_         | OAuth2 client ID used as the expected token audience |
@@ -198,13 +194,9 @@ optional client CA. Valid replacements are applied after a 500 ms debounce; exis
 connections continue uninterrupted. Directory watching supports atomic file renames and Kubernetes
 projected Secret updates.
 
-By default, both listeners require TLS from the first byte. Setting `--resp-starttls` keeps only the
-RESP listener plaintext until a client sends `STARTTLS`; Tellstone replies `+OK` in plaintext and
-then requires an immediate TLS 1.3 handshake on the same socket. `STARTTLS` is allowed before
-`AUTH` so credentials need not cross plaintext. The command must not be pipelined with any other
-plaintext bytes. The binary listener always retains implicit TLS, and each RESP upgrade loads the
-latest rotated certificate configuration. Once a RESP connection is handed to the TLS state machine
-— on accept for implicit TLS, or after a `STARTTLS` acceptance — it must complete the handshake
+By default, the listener requires TLS from the first byte (implicit TLS 1.3). The binary
+listener always retains implicit TLS and loads the latest rotated certificate configuration.
+Once a connection is handed to the TLS state machine on accept, it must complete the handshake
 within 10 seconds; the listener closes it at the deadline even if the client sends nothing further,
 so stalled connections cannot pile up.
 
@@ -212,23 +204,12 @@ so stalled connections cannot pile up.
 
 ## Using Tellstone
 
-### Redis‑compatible (RESP) — easiest
+### Binary protocol
 
-Start with `task run:resp`, then use any Redis client:
-
-```bash
-redis-cli -p 6379 PING            # PONG
-redis-cli -p 6379 SET foo bar     # OK
-redis-cli -p 6379 GET foo         # "bar"
-redis-cli -p 6379 SET k v EX 60   # OK (60s TTL)
-redis-cli -p 6379 DEL foo         # (integer) 1
-```
-
-Supported commands today: **`PING`, `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`, `COMMAND`,
-`ROLE` (`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`), `ACL`
-(`SETUSER`/`DELUSER`/`LIST`/`LOG`)**. Unknown commands return a
-`-ERR` reply without dropping the connection. `STARTTLS` is additionally available when
-`--resp-starttls` is enabled.
+Start with `task run`, then use any of the bundled clients (`client`, examples in
+`cmd/example/client`). The binary protocol speaks `GET`, `SET` (with `EX`/`PX`), `DEL`, `AUTH`,
+`COMMAND`, `ROLE` (`CREATE`/`SETUSER`/`DELUSER`/`DELETE`/`LIST`/`GETUSER`), and `ACL`
+(`SETUSER`/`DELUSER`/`LIST`/`LOG`).
 
 #### Authentication & RBAC
 
@@ -260,12 +241,26 @@ it emits SHA-512-crypt, not bcrypt. `ROLE SETUSER` accepts a raw `>password` and
 server-side, so runtime-created users need no tooling.
 
 ```bash
-./bin/tellstone --rbac-config policy.yaml --enable-resp
-redis-cli AUTH admin adminsecret                 # +OK
-redis-cli ROLE CREATE operator +get '~users:*'   # +OK (runtime roles)
-redis-cli ROLE SETUSER bob operator '>bobpw'     # +OK
-redis-cli ROLE GETUSER bob                       # bob / operator / 1
+./bin/tellstone --rbac-config policy.yaml
+# then authenticate with the binary client, e.g. cmd/example/role:
+#   c.AuthUser("admin", "adminsecret")
+#   c.RoleCreate("operator", ["+get", "~users:*"])
+#   c.RoleSetUser("bob", "operator", [">bobpw"])
+#   u, _ := c.RoleGetUser("bob")   # bob / operator / 1
 ```
+
+```bash
+# Phase 8 (ADR-012): PostgreSQL wire frontend for tooling that already speaks SQL.
+# Cleartext password check rides TLS only, so pair --pg-tls with the main TLS cert/key.
+./bin/tellstone --pg-addr 127.0.0.1:5432 --pg-tls --tls-cert cert.pem --tls-key key.pem --require-pass hunter2
+psql -h 127.0.0.1 -p 5432 -U default -c "INSERT INTO tellstone (key, value) VALUES ('foo', 'bar')"
+psql -h 127.0.0.1 -p 5432 -U default -c "SELECT key, value FROM tellstone WHERE key = 'foo'"
+```
+
+`SELECT` (with a `WHERE key = '...'` predicate), `INSERT`, `UPDATE`, `DELETE`, `BEGIN`/`COMMIT`/
+`ROLLBACK`, and prepared statements via the extended protocol (text and binary `bytea` parameters)
+are supported; values are returned as `bytea` and rendered `\x…`. Without TLS configured the SQL
+listener is trust-only. The full surface is documented in `docs/adr/012-postgresql-wire-phase8.md`.
 
 Roles are user-defined; a role's `rules` are Redis-style tokens: `+cmd` / `-cmd` grant or revoke
 one command, `+@cat` / `-@cat` a whole category, and `~prefix` whitelists a key namespace (an
@@ -301,7 +296,7 @@ public JWKS.
 
 ```bash
 ./bin/tellstone --rbac-config policy.yaml --oauth-provider google --oauth-client-id 1234.apps.googleusercontent.com
-redis-cli AUTH <id_token>              # +OK — claims map to a role via oauth.rules
+# binary client: c.AuthUser("role-mapped-user", oauthIDToken)
 ```
 
 Supported presets: `google`, `stackit`; set `--oauth-issuer` for any other OIDC provider. How
@@ -373,30 +368,16 @@ A runnable example lives in `cmd/example/client`.
 task bench:native       # pinned: server cpu0-15, generator cpu16-31
 ```
 
-### Redis‑compatible (RESP) via memtier
-
-```bash
-task bench:resp                 # latency run (pipeline=1)
-task bench:resp:pipeline        # throughput ceiling (pipeline=16)
-task bench:resp:hits            # preload then read-heavy (realistic ~100% hit rate)
-task bench:resp:correctness     # preload then read back — proves GET returns what SET stored
-```
-
-Override workload knobs on the command line, e.g.:
-
-```bash
-task bench:resp PIPELINE=16 DURATION=30 CONNS=50 RATIO=1:4 KEYSPACE=1000000
-```
-
-You can point `memtier_benchmark`/`redis-benchmark` at `:6379` directly and run the **identical
-command** against Redis, Dragonfly, Valkey (or `--protocol=memcache_text` against memcached) for
-an apples‑to‑apples comparison.
+The legacy Redis‑compatible (RESP) frontend used by the `task bench:resp*` / `task bench:compare`
+commands was removed in v2 (ADR‑012); PostgreSQL‑wire benchmarks will land with the SQL frontend.
 
 ### Reference results
 
-`memtier_benchmark` — 100k requests, 256-byte values, `--ratio=1:10` (1:10 read:write),
-pipeline 10, uniform random keys, preloaded key set. All four systems tested with identical
-parameters on the same hardware.
+The tables below are historical: they were measured with `memtier_benchmark` against the
+Redis‑compatible (RESP2) frontend, which is no longer part of the server. They remain useful as
+engine‑level comparison data. Methodology: 100k requests, 256-byte values, `--ratio=1:10`
+(1:10 read:write), pipeline 10, uniform random keys, preloaded key set. All systems tested with
+identical parameters on the same hardware.
 
 In-memory database benchmarks are highly sensitive to the underlying network infrastructure. 
 To provide an honest and comprehensive view of Tellstone's performance, 
@@ -457,7 +438,7 @@ Throughput with the native binary protocol (no pipelining, read-heavy):
 | 1000 | 1.47M RPS | 470us |
 | 2000 | 1.35M RPS | 1.2ms |
 
-> Numbers are environment-specific; reproduce with `task bench:resp` and the
+> Numbers are environment-specific; reproduce with `task bench:native` and the
 > `benchmark/benchmark.sh` script.
 
 ### Bare‑metal benchmarks (localhost, no network overhead)
@@ -527,11 +508,11 @@ Pull requests and pushes to `main` trigger the [CI workflow](.github/workflows/c
 - **Race tests** — `go test -race ./...`
 
 Benchmarks are not run automatically on every push due to resource constraints.
-Run them locally with `task bench:native` or `task bench:resp:precise`.
+Run them locally with `task bench:native`.
 
 ### Observability
-* **Metrics:** `task run:resp` with `--enable-metrics` exposes Prometheus text at
-  `http://<metrics-addr>/metrics` (default `:9100`).
+* **Metrics:** `TSD_ENABLE_METRICS=true ./bin/tellstone --enable-metrics` exposes Prometheus
+  text at `http://<metrics-addr>/metrics` (default `:9100`).
 * **Audit logging:** `--enable-audit` writes structured security events (see
   [Audit logging](#audit-logging)); run with `--audit-events all` to capture every event type.
 
@@ -542,11 +523,11 @@ assumes a specific core count, OS, or machine — every variable below is overri
 so the same commands work on a laptop, a CI runner, or a dedicated benchmarking host.
 
 **1) Profile a package's benchmarks directly** — no server involved, good for isolating one
-function (e.g. the storage engine or the RESP parser):
+function (e.g. the storage engine):
 
 ```bash
 task profile:pkg                                          # ./internal/storage/..., all benchmarks
-task profile:pkg PKG=./internal/resp/... BENCH=BenchmarkParseGet
+task profile:pkg PKG=./internal/network/... BENCH=BenchmarkX
 task profile:view FILE=tmp/profile/cpu.out                # opens the CPU profile in the browser
 task profile:view FILE=tmp/profile/mem.out ARGS=-alloc_space
 ```
@@ -554,13 +535,13 @@ task profile:view FILE=tmp/profile/mem.out ARGS=-alloc_space
 **2) Profile the running server under real load**, generated from a second terminal:
 
 ```bash
-task run:profiling                    # foreground server, RESP + live pprof on :6060
+task run:profiling                    # foreground server, live pprof on :6060
 ```
 
 ```bash
-# in a second terminal, generate load, e.g.:
-task bench:resp:pipeline
-# or: ./bin/benchmark -addr 127.0.0.1:19988 -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
+# in a second terminal, generate load against the running server (client only):
+task build:bench
+./bin/benchmark -addr 127.0.0.1:19988 -c 32 -n 1000000 -read-ratio 0.95 -skew 1.5
 ```
 
 ```bash
@@ -579,9 +560,9 @@ an SSH tunnel), or browse the raw index at `http://127.0.0.1:6060/debug/pprof/` 
 ---
 ## Contributing
 
-Contributions are welcome — especially around networking, replication, persistence, and RESP
-command coverage. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full guide (DCO sign-off
-required, core principles, workflow).
+Contributions are welcome — especially around networking, replication, persistence, and SQL
+frontend (PostgreSQL wire protocol) coverage. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full
+guide (DCO sign-off required, core principles, workflow).
 
 ---
 

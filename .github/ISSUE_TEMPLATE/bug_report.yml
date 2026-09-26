@@ -23,8 +23,7 @@ body:
       description: Which protocol does this bug affect?
       options:
         - Binary protocol
-        - RESP2 (Redis-compatible)
-        - Both
+        - PostgreSQL wire (SQL)
         - N/A
     validations:
       required: true
@@ -53,9 +52,9 @@ body:
       label: Steps to reproduce
       description: Minimal steps to reproduce the behavior.
       placeholder: |
-        1. Start Tellstone with `task run:resp`
-        2. Run `redis-cli -p 6379 SET foo bar`
-        3. Run `redis-cli -p 6379 GET foo`
+        1. Start Tellstone with `task run`
+        2. Use the binary client (see `cmd/example/client`) to `SET foo bar`
+        3. Read it back with `GET foo`
         4. See error...
     validations:
       required: true
@@ -82,7 +81,7 @@ body:
       description: "Paste the flags or environment variables used to start Tellstone."
       render: bash
       placeholder: |
-        task run:resp -- --enable-metrics
+        TSD_ENABLE_METRICS=true ./bin/tellstone --enable-metrics
 
   - type: textarea
     id: context

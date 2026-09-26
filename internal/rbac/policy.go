@@ -219,7 +219,7 @@ func (s *Store) Reload(policy *PolicyStore) {
 // ResolveOAuthToken verifies a bearer token through verify and maps its claims
 // to a role via oauth.rules, returning the pinned session and the subject it
 // was built from. (nil, "") means the token failed verification or matched no
-// rule — the AUTH workers in the RESP and binary listeners treat that as a deny
+// rule — the AUTH worker in the binary listener treats that as a deny
 // (fail-closed). verify is a closure rather than an oauth.Provider so this
 // store stays independent of the oauth package, matching RoleForClaims's
 // map-based signature.

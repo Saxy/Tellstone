@@ -49,6 +49,10 @@ func (d *shardDispatcher) Dispatch(key string, op byte, value []byte, ttl time.D
 		opStr = shard.CmdSet
 	case cluster.OpDel:
 		opStr = shard.CmdDel
+	case cluster.OpSetNX:
+		opStr = shard.CmdSetNX
+	case cluster.OpSetXX:
+		opStr = shard.CmdSetXX
 	default:
 		if d.logger.Enabled(log.LevelWarn) {
 			d.logger.Log(log.LevelWarn, "cluster dispatcher: unknown op",
@@ -72,6 +76,12 @@ func (d *shardDispatcher) Dispatch(key string, op byte, value []byte, ttl time.D
 			)
 		}
 		return resp.Err
+	}
+	// A conditional entry whose precondition failed leaves the shard untouched.
+	// Reporting it as ErrConditionNotMet is what carries "duplicate key" back to
+	// the proposer through the existing apply-error channel.
+	if (op == cluster.OpSetNX || op == cluster.OpSetXX) && !resp.OK {
+		return cluster.ErrConditionNotMet
 	}
 	if d.logger.Enabled(log.LevelDebug) {
 		d.logger.Log(log.LevelDebug, "cluster dispatcher: shard execute ok",
@@ -523,6 +533,42 @@ func (cs *clusterStore) Set(key string, value []byte, ttl time.Duration) error {
 		)
 	}
 	return nil
+}
+
+// SetIfAbsent proposes a conditional SET that only creates the key. Because the
+// check and the write are ordered by the same Raft log, concurrent inserts of
+// the same key resolve deterministically on every replica. An unsatisfied
+// precondition comes back as cluster.ErrConditionNotMet, which
+// cluster.IsConditionNotMet still recognises across the gateway hop.
+func (cs *clusterStore) SetIfAbsent(key string, value []byte, ttl time.Duration) (bool, error) {
+	return cs.setCond(key, value, ttl, cluster.EncodeSetNX, "SETNX")
+}
+
+// SetIfPresent is SetIfAbsent's mirror: it only overwrites an existing key.
+func (cs *clusterStore) SetIfPresent(key string, value []byte, ttl time.Duration) (bool, error) {
+	return cs.setCond(key, value, ttl, cluster.EncodeSetXX, "SETXX")
+}
+
+type encodeFunc func(key string, value []byte, ttl time.Duration) ([]byte, error)
+
+// setCond routes one conditional write through the log. Conditional values are
+// not chunked: a chain is reassembled as a plain SET, which would silently drop
+// the precondition.
+func (cs *clusterStore) setCond(key string, value []byte, ttl time.Duration, encode encodeFunc, name string) (bool, error) {
+	if len(value) > cluster.ChunkMax {
+		return false, fmt.Errorf("conditional %s: value of %d bytes exceeds the single-entry maximum of %d", name, len(value), cluster.ChunkMax)
+	}
+	data, err := encode(key, value, ttl)
+	if err != nil {
+		return false, err
+	}
+	if err = cs.routeAnywhere(key, [][]byte{data}); err != nil {
+		if cluster.IsConditionNotMet(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // encodeChunks splits a large value into a chunk chain of log-entry payloads.

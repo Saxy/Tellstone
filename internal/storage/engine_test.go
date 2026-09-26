@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"sync"
 	"testing"
 	"time"
 	"unsafe"
@@ -308,4 +309,87 @@ func TestEngine_Scan(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestEngine_SetIfAbsentIsAtomic checks that the create-if-absent precondition
+// and the write happen in one critical section. Racing N writers on one key must
+// yield exactly one successful create, which is what lets the SQL frontend
+// report a duplicate key instead of silently overwriting.
+func TestEngine_SetIfAbsentIsAtomic(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	const writers = 64
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	applied := 0
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok, err := engine.SetIfAbsent("race", []byte{byte(i)}, 0)
+			if err != nil {
+				t.Errorf("SetIfAbsent: %v", err)
+				return
+			}
+			if ok {
+				mu.Lock()
+				applied++
+				mu.Unlock()
+			}
+		}(i)
+	}
+	wg.Wait()
+	if applied != 1 {
+		t.Fatalf("SetIfAbsent applied %d writes, want exactly 1", applied)
+	}
+	if _, ok := engine.Get("race"); !ok {
+		t.Fatal("winning write did not land")
+	}
+}
+
+// TestEngine_SetIfPresentIsAtomic checks the mirror precondition: a row that is
+// absent must never be created by an UPDATE.
+func TestEngine_SetIfPresentIsAtomic(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	if ok, err := engine.SetIfPresent("missing", []byte("x"), 0); err != nil || ok {
+		t.Fatalf("SetIfPresent on absent key: ok=%v err=%v, want false, nil", ok, err)
+	}
+	if _, present := engine.Get("missing"); present {
+		t.Fatal("SetIfPresent created a key that did not exist")
+	}
+	if err := engine.Set("present", []byte("old"), 0); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if ok, err := engine.SetIfPresent("present", []byte("new"), 0); err != nil || !ok {
+		t.Fatalf("SetIfPresent on present key: ok=%v err=%v, want true, nil", ok, err)
+	}
+	if v, _ := engine.Get("present"); string(v) != "new" {
+		t.Fatalf("value = %q, want %q", v, "new")
+	}
+}
+
+// TestEngine_ConditionalSetTreatsExpiredAsAbsent pins the liveness rule: an
+// expired-but-resident entry counts as absent, so it neither blocks a create nor
+// satisfies an update.
+func TestEngine_ConditionalSetTreatsExpiredAsAbsent(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	if err := engine.Set("k", []byte("v"), 5*time.Millisecond); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if ok, err := engine.SetIfAbsent("k", []byte("fresh"), 0); err != nil || !ok {
+		t.Fatalf("SetIfAbsent over an expired key: ok=%v err=%v, want true, nil", ok, err)
+	}
+	if err := engine.Set("k2", []byte("v"), 5*time.Millisecond); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if ok, err := engine.SetIfPresent("k2", []byte("nope"), 0); err != nil || ok {
+		t.Fatalf("SetIfPresent over an expired key: ok=%v err=%v, want false, nil", ok, err)
+	}
 }

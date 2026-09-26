@@ -13,7 +13,7 @@ the provider is `nil`, no code path changes, and `AUTH` behaves exactly as befor
 
 ## How a presented credential is routed
 
-Both the RESP and binary listeners run the same dispatch on every `AUTH`:
+The binary listener runs the same dispatch on every `AUTH`:
 
 ```mermaid
 flowchart TD

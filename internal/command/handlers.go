@@ -2,9 +2,9 @@
 Package command
 Tellstone Shared Command Layer
 File: handlers.go
-Description: The GET, SET and DEL handlers, plus the EX/PX TTL parser moved out of
-the RESP frontend. These are the single source of truth for data-command semantics;
-the binary and RESP frontends call Execute and encode the reply through Reply.
+Description: The GET, SET and DEL handlers, plus the EX/PX TTL parser. These are
+the single source of truth for data-command semantics; the binary frontend calls
+Execute and encodes the reply through Reply.
 
 Authors:
 

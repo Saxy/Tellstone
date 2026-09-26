@@ -106,8 +106,42 @@ func (e *Engine) Close() {
 }
 
 func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
+	_, _, err := e.set(key, value, ttl, condAny)
+	return err
+}
+
+// SetIfAbsent writes key only when it is currently absent, and reports whether
+// the write was applied. The precondition and the write are evaluated under a
+// single engine lock, so two concurrent callers racing on the same key cannot
+// both observe "absent" and both create it.
+func (e *Engine) SetIfAbsent(key string, value []byte, ttl time.Duration) (bool, error) {
+	applied, _, err := e.set(key, value, ttl, condAbsent)
+	return applied, err
+}
+
+// SetIfPresent writes key only when it is currently present, and reports whether
+// the write was applied. Like SetIfAbsent the check and the write share one
+// critical section, so an absent key can never be "updated" by a racing writer.
+func (e *Engine) SetIfPresent(key string, value []byte, ttl time.Duration) (bool, error) {
+	applied, _, err := e.set(key, value, ttl, condPresent)
+	return applied, err
+}
+
+// cond is the precondition a conditional write evaluates inside the engine
+// lock. An expired-but-present entry counts as absent, matching Get and Delete.
+type cond uint8
+
+const (
+	condAny cond = iota
+	condAbsent
+	condPresent
+)
+
+// set is the shared body of Set and the conditional writes. It returns whether
+// the write was applied and whether the key was present beforehand (the latter
+// lets callers compensate a failed durability write).
+func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (applied, existed bool, err error) {
 	var exp time.Time
-	var err error
 	neededSize := len(value)
 	cryptoEnabled := e.cryptoEngine.Enabled()
 	if cryptoEnabled {
@@ -123,7 +157,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 					log.Uint64("max_bytes", e.maxBytes),
 				)
 			}
-			return ErrEngineFull
+			return false, false, ErrEngineFull
 		}
 	}
 	if ttl > 0 {
@@ -139,7 +173,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 					log.String("key", key),
 				)
 			}
-			return err
+			return false, false, err
 		}
 		storedKey = strings.Clone(key)
 	} else {
@@ -152,6 +186,17 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	}
 	e.mu.Lock()
 	oldItem, isUpdate := e.items[storedKey]
+	// An expired-but-still-resident entry counts as absent, so the precondition
+	// is evaluated on the same liveness rule Get and Delete use.
+	expired := isUpdate && !oldItem.Expiration.IsZero() && time.Now().After(oldItem.Expiration)
+	present := isUpdate && !expired
+	if c != condAny && present != (c == condPresent) {
+		// Precondition unsatisfied: leave the map untouched and report the
+		// write as not applied. Nothing was allocated, so nothing to account.
+		e.mu.Unlock()
+		atomic.AddUint64(&e.totalCommands, 1)
+		return false, present, nil
+	}
 	e.items[storedKey] = Item{
 		Value:      value,
 		Expiration: exp,
@@ -182,7 +227,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	if ttl > 0 {
 		e.chronometer.Register(storedKey, ttl)
 	}
-	return nil
+	return true, present, nil
 }
 
 // SetFromBuffer stores a key-value pair from a pre-built buffer containing
