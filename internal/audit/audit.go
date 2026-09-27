@@ -21,8 +21,8 @@ import "strings"
 type EventType string
 
 const (
-	// EventConnect fires when a new TCP connection is accepted by either
-	// the binary or RESP listener. Fields: remote_addr, protocol, shard_id.
+	// EventConnect fires when a new TCP connection is accepted by the
+	// binary listener. Fields: remote_addr, protocol, shard_id.
 	EventConnect EventType = "connect"
 
 	// EventDisconnect fires when a connection is closed. Fields: remote_addr,

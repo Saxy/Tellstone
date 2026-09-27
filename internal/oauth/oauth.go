@@ -20,9 +20,9 @@ import (
 )
 
 // VerifyTimeout bounds a single Provider.Verify call. Verification can reach
-// the identity provider (a JWKS refresh on key rotation), so the AUTH workers
-// in the RESP and binary listeners derive their context from it instead of an
-// unbounded background context.
+// the identity provider (a JWKS refresh on key rotation), so the AUTH worker
+// in the binary listener derives its context from it instead of an unbounded
+// background context.
 const VerifyTimeout = 10 * time.Second
 
 // ErrInvalidToken is returned by a Provider.Verify when the credential cannot be
@@ -65,9 +65,9 @@ type Provider interface {
 }
 
 // IsJWT reports whether b has the shape of a signed JWT: three dot-separated
-// base64url segments (header.payload.signature). The AUTH dispatchers in the
-// RESP and binary listeners use it to route a presented secret to token
-// verification instead of the bcrypt password path. Shape-only by design — a
+// base64url segments (header.payload.signature). The AUTH dispatcher in the
+// binary listener uses it to route a presented secret to token verification
+// instead of the bcrypt password path. Shape-only by design — a
 // well-formed but forged token is still rejected by Verify.
 func IsJWT(b []byte) bool {
 	dots := 0

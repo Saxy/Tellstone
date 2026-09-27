@@ -3,7 +3,7 @@
 
 FROM golang:1.26-alpine AS build
 
-RUN apk add --no-cache git
+RUN apk add --no-cache git gcc musl-dev
 
 WORKDIR /src
 
@@ -16,8 +16,10 @@ ARG VERSION=0.0.0-dev
 ARG COMMIT=unknown
 ARG DATE=unknown
 
-RUN CGO_ENABLED=0 go build \
-    -ldflags "-s -w \
+# pg_query_go embeds the PostgreSQL C parser and needs cgo; link statically
+# (musl) so the binary still runs on the distroless/static final stage.
+RUN CGO_ENABLED=1 go build \
+    -ldflags "-s -w -linkmode=external -extldflags=-static \
       -X github.com/Saxy/Tellstone/internal/version.Version=${VERSION} \
       -X github.com/Saxy/Tellstone/internal/version.Commit=${COMMIT} \
       -X github.com/Saxy/Tellstone/internal/version.Date=${DATE}" \
@@ -28,10 +30,8 @@ FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /tellstone /tellstone
 
 ENV TSD_ADDR=0.0.0.0:9988
-ENV TSD_ENABLE_RESP=true
-ENV TSD_RESP_ADDR=0.0.0.0:6379
 
-EXPOSE 9988 6379
+EXPOSE 9988
 
 USER nonroot:nonroot
 

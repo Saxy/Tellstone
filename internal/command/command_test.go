@@ -48,6 +48,20 @@ func (f *fakeStore) Set(key string, value []byte, ttl time.Duration) error {
 	return f.setErr
 }
 
+func (f *fakeStore) SetIfAbsent(key string, value []byte, ttl time.Duration) (bool, error) {
+	if _, ok := f.m[key]; ok {
+		return false, f.setErr
+	}
+	return true, f.Set(key, value, ttl)
+}
+
+func (f *fakeStore) SetIfPresent(key string, value []byte, ttl time.Duration) (bool, error) {
+	if _, ok := f.m[key]; !ok {
+		return false, f.setErr
+	}
+	return true, f.Set(key, value, ttl)
+}
+
 func (f *fakeStore) Delete(key string) (bool, error) {
 	_, ok := f.m[key]
 	delete(f.m, key)
@@ -260,7 +274,7 @@ func TestDel(t *testing.T) {
 }
 
 // rbacGate builds a Ctx with a policy store and a get-only "limited" session,
-// mirroring how the RESP frontend calls Execute for every data command.
+// mirroring how the frontend calls Execute for every data command.
 func rbacGate(store Store, args [][]byte, r *fakeReply) *Ctx {
 	admin, err := rbac.ParseRole("admin", "+@all", "~*")
 	if err != nil {

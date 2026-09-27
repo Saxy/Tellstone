@@ -51,14 +51,20 @@ var defaultMaxBytes = func() uint64 {
 // Engine is a single-map, lock-protected in-memory key-value store.
 // In SN mode it is owned by exactly one goroutine so the lock is uncontended.
 type Engine struct {
-	mu                   sync.RWMutex
-	items                map[string]Item
-	chronometer          TimelineWheel
-	cryptoEngine         *crypto.Engine
-	logger               log.Logger
-	maxBytes             uint64
-	allocatedBytes       uint64
-	keyCount             uint64
+	mu             sync.RWMutex
+	items          map[string]Item
+	chronometer    TimelineWheel
+	cryptoEngine   *crypto.Engine
+	logger         log.Logger
+	maxBytes       uint64
+	allocatedBytes uint64
+	keyCount       uint64
+	// versionSeq hands out the Version stamped on every item entering the map.
+	// It is a single engine-wide sequence rather than a per-key counter because
+	// a version has to stay unique for the item's whole lifetime: a per-key
+	// counter restarts at 1 when a key is deleted and re-created, which would
+	// let a stale rollback token match an unrelated later write.
+	versionSeq           uint64
 	expiredCount         uint64
 	hitCount             uint64
 	missCount            uint64
@@ -105,9 +111,61 @@ func (e *Engine) Close() {
 	}
 }
 
+// SetOutcome describes what a conditional write did to one key. It is returned
+// by SetIfAbsent and SetIfPresent so a caller whose durability write fails
+// afterwards can undo exactly its own change: Prev is the item that was
+// replaced (meaningful when PrevOK), and Version identifies this write until
+// some other writer stores a new value.
+type SetOutcome struct {
+	// Applied reports that the precondition held and the value was stored.
+	Applied bool
+	// PrevOK reports that a live entry existed beforehand. It is false both for
+	// a key that was absent and for one whose entry had already expired, so a
+	// rollback never resurrects an expired value.
+	PrevOK bool
+	// Prev is the entry the write replaced, including its expiration, so a
+	// rollback restores the original TTL rather than dropping it.
+	Prev Item
+	// Version is the version this write stored.
+	Version uint64
+}
+
 func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
+	_, err := e.set(key, value, ttl, condAny)
+	return err
+}
+
+// SetIfAbsent writes key only when it is currently absent, and reports what it
+// did. The precondition and the write are evaluated under a single engine
+// lock, so two concurrent callers racing on the same key cannot both observe
+// "absent" and both create it.
+func (e *Engine) SetIfAbsent(key string, value []byte, ttl time.Duration) (SetOutcome, error) {
+	return e.set(key, value, ttl, condAbsent)
+}
+
+// SetIfPresent writes key only when it is currently present, and reports what
+// it did. Like SetIfAbsent the check and the write share one critical section,
+// so an absent key can never be "updated" by a racing writer.
+func (e *Engine) SetIfPresent(key string, value []byte, ttl time.Duration) (SetOutcome, error) {
+	return e.set(key, value, ttl, condPresent)
+}
+
+// cond is the precondition a conditional write evaluates inside the engine
+// lock. An expired-but-present entry counts as absent, matching Get and Delete.
+type cond uint8
+
+const (
+	condAny cond = iota
+	condAbsent
+	condPresent
+)
+
+// set is the shared body of Set and the conditional writes. It returns what the
+// write did, including the entry it replaced and the version it stored, so a
+// caller can compensate a failed durability write without discarding a
+// concurrent writer's value.
+func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOutcome, error) {
 	var exp time.Time
-	var err error
 	neededSize := len(value)
 	cryptoEnabled := e.cryptoEngine.Enabled()
 	if cryptoEnabled {
@@ -123,7 +181,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 					log.Uint64("max_bytes", e.maxBytes),
 				)
 			}
-			return ErrEngineFull
+			return SetOutcome{}, ErrEngineFull
 		}
 	}
 	if ttl > 0 {
@@ -131,6 +189,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	}
 	var storedKey string
 	if cryptoEnabled {
+		var err error
 		encryptedBuf := make([]byte, 0, neededSize)
 		value, err = e.cryptoEngine.EncryptInPlace(encryptedBuf, value)
 		if err != nil {
@@ -139,7 +198,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 					log.String("key", key),
 				)
 			}
-			return err
+			return SetOutcome{}, err
 		}
 		storedKey = strings.Clone(key)
 	} else {
@@ -152,9 +211,24 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	}
 	e.mu.Lock()
 	oldItem, isUpdate := e.items[storedKey]
+	// An expired-but-still-resident entry counts as absent, so the precondition
+	// is evaluated on the same liveness rule Get and Delete use.
+	expired := isUpdate && !oldItem.Expiration.IsZero() && time.Now().After(oldItem.Expiration)
+	present := isUpdate && !expired
+	if c != condAny && present != (c == condPresent) {
+		// Precondition unsatisfied: leave the map untouched and report the
+		// write as not applied. Nothing was allocated, so nothing to account.
+		e.mu.Unlock()
+		atomic.AddUint64(&e.totalCommands, 1)
+		return SetOutcome{}, nil
+	}
+	// Versions come from one engine-wide sequence, so every stored value is
+	// uniquely attributable to the write that produced it.
+	version := e.nextVersion()
 	e.items[storedKey] = Item{
 		Value:      value,
 		Expiration: exp,
+		Version:    version,
 	}
 	e.mu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
@@ -182,7 +256,69 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 	if ttl > 0 {
 		e.chronometer.Register(storedKey, ttl)
 	}
-	return nil
+	// An expired predecessor is not offered as a rollback target: putting it
+	// back would resurrect a value the liveness rule had already retired.
+	return SetOutcome{Applied: true, PrevOK: present, Prev: oldItem, Version: version}, nil
+}
+
+// nextVersion returns the next engine-wide item version. It must be called
+// with e.mu held, which every writer and RestoreIf does.
+func (e *Engine) nextVersion() uint64 {
+	e.versionSeq++
+	return e.versionSeq
+}
+
+// RestoreIf rolls back a conditional write whose durability record could not be
+// written, putting back the entry the write replaced. It acts only while the
+// key still holds the version that write stored, so a value another writer has
+// stored in the meantime is never discarded. It reports whether the rollback
+// happened; false means the key moved on and the write stands.
+func (e *Engine) RestoreIf(key string, out SetOutcome) bool {
+	if !out.Applied {
+		return false
+	}
+	e.mu.Lock()
+	item, exists := e.items[key]
+	if !exists || item.Version != out.Version {
+		e.mu.Unlock()
+		return false
+	}
+	expired := !item.Expiration.IsZero() && time.Now().After(item.Expiration)
+	if !out.PrevOK {
+		// The write created the key, so undoing it removes the key again.
+		delete(e.items, key)
+		e.mu.Unlock()
+		e.releaseKey(key, item)
+		return true
+	}
+	restored := out.Prev
+	// A restore is itself a state change and takes a fresh version. Reusing the
+	// replaced entry's version would let a token from an earlier write match
+	// this state and roll back a write that never failed.
+	restored.Version = e.nextVersion()
+	e.items[key] = restored
+	e.mu.Unlock()
+	oldSize := uint64(len(key) + len(item.Value))
+	newSize := uint64(len(key) + len(restored.Value))
+	if newSize > oldSize {
+		atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
+	} else if oldSize > newSize {
+		atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
+	}
+	// The chronometer still holds the rolled-back write's schedule, so a
+	// restored TTL has to be re-armed for the time it has left.
+	if !restored.Expiration.IsZero() && !expired {
+		if remaining := time.Until(restored.Expiration); remaining > 0 {
+			e.chronometer.Register(key, remaining)
+		}
+	}
+	if e.logger.Enabled(log.LevelDebug) {
+		e.logger.Log(log.LevelDebug, "conditional write rolled back after durability failure",
+			log.String("key", key),
+			log.Uint64("version", out.Version),
+		)
+	}
+	return true
 }
 
 // SetFromBuffer stores a key-value pair from a pre-built buffer containing
@@ -214,6 +350,7 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	e.items[storedKey] = Item{
 		Value:      value,
 		Expiration: exp,
+		Version:    e.nextVersion(),
 	}
 	e.mu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
@@ -257,6 +394,7 @@ func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
 	e.items[storedKey] = Item{
 		Value:      value,
 		Expiration: exp,
+		Version:    e.nextVersion(),
 	}
 	e.mu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)

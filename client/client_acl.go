@@ -11,7 +11,7 @@ type ACLUser struct {
 
 // AuthLogEntry is one decoded ACL LOG record.
 type AuthLogEntry struct {
-	Timestamp  string // RFC3339, matching the RESP ACL LOG rendering
+	Timestamp  string // RFC3339, matching the ACL LOG rendering
 	Username   string
 	RemoteAddr string
 	Reason     string

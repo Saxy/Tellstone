@@ -115,12 +115,6 @@ func TestLoadConfigDefaultsAndEnv(t *testing.T) {
 	if cfg.GetTraceRatio() != 0.0 {
 		t.Fatalf("default TraceRatio mismatch: %f", cfg.GetTraceRatio())
 	}
-	if cfg.RESPEnabled() {
-		t.Fatalf("RESP should be disabled by default")
-	}
-	if cfg.GetRESPAddr() != "127.0.0.1:6379" {
-		t.Fatalf("default RESP addr mismatch: %s", cfg.GetRESPAddr())
-	}
 	wantShards := runtime.NumCPU()
 	if cfg.GetNumShards() != wantShards {
 		t.Fatalf("default NumShards mismatch: %d (expected %d)", cfg.GetNumShards(), wantShards)
@@ -409,44 +403,6 @@ func TestTLSFlagsOverrideEnvVars(t *testing.T) {
 	}
 }
 
-func TestRESPStartTLSDefaultsDisabled(t *testing.T) {
-	t.Setenv("TSD_RESP_STARTTLS", "")
-	cfg := LoadConfig(nil)
-	if cfg.RESPStartTLSEnabled() {
-		t.Fatal("RESP STARTTLS should be disabled by default")
-	}
-}
-
-func TestRESPStartTLSFlagAndEnv(t *testing.T) {
-	cfg := LoadConfig([]string{
-		"--tls-cert", "/path/to/cert.pem",
-		"--tls-key", "/path/to/key.pem",
-		"--resp-starttls",
-	})
-	if !cfg.RESPStartTLSEnabled() {
-		t.Fatal("RESP STARTTLS should be enabled by flag")
-	}
-
-	t.Setenv("TSD_TLS_CERT", "/env/cert.pem")
-	t.Setenv("TSD_TLS_KEY", "/env/key.pem")
-	t.Setenv("TSD_RESP_STARTTLS", "true")
-	cfg = LoadConfig(nil)
-	if !cfg.RESPStartTLSEnabled() {
-		t.Fatal("RESP STARTTLS should be enabled by environment")
-	}
-}
-
-func TestRESPStartTLSPanicWithoutTLS(t *testing.T) {
-	t.Setenv("TSD_TLS_CERT", "")
-	t.Setenv("TSD_TLS_KEY", "")
-	defer func() {
-		if r := recover(); r == nil {
-			t.Fatal("expected panic when RESP STARTTLS is enabled without TLS material")
-		}
-	}()
-	LoadConfig([]string{"--resp-starttls"})
-}
-
 func TestRequirePassDefaultEmpty(t *testing.T) {
 	cfg := LoadConfig(nil)
 	if cfg.GetRequirePass() != "" {
@@ -466,6 +422,52 @@ func TestRequirePassEnvVar(t *testing.T) {
 	cfg := LoadConfig(nil)
 	if cfg.GetRequirePass() != "envpass" {
 		t.Fatalf("require-pass env mismatch: %q", cfg.GetRequirePass())
+	}
+}
+
+func TestPGAddrDefaultDisabled(t *testing.T) {
+	cfg := LoadConfig(nil)
+	if cfg.GetPGAddr() != "" {
+		t.Fatalf("pg-addr should default to empty (frontend disabled), got %q", cfg.GetPGAddr())
+	}
+	if cfg.PGEnabled() {
+		t.Fatal("frontend must be disabled when pg-addr is empty")
+	}
+	if cfg.PGTLS() {
+		t.Fatal("pg-tls should default to false")
+	}
+}
+
+func TestPGAddrFlag(t *testing.T) {
+	cfg := LoadConfig([]string{"--pg-addr", "127.0.0.1:15432"})
+	if cfg.GetPGAddr() != "127.0.0.1:15432" {
+		t.Fatalf("pg-addr flag mismatch: %q", cfg.GetPGAddr())
+	}
+	if !cfg.PGEnabled() {
+		t.Fatal("frontend must be enabled when pg-addr is set")
+	}
+}
+
+func TestPGAddrEnvVar(t *testing.T) {
+	t.Setenv("TSD_PG_ADDR", ":25432")
+	cfg := LoadConfig(nil)
+	if cfg.GetPGAddr() != ":25432" {
+		t.Fatalf("pg-addr env mismatch: %q", cfg.GetPGAddr())
+	}
+	if !cfg.PGEnabled() {
+		t.Fatal("frontend must be enabled via env")
+	}
+}
+
+func TestPGTLSFlagAndEnv(t *testing.T) {
+	cfg := LoadConfig([]string{"--pg-tls"})
+	if !cfg.PGTLS() {
+		t.Fatal("pg-tls flag mismatch")
+	}
+	t.Setenv("TSD_PG_TLS", "true")
+	cfg = LoadConfig(nil)
+	if !cfg.PGTLS() {
+		t.Fatal("pg-tls env mismatch")
 	}
 }
 

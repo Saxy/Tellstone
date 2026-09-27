@@ -14,7 +14,7 @@ type RoleListEntry struct {
 }
 
 // RoleCreate issues ROLE CREATE <name> <rule>... on the binary protocol.
-// Rule tokens follow the RESP conventions: "+cmd", "-cmd", "+@category",
+// Rule tokens follow the Redis-style conventions: "+cmd", "-cmd", "+@category",
 // "-@category", "~prefix", "~*". Fails when the role already exists.
 func (c *Client) RoleCreate(role string, rules []string, scratchBuf []byte) error {
 	if err := c.valid(); err != nil {

@@ -2,7 +2,7 @@
 
 <!-- Clear and concise description of what this PR changes or introduces -->
 
-**Component:** (e.g., Networking/RESP, Storage Engine, Router/Shard, CLI, Build/CI)
+**Component:** (e.g., Networking/Binary Protocol, Storage Engine, Router/Shard, CLI, Build/CI)
 
 **Type of Change:**
 - [ ] Bug fix (non-breaking change which fixes an issue)

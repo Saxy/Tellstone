@@ -13,6 +13,7 @@ package cluster
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -262,5 +263,75 @@ func TestEncodeKeyAtWireFormatBoundary(t *testing.T) {
 	if op != OpDel || gotKey != maxKey || len(gotValue) != 0 {
 		t.Fatalf("del round trip mismatch: op=%d keyLen=%d valueLen=%d",
 			op, len(gotKey), len(gotValue))
+	}
+}
+
+// TestEncodeDecodeConditionalSet pins the conditional opcodes on the wire. The
+// SQL frontend's INSERT/UPDATE reach every replica through these bytes, so a
+// header change has to round-trip exactly.
+func TestEncodeDecodeConditionalSet(t *testing.T) {
+	cases := []struct {
+		name   string
+		encode func(string, []byte, time.Duration) ([]byte, error)
+		wantOp byte
+	}{
+		{"set", EncodeSet, OpSet},
+		{"setnx", EncodeSetNX, OpSetNX},
+		{"setxx", EncodeSetXX, OpSetXX},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			data, err := tc.encode("hello", []byte("world"), 5*time.Second)
+			if err != nil {
+				t.Fatalf("encode: %v", err)
+			}
+			op, key, value, ttl, err := DecodeLogEntry(data)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if op != tc.wantOp {
+				t.Fatalf("op = %#x, want %#x", op, tc.wantOp)
+			}
+			if key != "hello" || string(value) != "world" {
+				t.Fatalf("round trip: key=%q value=%q", key, value)
+			}
+			if ttl != 5*time.Second {
+				t.Fatalf("ttl = %v, want 5s", ttl)
+			}
+		})
+	}
+}
+
+// TestConditionalOpsKeepProposalTagClear guards the interaction with the
+// proposal-ID scheme: a tagged entry is one whose first byte has the high bit
+// set. The conditional opcodes must stay below 0x80 or every conditional write
+// would be mistaken for a tagged proposal and stripped before reaching Apply.
+func TestConditionalOpsKeepProposalTagClear(t *testing.T) {
+	for _, op := range []byte{OpSet, OpDel, OpSetNX, OpSetXX} {
+		if op&0x80 != 0 {
+			t.Errorf("opcode %#x has the high bit set and would collide with the proposal tag", op)
+		}
+	}
+}
+
+// TestIsConditionNotMet checks the sentinel survives wrapping and is also
+// recognized from its text, which is all that survives the pipelined
+// follower-forward and cross-cluster gateway hops.
+func TestIsConditionNotMet(t *testing.T) {
+	if IsConditionNotMet(nil) {
+		t.Error("nil error must not report a condition failure")
+	}
+	if !IsConditionNotMet(ErrConditionNotMet) {
+		t.Error("bare sentinel not recognized")
+	}
+	if !IsConditionNotMet(fmt.Errorf("MOVED: write to region leader failed: %w", ErrConditionNotMet)) {
+		t.Error("wrapped sentinel not recognized")
+	}
+	rebuilt := errors.New("MOVED: region leader failed: " + ErrConditionNotMet.Error())
+	if !IsConditionNotMet(rebuilt) {
+		t.Error("rebuilt-from-wire sentinel not recognized")
+	}
+	if IsConditionNotMet(errors.New("CLUSTERDOWN: no gateway is configured")) {
+		t.Error("unrelated error reported as a condition failure")
 	}
 }

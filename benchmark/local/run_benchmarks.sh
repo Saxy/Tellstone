@@ -3,7 +3,6 @@
 set -e
 
 RESULTS_DIR="/home/debian/bench_results"
-TELLSTONE_BIN="/home/debian/Tellstone/bin/tellstone"
 PORT=6379
 HOST="127.0.0.1"
 DATA_SIZE=256
@@ -12,7 +11,10 @@ REQUESTS=500000
 RATIO="1:10"
 
 CPU_COUNTS="4 16 32"
-ENGINES="redis valkey dragonfly tellstone"
+# Tellstone's Redis-compatible (RESP) frontend was removed in v2 (ADR-012), so
+# the historical comparison suite now covers only the reference engines. The
+# engine-level benchmark tables in README.md predate the removal.
+ENGINES="redis valkey dragonfly"
 
 mkdir -p "$RESULTS_DIR"
 
@@ -20,7 +22,6 @@ stop_servers() {
     pkill -f "redis-server.*$PORT" 2>/dev/null || true
     pkill -f "valkey-server.*$PORT" 2>/dev/null || true
     pkill -f "dragonfly.*$PORT" 2>/dev/null || true
-    pkill -f "tellstone.*resp-addr" 2>/dev/null || true
     sleep 2
 }
 
@@ -75,15 +76,6 @@ start_server() {
                 --maxmemory 80gb &
             wait_for_port "dragonfly"
             ;;
-        tellstone)
-            taskset -c "$cpuset" "$TELLSTONE_BIN" \
-                -enable-resp \
-                -resp-addr "$HOST:$PORT" \
-                -shards "$cpus" \
-                -max-mem-bytes 80GiB \
-                -log-level warn &
-            wait_for_port "tellstone"
-            ;;
     esac
 }
 
@@ -112,7 +104,7 @@ run_benchmark() {
 }
 
 echo "========================================================"
-echo "Benchmark Suite: Redis vs Valkey vs Dragonfly vs Tellstone"
+echo "Benchmark Suite: Redis vs Valkey vs Dragonfly"
 echo "Server Hardware: 56 CPUs, 118 GB RAM"
 echo "CPU configs: $CPU_COUNTS"
 echo "Results dir: $RESULTS_DIR"
