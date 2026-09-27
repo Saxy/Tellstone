@@ -1,0 +1,43 @@
+internal/storage/engine.go
+  s_c2c23bbc940964::t_0f02462b67d7da 192
+  s_c2c23bbc940964::t_8f67feacb7d032 163-167,184,201,223,231,259-263,271-297,299-321
+  s_c2c23bbc940964::t_bfd234aa3c0222 298
+  s_c2c23bbc940964::t_a33b0a42f2ceac 54-61,67
+  s_c2c23bbc940964::t_750a2267a13309 114-132,134,138-143,146-150
+  s_c2c23bbc940964::t_550caf3e65150b 225-227
+  s_c2c23bbc940964::t_e55807a9e5755f 264-270,353,397
+  s_c2c23bbc940964::t_a181186650a0f0 62-66
+internal/cluster/node.go
+  s_c2c23bbc940964::t_65ed37d4ae883a 636-638
+  s_c2c23bbc940964::t_dbf9f815de1b52 655
+internal/shard/runner.go
+  s_c2c23bbc940964::t_36ba50c95014a4 177-180,185,188,190,195,200
+internal/storage/engine_test.go
+  s_c2c23bbc940964::t_d0352b84623a69 503
+  s_c2c23bbc940964::t_bb97552bceb15a 331,336,358-359,367-368,386-387,393-394
+  s_c2c23bbc940964::t_2103db10e2f848 395-502,504-507
+  s_c2c23bbc940964::t_4eb793a587c7be 5
+internal/sql/integration_test.go
+  s_c2c23bbc940964::t_2bde9759eca750 747-753,757,759,761-767,770,772,774-778,787-791,794,796,798-802,808
+  s_c2c23bbc940964::t_a62bb8af9ce957 265-307
+internal/storage/storage.go
+  s_c2c23bbc940964::t_5426aea4b00ca9 35-39
+internal/cluster/fsm.go
+  s_c2c23bbc940964::t_2b14954d753157 226-230
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b7dd33b57a9820337375f7a9cf9bf052ab0ee545",
+  "prompts": {},
+  "sessions": {
+    "s_c2c23bbc940964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f21084331ffeWdPwPcacLO1zfT",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
