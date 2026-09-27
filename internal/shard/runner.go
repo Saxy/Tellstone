@@ -174,31 +174,30 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		//
 		// The durability record is written only after the engine accepted the
 		// write, so a rejected conditional leaves nothing for replay to
-		// resurrect. A failure there is compensated exactly like CmdSet's:
-		// only a key that did not exist beforehand can be rolled back.
+		// resurrect. A failure there is compensated against the engine, using
+		// the version the engine just stored: the rollback is skipped once
+		// another writer has stored its own value, so a concurrent write is
+		// never silently discarded.
 		var expiration time.Time
 		if ttl > 0 {
 			expiration = time.Now().Add(ttl)
 		}
-		_, keyExisted := s.Engine.Get(key)
-		var applied bool
+		var outcome storage.SetOutcome
 		var err error
 		if op == CmdSetNX {
-			applied, err = s.Engine.SetIfAbsent(key, value, ttl)
+			outcome, err = s.Engine.SetIfAbsent(key, value, ttl)
 		} else {
-			applied, err = s.Engine.SetIfPresent(key, value, ttl)
+			outcome, err = s.Engine.SetIfPresent(key, value, ttl)
 		}
 		if err != nil {
 			return Response{Err: err}
 		}
-		if !applied {
+		if !outcome.Applied {
 			return Response{}
 		}
 		if s.Persistence.Enabled() {
 			if err = s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
-				if !keyExisted {
-					s.Engine.Delete(key)
-				}
+				s.Engine.RestoreIf(key, outcome)
 				return Response{Err: err}
 			}
 		}

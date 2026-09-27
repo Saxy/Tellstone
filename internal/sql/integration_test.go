@@ -262,6 +262,49 @@ func (cl *tclient) query(q string) []frame {
 	return cl.recvUntil(msgReadyForQuery)
 }
 
+// trySend, tryRecv and tryQuery are the non-fatal variants of send, recv and
+// query. testing.T.Fatalf must only be called from the goroutine running the
+// test; from a worker it calls runtime.Goexit on the wrong goroutine, which
+// aborts the worker and leaves the test hanging or falsely green. These report
+// the transport error so the worker can record it and return.
+func (cl *tclient) trySend(typ byte, payload []byte) error {
+	var m msgBuilder
+	m.begin(typ)
+	m.bytes(payload)
+	m.end()
+	_, err := cl.cn.Write(m.buf)
+	return err
+}
+
+func (cl *tclient) tryRecv() (frame, error) {
+	typ, p, err := readFrame(cl.r, -1)
+	if err != nil {
+		return frame{}, err
+	}
+	if os.Getenv("SQL_DEBUG_LOG") != "" {
+		fmt.Fprintf(os.Stderr, "recv[%c] payload=%q\n", typ, p)
+	}
+	return frame{typ: typ, val: p}, nil
+}
+
+// tryQuery runs a simple query and collects frames through ReadyForQuery.
+func (cl *tclient) tryQuery(q string) ([]frame, error) {
+	if err := cl.trySend(msgQuery, append([]byte(q), 0)); err != nil {
+		return nil, fmt.Errorf("send query: %w", err)
+	}
+	var out []frame
+	for {
+		f, err := cl.tryRecv()
+		if err != nil {
+			return out, fmt.Errorf("read reply: %w", err)
+		}
+		out = append(out, f)
+		if f.typ == msgReadyForQuery {
+			return out, nil
+		}
+	}
+}
+
 func findFrame(frames []frame, typ byte) *frame {
 	for i := range frames {
 		if frames[i].typ == typ {
@@ -701,28 +744,38 @@ func TestAtomicConditionalWrites(t *testing.T) {
 	// and the rest must be duplicate-key violations. That is only possible if
 	// the existence check and the write are one atomic store operation.
 	const writers = 8
+	// Sessions are dialled and authenticated on the test goroutine, because
+	// both helpers report failure with t.Fatalf, which is only legal there.
+	inserters := make([]*tclient, writers)
+	for i := range inserters {
+		inserters[i] = dialServer(t, srv.Addr())
+		inserters[i].startupTrust("default")
+	}
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	dupes, created := 0, 0
-	for i := 0; i < writers; i++ {
+	for i, s := range inserters {
 		wg.Add(1)
-		go func(i int) {
+		go func(i int, s *tclient) {
 			defer wg.Done()
-			s := dialServer(t, srv.Addr())
-			s.startupTrust("default")
-			frames := s.query(fmt.Sprintf(`INSERT INTO tellstone (key, value) VALUES ('concurrent', 'w%d')`, i))
+			frames, err := s.tryQuery(fmt.Sprintf(`INSERT INTO tellstone (key, value) VALUES ('concurrent', 'w%d')`, i))
+			// Count only after the exchange succeeded, so a transport failure
+			// cannot be mistaken for a duplicate-key rejection.
+			if err != nil {
+				t.Errorf("concurrent INSERT: %v", err)
+				return
+			}
 			mu.Lock()
 			defer mu.Unlock()
-			switch {
-			case findTag(frames) == "INSERT 0 1":
+			if findTag(frames) == "INSERT 0 1" {
 				created++
-			default:
-				if code, _, ok := findError(frames); !ok || code != errDuplicateKey {
-					t.Errorf("concurrent INSERT: want %s, got code=%q ok=%v frames=%s", errDuplicateKey, code, ok, frameTypes(frames))
-				}
-				dupes++
+				return
 			}
-		}(i)
+			if code, _, ok := findError(frames); !ok || code != errDuplicateKey {
+				t.Errorf("concurrent INSERT: want %s, got code=%q ok=%v frames=%s", errDuplicateKey, code, ok, frameTypes(frames))
+			}
+			dupes++
+		}(i, s)
 	}
 	wg.Wait()
 	if created != 1 || dupes != writers-1 {
@@ -731,21 +784,28 @@ func TestAtomicConditionalWrites(t *testing.T) {
 
 	// UPDATE only touches rows that exist, so the affected-row count stays
 	// honest under concurrency too.
+	updaters := make([]*tclient, writers)
+	for i := range updaters {
+		updaters[i] = dialServer(t, srv.Addr())
+		updaters[i].startupTrust("default")
+	}
 	var upd sync.WaitGroup
 	applied := 0
-	for i := 0; i < writers; i++ {
+	for i, s := range updaters {
 		upd.Add(1)
-		go func(i int) {
+		go func(i int, s *tclient) {
 			defer upd.Done()
-			s := dialServer(t, srv.Addr())
-			s.startupTrust("default")
-			frames := s.query(fmt.Sprintf(`UPDATE tellstone SET value = 'u%d' WHERE key = 'race'`, i))
+			frames, err := s.tryQuery(fmt.Sprintf(`UPDATE tellstone SET value = 'u%d' WHERE key = 'race'`, i))
+			if err != nil {
+				t.Errorf("concurrent UPDATE: %v", err)
+				return
+			}
 			mu.Lock()
 			defer mu.Unlock()
 			if findTag(frames) == "UPDATE 1" {
 				applied++
 			}
-		}(i)
+		}(i, s)
 	}
 	upd.Wait()
 	if applied != writers {

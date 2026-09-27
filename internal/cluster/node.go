@@ -633,7 +633,9 @@ func (n *Node) processReady(rd raft.Ready) {
 				Data:  data[proposalIDSize:],
 			}
 			applyErr := n.fsm.Apply(stripped)
-			if applyErr != nil && n.cfg.Logger.Enabled(log.LevelError) {
+			// A failed write condition is an expected reply to the proposer,
+			// not an apply fault, so it stays out of the error log.
+			if applyErr != nil && !IsConditionNotMet(applyErr) && n.cfg.Logger.Enabled(log.LevelError) {
 				n.cfg.Logger.Log(log.LevelError, "cluster: fsm apply failed",
 					log.String("error", applyErr.Error()),
 					log.Uint64("index", e.GetIndex()),
@@ -650,7 +652,7 @@ func (n *Node) processReady(rd raft.Ready) {
 			// Raft internal entries (no-ops on leader election, ConfChanges)
 			// have empty or short payloads that carry no FSM operation.
 			// Skip them — the FSM has nothing to do.
-		} else if err := n.fsm.Apply(e); err != nil && n.cfg.Logger.Enabled(log.LevelError) {
+		} else if err := n.fsm.Apply(e); err != nil && !IsConditionNotMet(err) && n.cfg.Logger.Enabled(log.LevelError) {
 			n.cfg.Logger.Log(log.LevelError, "cluster: fsm apply failed (untagged entry)",
 				log.String("error", err.Error()),
 				log.Uint64("index", e.GetIndex()),

@@ -32,4 +32,9 @@ import "time"
 type Item struct {
 	Value      []byte
 	Expiration time.Time
+	// Version counts the state changes applied to this key and is never zero
+	// for a stored item. It lets a writer tell whether its own value is still
+	// the current one, so a durability failure can be rolled back without
+	// discarding a value another writer has since stored.
+	Version uint64
 }

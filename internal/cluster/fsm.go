@@ -223,7 +223,11 @@ func (f *FSM) Apply(entry *pb.Entry) error {
 		)
 	}
 	if err := f.dispatcher.Dispatch(key, op, value, ttl); err != nil {
-		if f.logger.Enabled(log.LevelError) {
+		// An unsatisfied precondition is a normal outcome, not a fault: it is
+		// how a losing INSERT and a stale UPDATE are reported back to the
+		// proposer. Logging it at error level would emit a line per duplicate
+		// key, which is the normal case for a primary key under load.
+		if !IsConditionNotMet(err) && f.logger.Enabled(log.LevelError) {
 			f.logger.Log(log.LevelError, "cluster fsm: dispatch failed",
 				log.String("error", err.Error()),
 				log.Uint64("index", entry.GetIndex()),

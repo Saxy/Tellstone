@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -327,12 +328,12 @@ func TestEngine_SetIfAbsentIsAtomic(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			ok, err := engine.SetIfAbsent("race", []byte{byte(i)}, 0)
+			out, err := engine.SetIfAbsent("race", []byte{byte(i)}, 0)
 			if err != nil {
 				t.Errorf("SetIfAbsent: %v", err)
 				return
 			}
-			if ok {
+			if out.Applied {
 				mu.Lock()
 				applied++
 				mu.Unlock()
@@ -354,8 +355,8 @@ func TestEngine_SetIfPresentIsAtomic(t *testing.T) {
 	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
 	defer engine.Close()
 
-	if ok, err := engine.SetIfPresent("missing", []byte("x"), 0); err != nil || ok {
-		t.Fatalf("SetIfPresent on absent key: ok=%v err=%v, want false, nil", ok, err)
+	if out, err := engine.SetIfPresent("missing", []byte("x"), 0); err != nil || out.Applied {
+		t.Fatalf("SetIfPresent on absent key: applied=%v err=%v, want false, nil", out.Applied, err)
 	}
 	if _, present := engine.Get("missing"); present {
 		t.Fatal("SetIfPresent created a key that did not exist")
@@ -363,8 +364,8 @@ func TestEngine_SetIfPresentIsAtomic(t *testing.T) {
 	if err := engine.Set("present", []byte("old"), 0); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
-	if ok, err := engine.SetIfPresent("present", []byte("new"), 0); err != nil || !ok {
-		t.Fatalf("SetIfPresent on present key: ok=%v err=%v, want true, nil", ok, err)
+	if out, err := engine.SetIfPresent("present", []byte("new"), 0); err != nil || !out.Applied {
+		t.Fatalf("SetIfPresent on present key: applied=%v err=%v, want true, nil", out.Applied, err)
 	}
 	if v, _ := engine.Get("present"); string(v) != "new" {
 		t.Fatalf("value = %q, want %q", v, "new")
@@ -382,14 +383,127 @@ func TestEngine_ConditionalSetTreatsExpiredAsAbsent(t *testing.T) {
 		t.Fatalf("Set: %v", err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	if ok, err := engine.SetIfAbsent("k", []byte("fresh"), 0); err != nil || !ok {
-		t.Fatalf("SetIfAbsent over an expired key: ok=%v err=%v, want true, nil", ok, err)
+	if out, err := engine.SetIfAbsent("k", []byte("fresh"), 0); err != nil || !out.Applied {
+		t.Fatalf("SetIfAbsent over an expired key: applied=%v err=%v, want true, nil", out.Applied, err)
 	}
 	if err := engine.Set("k2", []byte("v"), 5*time.Millisecond); err != nil {
 		t.Fatalf("Set: %v", err)
 	}
 	time.Sleep(30 * time.Millisecond)
-	if ok, err := engine.SetIfPresent("k2", []byte("nope"), 0); err != nil || ok {
-		t.Fatalf("SetIfPresent over an expired key: ok=%v err=%v, want false, nil", ok, err)
+	if out, err := engine.SetIfPresent("k2", []byte("nope"), 0); err != nil || out.Applied {
+		t.Fatalf("SetIfPresent over an expired key: applied=%v err=%v, want false, nil", out.Applied, err)
+	}
+}
+
+// TestEngine_RestoreIfSparesConcurrentWriter pins the reason a conditional
+// write reports a version. The shard applies the write to memory first and the
+// durability record second; if that record fails it rolls the memory change
+// back. A plain rollback would delete or overwrite whatever a competing writer
+// stored in between, so the rollback must no-op once the version moved on.
+func TestEngine_RestoreIfSparesConcurrentWriter(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	// SETNX creates the key, then a competing writer replaces it.
+	first, err := engine.SetIfAbsent("k", []byte("first"), 0)
+	if err != nil || !first.Applied {
+		t.Fatalf("SetIfAbsent: applied=%v err=%v", first.Applied, err)
+	}
+	if _, err := engine.SetIfPresent("k", []byte("second"), 0); err != nil {
+		t.Fatalf("SetIfPresent: %v", err)
+	}
+
+	// The late rollback of the first write must not touch the newer value.
+	if engine.RestoreIf("k", first) {
+		t.Error("RestoreIf rolled back a write another writer had already replaced")
+	}
+	if v, ok := engine.Get("k"); !ok || string(v) != "second" {
+		t.Fatalf("value = %q ok=%v, want %q", v, ok, "second")
+	}
+}
+
+// TestEngine_RestoreIfUndoesOwnWrite is the ordinary case: nothing else wrote
+// the key, so the failed write is rolled back and a create is removed again.
+func TestEngine_RestoreIfUndoesOwnWrite(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	out, err := engine.SetIfAbsent("k", []byte("v"), 0)
+	if err != nil || !out.Applied {
+		t.Fatalf("SetIfAbsent: applied=%v err=%v", out.Applied, err)
+	}
+	if !engine.RestoreIf("k", out) {
+		t.Fatal("RestoreIf did not roll back its own write")
+	}
+	if _, ok := engine.Get("k"); ok {
+		t.Fatal("rolled-back create left the key behind")
+	}
+	// A second rollback of the same token must not remove a later write.
+	if out2, err := engine.SetIfAbsent("k", []byte("again"), 0); err != nil || !out2.Applied {
+		t.Fatalf("SetIfAbsent after rollback: applied=%v err=%v", out2.Applied, err)
+	}
+	if engine.RestoreIf("k", out) {
+		t.Error("a spent token rolled back a later write")
+	}
+	if v, ok := engine.Get("k"); !ok || string(v) != "again" {
+		t.Fatalf("value = %q ok=%v, want %q", v, ok, "again")
+	}
+}
+
+// TestEngine_RestoreIfRestoresPreviousValueAndTTL covers the update case: the
+// replaced entry comes back with its own value and its own expiration, not as a
+// permanent key.
+func TestEngine_RestoreIfRestoresPreviousValueAndTTL(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	if err := engine.Set("k", []byte("old"), 2*time.Second); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	out, err := engine.SetIfPresent("k", []byte("new"), 0)
+	if err != nil || !out.Applied {
+		t.Fatalf("SetIfPresent: applied=%v err=%v", out.Applied, err)
+	}
+	if !out.PrevOK || string(out.Prev.Value) != "old" {
+		t.Fatalf("Prev = %q (ok=%v), want %q", out.Prev.Value, out.PrevOK, "old")
+	}
+	if out.Prev.Expiration.IsZero() {
+		t.Fatal("Prev lost the original TTL, so a rollback would make the key permanent")
+	}
+	if !engine.RestoreIf("k", out) {
+		t.Fatal("RestoreIf did not roll back its own update")
+	}
+	if v, ok := engine.Get("k"); !ok || string(v) != "old" {
+		t.Fatalf("value = %q ok=%v, want %q", v, ok, "old")
+	}
+	// The restored TTL must still fire rather than pinning the key forever.
+	time.Sleep(2200 * time.Millisecond)
+	if _, ok := engine.Get("k"); ok {
+		t.Fatal("restored key outlived its original TTL")
+	}
+}
+
+// TestEngine_RestoreIfKeepsAccountingBalanced guards the memory ceiling: a
+// rolled-back write must give back exactly the bytes it took, or a long run of
+// durability failures would leak the engine's budget.
+func TestEngine_RestoreIfKeepsAccountingBalanced(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		out, err := engine.SetIfAbsent(fmt.Sprintf("k%d", i), bytes.Repeat([]byte("x"), 512), 0)
+		if err != nil || !out.Applied {
+			t.Fatalf("SetIfAbsent: applied=%v err=%v", out.Applied, err)
+		}
+		if !engine.RestoreIf(fmt.Sprintf("k%d", i), out) {
+			t.Fatalf("RestoreIf %d did not roll back", i)
+		}
+	}
+	if got := engine.AllocatedBytes(); got != 0 {
+		t.Fatalf("memory usage after %d rolled-back writes = %d, want 0", n, got)
+	}
+	if got := engine.KeyCount(); got != 0 {
+		t.Fatalf("key count after %d rolled-back writes = %d, want 0", n, got)
 	}
 }
