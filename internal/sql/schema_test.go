@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
 func testSchema() *Schema {
@@ -350,6 +352,40 @@ func TestTranslateCreateTable(t *testing.T) {
 		}
 	})
 
+	// A DEFAULT and an INSERT of the same literal must land on the same bytes.
+	// Encoding the default through a different path would let the same value
+	// compare differently depending on how the row came to exist, and for bytea
+	// that means storing the literal characters "\x4142" where an insert stores
+	// the decoded bytes.
+	t.Run("defaults agree with the insert path", func(t *testing.T) {
+		cases := []struct {
+			typ ColumnType
+			lit string // as written in the CREATE TABLE
+			// The text an INSERT of the same value delivers to the client.
+			text string
+		}{
+			{TypeBytes, `E'\\x4142'`, `\x4142`},
+			{TypeJSONB, `'{"a":1}'`, `{"a":1}`},
+			{TypeVarchar, `'hi'`, `hi`},
+			{TypeInt, `'42'`, `42`},
+			{TypeBool, `'true'`, `true`},
+		}
+		for _, tc := range cases {
+			lit := tc.lit
+			got, err := defaultValueOf(tc.typ, "c", parseDefaultNode(t, lit))
+			if err != nil {
+				t.Fatalf("%s default %s: %v", tc.typ, lit, err)
+			}
+			want, err := encodeTextAs(tc.typ, []byte(tc.text))
+			if err != nil {
+				t.Fatalf("encodeTextAs(%s, %q): %v", tc.typ, tc.text, err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Errorf("%s default %s encoded to %q, insert path gives %q", tc.typ, lit, got, want)
+			}
+		}
+	})
+
 	t.Run("not null and defaults", func(t *testing.T) {
 		p, err := Translate(`CREATE TABLE t (id int PRIMARY KEY, n int NOT NULL DEFAULT 7, f float DEFAULT 1.5, b bool DEFAULT true, s text DEFAULT 'hi', j jsonb DEFAULT '{"a":1}')`)
 		if err != nil {
@@ -612,4 +648,23 @@ func TestCatalogIfExistsForms(t *testing.T) {
 	if _, err := cat.DropIfExists("users"); err == nil {
 		t.Fatal("DropIfExists removed an entry that still had rows")
 	}
+}
+
+// parseDefaultNode parses a bare literal through CREATE TABLE and returns the
+// DEFAULT expression exactly as defaultValueOf receives it in production.
+func parseDefaultNode(t *testing.T, lit string) *pg_query.Node {
+	t.Helper()
+	res, err := pg_query.Parse("CREATE TABLE d (c text DEFAULT " + lit + ")")
+	if err != nil {
+		t.Fatalf("parse %s: %v", lit, err)
+	}
+	cd := res.Stmts[0].Stmt.GetCreateStmt().GetTableElts()[0].GetColumnDef()
+	for _, con := range cd.GetConstraints() {
+		c := con.GetConstraint()
+		if c.GetContype() == pg_query.ConstrType_CONSTR_DEFAULT {
+			return c.GetRawExpr()
+		}
+	}
+	t.Fatalf("%s produced no DEFAULT constraint", lit)
+	return nil
 }

@@ -58,6 +58,66 @@ func (k StmtKind) command() (uint16, string) {
 	}
 }
 
+// authKey is the key an RBAC prefix rule is matched against.
+//
+// A prefix grant names physical keyspace, so the decision has to be made against
+// the namespace the statement will touch. The plan's key cannot be used for that:
+// on a catalog table it holds nothing but a row id, so comparing a bare "1"
+// against a grant of "tellstone/users/" never matches and every table-scoped
+// grant would deny the very table it names. It is also absent on INSERT, whose
+// row id arrives among the column values.
+//
+// The table's own key prefix is used instead. It needs no schema and no bound
+// row, so it is available before the catalog is read -- which is what keeps the
+// authorization ahead of resolvePlan, where an unauthorized session learns
+// nothing about which tables exist. It covers every row of the table, so a grant
+// cannot be satisfied by naming one row id, and a prefix wide enough for one
+// table cannot reach into another.
+func authKey(plan *Plan, params []paramVal) ([]byte, error) {
+	if plan.Table == tableName {
+		// The implicit table stores its keys verbatim under their own names, so
+		// the plan's key is already the physical key and the prefix rules were
+		// written against it. A Describe arrives before any Bind, so a
+		// parameterized statement has no value to resolve here; the prefix check
+		// is deferred to execution, where it has one. Only the implicit table
+		// reaches this branch -- a catalog table is decided by its prefix below
+		// and needs neither the schema nor the bound row.
+		if plan.Key.Param > 0 && len(params) == 0 {
+			return []byte(tableName + "/"), nil
+		}
+		return plan.Key.resolve(params)
+	}
+	return []byte(TablePrefix(DefaultDB, plan.Table)), nil
+}
+
+// authorize applies the session's command bit and key prefixes to a plan and
+// records the attempt. It is a no-op for a session with no authentication.
+//
+// It is deliberately separate from execute because the extended protocol needs
+// it earlier: Describe of a prepared statement has to report parameter and result
+// types, which means reading the table's schema, and that must not happen for a
+// statement the session is not allowed to run.
+func (s *Server) authorize(c *pgConn, plan *Plan, params []paramVal) error {
+	if c.auth == nil || c.auth.session == nil {
+		return nil
+	}
+	key, err := authKey(plan, params)
+	if err != nil {
+		return err
+	}
+	cmd, name := plan.Kind.command()
+	if !c.auth.session.IsAllowed(cmd, key) {
+		if s.policy != nil {
+			s.policy.LogDenied(c.user, c.remoteAddr, name, string(key))
+		}
+		s.auditDenied(c, name, key)
+		return &pgError{code: errInsufficientPrivilege, msg: "permission denied for table " + plan.Table}
+	}
+	c.auth.session.CountCommand()
+	s.auditCommand(c, name, key)
+	return nil
+}
+
 // execute runs a translated plan against the shared store with the bound
 // parameters. RBAC enforcement mirrors the binary frontend: the session's
 // command bit and key prefixes are consulted on every data statement.
@@ -93,21 +153,8 @@ func (s *Server) execute(c *pgConn, plan *Plan, params []paramVal) (*execOutcome
 		}
 	}
 
-	if c.auth != nil && c.auth.session != nil {
-		key, err := plan.Key.resolve(params)
-		if err != nil {
-			return nil, err
-		}
-		cmd, name := plan.Kind.command()
-		if !c.auth.session.IsAllowed(cmd, key) {
-			if s.policy != nil {
-				s.policy.LogDenied(c.user, c.remoteAddr, name, string(key))
-			}
-			s.auditDenied(c, name, key)
-			return nil, &pgError{code: errInsufficientPrivilege, msg: "permission denied for table " + tableName}
-		}
-		c.auth.session.CountCommand()
-		s.auditCommand(c, name, key)
+	if err := s.authorize(c, plan, params); err != nil {
+		return nil, err
 	}
 
 	// The table is resolved here, after the RBAC decision above, so a session

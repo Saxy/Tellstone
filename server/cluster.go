@@ -291,12 +291,23 @@ func (cs *clusterStore) handleCrossClusterOp(op network.OpKind, payload []byte) 
 // nodeForRegion returns the local Raft group node that hosts the region owning
 // the key's route, falling back to the bootstrap node when unavailable.
 func (cs *clusterStore) nodeForRegion(route *cluster.RegionRoute) *cluster.Node {
-	if cs.coord != nil && route != nil {
-		if n := cs.coord.NodeForRegion(route.ID); n != nil {
-			return n
-		}
+	if n := cs.localNodeForRegion(route); n != nil {
+		return n
 	}
 	return cs.node
+}
+
+// localNodeForRegion returns the Raft node hosting route, or nil when this node
+// does not host that region.
+//
+// It exists because nodeForRegion's bootstrap fallback is only appropriate for
+// reads that can tolerate the wrong answer. A caller that must prove something
+// about a specific region needs to know whether it actually holds that region.
+func (cs *clusterStore) localNodeForRegion(route *cluster.RegionRoute) *cluster.Node {
+	if cs.coord != nil && route != nil {
+		return cs.coord.NodeForRegion(route.ID)
+	}
+	return nil
 }
 
 // localRead serves a key through the linearizable local read path: wait
@@ -688,7 +699,7 @@ func (cs *clusterStore) ScanPrefix(prefix string, fn func(key, value []byte) boo
 		if len(route.EndKey) > 0 && bytes.Compare(route.EndKey, segUpper) < 0 {
 			segUpper = route.EndKey
 		}
-		if err := cs.scanRegion(&route, segLower, segUpper, func(k, v []byte) {
+		if err := cs.scanRegion(&route, prefix, segLower, segUpper, func(k, v []byte) {
 			collected = append(collected, row{key: string(k), val: bytes.Clone(v)})
 		}); err != nil {
 			return 0, err
@@ -711,11 +722,37 @@ func (cs *clusterStore) ScanPrefix(prefix string, fn func(key, value []byte) boo
 	return delivered, nil
 }
 
+// scanRegionPrefix walks the keys of one region that lie inside the requested
+// [lower, upper) bounds.
+//
+// The scan is rooted at prefix, not at lower, and the bounds are applied inside
+// the callback. That distinction is load-bearing: `lower` is clamped to the
+// region's own StartKey, which can land in the middle of a row when a boundary
+// falls between two columns of the same row. Scanning with that value as a
+// literal prefix would only match keys beginning with that exact substring, so
+// the rest of the row — `.../2/name` after a start key of `.../2/id` — would be
+// skipped entirely and the row would vanish from the result. Scans that skip rows
+// are the one failure a range read cannot have, so the prefix stays the prefix
+// and the bounds filter.
+func (cs *clusterStore) scanRegionPrefix(prefix string, lower, upper []byte, fn func(key, value []byte)) error {
+	_, err := cs.local.ScanPrefix(prefix, func(k, v []byte) bool {
+		if bytes.Compare(k, lower) < 0 {
+			return true // belongs to an earlier region
+		}
+		if bytes.Compare(k, upper) >= 0 {
+			return false // past this region
+		}
+		fn(k, v)
+		return true
+	})
+	return err
+}
+
 // scanRegion linearizes against one region's leader and then walks the local
 // engine for that region's share of the range. A linearizable read that cannot
 // complete is logged and the local engine is served anyway, because a stale
 // answer still beats failing an ordinary range read outright.
-func (cs *clusterStore) scanRegion(route *cluster.RegionRoute, lower, upper []byte, fn func(key, value []byte)) error {
+func (cs *clusterStore) scanRegion(route *cluster.RegionRoute, prefix string, lower, upper []byte, fn func(key, value []byte)) error {
 	rn := cs.nodeForRegion(route)
 	if rn == nil {
 		rn = cs.node
@@ -731,38 +768,30 @@ func (cs *clusterStore) scanRegion(route *cluster.RegionRoute, lower, upper []by
 			)
 		}
 	}
-	_, err := cs.local.ScanPrefix(string(lower), func(k, v []byte) bool {
-		if bytes.Compare(k, upper) >= 0 {
-			return false
-		}
-		fn(k, v)
-		return true
-	})
-	return err
+	return cs.scanRegionPrefix(prefix, lower, upper, fn)
 }
 
 // scanRegionStrict is scanRegion for a guard, where a stale answer is worse than
 // no answer. Unlike the ordinary path it propagates a failed linearizable read
 // instead of falling back to the local engine, because "this region could not be
 // read" must never be collapsed into "this region is empty".
-func (cs *clusterStore) scanRegionStrict(route *cluster.RegionRoute, lower, upper []byte, fn func(key, value []byte)) error {
-	rn := cs.nodeForRegion(route)
+//
+// It also refuses a region this node does not host. nodeForRegion falls back to
+// the bootstrap node, but that node is a *different Raft group*: linearizing it
+// proves nothing about this region, and the local engine it would then be read
+// from holds this node's data for whichever regions it replicates, not this one.
+// Both halves of that fallback are wrong for a guard, so it is not taken.
+func (cs *clusterStore) scanRegionStrict(route *cluster.RegionRoute, prefix string, lower, upper []byte, fn func(key, value []byte)) error {
+	rn := cs.localNodeForRegion(route)
 	if rn == nil {
-		rn = cs.node
+		return fmt.Errorf("region %d: this node holds no Raft node for the region; refusing to verify emptiness from unrelated state", route.ID)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	if err := rn.LinearizableRead(ctx); err != nil {
 		return fmt.Errorf("region %d: linearizable read: %w", route.ID, err)
 	}
-	_, err := cs.local.ScanPrefix(string(lower), func(k, v []byte) bool {
-		if bytes.Compare(k, upper) >= 0 {
-			return false
-		}
-		fn(k, v)
-		return true
-	})
-	return err
+	return cs.scanRegionPrefix(prefix, lower, upper, fn)
 }
 
 // PrefixExists reports whether any key exists under prefix, cluster-wide, and
@@ -804,7 +833,7 @@ func (cs *clusterStore) PrefixExists(prefix string) (bool, error) {
 		if len(route.EndKey) > 0 && bytes.Compare(route.EndKey, segUpper) < 0 {
 			segUpper = route.EndKey
 		}
-		if err := cs.scanRegionStrict(&route, segLower, segUpper, func(k, _ []byte) {
+		if err := cs.scanRegionStrict(&route, prefix, segLower, segUpper, func(k, _ []byte) {
 			found = true
 		}); err != nil {
 			return false, err

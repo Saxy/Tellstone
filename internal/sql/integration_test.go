@@ -460,6 +460,32 @@ func testLogger() log.Logger {
 	return log.NewNoOpLogger()
 }
 
+// newRowRBACPolicy grants the role "rows" access to exactly one table's physical
+// key prefix, so a grant of "~prefix tellstone/users/" can be shown to permit that
+// table and refuse the next one.
+func newRowRBACPolicy(t *testing.T) *rbac.Store {
+	t.Helper()
+	hash, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.DefaultCost)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	yaml := fmt.Sprintf(`
+roles:
+  - name: rows
+    rules: ["+@all", "~tellstone/users/*"]
+users:
+  - name: carol
+    password: %q
+    role: rows
+default_role: rows
+`, string(hash))
+	policy, err := rbac.Parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse policy: %v", err)
+	}
+	return rbac.NewStore(policy, log.NewNoOpLogger())
+}
+
 func newRBACPolicy(t *testing.T) *rbac.Store {
 	t.Helper()
 	hash, err := bcrypt.GenerateFromPassword([]byte("secret"), bcrypt.DefaultCost)
@@ -1286,6 +1312,193 @@ func TestRBACOverTLS(t *testing.T) {
 	if !ok || code != errInvalidPassword {
 		t.Fatalf("unknown user: code=%q ok=%v", code, ok)
 	}
+}
+
+// A prefix grant names a physical key prefix, so a catalog table's RBAC decision
+// has to be made against the keys that table actually writes. Checking the
+// statement's predicate value instead would compare a bare row id like "1" to
+// "tellstone/users/", which never matches, and every table-scoped grant would
+// deny everything -- or, with a wider prefix, would authorize a row in a table
+// the grant never named.
+func TestRBACAuthorizesCatalogTablesByTheirKeyPrefix(t *testing.T) {
+	srv, store := newTestServer(t, srvOpts{policy: newRowRBACPolicy(t), withTLS: true})
+
+	// The tables and their rows are seeded straight into the store. Only carol's
+	// session exists, so nothing in the test can quietly bypass the RBAC check
+	// that is under test.
+	for _, tbl := range []struct {
+		name string
+		cols []Column
+	}{
+		{"users", []Column{{Name: "id", Type: TypeBigInt}, {Name: "name", Type: TypeVarchar, Nullable: true}}},
+		{"secrets", []Column{{Name: "id", Type: TypeBigInt}, {Name: "token", Type: TypeVarchar, Nullable: true}}},
+	} {
+		blob, err := EncodeSchema(&Schema{DB: DefaultDB, Table: tbl.name, Columns: tbl.cols, PrimaryKey: 0})
+		if err != nil {
+			t.Fatalf("encode schema %s: %v", tbl.name, err)
+		}
+		if err := store.Set(MetaTableKey(DefaultDB, tbl.name), blob, 0); err != nil {
+			t.Fatalf("seed catalog %s: %v", tbl.name, err)
+		}
+		if err := store.Set(ColumnKey(DefaultDB, tbl.name, "1", "id"), EncodeOrderableInt(1), 0); err != nil {
+			t.Fatalf("seed row %s: %v", tbl.name, err)
+		}
+	}
+
+	carol := dialServer(t, srv.Addr())
+	carol.startupPassword("carol", "secret")
+
+	// The grant names tellstone/users/, so that table is readable and writable.
+	f := carol.query(`SELECT name FROM users WHERE id = 1`)
+	if tag := findTag(f); tag != "SELECT 1" {
+		code, msg, _ := findError(f)
+		t.Fatalf("carol reading the granted table: tag=%q code=%q msg=%q", tag, code, msg)
+	}
+	if tag := findTag(carol.query(`INSERT INTO users (id, name) VALUES (2, 'grace')`)); tag != "INSERT 0 1" {
+		t.Fatalf("carol writing the granted table: tag=%q", tag)
+	}
+
+	// The other table is outside the grant, so it must be refused rather than
+	// allowed because its row id happens to match one the grant covers.
+	code, _, ok := findError(carol.query(`SELECT token FROM secrets WHERE id = 1`))
+	if !ok || code != errInsufficientPrivilege {
+		t.Fatalf("carol reading the ungranted table: code=%q ok=%v", code, ok)
+	}
+	code, _, ok = findError(carol.query(`INSERT INTO secrets (id, token) VALUES (2, 'x')`))
+	if !ok || code != errInsufficientPrivilege {
+		t.Fatalf("carol writing the ungranted table: code=%q ok=%v", code, ok)
+	}
+	// An UPDATE of the granted table is allowed too: authorization is made on
+	// the table's namespace, so it must not depend on the statement kind.
+	if tag := findTag(carol.query(`UPDATE users SET name = 'ada l.' WHERE id = 1`)); tag != "UPDATE 1" {
+		t.Fatalf("carol updating the granted table: tag=%q", tag)
+	}
+}
+
+// A parameterized Describe arrives before its Bind, so the implicit table's key
+// cannot be resolved yet. Authorization at that point has to be deferred rather
+// than refused: a Describe that failed on a statement it cannot yet evaluate
+// would break every extended-protocol query against the implicit table.
+func TestDescribeOfAParameterizedImplicitStatementStillWorks(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{policy: newRBACPolicy(t), withTLS: true})
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupPassword("alice", "secret")
+
+	sess.send(msgParse, concat(cstring("q"), cstring(`SELECT key, value FROM tellstone WHERE key = $1`), two(0)))
+	sess.expectLine(msgParseComplete)
+	sess.send(msgDescribe, concat([]byte{'S'}, cstring("q")))
+	pd := sess.expectLine(msgParameterDesc)
+	assertParameterDescription(t, pd.val, []int32{oidText})
+	rd := sess.expectLine(msgRowDescription)
+	assertRowDescription(t, rd.val, []string{"key", "value"}, []int32{oidText, oidBytea})
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+
+	// The bound value is still checked against the session's prefixes at
+	// execution, which is where the authorization decision belongs.
+	sess.send(msgBind, concat(cstring(""), cstring("q"), two(0), two(1), four(6), []byte("extkey"), two(0)))
+	sess.expectLine(msgBindComplete)
+	sess.send(msgExecute, concat(cstring(""), four(0)))
+	sess.expectLine(msgRowDescription)
+	if tag := findTag([]frame{sess.expectLine(msgCommandComplete)}); tag != "SELECT 0" {
+		t.Fatalf("tag = %q", tag)
+	}
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+}
+
+// ParameterDescription has to report every $n the statement references,
+// including the ones carried in a catalog table's column values. An INSERT's
+// parameters live there rather than on the plan's Key, and reporting a count of
+// zero would leave the client sending no Bind values for a query that needs them.
+func TestParameterDescriptionCountsCatalogColumnParameters(t *testing.T) {
+	srv, store := newTestServer(t, srvOpts{})
+	blob, err := EncodeSchema(&Schema{DB: DefaultDB, Table: "users",
+		Columns: []Column{{Name: "id", Type: TypeBigInt}, {Name: "name", Type: TypeVarchar, Nullable: true}}, PrimaryKey: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(MetaTableKey(DefaultDB, "users"), blob, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	sess.send(msgParse, concat(cstring("ins"), cstring(`INSERT INTO users (id, name) VALUES ($1, $2)`), two(0)))
+	sess.expectLine(msgParseComplete)
+	sess.send(msgDescribe, concat([]byte{'S'}, cstring("ins")))
+	pd := sess.expectLine(msgParameterDesc)
+	// Two parameters: id is bigint, name is text.
+	assertParameterDescription(t, pd.val, []int32{oidInt8, oidText})
+	// An INSERT produces no rows, so Describe follows with NoData.
+	sess.expectLine(msgNoData)
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+
+	// And the described statement must actually bind and run with them.
+	sess.send(msgBind, concat(cstring(""), cstring("ins"), two(0), two(2),
+		four(1), []byte("7"), four(3), []byte("ada"), two(0)))
+	sess.expectLine(msgBindComplete)
+	sess.send(msgExecute, concat(cstring(""), four(0)))
+	if tag := findTag([]frame{sess.expectLine(msgCommandComplete)}); tag != "INSERT 0 1" {
+		t.Fatalf("parameterized insert tag = %q", tag)
+	}
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+}
+
+// Describe of a prepared statement must not resolve the statement against the
+// catalog before the session has been authorized for it. Otherwise the
+// RowDescription a client receives at Describe time already names the columns of
+// a table it was refused access to at Bind time -- and a table that does not
+// exist is distinguishable from one it may not read, which is the difference
+// between "no such table" and "permission denied".
+func TestDescribeDoesNotResolveAnUnauthorizedTable(t *testing.T) {
+	srv, store := newTestServer(t, srvOpts{policy: newRowRBACPolicy(t), withTLS: true})
+	blob, err := EncodeSchema(&Schema{DB: DefaultDB, Table: "secrets",
+		Columns: []Column{{Name: "id", Type: TypeBigInt}, {Name: "token", Type: TypeVarchar, Nullable: true}}, PrimaryKey: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(MetaTableKey(DefaultDB, "secrets"), blob, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupPassword("carol", "secret")
+
+	sess.send(msgParse, concat(cstring("probe"), cstring(`SELECT id, token FROM secrets WHERE id = $1`), two(0)))
+	sess.expectLine(msgParseComplete)
+	sess.send(msgDescribe, concat([]byte{'S'}, cstring("probe")))
+	// The first frame after Describe must be the refusal, not a
+	// ParameterDescription or RowDescription describing the table's columns.
+	f := sess.recv()
+	if f.typ != msgErrorResponse {
+		t.Fatalf("Describe answered with %q before authorizing; a ParameterDescription or RowDescription here discloses the schema of a table the session may not read", f.typ)
+	}
+	if code, _, ok := findError([]frame{f}); !ok || code != errInsufficientPrivilege {
+		t.Fatalf("Describe: code=%q ok=%v", code, ok)
+	}
+	// The extended protocol stays in its error state until the client Syncs.
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+
+	// A fresh statement is refused when it is executed, which is where the
+	// authorization decision belongs anyway. The simple-query path is used
+	// because a Describe-first statement would be refused at Describe.
+	sess.send(msgParse, concat(cstring("probe2"), cstring(`SELECT id, token FROM secrets WHERE id = $1`), two(0)))
+	sess.expectLine(msgParseComplete)
+	sess.send(msgBind, concat(cstring(""), cstring("probe2"), two(0), two(1), four(1), []byte("1"), two(0)))
+	sess.expectLine(msgBindComplete)
+	sess.send(msgExecute, concat(cstring(""), four(0)))
+	code, _, ok := findError([]frame{sess.recv()})
+	if !ok || code != errInsufficientPrivilege {
+		t.Fatalf("Bind: code=%q ok=%v", code, ok)
+	}
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
 }
 
 // TestDDLOverTheWire exercises CREATE TABLE and DROP TABLE as a client meets

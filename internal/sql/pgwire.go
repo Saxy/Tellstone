@@ -790,6 +790,14 @@ func (c *pgConn) handleDescribe(payload []byte) error {
 // parameters, and the message is still sent with a count of zero: the protocol
 // expects it after every Describe of a prepared statement.
 func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
+	// The session is authorized before the schema is read. Reporting parameter
+	// types means naming the columns a parameter fills, so a Describe that ran
+	// first would describe a table the session is not allowed to touch -- and
+	// its "relation does not exist" answer would be distinguishable from a
+	// permission refusal, which is itself a disclosure.
+	if err := c.srv.authorize(c, plan, nil); err != nil {
+		return err
+	}
 	// Describe precedes execution, so the schema has to be resolved here too:
 	// a parameter's type is the type of the column it fills, and on a catalog
 	// table that lives in the schema.
@@ -835,9 +843,19 @@ func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
 	return c.writeMsg(&buf)
 }
 
+// maxParam is the highest $n the statement references, which is how many
+// ParameterDescription entries the protocol expects.
+//
+// A catalog statement carries its arguments in Values rather than Key/Val --
+// an INSERT has no Key at all, and its parameters arrive among the column values
+// -- so Values has to be scanned too. Leaving it out reported a count of zero
+// for a statement that does take parameters, and the client then sent no
+// Bind values for a query that required them.
 func maxParam(p *Plan) int {
 	m := 0
-	for _, v := range []ValRef{p.Key, p.Val} {
+	refs := []ValRef{p.Key, p.Val}
+	refs = append(refs, p.Values...)
+	for _, v := range refs {
 		if v.Param > m {
 			m = v.Param
 		}
@@ -846,6 +864,12 @@ func maxParam(p *Plan) int {
 }
 
 func (c *pgConn) sendRowDescription(plan *Plan) error {
+	// As in sendStatementParamDesc, authorization comes first: the column names
+	// and types sent below are the table's schema, and a session that may not
+	// read the table must not be able to learn its shape from Describe.
+	if err := c.srv.authorize(c, plan, nil); err != nil {
+		return err
+	}
 	// Describe runs before Execute, so the projection has to be resolved here
 	// as well: a "*" over a catalog table cannot be expanded without the
 	// schema, and the client needs the column count and OIDs to decode

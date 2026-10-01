@@ -28,7 +28,26 @@ import (
 var (
 	ErrEngineFull       = errors.New("memory: limit reached")
 	ErrInvalidKeyLength = errors.New("storage: invalid key length for SetFromBuffer")
+	// ErrKeyTooLong is returned when a key exceeds MaxKeyLen.
+	ErrKeyTooLong = errors.New("storage: key exceeds the maximum length")
 )
+
+// MaxKeyLen is the longest key the front-coded B+Tree can represent.
+//
+// A node records each entry's suffix length in a uint16, so a key longer than
+// 65535 bytes truncates on the way in. The stored key is then not the key that
+// was written: the entry cannot be found again, so the write appears to succeed
+// and the key is silently lost. Rejecting it is the only outcome that keeps the
+// key and the entry in agreement.
+const MaxKeyLen = 1<<16 - 1
+
+// checkKeyLen reports whether a key is within MaxKeyLen.
+func checkKeyLen(key string) error {
+	if len(key) > MaxKeyLen {
+		return ErrKeyTooLong
+	}
+	return nil
+}
 
 // defaultMaxBytes defines the safety ceiling for memory consumption.
 //
@@ -173,6 +192,9 @@ const (
 // caller can compensate a failed durability write without discarding a
 // concurrent writer's value.
 func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOutcome, error) {
+	if err := checkKeyLen(key); err != nil {
+		return SetOutcome{}, err
+	}
 	var exp time.Time
 	neededSize := len(value)
 	cryptoEnabled := e.cryptoEngine.Enabled()
@@ -344,6 +366,9 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	if keyLen < 0 || keyLen > len(buf) {
 		return ErrInvalidKeyLength
 	}
+	if err := checkKeyLen(string(buf[:keyLen])); err != nil {
+		return err
+	}
 	if e.cryptoEngine.Enabled() {
 		return e.Set(string(buf[:keyLen]), buf[keyLen:], ttl)
 	}
@@ -393,6 +418,9 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 // would double-encrypt. The engine retains the value's backing bytes for the
 // entry's lifetime; callers must not mutate or reuse the buffer after this call.
 func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
+	if err := checkKeyLen(key); err != nil {
+		return err
+	}
 	var exp time.Time
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)

@@ -137,6 +137,27 @@ func TestTranslateAcceptsExpectedTableSpellings(t *testing.T) {
 	}
 }
 
+// INSERT ... VALUES with no column list is the ordinary positional form and must
+// translate. Its values line up with the schema's columns by position, and the
+// arity is checked once the schema is known. The implicit table is a different
+// case: it has exactly two columns whose names matter, so it still requires the
+// list to be written out.
+func TestTranslateInsertWithoutAColumnList(t *testing.T) {
+	p, err := Translate(`INSERT INTO users VALUES (1, 'ada', 36)`)
+	if err != nil {
+		t.Fatalf("positional INSERT rejected: %v", err)
+	}
+	if p.Columns != nil {
+		t.Fatalf("Columns = %v, want nil for a positional INSERT", p.Columns)
+	}
+	if len(p.Values) != 3 {
+		t.Fatalf("Values has %d entries, want 3", len(p.Values))
+	}
+	if _, err := Translate(`INSERT INTO tellstone VALUES ('k', 'v')`); err == nil {
+		t.Error("implicit-table INSERT without a column list should still be refused")
+	}
+}
+
 func TestTranslateRejected(t *testing.T) {
 	cases := []string{
 		"",

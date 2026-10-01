@@ -1,3 +1,17 @@
+/*
+Package cluster
+Tellstone Cloud-Native In-Memory Database
+File: split_row_test.go
+Description: Tests for row-safe split boundaries. Verifies that a chosen
+split key is snapped to a row prefix so no key range can fall inside a row,
+that a region whose start key lands mid-row is handled, that row ids
+containing the separator are treated as one segment, and that a refused
+split leaves both regions untouched.
+
+Authors:
+
+	Maximilian Hagen
+*/
 package cluster
 
 import (

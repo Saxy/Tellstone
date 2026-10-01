@@ -213,6 +213,47 @@ func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 	}
 }
 
+// An UPDATE that names a column the row has no key for must create that key.
+// The row already exists -- its primary key was claimed at INSERT -- so the
+// column is being created, not updated. A conditional write keyed on the target
+// column's own existence would decline here and report success, leaving an
+// UPDATE that silently did nothing.
+func TestRowUpdateCreatesAnAbsentColumn(t *testing.T) {
+	sch := rowTestSchema()
+	srv, _ := newRowServer(t, sch)
+	if err := srv.insertRow(sch, "1", cellsFor(t, sch, map[string]any{
+		"id": int64(1),
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, err := srv.store.GetErr(rowKey(sch, "1", 1)); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("age unexpectedly has a key before the update")
+	}
+
+	cells := make(rowCells, len(sch.Columns))
+	cells[1] = rowValue{value: EncodeOrderableInt(41), set: true}
+	if err := srv.updateRow(sch, "1", cells); err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, err := srv.readRow(sch, "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got[1].set {
+		t.Fatal("UPDATE did not create the column it named")
+	}
+	age, err := DecodeValue(TypeInt, got[1].value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if age != int64(41) {
+		t.Fatalf("age is %v, want 41", age)
+	}
+}
+
 // TestRowDeleteRemovesEveryKey checks the sweep, not just the primary key. A
 // delete that left column keys behind would let a later CREATE TABLE of the
 // same name inherit them, and would make a table's row count wrong.
@@ -374,6 +415,49 @@ func TestRowRejectsUndecodableValues(t *testing.T) {
 	cells[1] = rowValue{value: []byte("not an int"), set: true}
 	if err := srv.insertRow(sch, "1", cells); err == nil {
 		t.Fatal("insert stored a value that does not decode as int")
+	}
+}
+
+// encodeTimestampText formats with a fractional-second offset written without a
+// colon ("-05"). That is the text PostgreSQL sends for timestamptz, so the
+// encoder must be able to read it back: a value this package writes and cannot
+// re-read is a value a client cannot round trip.
+func TestTimestampTextRoundTrip(t *testing.T) {
+	instants := []time.Time{
+		time.Date(2021, 1, 2, 15, 4, 5, 123456000, time.UTC),
+		time.Date(1999, 12, 31, 23, 59, 59, 0, time.UTC),
+	}
+	for _, ts := range instants {
+		text, err := wireCell(TypeTimestamp, EncodeOrderableTimestamp(ts))
+		if err != nil {
+			t.Fatalf("wireCell: %v", err)
+		}
+		enc, err := encodeTextAs(TypeTimestamp, text)
+		if err != nil {
+			t.Fatalf("encodeTextAs(%q): %v", text, err)
+		}
+		got, err := DecodeValue(TypeTimestamp, enc)
+		if err != nil {
+			t.Fatalf("DecodeValue(%q): %v", text, err)
+		}
+		if gotTS, ok := got.(time.Time); !ok || !gotTS.Equal(ts) {
+			t.Fatalf("round trip of %q gave %#v, want %v", text, got, ts)
+		}
+	}
+}
+
+// The colon-less offset is the format that actually arrives on the wire, so it
+// must be accepted directly rather than only via this package's own output.
+func TestEncodeTextAsAcceptsColonlessTimestampOffset(t *testing.T) {
+	for _, in := range []string{
+		"2021-01-02 15:04:05.123456-05",
+		"2021-01-02 15:04:05.123456+01",
+		"2021-01-02 15:04:05-05",
+		"2021-01-02 15:04:05.123456-0700",
+	} {
+		if _, err := encodeTextAs(TypeTimestamp, []byte(in)); err != nil {
+			t.Errorf("encodeTextAs(%q) = %v, want it accepted", in, err)
+		}
 	}
 }
 

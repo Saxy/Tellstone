@@ -182,7 +182,13 @@ func (s *Server) updateRow(sch *Schema, rowID string, cells rowCells) error {
 			}
 			continue
 		}
-		if _, err := s.store.SetIfPresent(key, cell.value, 0); err != nil {
+		// A plain Set, not SetIfPresent. The row is known to exist by now --
+		// rowExists checked the primary key above -- but the column being named
+		// may have no key yet, because a nullable column the INSERT omitted was
+		// never written. A write conditional on that column's own existence would
+		// decline, and this method has no way to report the affected-row count, so
+		// the UPDATE would silently do nothing and still succeed.
+		if err := s.store.Set(key, cell.value, 0); err != nil {
 			return err
 		}
 	}

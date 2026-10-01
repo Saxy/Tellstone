@@ -349,6 +349,20 @@ func columnTypeOf(tn *pg_query.TypeName) (ColumnType, error) {
 // non-deterministic across replicas.
 func defaultValueOf(typ ColumnType, column string, node *pg_query.Node) ([]byte, error) {
 	if ac := node.GetAConst(); ac != nil {
+		// A quoted literal reaches us as text, and the column type decides how to
+		// read it — the same decision encodeTextAs makes for a bound parameter or
+		// an extended-protocol value. Reusing it here is what keeps the two paths
+		// from disagreeing about what a literal means: encoding DEFAULT '\x4142'
+		// with EncodeValue directly would store the four literal characters
+		// "\x4142" where an INSERT of the same text stores the byte 0x41 0x42, so
+		// the same value would compare differently depending on how it arrived.
+		if sv := ac.GetSval(); sv != nil && !ac.GetIsnull() {
+			enc, err := encodeTextAs(typ, []byte(sv.GetSval()))
+			if err != nil {
+				return nil, fmt.Errorf("column %q default: %w", column, err)
+			}
+			return enc, nil
+		}
 		v, err := literalValue(ac)
 		if err != nil {
 			return nil, fmt.Errorf("column %q default: %w", column, err)

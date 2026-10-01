@@ -57,6 +57,8 @@ func (t *btree) checkInvariants(tb testing.TB) {
 	// child ranges would make a seek miss keys that are present.
 	var check func(n *btreeNode, depth int) (lo, hi string, have bool)
 	check = func(n *btreeNode, depth int) (string, string, bool) {
+		var lo, hi string
+		have := false
 		keys := n.ownKeys()
 		for i, k := range keys {
 			if i > 0 && k <= keys[i-1] {
@@ -88,11 +90,15 @@ func (t *btree) checkInvariants(tb testing.TB) {
 			tb.Fatalf("internal node has %d children for %d separators", len(n.kids), len(n.keys))
 		}
 		prevHi := ""
-		have := false
 		for i, kid := range n.kids {
-			// kids[0] holds keys below keys[0]; kids[j+1] holds [keys[j], keys[j+1]).
+			// kids[0] holds keys below keys[0]; kids[i] holds [keys[i-1], keys[i]).
+			// A child whose lowest key sits below its own lower bound would make
+			// a seek for the separator descend into the wrong subtree and miss
+			// keys that are present. The comparison was written the other way
+			// round, so it rejected correct trees (a child legitimately starting
+			// above its separator) and let the real overlap through.
 			if i > 0 {
-				if keys[i-1] < kidMin(tb, kid) {
+				if kidMin(tb, kid) < keys[i-1] {
 					tb.Fatalf("depth %d: child %d starts at %q, below separator %q",
 						depth, i, kidMin(tb, kid), keys[i-1])
 				}
@@ -102,21 +108,27 @@ func (t *btree) checkInvariants(tb testing.TB) {
 					depth, i, kidMax(tb, kid), keys[i])
 			}
 			klo, khi, khave := check(kid, depth+1)
+			// Every child's range is compared, and the bounds are carried
+			// outward unconditionally. Returning early on the first non-empty
+			// child left prevHi zero, so the remaining children were compared
+			// against an empty range and the disjointness check below could not
+			// fail on a real overlap -- the one corruption a scan would misread
+			// went unnoticed precisely because the tree was large enough to have
+			// a non-empty first child.
 			if khave {
 				if have && klo < prevHi {
 					tb.Fatalf("depth %d: child %d starts at %q, below previous child end %q",
 						depth, i, klo, prevHi)
 				}
-				if !have {
-					return klo, khi, true
-				}
-			}
-			if khave {
 				prevHi = khi
 				have = true
+				if lo == "" {
+					lo = klo
+				}
 			}
+			hi = khi
 		}
-		return "", "", have
+		return lo, hi, have
 	}
 	check(t.root, 0)
 

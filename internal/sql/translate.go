@@ -506,7 +506,13 @@ func translateInsert(is *pg_query.InsertStmt) (*Plan, error) {
 		}
 		names = nil
 	}
-	if len(names) != len(items) {
+	// Only a statement that named its columns has two lists to compare. Without
+	// a column list the values are positional and names is nil, so comparing its
+	// length would report "names 0 columns but supplies N values" and refuse the
+	// ordinary INSERT INTO t VALUES (...). The arity is checked against the
+	// schema in buildCells instead, which is the only place the column count is
+	// actually known.
+	if names != nil && len(names) != len(items) {
 		return nil, fmt.Errorf("%w: INSERT names %d columns but supplies %d values", errUnsupported, len(names), len(items))
 	}
 	refs := make([]ValRef, len(items))

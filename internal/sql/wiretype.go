@@ -137,10 +137,19 @@ func encodeTextAs(t ColumnType, text []byte) ([]byte, error) {
 		}
 		return nil, &pgError{code: errSyntax, msg: fmt.Sprintf("invalid input syntax for type %s: %q", t, truncateForError(text))}
 	case TypeTimestamp:
+		// timestampText comes first: it is both what PostgreSQL sends and what
+		// encodeTimestampText below produces, so the two agree. It is an
+		// RFC3339-shaped offset written without the colon ("-05", "+01"), which
+		// none of the standard layouts below match — a timestamp with a
+		// fractional-second offset could be formatted but never read back.
 		for _, layout := range []string{
-			time.RFC3339Nano,
+			timestampText,
+			"2006-01-02 15:04:05-07",
 			"2006-01-02 15:04:05.999999-07:00",
 			"2006-01-02 15:04:05.999999Z07:00",
+			"2006-01-02 15:04:05.999999-0700",
+			"2006-01-02 15:04:05.999999Z0700",
+			time.RFC3339Nano,
 			"2006-01-02 15:04:05.999999",
 			"2006-01-02",
 		} {

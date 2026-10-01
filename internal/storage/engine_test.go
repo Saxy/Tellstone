@@ -2,12 +2,61 @@ package storage
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
 	"time"
 	"unsafe"
 )
+
+// TestEngine_RejectsOverlongKeys covers the boundary where the front-coded
+// B+Tree's uint16 suffix length overflows. A key of 65536 bytes truncated to a
+// length of 0 on the way in, so the entry was written under a key that was not
+// the one supplied: the write reported success and the key could then never be
+// read or deleted again. Every entry point has to refuse the key instead.
+func TestEngine_RejectsOverlongKeys(t *testing.T) {
+	engine := NewEngine(10*time.Millisecond, 100, 0, nil, nil)
+	defer engine.Close()
+
+	atLimit := string(bytes.Repeat([]byte("k"), MaxKeyLen))
+	tooLong := atLimit + "x"
+
+	if err := engine.Set(atLimit, []byte("v"), 0); err != nil {
+		t.Fatalf("a key of exactly MaxKeyLen was refused: %v", err)
+	}
+	if err := engine.Set(tooLong, []byte("v"), 0); !errors.Is(err, ErrKeyTooLong) {
+		t.Errorf("Set(%d bytes) = %v, want ErrKeyTooLong", len(tooLong), err)
+	}
+	if _, err := engine.SetIfAbsent(tooLong, []byte("v"), 0); !errors.Is(err, ErrKeyTooLong) {
+		t.Errorf("SetIfAbsent(%d bytes) = %v, want ErrKeyTooLong", len(tooLong), err)
+	}
+	if _, err := engine.SetIfPresent(tooLong, []byte("v"), 0); !errors.Is(err, ErrKeyTooLong) {
+		t.Errorf("SetIfPresent(%d bytes) = %v, want ErrKeyTooLong", len(tooLong), err)
+	}
+	if err := engine.SetRaw(tooLong, []byte("v"), 0); !errors.Is(err, ErrKeyTooLong) {
+		t.Errorf("SetRaw(%d bytes) = %v, want ErrKeyTooLong", len(tooLong), err)
+	}
+	// SetFromBuffer splits a buffer into key and value, so it has to check the
+	// key half rather than the whole buffer.
+	buf := append([]byte(tooLong), []byte("value")...)
+	if err := engine.SetFromBuffer(buf, len(tooLong), 0); !errors.Is(err, ErrKeyTooLong) {
+		t.Errorf("SetFromBuffer with a %d-byte key = %v, want ErrKeyTooLong", len(tooLong), err)
+	}
+
+	// A refused write must leave nothing behind: the key still absent, and the
+	// scan must not surface a truncated entry under some other key.
+	if _, ok := engine.Get(tooLong); ok {
+		t.Error("a refused key is present")
+	}
+	hits := engine.ScanPrefix(tooLong[:MaxKeyLen], func(k, _ []byte) bool {
+		t.Logf("scan surfaced %d-byte key", len(k))
+		return true
+	})
+	if hits != 1 {
+		t.Fatalf("scan found %d keys, want only the one written at MaxKeyLen", hits)
+	}
+}
 
 // TestEngine_SetCopiesAliasedKeyAndValue reproduces the data-corruption bug where the
 // engine retained a key/value that aliased a transient network read buffer (the server's
