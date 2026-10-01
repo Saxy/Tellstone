@@ -1,0 +1,24 @@
+internal/storage/engine.go
+  s_c2c23bbc940964::t_1a0b8412116e41 369-374
+internal/storage/engine_test.go
+  s_c2c23bbc940964::t_1ce0836475767f 41-47,52-57
+internal/storage/btree.go
+  s_c2c23bbc940964::t_cb453d78ef92bf 435-436
+  s_c2c23bbc940964::t_885f9c7225c2d9 403-404
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1e98810aacb102d234e2003adb2984246653443f",
+  "prompts": {},
+  "sessions": {
+    "s_c2c23bbc940964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f21084331ffeWdPwPcacLO1zfT",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
