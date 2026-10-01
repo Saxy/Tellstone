@@ -15,6 +15,8 @@ package command
 
 import (
 	"errors"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -66,6 +68,27 @@ func (f *fakeStore) Delete(key string) (bool, error) {
 	_, ok := f.m[key]
 	delete(f.m, key)
 	return ok, nil
+}
+
+// ScanPrefix serves the range read from the fake's sorted view of its map, so
+// the seam's ordering contract is exercised rather than stubbed out.
+func (f *fakeStore) ScanPrefix(prefix string, fn func(key, value []byte) bool) (int, error) {
+	keys := make([]string, 0, len(f.m))
+	for k := range f.m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	n := 0
+	for _, k := range keys {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		if !fn([]byte(k), f.m[k]) {
+			break
+		}
+		n++
+	}
+	return n, nil
 }
 
 type replyKind int

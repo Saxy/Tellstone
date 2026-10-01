@@ -25,6 +25,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -55,6 +56,30 @@ func (s *testStore) GetErr(key string) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	return append([]byte(nil), v...), true, nil
+}
+
+// ScanPrefix walks the prefix range in key order, which the catalog's table
+// listing and row count both depend on.
+func (s *testStore) ScanPrefix(prefix string, fn func(key, value []byte) bool) (int, error) {
+	s.mu.Lock()
+	keys := make([]string, 0, len(s.data))
+	for k := range s.data {
+		if strings.HasPrefix(k, prefix) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	rows := make([][2][]byte, 0, len(keys))
+	for _, k := range keys {
+		rows = append(rows, [2][]byte{[]byte(k), append([]byte(nil), s.data[k]...)})
+	}
+	s.mu.Unlock()
+	for _, kv := range rows {
+		if !fn(kv[0], kv[1]) {
+			break
+		}
+	}
+	return len(rows), nil
 }
 
 func (s *testStore) Set(key string, value []byte, _ time.Duration) error {
@@ -619,7 +644,10 @@ func TestSimpleErrors(t *testing.T) {
 		code string
 	}{
 		{`DROP TABLE tellstone`, errSyntax},
-		{`SELECT * FROM other_table`, errUndefinedTable},
+		// A table that does not exist is reported missing by the catalog, which
+		// is a lookup. The filter is required, so it is there to reach that
+		// point: without it the statement is rejected as malformed first.
+		{`SELECT * FROM other_table WHERE key = 'a'`, errUndefinedTable},
 		{`SELECT value FROM tellstone`, errSyntax},
 		{`INSERT INTO tellstone (key, value) VALUES ('a')`, errSyntax},
 		{`SELECT count(*) FROM tellstone WHERE key = 'a'`, errSyntax},
@@ -1257,5 +1285,125 @@ func TestRBACOverTLS(t *testing.T) {
 	code, _, ok = findError([]frame{evil.recv()})
 	if !ok || code != errInvalidPassword {
 		t.Fatalf("unknown user: code=%q ok=%v", code, ok)
+	}
+}
+
+// TestDDLOverTheWire exercises CREATE TABLE and DROP TABLE as a client meets
+// them: parsed, authorized, executed against the catalog, and answered with a
+// CommandComplete. The catalog entry is checked in the store, because a DDL
+// statement that reported success without publishing a schema would be
+// invisible to every later statement.
+func TestDDLOverTheWire(t *testing.T) {
+	srv, store := newTestServer(t, srvOpts{})
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	frames := sess.query(`CREATE TABLE users (id bigint PRIMARY KEY, name text, age int)`)
+	if tag := findTag(frames); tag != "CREATE TABLE" {
+		t.Fatalf("CREATE TABLE reported %q, frames %s", tag, frameTypes(frames))
+	}
+	raw, ok, err := store.GetErr(MetaTableKey(DefaultDB, "users"))
+	if err != nil || !ok {
+		t.Fatalf("catalog entry was not written: ok=%v err=%v", ok, err)
+	}
+	sch, err := DecodeSchema(DefaultDB, "users", raw)
+	if err != nil {
+		t.Fatalf("the published schema does not decode: %v", err)
+	}
+	if sch.PrimaryKey != 0 || sch.Columns[1].Name != "name" || sch.Columns[1].Type != TypeVarchar {
+		t.Fatalf("published schema is %+v", sch)
+	}
+	// A second CREATE of the same name is a duplicate-object error, not a
+	// silent redefinition of a table rows may already exist against.
+	frames = sess.query(`CREATE TABLE users (id bigint PRIMARY KEY)`)
+	if code, _, ok := findError(frames); !ok || code != errDuplicateTable {
+		t.Fatalf("duplicate CREATE reported code=%s ok=%v", code, ok)
+	}
+	// With the clause, it succeeds and leaves the original definition alone.
+	frames = sess.query(`CREATE TABLE IF NOT EXISTS users (id int PRIMARY KEY, other text)`)
+	if tag := findTag(frames); tag != "CREATE TABLE" {
+		t.Fatalf("CREATE TABLE IF NOT EXISTS reported %q", tag)
+	}
+	raw, _, _ = store.GetErr(MetaTableKey(DefaultDB, "users"))
+	unchanged, err := DecodeSchema(DefaultDB, "users", raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(unchanged.Columns) != 3 || unchanged.Columns[1].Name != "name" {
+		t.Fatalf("IF NOT EXISTS replaced the existing definition: %+v", unchanged.Columns)
+	}
+
+	// DROP of a table that does not exist is undefined-table; with the clause
+	// it is a quiet success.
+	frames = sess.query(`DROP TABLE nosuch`)
+	if code, _, ok := findError(frames); !ok || code != errUndefinedTable {
+		t.Fatalf("DROP of a missing table reported code=%s ok=%v", code, ok)
+	}
+	frames = sess.query(`DROP TABLE IF EXISTS nosuch`)
+	if tag := findTag(frames); tag != "DROP TABLE" {
+		t.Fatalf("DROP IF EXISTS reported %q", tag)
+	}
+
+	// The implicit table is not the catalog's to drop: phase 8 depends on it.
+	frames = sess.query(`DROP TABLE tellstone`)
+	if _, _, ok := findError(frames); !ok {
+		t.Fatalf("DROP TABLE tellstone succeeded, frames %s", frameTypes(frames))
+	}
+
+	frames = sess.query(`DROP TABLE users`)
+	if tag := findTag(frames); tag != "DROP TABLE" {
+		t.Fatalf("DROP TABLE reported %q", tag)
+	}
+	if _, ok, _ := store.GetErr(MetaTableKey(DefaultDB, "users")); ok {
+		t.Fatal("the catalog entry survived DROP TABLE")
+	}
+}
+
+// TestDDLRejectsUnusableStatementsOverTheWire checks that the rejections reach
+// the client as errors rather than being swallowed, and that a rejected CREATE
+// leaves nothing behind in the catalog.
+func TestDDLRejectsUnusableStatementsOverTheWire(t *testing.T) {
+	srv, store := newTestServer(t, srvOpts{})
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	cases := []string{
+		`CREATE TABLE t (a int)`,
+		`CREATE TABLE t (a int, b int, PRIMARY KEY (a, b))`,
+		`CREATE TABLE tellstone (id int PRIMARY KEY)`,
+		`CREATE TABLE t (id int PRIMARY KEY, UNIQUE (id))`,
+		`CREATE INDEX i ON tellstone (key)`,
+	}
+	for _, q := range cases {
+		frames := sess.query(q)
+		if _, _, ok := findError(frames); !ok {
+			t.Fatalf("%q was accepted, frames %s", q, frameTypes(frames))
+		}
+	}
+	// A rejected CREATE must not have published a partial schema.
+	if _, ok, _ := store.GetErr(MetaTableKey(DefaultDB, "t")); ok {
+		t.Fatal("a rejected CREATE TABLE left a catalog entry behind")
+	}
+}
+
+// TestDDLInsideTransactionIsNotBlocked checks the transaction restriction kept
+// its meaning: it exists because a row write would already be durable when
+// ROLLBACK ran, and it must not start applying to catalog writes without that
+// reasoning being revisited.
+func TestDDLInsideTransactionIsNotBlocked(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	if tag := findTag(sess.query(`BEGIN`)); tag != "BEGIN" {
+		t.Fatal("BEGIN did not take")
+	}
+	// A row write inside the block is still refused.
+	frames := sess.query(`INSERT INTO tellstone (key, value) VALUES ('a', 'b')`)
+	if _, _, ok := findError(frames); !ok {
+		t.Fatal("a row write inside a transaction block was accepted")
+	}
+	if tag := findTag(sess.query(`CREATE TABLE t (id int PRIMARY KEY)`)); tag != "CREATE TABLE" {
+		t.Fatalf("CREATE TABLE inside a block reported %q", tag)
 	}
 }

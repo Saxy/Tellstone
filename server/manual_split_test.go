@@ -20,7 +20,9 @@ import (
 	"bytes"
 	"context"
 	"net"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -61,6 +63,35 @@ func (m *manualStore) Get(key string) ([]byte, bool) {
 	defer m.mu.RUnlock()
 	v, ok := m.store[key]
 	return v, ok
+}
+
+// ScanPrefix serves the range read from the fake's sorted view, so the cluster
+// store's cross-region merge is exercised against real key order.
+func (m *manualStore) ScanPrefix(prefix string, fn func(key, value []byte) bool) (int, error) {
+	m.mu.RLock()
+	keys := make([]string, 0, len(m.store))
+	for k := range m.store {
+		keys = append(keys, k)
+	}
+	m.mu.RUnlock()
+	sort.Strings(keys)
+	n := 0
+	for _, k := range keys {
+		if !strings.HasPrefix(k, prefix) {
+			continue
+		}
+		m.mu.RLock()
+		v, ok := m.store[k]
+		m.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		if !fn([]byte(k), v) {
+			break
+		}
+		n++
+	}
+	return n, nil
 }
 
 // snapshot returns a copy of the store so a test can assert the exact key set.

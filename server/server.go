@@ -249,6 +249,13 @@ func (s *Server) Run() error {
 			cs.SetFederation(s.fedMgr, s.gateway, cfg.GetClusterID())
 			s.gateway.SetHandler(cs.handleCrossClusterOp)
 		}
+		// Phase 9 DDL (ADR-013): schema mutations travel as their own Raft
+		// entries, timestamped by the placement driver's pool. Without this the
+		// catalog still works, but through conditional key/value writes that
+		// carry no schema timestamp and no drop guard.
+		if s.pdNode != nil {
+			cs.SetDDL(s.pdNode.Pool())
+		}
 		s.store = cs
 	}
 	s.netSrv = network.NewServer(
@@ -1283,4 +1290,11 @@ func (s *Server) aclLog(msg *network.Message) ([]byte, network.MessageType, erro
 		return roleReply(fmt.Errorf("acl log exceeds the 64 KiB wire limit"))
 	}
 	return payload, network.MsgResponse, nil
+}
+
+// ScanPrefix serves the range read from every shard's ordered index and merges
+// the results into key order. A row's column keys hash to different shards, so
+// this is the standalone-mode path a Phase 9 row read takes.
+func (rs *RouterStore) ScanPrefix(prefix string, fn func(key, value []byte) bool) (int, error) {
+	return rs.router.ScanPrefix(prefix, fn), nil
 }

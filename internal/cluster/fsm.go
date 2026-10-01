@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/keyspace"
 	"github.com/Saxy/Tellstone/internal/log"
 	pb "go.etcd.io/raft/v3/raftpb"
 )
@@ -47,9 +48,22 @@ const (
 	// OpSetXX is the log entry opcode for a conditional SET that only
 	// overwrites an already-present key, the replication-safe UPDATE.
 	OpSetXX byte = 0x05
-	// opHeaderSize is the fixed header: 1B op + 8B TTL + 2B keyLen = 11 bytes.
+	// OpCreateTable is the log entry opcode for a replicated schema creation.
+	// It is a distinct opcode rather than an OpSetNX of the catalog key
+	// because a schema mutation is not a KV write: it carries a proposer-
+	// assigned timestamp, it has no TTL, and its replay is observable.
+	OpCreateTable byte = 0x06
+	// OpDropTable is the log entry opcode for a replicated schema removal.
+	OpDropTable byte = 0x07
+	// opHeaderSize is the fixed header: 1B op + 8B TTL/TSO + 2B keyLen = 11 bytes.
 	opHeaderSize = 11
 )
+
+// IsDDL reports whether op is a schema-mutating opcode. DDL entries are decoded
+// by their own codec because the 8-byte field after the opcode carries a TSO
+// rather than a TTL, and inheriting TTL semantics would let a schema definition
+// expire and silently delete a table.
+func IsDDL(op byte) bool { return op == OpCreateTable || op == OpDropTable }
 
 // ErrConditionNotMet is what a Dispatcher reports for a conditional log entry
 // (OpSetNX/OpSetXX) whose precondition is unsatisfied. It travels back to the
@@ -202,6 +216,12 @@ func (f *FSM) Apply(entry *pb.Entry) error {
 	if len(entry.GetData()) > 0 && entry.GetData()[0] == OpChunkSet {
 		return f.applyChunk(entry)
 	}
+	// DDL entries share the 11-byte header width with KV entries but carry a
+	// TSO where a KV entry carries a TTL, so they are decoded separately rather
+	// than being read as a SET with a nonsensical expiration.
+	if len(entry.GetData()) > 0 && IsDDL(entry.GetData()[0]) {
+		return f.applyDDL(entry)
+	}
 	op, key, value, ttl, err := DecodeLogEntry(entry.GetData())
 	if err != nil {
 		if f.logger.Enabled(log.LevelError) {
@@ -296,4 +316,136 @@ func (f *FSM) applyChunk(entry *pb.Entry) error {
 		}
 	}
 	return nil
+}
+
+// ErrTableNotEmpty reports that a DROP TABLE was refused because keys still
+// exist under the table's row prefix. It is a client error rather than a
+// cluster fault, and is raised while *proposing* the entry, not while applying
+// it, so the SQL layer can map it to 0A000.
+var ErrTableNotEmpty = errors.New("cluster ddl: table is not empty")
+
+// IsTableNotEmpty reports whether err is an emptiness-guard refusal, matching on
+// text as a fallback because the error is rebuilt from its wire form on the
+// follower-forward and gateway hops.
+func IsTableNotEmpty(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, ErrTableNotEmpty) || strings.Contains(err.Error(), ErrTableNotEmpty.Error())
+}
+
+// ErrEmptinessUnverifiable reports that a DROP TABLE could not be proven safe
+// because this node cannot complete a cluster-wide range read. It is
+// deliberately distinct from ErrTableNotEmpty: "I could not check" must not be
+// reported to a client as "your table has rows", and neither may be reported as
+// success.
+var ErrEmptinessUnverifiable = errors.New("cluster ddl: cannot verify table is empty on this node")
+
+// RowPrefixFor returns the key prefix under which a table's rows live. It is
+// derived from the catalog key rather than accepted separately, so the guard
+// cannot be pointed at a different range than the one the drop removes.
+//
+// The catalog key is <db>/~meta/tables/<db>/<table>, so the row prefix is the
+// same key with the reserved catalog subtree removed. Deriving it by string
+// surgery is what makes this worth doing carefully: a subtly wrong prefix
+// would make the guard scan the wrong range, and a guard that scans too wide
+// refuses every drop.
+func RowPrefixFor(catalogKey string) (string, error) {
+	marker := keyspace.Separator + keyspace.MetaPrefix + keyspace.Separator
+	i := strings.Index(catalogKey, marker)
+	if i < 0 {
+		return "", fmt.Errorf("cluster ddl: %q is not a catalog key", catalogKey)
+	}
+	db := catalogKey[:i]
+	// What remains after <db>/~meta/ is "tables/<db>/<table>".
+	rest := catalogKey[i+len(marker):]
+	const tablesSeg = "tables" + keyspace.Separator
+	if !strings.HasPrefix(rest, tablesSeg) {
+		return "", fmt.Errorf("cluster ddl: %q is not a catalog key", catalogKey)
+	}
+	// The table is named by <db>/<table> in the same namespace the rows use, so
+	// the row prefix is <db>/<table>/. Reuse the layout's own segment rule
+	// rather than trusting the split, and require the names to match the
+	// database the key was filed under: a mismatch means the key is not a
+	// catalog key this guard understands, and guessing which of the two to
+	// trust is how a guard ends up scanning the wrong table.
+	names := rest[len(tablesSeg):]
+	rowDB, table, ok := strings.Cut(names, keyspace.Separator)
+	if !ok {
+		return "", fmt.Errorf("cluster ddl: %q names no table", catalogKey)
+	}
+	if table == "" {
+		return "", fmt.Errorf("cluster ddl: %q names no table", catalogKey)
+	}
+	if rowDB != db {
+		return "", fmt.Errorf("cluster ddl: %q files table under %q but names %q", catalogKey, db, rowDB)
+	}
+	if err := keyspace.ValidateDatabaseName(rowDB); err != nil {
+		return "", fmt.Errorf("cluster ddl: %q: %w", catalogKey, err)
+	}
+	if err := keyspace.ValidateTableName(table); err != nil {
+		return "", fmt.Errorf("cluster ddl: %q: %w", catalogKey, err)
+	}
+	return keyspace.TablePrefix(rowDB, table), nil
+}
+
+// applyDDL applies a schema mutation.
+//
+// Determinism is the whole design constraint here. Every branch below is a pure
+// function of the committed entry plus the dispatcher's own state, which every
+// replica of this group shares: two replicas that have applied the same log
+// prefix are in the same state. In particular nothing here reads a clock or
+// allocates a sequence number, and the emptiness guard is evaluated against the
+// local store rather than any node-local intent.
+func (f *FSM) applyDDL(entry *pb.Entry) error {
+	e, err := DecodeDDLEntry(entry.GetData())
+	if err != nil {
+		if f.logger.Enabled(log.LevelError) {
+			f.logger.Log(log.LevelError, "cluster ddl: decode error",
+				log.String("error", err.Error()),
+				log.Uint64("index", entry.GetIndex()))
+		}
+		return err
+	}
+	if f.logger.Enabled(log.LevelDebug) {
+		f.logger.Log(log.LevelDebug, "cluster ddl: applying",
+			log.Uint("op", uint32(e.Op)),
+			log.String("key", e.Key),
+			log.Uint64("tso", e.TSO),
+			log.Int("body_len", len(e.Body)),
+			log.Uint64("index", entry.GetIndex()))
+	}
+
+	switch e.Op {
+	case OpCreateTable:
+		// The schema blob is the body. It is written with the ordinary
+		// conditional-create opcode so that a replayed entry cannot overwrite a
+		// table another entry created first: the first creator wins, and a
+		// duplicate create is reported to the proposer rather than silently
+		// redefining a table that may already hold rows.
+		if err := f.dispatcher.Dispatch(e.Key, OpSetNX, e.Body, 0); err != nil {
+			return err
+		}
+		return nil
+
+	case OpDropTable:
+		// The emptiness guard is NOT here, and that is deliberate.
+		//
+		// Apply must be a pure function of the log. A guard that scanned local
+		// state would break that: a node's engines hold the data of every
+		// region it hosts, and different nodes host different regions, so two
+		// replicas of this same group can hold different amounts of the
+		// dropped table's rows. One replica would delete the catalog key while
+		// another refused, and the state machines would diverge permanently.
+		//
+		// The guard therefore runs before the entry is proposed, on the node
+		// that can see every region's leader, and an entry only enters the log
+		// if the table was already proven empty. Once it is here, deletion is
+		// unconditional and identical everywhere.
+		if err := f.dispatcher.Dispatch(e.Key, OpDel, nil, 0); err != nil {
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("cluster ddl: unhandled opcode 0x%02x", e.Op)
 }
