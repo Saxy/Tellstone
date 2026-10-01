@@ -400,8 +400,8 @@ func (t *btree) set(key string, val []byte, exp time.Time) {
 // contains reports whether the subtree holds key.
 func (n *btreeNode) contains(key string) bool {
 	if n.leaf {
-		i := n.lowerBound(key)
-		return i < len(n.keys) && n.entryKey(i) == key
+		_, exact := n.search(key)
+		return exact
 	}
 	return n.kids[n.childIndex(key)].contains(key)
 }
@@ -432,8 +432,8 @@ func (t *btree) remove(key string) bool {
 // or nil if this node absorbed the key.
 func (n *btreeNode) insertNode(key string, val []byte, exp time.Time) *btreeSplit {
 	if n.leaf {
-		i := n.lowerBound(key)
-		if i < len(n.keys) && n.entryKey(i) == key {
+		i, exact := n.search(key)
+		if exact {
 			n.keys[i].val = val
 			n.keys[i].exp = encodeExp(exp)
 			return nil

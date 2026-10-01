@@ -366,8 +366,12 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	if keyLen < 0 || keyLen > len(buf) {
 		return ErrInvalidKeyLength
 	}
-	if err := checkKeyLen(string(buf[:keyLen])); err != nil {
-		return err
+	// keyLen is already the key's byte count, so it is compared directly.
+	// Converting buf[:keyLen] to a string just to take its length copies the
+	// whole key, which on this path -- documented above as existing to avoid the
+	// copy Set performs -- is the copy the caller came here to skip.
+	if keyLen > MaxKeyLen {
+		return ErrKeyTooLong
 	}
 	if e.cryptoEngine.Enabled() {
 		return e.Set(string(buf[:keyLen]), buf[keyLen:], ttl)

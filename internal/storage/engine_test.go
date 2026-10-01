@@ -38,10 +38,22 @@ func TestEngine_RejectsOverlongKeys(t *testing.T) {
 		t.Errorf("SetRaw(%d bytes) = %v, want ErrKeyTooLong", len(tooLong), err)
 	}
 	// SetFromBuffer splits a buffer into key and value, so it has to check the
-	// key half rather than the whole buffer.
+	// key half rather than the whole buffer. The boundary is checked in both
+	// directions: a key of exactly MaxKeyLen is still representable, so refusing
+	// it would be as wrong as accepting one byte more.
+	atLimitBuf := append([]byte(atLimit), []byte("value")...)
+	if err := engine.SetFromBuffer(atLimitBuf, MaxKeyLen, 0); err != nil {
+		t.Errorf("SetFromBuffer with a key of exactly MaxKeyLen = %v, want success", err)
+	}
 	buf := append([]byte(tooLong), []byte("value")...)
 	if err := engine.SetFromBuffer(buf, len(tooLong), 0); !errors.Is(err, ErrKeyTooLong) {
 		t.Errorf("SetFromBuffer with a %d-byte key = %v, want ErrKeyTooLong", len(tooLong), err)
+	}
+	// A key over the limit is refused on its length alone, so a value long
+	// enough to be rejected by any buffer-wide limit must not change the answer.
+	longValBuf := append([]byte(tooLong), bytes.Repeat([]byte("v"), 4*MaxKeyLen)...)
+	if err := engine.SetFromBuffer(longValBuf, len(tooLong), 0); !errors.Is(err, ErrKeyTooLong) {
+		t.Errorf("SetFromBuffer with a long value = %v, want ErrKeyTooLong", err)
 	}
 
 	// A refused write must leave nothing behind: the key still absent, and the
