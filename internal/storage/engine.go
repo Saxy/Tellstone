@@ -28,7 +28,26 @@ import (
 var (
 	ErrEngineFull       = errors.New("memory: limit reached")
 	ErrInvalidKeyLength = errors.New("storage: invalid key length for SetFromBuffer")
+	// ErrKeyTooLong is returned when a key exceeds MaxKeyLen.
+	ErrKeyTooLong = errors.New("storage: key exceeds the maximum length")
 )
+
+// MaxKeyLen is the longest key the front-coded B+Tree can represent.
+//
+// A node records each entry's suffix length in a uint16, so a key longer than
+// 65535 bytes truncates on the way in. The stored key is then not the key that
+// was written: the entry cannot be found again, so the write appears to succeed
+// and the key is silently lost. Rejecting it is the only outcome that keeps the
+// key and the entry in agreement.
+const MaxKeyLen = 1<<16 - 1
+
+// checkKeyLen reports whether a key is within MaxKeyLen.
+func checkKeyLen(key string) error {
+	if len(key) > MaxKeyLen {
+		return ErrKeyTooLong
+	}
+	return nil
+}
 
 // defaultMaxBytes defines the safety ceiling for memory consumption.
 //
@@ -71,6 +90,13 @@ type Engine struct {
 	totalCommands        uint64
 	cryptoEncryptedBytes uint64
 	cryptoDecryptedBytes uint64
+
+	// index is the ordered index over live keys, backing prefix range reads
+	// (ADR-013 guardrail 1). It carries no lock of its own: every mutation
+	// site below updates it while already holding mu, and ScanPrefix holds a
+	// read lock for the duration of a walk because the tree restructures in
+	// place on insert, split and compaction.
+	index *btree
 }
 
 func NewEngine(interval time.Duration, numSlots uint32, maxBytes uint64, logger log.Logger, cryptoEngine *crypto.Engine) *Engine {
@@ -84,6 +110,7 @@ func NewEngine(interval time.Duration, numSlots uint32, maxBytes uint64, logger 
 		e.maxBytes = defaultMaxBytes
 	}
 	e.items = make(map[string]Item)
+	e.index = newBTree()
 	if interval <= 0 || numSlots == 0 {
 		e.chronometer = &NoOpChronometer{}
 		if e.logger.Enabled(log.LevelInfo) {
@@ -165,6 +192,9 @@ const (
 // caller can compensate a failed durability write without discarding a
 // concurrent writer's value.
 func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOutcome, error) {
+	if err := checkKeyLen(key); err != nil {
+		return SetOutcome{}, err
+	}
 	var exp time.Time
 	neededSize := len(value)
 	cryptoEnabled := e.cryptoEngine.Enabled()
@@ -230,6 +260,10 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 		Expiration: exp,
 		Version:    version,
 	}
+	// The index keeps the stored value, which is the representation a reader
+	// gets back: encrypted when crypto is on, so ScanPrefix decrypts the same
+	// way Get does rather than handing out ciphertext.
+	e.index.set(storedKey, value, exp)
 	e.mu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
 	if isUpdate {
@@ -287,6 +321,7 @@ func (e *Engine) RestoreIf(key string, out SetOutcome) bool {
 	if !out.PrevOK {
 		// The write created the key, so undoing it removes the key again.
 		delete(e.items, key)
+		e.index.remove(key)
 		e.mu.Unlock()
 		e.releaseKey(key, item)
 		return true
@@ -297,6 +332,7 @@ func (e *Engine) RestoreIf(key string, out SetOutcome) bool {
 	// this state and roll back a write that never failed.
 	restored.Version = e.nextVersion()
 	e.items[key] = restored
+	e.index.set(key, restored.Value, restored.Expiration)
 	e.mu.Unlock()
 	oldSize := uint64(len(key) + len(item.Value))
 	newSize := uint64(len(key) + len(restored.Value))
@@ -330,6 +366,13 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	if keyLen < 0 || keyLen > len(buf) {
 		return ErrInvalidKeyLength
 	}
+	// keyLen is already the key's byte count, so it is compared directly.
+	// Converting buf[:keyLen] to a string just to take its length copies the
+	// whole key, which on this path -- documented above as existing to avoid the
+	// copy Set performs -- is the copy the caller came here to skip.
+	if keyLen > MaxKeyLen {
+		return ErrKeyTooLong
+	}
 	if e.cryptoEngine.Enabled() {
 		return e.Set(string(buf[:keyLen]), buf[keyLen:], ttl)
 	}
@@ -352,6 +395,7 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 		Expiration: exp,
 		Version:    e.nextVersion(),
 	}
+	e.index.set(storedKey, value, exp)
 	e.mu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
 	if isUpdate {
@@ -378,6 +422,9 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 // would double-encrypt. The engine retains the value's backing bytes for the
 // entry's lifetime; callers must not mutate or reuse the buffer after this call.
 func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
+	if err := checkKeyLen(key); err != nil {
+		return err
+	}
 	var exp time.Time
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)
@@ -396,6 +443,7 @@ func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
 		Expiration: exp,
 		Version:    e.nextVersion(),
 	}
+	e.index.set(storedKey, value, exp)
 	e.mu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
 	if isUpdate {
@@ -435,6 +483,7 @@ func (e *Engine) Delete(key string) bool {
 	}
 	expired := !item.Expiration.IsZero() && time.Now().After(item.Expiration)
 	delete(e.items, key)
+	e.index.remove(key)
 	e.mu.Unlock()
 	e.releaseKey(key, item)
 	if expired {
@@ -457,6 +506,7 @@ func (e *Engine) deleteIfExpired(key string) bool {
 		return false
 	}
 	delete(e.items, key)
+	e.index.remove(key)
 	e.mu.Unlock()
 	e.releaseKey(key, item)
 	return true
@@ -634,4 +684,55 @@ func (e *Engine) Scan(start, end []byte, fn func(key string, value []byte)) {
 	for i := range snap {
 		fn(snap[i].key, snap[i].val)
 	}
+}
+
+// ScanPrefix calls fn for every live key beginning with prefix, in key order,
+// stopping early if fn returns false, and reports how many keys were delivered.
+//
+// This is the range read ADR-013 guardrail 1 requires: a row is a set of column
+// keys under one prefix, so reconstructing it is one walk of the ordered index
+// rather than one lookup per column. The index duplicates each value into its
+// leaf entry, and stored values are never mutated once they enter the engine, so
+// the callback reads them without a copy and the whole scan allocates nothing on
+// the engine side.
+//
+// Keys arrive as []byte rather than string, unlike Scan, because converting the
+// index's decoded key to a string would allocate once per key and undo the point
+// of the index. Callers that want a string copy it themselves.
+//
+// The callback runs under the engine's read lock, because the index restructures
+// in place on insert, split and compaction and cannot be walked while that
+// happens. The callback must not call back into a mutating engine method.
+func (e *Engine) ScanPrefix(prefix string, fn func(key, value []byte) bool) int {
+	now := time.Now()
+	cryptoEnabled := e.cryptoEngine.Enabled()
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	delivered := 0
+	e.index.ScanPrefix(prefix, func(key, val []byte, exp time.Time) bool {
+		if !exp.IsZero() && now.After(exp) {
+			// Skipped rather than evicted, matching Scan and ForEach: eviction
+			// takes the write lock, which a read-locked walk cannot take.
+			return true
+		}
+		out := val
+		if cryptoEnabled {
+			buf := make([]byte, 0, len(val))
+			plain, err := e.cryptoEngine.DecryptInPlaceWithDst(buf, val)
+			if err != nil {
+				if e.logger.Enabled(log.LevelError) {
+					e.logger.Log(log.LevelError, "in-place decryption failed during ScanPrefix",
+						log.String("key", string(key)),
+					)
+				}
+				return true
+			}
+			out = plain
+			atomic.AddUint64(&e.cryptoDecryptedBytes, uint64(len(plain)))
+		}
+		delivered++
+		return fn(key, out)
+	})
+	atomic.AddUint64(&e.totalCommands, 1)
+	return delivered
 }

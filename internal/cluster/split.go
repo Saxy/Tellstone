@@ -21,10 +21,12 @@ package cluster
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	"github.com/Saxy/Tellstone/internal/keyspace"
 	"github.com/Saxy/Tellstone/internal/log"
 )
 
@@ -97,10 +99,9 @@ func (sc *SplitCoordinator) Split(ctx context.Context, req SplitRequest) (*Split
 	}
 
 	// 2. Choose split key.
-	splitKey := make([]byte, len(req.SplitKey))
-	copy(splitKey, req.SplitKey)
-	if len(splitKey) == 0 {
-		splitKey = midpointKey(cur.StartKey, cur.EndKey)
+	splitKey, err := sc.chooseSplitKey(cur, req.SplitKey)
+	if err != nil {
+		return nil, err
 	}
 
 	// Validate split key is strictly inside the region.
@@ -174,6 +175,78 @@ func (sc *SplitCoordinator) Split(ctx context.Context, req SplitRequest) (*Split
 	}
 
 	return &SplitResult{LeftID: cur.ID, RightID: newID}, nil
+}
+
+// ErrSplitWouldCutRow reports that a region cannot be split without cutting a
+// row in half, so the split was refused rather than performed.
+//
+// This is a normal, expected outcome and not a fault: a region holding a single
+// large row has no row boundary inside it, and cutting that row would scatter
+// its columns across two regions. The split is retried once the region has
+// grown enough to contain a second row, and callers that drive splits on a
+// schedule can treat this as "try again later" rather than an error to report.
+var ErrSplitWouldCutRow = errors.New("cluster split: no row boundary available inside region")
+
+// chooseSplitKey picks the key to split cur at, snapping an automatically chosen
+// point onto a row boundary so a split never lands inside a row.
+//
+// An explicitly supplied split key is honoured verbatim. It is an operator
+// decision -- the escape hatch for regions whose boundaries are already wrong
+// from before this rule existed -- and second-guessing it would make the
+// coordinator unable to make progress on exactly the regions that most need
+// operator attention. A split key that lands mid-row is logged, because the
+// resulting region boundary is a hazard even when it was asked for.
+func (sc *SplitCoordinator) chooseSplitKey(cur *Region, requested []byte) ([]byte, error) {
+	if len(requested) > 0 {
+		splitKey := make([]byte, len(requested))
+		copy(splitKey, requested)
+		if _, inRow := keyspace.RowPrefixOf(splitKey); inRow {
+			if sc.logger != nil && sc.logger.Enabled(log.LevelWarn) {
+				sc.logger.Log(log.LevelWarn, "split: requested split key falls inside a row; "+
+					"the resulting boundary will separate that row's columns",
+					log.String("split_key", string(splitKey)))
+			}
+		}
+		return splitKey, nil
+	}
+
+	mid := midpointKey(cur.StartKey, cur.EndKey)
+
+	// A midpoint that is not inside a row has no row to cut, so it is already
+	// a legal boundary: it sits between two keys rather than within one.
+	prefix, inRow := keyspace.RowPrefixOf(mid)
+	if !inRow {
+		return mid, nil
+	}
+
+	// The midpoint is inside a row, so snap it back to that row's prefix, which
+	// leaves the whole row on the right of the boundary. Only the backward
+	// direction is derivable from a key alone; see keyspace.RowPrefixOf for why
+	// the forward direction is not merely unimplemented but unsound.
+	snapped := make([]byte, len(prefix))
+	copy(snapped, prefix)
+
+	// The snapped point has to be strictly inside the region. It can fail this
+	// when the region holds a single row, or when the region start is itself
+	// already inside a row -- a boundary this code did not create. Refusing is
+	// the correct answer in both cases: every alternative cuts a row.
+	if len(cur.StartKey) > 0 && bytes.Compare(snapped, cur.StartKey) <= 0 {
+		return nil, fmt.Errorf("%w: region %d holds a single row [%q, %q)",
+			ErrSplitWouldCutRow, cur.ID, cur.StartKey, cur.EndKey)
+	}
+	if len(cur.EndKey) > 0 && bytes.Compare(snapped, cur.EndKey) >= 0 {
+		return nil, fmt.Errorf("%w: region %d holds a single row [%q, %q)",
+			ErrSplitWouldCutRow, cur.ID, cur.StartKey, cur.EndKey)
+	}
+
+	if sc.logger != nil && sc.logger.Enabled(log.LevelInfo) {
+		sc.logger.Log(log.LevelInfo, "split: snapped midpoint to row boundary",
+			log.Uint64("region_id", cur.ID),
+			log.String("midpoint", string(mid)),
+			log.String("split_key", string(snapped)),
+		)
+	}
+	return snapped, nil
 }
 
 // midpointKey returns a key approximately in the middle of [start, end).

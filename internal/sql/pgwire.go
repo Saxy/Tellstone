@@ -104,6 +104,12 @@ const maxPasswordFrameSize = 1 << 16
 // after which idle time is normal and unconstrained.
 const authReadTimeout = 30 * time.Second
 
+// resultFormatBinary is the extended-protocol binary format code. The frontend
+// does not advertise it, but a client may still send a binary parameter, in
+// which case the bytes are already the column's own encoding and must not be
+// re-parsed as text.
+const resultFormatBinary = 1
+
 // resultFormatText is the only result/parameter format Phase 8 speaks: column
 // data rides as text (bytea hex-encoded), mirroring libpq's default.
 const resultFormatText = 0
@@ -784,6 +790,20 @@ func (c *pgConn) handleDescribe(payload []byte) error {
 // parameters, and the message is still sent with a count of zero: the protocol
 // expects it after every Describe of a prepared statement.
 func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
+	// The session is authorized before the schema is read. Reporting parameter
+	// types means naming the columns a parameter fills, so a Describe that ran
+	// first would describe a table the session is not allowed to touch -- and
+	// its "relation does not exist" answer would be distinguishable from a
+	// permission refusal, which is itself a disclosure.
+	if err := c.srv.authorize(c, plan, nil); err != nil {
+		return err
+	}
+	// Describe precedes execution, so the schema has to be resolved here too:
+	// a parameter's type is the type of the column it fills, and on a catalog
+	// table that lives in the schema.
+	if err := c.srv.resolvePlan(plan); err != nil {
+		return err
+	}
 	n := maxParam(plan)
 	types := map[int]int32{}
 	if plan.Key.Param > 0 {
@@ -791,6 +811,23 @@ func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
 	}
 	if plan.Val.Param > 0 {
 		types[plan.Val.Param] = oidBytea
+	}
+	if plan.Schema != nil {
+		// The implicit table's key is text and value is bytea; a catalog
+		// table's parameters are whatever its columns declare. A client that
+		// trusts this OID to decide how to encode the value, so reporting text
+		// for a bigint key would be a lie the wire cannot catch.
+		if plan.Key.Param > 0 {
+			types[plan.Key.Param] = oidOf(plan.Schema.Columns[plan.Schema.PrimaryKey].Type)
+		}
+		for i, ref := range plan.Values {
+			if ref.Param <= 0 || i >= len(plan.Columns) {
+				continue
+			}
+			if idx, ok := plan.Schema.columnIndex(plan.Columns[i]); ok {
+				types[ref.Param] = oidOf(plan.Schema.Columns[idx].Type)
+			}
+		}
 	}
 	var buf msgBuilder
 	buf.begin(msgParameterDesc)
@@ -806,9 +843,19 @@ func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
 	return c.writeMsg(&buf)
 }
 
+// maxParam is the highest $n the statement references, which is how many
+// ParameterDescription entries the protocol expects.
+//
+// A catalog statement carries its arguments in Values rather than Key/Val --
+// an INSERT has no Key at all, and its parameters arrive among the column values
+// -- so Values has to be scanned too. Leaving it out reported a count of zero
+// for a statement that does take parameters, and the client then sent no
+// Bind values for a query that required them.
 func maxParam(p *Plan) int {
 	m := 0
-	for _, v := range []ValRef{p.Key, p.Val} {
+	refs := []ValRef{p.Key, p.Val}
+	refs = append(refs, p.Values...)
+	for _, v := range refs {
 		if v.Param > m {
 			m = v.Param
 		}
@@ -817,17 +864,37 @@ func maxParam(p *Plan) int {
 }
 
 func (c *pgConn) sendRowDescription(plan *Plan) error {
+	// As in sendStatementParamDesc, authorization comes first: the column names
+	// and types sent below are the table's schema, and a session that may not
+	// read the table must not be able to learn its shape from Describe.
+	if err := c.srv.authorize(c, plan, nil); err != nil {
+		return err
+	}
+	// Describe runs before Execute, so the projection has to be resolved here
+	// as well: a "*" over a catalog table cannot be expanded without the
+	// schema, and the client needs the column count and OIDs to decode
+	// anything. resolvePlan is idempotent, so Execute will not re-read it.
+	if err := c.srv.resolvePlan(plan); err != nil {
+		return err
+	}
 	var buf msgBuilder
 	buf.begin(msgRowDescription)
 	buf.int16(int16(len(plan.Cols)))
-	for _, col := range plan.Cols {
+	for i, col := range plan.Cols {
 		oid := int32(oidText)
-		if col == colValue {
+		if plan.Schema != nil {
+			// A catalog column is typed by its schema, which is the only place
+			// the declared type lives. resolvePlan has already checked that
+			// the projection names real columns.
+			if idx, ok := plan.Schema.columnIndex(col); ok {
+				oid = oidOf(plan.Schema.Columns[idx].Type)
+			}
+		} else if col == colValue {
 			oid = oidBytea
 		}
 		buf.cstring(col)
 		buf.int32(0) // table OID (implicit table, none)
-		buf.int16(0) // attribute number
+		buf.int16(int16(i + 1))
 		buf.int32(oid)
 		buf.int16(-1) // typlen: variable
 		buf.int32(-1) // typmod

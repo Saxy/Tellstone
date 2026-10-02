@@ -45,6 +45,17 @@ type Store interface {
 	// means the deletion did not happen (e.g. not leader in cluster mode);
 	// the boolean is only meaningful when err is nil.
 	Delete(key string) (bool, error)
+	// ScanPrefix calls fn for every live key beginning with prefix, in key
+	// order, stopping early if fn returns false, and reports how many keys
+	// were delivered. It is the range read ADR-013 guardrail 1 requires: a SQL
+	// row is a set of column keys under one prefix, so reconstructing it is
+	// one walk of the ordered index rather than one lookup per column.
+	//
+	// key and value are only valid for the duration of the call. A
+	// implementation that cannot serve the range in place -- one spanning
+	// several shards or regions -- has to collect and merge, which copies;
+	// an implementation serving a single engine does not.
+	ScanPrefix(prefix string, fn func(key, value []byte) bool) (int, error)
 }
 
 // Reply is the transport-specific wire encoder.
