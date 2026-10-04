@@ -13,6 +13,9 @@
 #      is the part that actually proves Raft is doing its job.
 #   5. Refuse a duplicate CREATE, and refuse a DROP of a table that still has
 #      rows; then empty the table and DROP succeeds.
+#   6. Phase 10: EXPLAIN the plan for a point lookup, a range and a full scan;
+#      confirm EXPLAIN does not execute; confirm ANALYZE counts rows and is
+#      node-local; confirm a planned-but-unexecutable plan refuses with 0A000.
 #
 # Usage:
 #   scripts/manual-ddl-test.sh
@@ -45,10 +48,27 @@ check() {
         shown=$(printf '%s' "$out" | head -c 160 | tr '\n' ' ')
         if [ -z "$expect" ]; then
                 [ -z "$out" ] && ok "$label (no output)" || bad "$label: expected no output, got: $shown"
-        elif printf '%s' "$out" | grep -qF "$expect"; then
+        elif printf '%s' "$out" | grep -qF -- "$expect"; then
                 ok "$label (got: $shown)"
         else
                 bad "$label: wanted '$expect', got: $shown"
+        fi
+}
+
+# check_not <label> <forbidden-substring> <sql>
+#
+# The inverse of check. Needed for the two properties Phase 10 has that Phase 9
+# did not: EXPLAIN must not return the row it describes, and a node's ANALYZE
+# count must not appear on a node that never ran it.
+check_not() {
+        local label="$1" forbid="$2" sql="$3"
+        local out shown
+        out=$(psql -h 127.0.0.1 -p "$port" -U default -d test -X -At -t -c "$sql" 2>&1)
+        shown=$(printf '%s' "$out" | head -c 160 | tr '\n' ' ')
+        if printf '%s' "$out" | grep -qF -- "$forbid"; then
+                bad "$label: output should not contain '$forbid', got: $shown"
+        else
+                ok "$label (no '$forbid')"
         fi
 }
 
@@ -58,7 +78,7 @@ expect_err() {
         local out shown
         out=$(psql -h 127.0.0.1 -p "$port" -U default -d test -X -At -t -c "$sql" 2>&1)
         shown=$(printf '%s' "$out" | head -c 160 | tr '\n' ' ')
-        if printf '%s' "$out" | grep -qiE "^ERROR" && printf '%s' "$out" | grep -qF "$expect"; then
+        if printf '%s' "$out" | grep -qiE "^ERROR" && printf '%s' "$out" | grep -qF -- "$expect"; then
                 ok "$label (refused: $shown)"
         else
                 bad "$label: wanted error '$expect', got: $shown"
@@ -170,6 +190,118 @@ for i in 1 2 3; do
 done
 port=$((base_pg + 2))
 check "address untouched by meta's drop" "12 Analytical Way" "SELECT street FROM address WHERE id = 1"
+
+# ------------------------------------------------------- Phase 10: planner
+#
+# The Phase 9 checks above all exercise one access path: a primary-key equality.
+# Phase 10's observable behaviour is *which* path was chosen, which is only
+# visible through EXPLAIN, plus the refusal of the paths that are planned but
+# cannot be executed yet. Everything below is checked on a live cluster rather
+# than in-process, because the planner reads the same replicated catalog the
+# DDL tests above just wrote.
+
+log "Phase 10: create a table to plan against"
+port=$((base_pg + 1))
+check "create metrics" "CREATE TABLE" "CREATE TABLE metrics (id bigint PRIMARY KEY, label text, score int)"
+
+log "seed 12 rows, including the int64 extremes and a negative id"
+for i in $(seq 1 10); do
+        check "insert id=$i" "INSERT 0 1" \
+                "INSERT INTO metrics (id, label, score) VALUES ($i, 'label-$i', $((i * 10)))"
+done
+check "insert MaxInt64"  "INSERT 0 1" "INSERT INTO metrics (id, label, score) VALUES (9223372036854775807, 'top', 1)"
+check "insert negative"  "INSERT 0 1" "INSERT INTO metrics (id, label, score) VALUES (-5, 'sub-zero', -1)"
+
+log "row ids are hex: a point lookup must still return the integer, not the key bytes"
+check "MaxInt64 reads back as an integer" "9223372036854775807" \
+        "SELECT id FROM metrics WHERE id = 9223372036854775807"
+check "negative id reads back"  "-5"       "SELECT id FROM metrics WHERE id = -5"
+check "id=9 is not confused with id=10" "9|90" \
+        "SELECT id, score FROM metrics WHERE id = 9"
+
+log "EXPLAIN picks the access method; a client can see the plan, not the data"
+check "equality on the key is an index scan" "Index Scan on metrics" \
+        "EXPLAIN SELECT label FROM metrics WHERE id = 4"
+check "bounded inequality is a range scan"   "Range Scan on metrics" \
+        "EXPLAIN SELECT label FROM metrics WHERE id >= 2 AND id <= 8"
+check "BETWEEN is desugared into a range"    "Range Scan on metrics" \
+        "EXPLAIN SELECT label FROM metrics WHERE id BETWEEN 2 AND 8"
+check "non-key filter falls back to a scan"  "Seq Scan on metrics" \
+        "EXPLAIN SELECT label FROM metrics WHERE label = 'label-4'"
+
+log "a TEXT primary key cannot be ranged, so it must NOT claim a range scan"
+check "create notes" "CREATE TABLE" "CREATE TABLE notes (slug text PRIMARY KEY, body text)"
+check "insert into notes" "INSERT 0 1" "INSERT INTO notes (slug, body) VALUES ('a', 'first note')"
+check "text key point lookup works" "first note" "SELECT body FROM notes WHERE slug = 'a'"
+check "text key equality is an index scan" "Index Scan on notes" \
+        "EXPLAIN SELECT body FROM notes WHERE slug = 'a'"
+check "text key inequality is NOT a range scan" "Seq Scan on notes" \
+        "EXPLAIN SELECT body FROM notes WHERE slug > 'a'"
+expect_err "drop non-empty notes" "table is not empty" "DROP TABLE notes"
+check "delete the note" "DELETE 1" "DELETE FROM notes WHERE slug = 'a'"
+check "drop now allowed" "DROP TABLE" "DROP TABLE notes"
+
+log "EXPLAIN must not execute: it describes the query, it does not run it"
+check_not "EXPLAIN returns no row data" "label-4" \
+        "EXPLAIN SELECT label, score FROM metrics WHERE id = 4"
+log "before ANALYZE the cost model admits it is guessing"
+check "un-analyzed table says so" "never analyzed" \
+        "EXPLAIN SELECT label FROM metrics WHERE label = 'label-4'"
+
+log "ANALYZE counts rows, not keys (12 rows x 3 columns would be 36 keys)"
+check "analyze metrics" "ANALYZE 1" "ANALYZE metrics"
+check "count is 12 rows, not 36 keys" "12 rows" \
+        "EXPLAIN SELECT label FROM metrics WHERE label = 'label-4'"
+check_not "the guess caveat is gone after ANALYZE" "never analyzed" \
+        "EXPLAIN SELECT label FROM metrics WHERE label = 'label-4'"
+check "bare ANALYZE covers every catalog table" "ANALYZE 13" "ANALYZE"
+
+log "statistics are node-local by design (ADR-014 decision 8)"
+port=$((base_pg + 1))
+check "node-1 has the measurement" "12 rows" \
+        "EXPLAIN SELECT label FROM metrics WHERE label = 'label-4'"
+port=$((base_pg + 3))
+check_not "node-3 never ran ANALYZE, so it must not claim the number" "12 rows" \
+        "EXPLAIN SELECT label FROM metrics WHERE label = 'label-4'"
+check "node-3 still reports the estimate" "never analyzed" \
+        "EXPLAIN SELECT label FROM metrics WHERE label = 'label-4'"
+
+log "a planned but unexecutable plan refuses with 0A000, naming plan and phase"
+port=$((base_pg + 1))
+expect_err "range scan refused" "RangeScan" \
+        "SELECT label FROM metrics WHERE id >= 2 AND id <= 8"
+expect_err "range refusal names the phase that will run it" "Phase 11" \
+        "SELECT label FROM metrics WHERE id >= 2 AND id <= 8"
+expect_err "full scan refused" "FullScan" \
+        "SELECT label FROM metrics WHERE label = 'label-4'"
+expect_err "unfiltered query refused" "FullScan" \
+        "SELECT label FROM metrics"
+expect_err "multi-row UPDATE refused" "Phase 11" \
+        "UPDATE metrics SET score = 1 WHERE score > 0"
+expect_err "multi-row DELETE refused" "Phase 11" \
+        "DELETE FROM metrics WHERE id >= 2"
+check "point UPDATE still works" "UPDATE 1" "UPDATE metrics SET score = 99 WHERE id = 4"
+check "point DELETE still works" "DELETE 1" "DELETE FROM metrics WHERE id = 10"
+
+log "statements that would require executing under EXPLAIN are refused, not faked"
+expect_err "EXPLAIN ANALYZE refused" "EXPLAIN ANALYZE" \
+        "EXPLAIN ANALYZE SELECT label FROM metrics WHERE id = 4"
+expect_err "VACUUM refused" "VACUUM" "VACUUM"
+expect_err "EXPLAIN of DDL refused" "syntax error" \
+        "EXPLAIN CREATE TABLE nope (id bigint PRIMARY KEY)"
+expect_err "EXPLAIN of a transaction refused" "syntax error" "EXPLAIN BEGIN"
+
+log "Phase 10 leaves the cluster clean"
+for i in 1 2 3 4 5 6 7 8 9; do
+        check "delete id=$i" "DELETE 1" "DELETE FROM metrics WHERE id = $i"
+done
+check "delete MaxInt64" "DELETE 1" "DELETE FROM metrics WHERE id = 9223372036854775807"
+check "delete negative" "DELETE 1" "DELETE FROM metrics WHERE id = -5"
+check "drop metrics"   "DROP TABLE" "DROP TABLE metrics"
+expect_err "metrics is gone" "does not exist" "SELECT label FROM metrics WHERE id = 1"
+port=$((base_pg + 1))
+check "address survived the whole phase" "12 Analytical Way" \
+        "SELECT street FROM address WHERE id = 1"
 
 if [ "$fail" -gt 0 ]; then
         log "FAILURES — node logs kept in $work"

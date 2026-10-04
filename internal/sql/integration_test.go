@@ -33,6 +33,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
+	"github.com/Saxy/Tellstone/internal/keyspace"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/rbac"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
@@ -1340,7 +1341,11 @@ func TestRBACAuthorizesCatalogTablesByTheirKeyPrefix(t *testing.T) {
 		if err := store.Set(MetaTableKey(DefaultDB, tbl.name), blob, 0); err != nil {
 			t.Fatalf("seed catalog %s: %v", tbl.name, err)
 		}
-		if err := store.Set(ColumnKey(DefaultDB, tbl.name, "1", "id"), EncodeOrderableInt(1), 0); err != nil {
+		// The row id is built with the same encoder the planner uses, so this
+		// seed keeps landing where `WHERE id = 1` will look. Hardcoding "1"
+		// would work only until the row-id encoding changed, and would fail as
+		// a silently empty result rather than as a compile error.
+		if err := store.Set(ColumnKey(DefaultDB, tbl.name, keyspace.EncodeIntRowID(1), "id"), EncodeOrderableInt(1), 0); err != nil {
 			t.Fatalf("seed row %s: %v", tbl.name, err)
 		}
 	}

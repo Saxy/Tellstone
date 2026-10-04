@@ -13,8 +13,12 @@ package sql
 import (
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
+	"time"
 
 	"github.com/Saxy/Tellstone/internal/audit"
+	"github.com/Saxy/Tellstone/internal/keyspace"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/rbac"
 )
@@ -164,6 +168,10 @@ func (s *Server) execute(c *pgConn, plan *Plan, params []paramVal) (*execOutcome
 	}
 
 	switch plan.Kind {
+	case StmtExplain:
+		return s.execExplain(plan)
+	case StmtAnalyze:
+		return s.execAnalyze(plan)
 	case StmtSelect:
 		return s.execSelect(c, plan, params)
 	case StmtInsert:
@@ -416,14 +424,24 @@ func (s *Server) execDDL(c *pgConn, plan *Plan) (*execOutcome, error) {
 		}
 		return &execOutcome{tag: "CREATE TABLE"}, nil
 	case StmtDropTable:
+		// The table's statistics are forgotten only once the drop has actually
+		// happened. Forgetting first would lose the count of a DROP that then
+		// failed -- a populated table, say -- leaving the table in place with no
+		// statistics and no way to tell why.
+		dropped := false
 		if plan.IfExists {
 			if _, err := cat.DropIfExists(plan.Table); err != nil {
 				return nil, s.schemaError(err)
 			}
-			return &execOutcome{tag: "DROP TABLE"}, nil
+			dropped = true
+		} else {
+			if err := cat.Drop(plan.Table); err != nil {
+				return nil, s.schemaError(err)
+			}
+			dropped = true
 		}
-		if err := cat.Drop(plan.Table); err != nil {
-			return nil, s.schemaError(err)
+		if dropped {
+			s.stats.Forget(DefaultDB, plan.Table)
 		}
 		return &execOutcome{tag: "DROP TABLE"}, nil
 	default:
@@ -466,6 +484,9 @@ func (s *Server) schemaError(err error) error {
 
 // execSelectRow reconstructs a row by range scan and projects it.
 func (s *Server) execSelectRow(plan *Plan, params []paramVal) (*execOutcome, error) {
+	if err := refuseMultiRow(plan.Phys); err != nil {
+		return nil, err
+	}
 	rowID, err := plan.rowID(params)
 	if err != nil {
 		return nil, err
@@ -515,9 +536,28 @@ func (s *Server) execInsertRow(plan *Plan, params []paramVal) (*execOutcome, err
 	// that would fail for every type but text. buildCells has already encoded
 	// the column correctly for every other type, so the right source here is
 	// that encoding, re-read through the type rather than assumed.
-	pkCell, err := encodeTextAs(sch.Columns[sch.PrimaryKey].Type, []byte(rowID))
-	if err != nil {
-		return nil, err
+	pkType := sch.Columns[sch.PrimaryKey].Type
+	var pkCell []byte
+	switch pkType {
+	case TypeInt, TypeBigInt:
+		// The row id is hex, not decimal text, so it has to be read back with
+		// the row id's own decoder. Parsing it as a decimal number instead
+		// would succeed and produce a different integer -- "8000000000000001"
+		// is a valid decimal and is the row id of 1 -- so the row would be
+		// filed under an id the client never asked for.
+		n, err := keyspace.DecodeIntRowID(rowID)
+		if err != nil {
+			return nil, err
+		}
+		pkCell, err = EncodeValue(pkType, n)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		var err error
+		if pkCell, err = encodeTextAs(pkType, []byte(rowID)); err != nil {
+			return nil, err
+		}
 	}
 	cells[sch.PrimaryKey] = rowValue{value: pkCell, set: true}
 	if err := s.insertRow(sch, rowID, cells); err != nil {
@@ -542,6 +582,9 @@ func (s *Server) execInsertRow(plan *Plan, params []paramVal) (*execOutcome, err
 // affected rows when it is not there.
 func (s *Server) execUpdateRow(plan *Plan, params []paramVal) (*execOutcome, error) {
 	sch := plan.Schema
+	if err := refuseMultiRow(plan.Phys); err != nil {
+		return nil, err
+	}
 	rowID, err := plan.rowID(params)
 	if err != nil {
 		return nil, err
@@ -568,6 +611,9 @@ func (s *Server) execUpdateRow(plan *Plan, params []paramVal) (*execOutcome, err
 
 // execDeleteRow removes a row and every one of its column keys.
 func (s *Server) execDeleteRow(plan *Plan, params []paramVal) (*execOutcome, error) {
+	if err := refuseMultiRow(plan.Phys); err != nil {
+		return nil, err
+	}
 	rowID, err := plan.rowID(params)
 	if err != nil {
 		return nil, err
@@ -608,6 +654,20 @@ func (p *Plan) rowID(params []paramVal) (string, error) {
 		// Text is already canonical. Parsing it would only risk a rejection of
 		// a value the column can hold.
 		return string(key), nil
+	}
+	// An integer row id becomes 16 hex digits of the sign-flipped value rather
+	// than a decimal string. The reason is not aesthetics: a range scan needs
+	// the row id to sort in value order, and a variable-width decimal string
+	// does not ("10" sorts before "9"), while fixed-width hex does. Hex also
+	// contains neither '%' nor '/', which the unconditional row-id escape would
+	// otherwise rewrite, and the escape is not order-preserving. See
+	// keyspace.EncodeIntRowID.
+	if pk.Type == TypeInt || pk.Type == TypeBigInt {
+		n, err := strconv.ParseInt(strings.TrimSpace(string(key)), 10, 64)
+		if err != nil {
+			return "", &pgError{code: errSyntax, msg: fmt.Sprintf("invalid input syntax for type %s: %q", pk.Type, truncateForError(key))}
+		}
+		return keyspace.EncodeIntRowID(n), nil
 	}
 	enc, err := encodeTextAs(pk.Type, key)
 	if err != nil {
@@ -762,20 +822,10 @@ func (s *Server) resolvePlan(plan *Plan) error {
 		}
 		plan.Schema = sch
 	}
-	// The filter must name the primary key, which is the only column that
-	// identifies a row. Checked here rather than in the translator because only
-	// the schema knows which column it is.
 	switch plan.Kind {
 	case StmtSelect, StmtUpdate, StmtDelete:
-		if _, ok := plan.Schema.columnIndex(plan.WhereCol); !ok {
-			return &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", plan.WhereCol)}
-		}
-		if plan.WhereCol != plan.Schema.PrimaryKeyName() {
-			return &pgError{
-				code: errFeatureNotSupported,
-				msg: fmt.Sprintf("only the primary key %q may be filtered; %q is not a row identifier",
-					plan.Schema.PrimaryKeyName(), plan.WhereCol),
-			}
+		if err := s.planAccess(plan); err != nil {
+			return err
 		}
 	}
 	// A "*" projection is expanded into the schema's columns, in declaration
@@ -809,4 +859,126 @@ func (s *Server) resolvePlan(plan *Plan) error {
 		plan.Key = plan.Values[idx]
 	}
 	return nil
+}
+
+// planAccess chooses the access method for a data statement and records it on
+// the plan.
+//
+// It is the seam between translation and execution. Translation is a pure
+// function over a parse tree and cannot see the schema; execution can, and the
+// planner needs it. Keeping the decision here means the plan a client reads
+// under EXPLAIN is produced by the same call that would decide execution, so
+// the two cannot disagree about which method was chosen.
+func (s *Server) planAccess(plan *Plan) error {
+	if plan.Schema == nil {
+		return nil
+	}
+	// The point-lookup path is already carried on the plan as WhereCol/Key and
+	// is what this phase executes. It is planned too, so EXPLAIN reports it and
+	// the refusal below has something to compare against.
+	filter, err := plan.predicate()
+	if err != nil {
+		return err
+	}
+	o := &optimizer{sch: plan.Schema, stats: s.statsFor(plan.Schema)}
+	phys, err := o.plan(filter)
+	if err != nil {
+		return err
+	}
+	plan.Phys = phys
+	return nil
+}
+
+// predicate returns the statement's WHERE clause as an expression tree.
+func (p *Plan) predicate() (Expr, error) {
+	if p.Where == nil {
+		return nil, nil
+	}
+	return translateExpr(p.Where)
+}
+
+// executable reports whether this phase can run a plan.
+//
+// Only a point lookup can. The wire protocol here returns a single DataRow, so a
+// plan that can match many rows has nowhere to put them: truncating at one row
+// would be a silent wrong answer, and returning only the first would be the
+// same answer dressed as a complete one. Phase 11 adds the streaming pipeline
+// that a range or a scan can be delivered through.
+func (p *physicalPlan) executable() bool {
+	return p != nil && p.Kind == PlanPointLookup && !p.EmptyRange
+}
+
+// execExplain renders the wrapped statement's plan without running it.
+func (s *Server) execExplain(plan *Plan) (*execOutcome, error) {
+	if err := s.resolvePlan(plan.Inner); err != nil {
+		return nil, err
+	}
+	lines := Explain(plan.Inner.Phys, s.statsFor(plan.Inner.Schema), time.Now())
+	text := strings.Join(textLines(lines), "\n")
+	return &execOutcome{tag: "EXPLAIN", row: [][]byte{[]byte(text)}, selectRows: true}, nil
+}
+
+// textLines renders already-encoded cells as one string per line.
+func textLines(cells [][]byte) []string {
+	out := make([]string, len(cells))
+	for i, c := range cells {
+		out[i] = string(c)
+	}
+	return out
+}
+
+// execAnalyze collects local row counts for the optimizer.
+func (s *Server) execAnalyze(plan *Plan) (*execOutcome, error) {
+	if len(plan.AnalyzeTables) == 0 {
+		stats, err := s.analyzeAll()
+		if err != nil {
+			return nil, err
+		}
+		total := uint64(0)
+		for _, st := range stats {
+			total += st.Rows
+		}
+		return &execOutcome{tag: fmt.Sprintf("ANALYZE %d", total)}, nil
+	}
+	for _, name := range plan.AnalyzeTables {
+		sch, err := s.catalog().Get(name)
+		if err != nil {
+			if errors.Is(err, ErrNoSuchTable) {
+				return nil, &pgError{code: errUndefinedTable, msg: fmt.Sprintf("relation %q does not exist", name)}
+			}
+			return nil, s.schemaError(err)
+		}
+		if _, err := s.analyzeTable(sch); err != nil {
+			return nil, err
+		}
+	}
+	return &execOutcome{tag: fmt.Sprintf("ANALYZE %d", len(plan.AnalyzeTables))}, nil
+}
+
+// refuseMultiRow rejects a plan this phase cannot deliver.
+//
+// The message names the phase it is waiting for, because "not supported" with
+// no reason invites a client to conclude the query is wrong rather than the
+// engine being incomplete. It names the plan it was refused for too: a client
+// that sees `Range Scan` knows to retry with an equality, and one that sees
+// `Seq Scan` knows to wait.
+func refuseMultiRow(p *physicalPlan) error {
+	if p == nil || p.executable() {
+		return nil
+	}
+	if p.EmptyRange {
+		// An empty range has no rows to return, which is a complete answer and
+		// not a truncation. Phase 11 will produce it as a zero-row result; here
+		// it is still a single-row protocol, so the honest answer is refusal
+		// rather than a fabricated empty set that a client could not tell from
+		// a query that matched nothing.
+		return &pgError{
+			code: errFeatureNotSupported,
+			msg:  fmt.Sprintf("%s matches no rows; returning a multi-row result is deferred to Phase 11", p.Kind),
+		}
+	}
+	return &pgError{
+		code: errFeatureNotSupported,
+		msg:  fmt.Sprintf("plan %s cannot be executed: multi-row execution pipeline deferred to Phase 11", p.Kind),
+	}
 }

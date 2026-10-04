@@ -174,15 +174,28 @@ func TestCatalogTableRowIdentity(t *testing.T) {
 	queryErr(t, cl, `SELECT v FROM t WHERE id = 'abc'`, errSyntax)
 	queryErr(t, cl, `INSERT INTO t (id, v) VALUES (99999999999999999999, 'x')`, errSyntax)
 
-	// Only the primary key identifies a row. Filtering on another column is
-	// refused rather than answered with a wrong (or empty) result, because
-	// answering it would require a scan whose semantics differ from equality.
+	// A filter on a non-key column is planned -- as a full scan, which is what
+	// it needs -- and then refused, because this phase can return only one row
+	// (ADR-014 decision 3). The message says which plan was refused and which
+	// phase is coming, so a client can tell an incomplete engine from a wrong
+	// query.
 	msg := queryErr(t, cl, `SELECT v FROM t WHERE v = 'seven'`, errFeatureNotSupported)
-	if !strings.Contains(msg, "id") {
-		t.Fatalf("non-key filter message should name the primary key: %q", msg)
+	for _, want := range []string{"FullScan", "Phase 11"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("non-key filter message should mention %q: %q", want, msg)
+		}
 	}
 	queryErr(t, cl, `UPDATE t SET v = 'x' WHERE v = 'seven'`, errFeatureNotSupported)
 	queryErr(t, cl, `DELETE FROM t WHERE v = 'seven'`, errFeatureNotSupported)
+
+	// A range on an integer key plans as a range scan and is refused the same
+	// way. Asserting the plan appears in the message is what pins the fact that
+	// the query was planned at all -- a blanket refusal would pass the checks
+	// above too.
+	msg = queryErr(t, cl, `SELECT v FROM t WHERE id > 1 AND id < 100`, errFeatureNotSupported)
+	if !strings.Contains(msg, "RangeScan") {
+		t.Fatalf("integer range message should name the plan: %q", msg)
+	}
 
 	// A column the table does not have is a column error, not a missing table.
 	queryErr(t, cl, `SELECT nosuch FROM t WHERE id = 7`, errUndefinedColumn)
@@ -190,13 +203,25 @@ func TestCatalogTableRowIdentity(t *testing.T) {
 
 	// Statements that address a row without a key are refused, not widened
 	// into a full-table operation.
-	// A statement with no filter is refused, not widened into a whole-table
-	// delete. The code is 42601 because the filter is what the translator
-	// requires, not a constraint the row violated.
-	queryErr(t, cl, `DELETE FROM t`, errSyntax)
-	// A range predicate is refused at translation: answering it would need a
-	// scan whose result is not one row.
-	queryErr(t, cl, `SELECT v FROM t WHERE id > 1`, errSyntax)
+	// A statement with no filter is still refused, and still not widened into a
+	// whole-table delete. The planner now classifies it as a full scan and
+	// execution refuses it, so the code moved from 42601 to 0A000 -- and the
+	// message naming the plan is stronger evidence than the old code was,
+	// because "FullScan" shows the unfiltered statement was recognised as one
+	// rather than quietly executed.
+	msg = queryErr(t, cl, `DELETE FROM t`, errFeatureNotSupported)
+	if !strings.Contains(msg, "FullScan") {
+		t.Fatalf("unfiltered DELETE should be planned as a full scan: %q", msg)
+	}
+	// A range predicate now *plans* -- the optimizer recognises it, and an
+	// integer key is range-scannable since row ids became order-preserving --
+	// and is refused at execution instead, because this phase returns one row
+	// (ADR-014 decision 3). The code moved from 42601 to 0A000 as a result: this
+	// is no longer a statement the translator cannot express.
+	msg = queryErr(t, cl, `SELECT v FROM t WHERE id > 1`, errFeatureNotSupported)
+	if !strings.Contains(msg, "RangeScan") {
+		t.Fatalf("open-ended range should plan as a range scan: %q", msg)
+	}
 }
 
 func TestCatalogTableNullsAndDefaults(t *testing.T) {

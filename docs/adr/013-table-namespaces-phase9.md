@@ -93,6 +93,12 @@ INSERT INTO users (user_id, name) VALUES (42, 'max');
 -- tellstone/users/42/name = "max"
 ```
 
+> **Superseded in Phase 10 (ADR-014 decision 4).** An integer row id is now 16
+> fixed-width hex digits of the sign-flipped value, so the key this statement
+> writes is `tellstone/users/000000000000002a/name`. The change was required for
+> range-scan correctness and is a breaking format change; see ADR-014 §5. The
+> example is left as written when this ADR was accepted.
+
 The PK column does **not** keep its own `<table>/<id>/<column>` location; it
 is elevated to the `<row-id>` position. Point lookups then need only the raw
 key `tellstone/users/<pk>`. Tables without a PK column are not rejected; they
@@ -314,6 +320,14 @@ the single point that builds keys, rather than at each call site. An `INT`/
 `BIGINT` primary key needs no escaping; a textual key does, and the escaping
 must be total (not merely "reject `/`") so that distinct primary keys always
 produce distinct key prefixes.
+
+> **Corrected in Phase 10 (ADR-014 decision 4).** "Needs no escaping" was true
+> of the *value* encoding, not of the row id that was actually stored, and the
+> difference was not cosmetic: escaping is not order-preserving, so a range
+> bounded on an escaped integer row id omitted and included the wrong rows.
+> Phase 10 renders integer row ids as hex, whose alphabet contains neither `/`
+> nor `%`, which makes the claim true of the row id itself rather than
+> incidentally true.
 
 ## Measured index cost
 
