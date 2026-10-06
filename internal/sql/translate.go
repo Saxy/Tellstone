@@ -51,6 +51,12 @@ const (
 	// name on the plan instead of a key and a value.
 	StmtCreateTable
 	StmtDropTable
+	// StmtExplain wraps a statement and renders its plan instead of running it.
+	// The wrapped statement lives on Inner, and is planned but never executed.
+	StmtExplain
+	// StmtAnalyze collects local row-count statistics for the optimizer.
+	// Phase 10 keeps those local rather than replicated (ADR-014 decision 5).
+	StmtAnalyze
 )
 
 // ValRef is a bound-value reference: either a literal extracted from the query
@@ -102,6 +108,22 @@ type Plan struct {
 	// Table names the table a DDL statement acts on, and the table a
 	// catalog-backed DML statement acts on.
 	Table string
+	// Where is the statement's WHERE clause as a parse-tree node, kept so the
+	// planner can build the predicate at execution time once the schema is
+	// known. Translation cannot plan: it has no schema.
+	Where *pg_query.Node
+	// Phys is the access method chosen for a data statement, resolved in
+	// resolvePlan once the schema is known. EXPLAIN renders it; a statement that
+	// is not a point lookup is refused at execution because the wire protocol
+	// returns one row (ADR-014 decision 3).
+	Phys *physicalPlan
+	// Inner is the statement an StmtExplain wraps. It is planned exactly as it
+	// would be on its own, which is the only way the plan a client reads can be
+	// the plan it would get.
+	Inner *Plan
+	// AnalyzeTables names the tables an StmtAnalyze collects. Empty means every
+	// table in the catalog, which is what a bare ANALYZE means.
+	AnalyzeTables []string
 	// Columns and Values are a multi-column statement's column list and its
 	// values, positionally paired. They are used only on the catalog path; the
 	// implicit table carries its single key and value on Key and Val.
@@ -152,6 +174,10 @@ func Translate(sql string) (*Plan, error) {
 		return translateUpdate(node.GetUpdateStmt())
 	case node.GetDeleteStmt() != nil:
 		return translateDelete(node.GetDeleteStmt())
+	case node.GetExplainStmt() != nil:
+		return translateExplain(node.GetExplainStmt())
+	case node.GetVacuumStmt() != nil:
+		return translateVacuum(node.GetVacuumStmt())
 	case node.GetTransactionStmt() != nil:
 		return translateTransaction(node.GetTransactionStmt())
 	case node.GetCreateStmt() != nil:
@@ -347,7 +373,44 @@ func valueRef(node *pg_query.Node, column string) (ValRef, error) {
 // table, but the shape is still checked here: a predicate that is not an
 // equality on a plain column reference is not addressable however the schema
 // turns out.
+// rowPredicate extracts the single-column equality that identifies one row.
+//
+// It is opportunistic: a WHERE clause it cannot read is reported as "no single
+// row predicate" rather than as an error, because the planner is the thing that
+// decides what a predicate means. Reporting the error here would make a range
+// scan unplannable -- the translator would reject it before the optimizer ever
+// saw it, and the optimizer is exactly where a range is supposed to be
+// recognised. The planner re-validates the clause and raises the real error for
+// a predicate neither can express.
+//
+// The fields are only consumed on the point-lookup path, which is reached only
+// when this function succeeded, so tolerating other shapes costs nothing.
 func rowPredicate(where *pg_query.Node) (col string, ref ValRef, err error) {
+	col, ref, err = singleRowPredicate(where)
+	if errors.Is(err, errUnsupported) || errors.Is(err, errNoWhere) {
+		// Not a single-row predicate -- or none at all. The planner reads the
+		// clause and reports something more useful than this function can: an
+		// unfiltered catalog query is a full scan, and "requires a WHERE key"
+		// was true only while a scan was impossible to plan.
+		return "", ValRef{}, nil
+	}
+	return col, ref, err
+}
+
+// rowPredicateFor picks the strict or the tolerant reader. The implicit table
+// predates the planner and keeps its old behaviour.
+func rowPredicateFor(table string, implicit bool, where *pg_query.Node) (string, ValRef, error) {
+	if implicit {
+		return singleRowPredicate(where)
+	}
+	return rowPredicate(where)
+}
+
+// singleRowPredicate is rowPredicate without the tolerance, for the implicit
+// tellstone table. That table has no catalog schema and so is never planned; its
+// single key column is the whole of its access path, and a predicate it cannot
+// read has to be refused rather than deferred.
+func singleRowPredicate(where *pg_query.Node) (col string, ref ValRef, err error) {
 	if where == nil {
 		return "", ValRef{}, errNoWhere
 	}
@@ -392,11 +455,12 @@ func translateSelect(ss *pg_query.SelectStmt) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
-	whereCol, key, err := rowPredicate(ss.GetWhereClause())
+	whereCol, key, err := rowPredicateFor(table, implicit, ss.GetWhereClause())
 	if err != nil {
 		return nil, err
 	}
-	plan := &Plan{Kind: StmtSelect, Table: table, WhereCol: whereCol, Key: key}
+	plan := &Plan{Kind: StmtSelect, Table: table, WhereCol: whereCol, Key: key,
+		Where: ss.GetWhereClause()}
 
 	// A bare star cannot be expanded here: the column list lives in the
 	// catalog, which only the executor can read. It is carried as "*" and
@@ -656,14 +720,15 @@ func translateUpdate(us *pg_query.UpdateStmt) (*Plan, error) {
 	if len(us.GetFromClause()) > 0 {
 		return nil, fmt.Errorf("%w: UPDATE ... FROM is not supported", errUnsupported)
 	}
-	whereCol, key, err := rowPredicate(us.GetWhereClause())
+	whereCol, key, err := rowPredicateFor(table, implicit, us.GetWhereClause())
 	if err != nil {
 		return nil, err
 	}
 	if key.Null {
 		return nil, &pgError{code: errNotNullViolation, msg: "null value in the filter violates not-null constraint"}
 	}
-	plan := &Plan{Kind: StmtUpdate, Table: table, WhereCol: whereCol, Key: key}
+	plan := &Plan{Kind: StmtUpdate, Table: table, WhereCol: whereCol, Key: key,
+		Where: us.GetWhereClause()}
 
 	// The SET list is a set of column assignments. Each must be a plain
 	// column = literal or parameter; an expression would need evaluation this
@@ -719,7 +784,7 @@ func translateDelete(ds *pg_query.DeleteStmt) (*Plan, error) {
 	if len(ds.GetUsingClause()) > 0 {
 		return nil, fmt.Errorf("%w: DELETE ... USING is not supported", errUnsupported)
 	}
-	whereCol, key, err := rowPredicate(ds.GetWhereClause())
+	whereCol, key, err := rowPredicateFor(table, implicit, ds.GetWhereClause())
 	if err != nil {
 		return nil, err
 	}
@@ -729,7 +794,8 @@ func translateDelete(ds *pg_query.DeleteStmt) (*Plan, error) {
 	if implicit && whereCol != colKey {
 		return nil, fmt.Errorf("%w: only the key column may be filtered", errUnsupported)
 	}
-	return &Plan{Kind: StmtDelete, Table: table, WhereCol: whereCol, Key: key}, nil
+	return &Plan{Kind: StmtDelete, Table: table, WhereCol: whereCol, Key: key,
+		Where: ds.GetWhereClause()}, nil
 }
 
 func translateTransaction(ts *pg_query.TransactionStmt) (*Plan, error) {
@@ -757,4 +823,71 @@ func resultColOIDs(cols []string) []int32 {
 		}
 	}
 	return oids
+}
+
+// translateExplain wraps a statement in a plan request.
+//
+// EXPLAIN ANALYZE is refused rather than accepted-and-ignored. Silently
+// dropping the ANALYZE would report a plan for a query that never ran, and a
+// client that asked to measure would believe it had measured; running it would
+// need an execution path that returns more than one row. Both are worse than an
+// error that names the reason.
+func translateExplain(es *pg_query.ExplainStmt) (*Plan, error) {
+	for _, opt := range es.GetOptions() {
+		if d := opt.GetDefElem(); d != nil && d.GetDefname() == "analyze" {
+			return nil, fmt.Errorf("%w: EXPLAIN ANALYZE would have to execute the statement, and this phase cannot return a multi-row result; use EXPLAIN alone", errUnsupported)
+		}
+	}
+	inner, err := explainInner(es.GetQuery())
+	if err != nil {
+		return nil, err
+	}
+	// The projection is fixed: one text column. Declaring it here rather than
+	// leaving Cols empty matters because RowDescription reports len(Cols) as the
+	// field count, while the rendered plan is one cell wide -- a mismatch a real
+	// client rejects outright ("unexpected field count in D message"), and one
+	// no in-process test can see, because it never parses the description.
+	return &Plan{Kind: StmtExplain, Inner: inner, Cols: []string{"QUERY PLAN"}}, nil
+}
+
+// explainInner translates the node an EXPLAIN wraps. EXPLAIN of anything but a
+// data command is refused, because the plan being asked for is a row-access
+// plan and there is no such thing for DDL or a transaction.
+func explainInner(n *pg_query.Node) (*Plan, error) {
+	switch {
+	case n.GetSelectStmt() != nil:
+		return translateSelect(n.GetSelectStmt())
+	case n.GetInsertStmt() != nil:
+		return translateInsert(n.GetInsertStmt())
+	case n.GetUpdateStmt() != nil:
+		return translateUpdate(n.GetUpdateStmt())
+	case n.GetDeleteStmt() != nil:
+		return translateDelete(n.GetDeleteStmt())
+	}
+	return nil, fmt.Errorf("%w: EXPLAIN supports SELECT, INSERT, UPDATE and DELETE", errUnsupported)
+}
+
+// translateVacuum accepts ANALYZE and refuses VACUUM.
+//
+// Both arrive as the same node, distinguished by IsVacuumcmd. VACUUM reclaims
+// space this layout does not have -- there is no free-list to compact, because
+// a delete removes keys outright -- so accepting it would promise something the
+// store cannot do. ANALYZE reads statistics and is the half that is real.
+func translateVacuum(vs *pg_query.VacuumStmt) (*Plan, error) {
+	if vs.GetIsVacuumcmd() {
+		return nil, fmt.Errorf("%w: VACUUM is not supported; this layout deletes keys outright and has nothing to reclaim", errUnsupported)
+	}
+	plan := &Plan{Kind: StmtAnalyze}
+	for _, r := range vs.GetRels() {
+		vr := r.GetVacuumRelation()
+		if vr == nil {
+			continue
+		}
+		name := vr.GetRelation().GetRelname()
+		if err := ValidateTableName(name); err != nil {
+			return nil, err
+		}
+		plan.AnalyzeTables = append(plan.AnalyzeTables, name)
+	}
+	return plan, nil
 }

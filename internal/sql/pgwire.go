@@ -169,6 +169,11 @@ type Server struct {
 	conns   map[*pgConn]struct{}
 
 	backendSecret atomic.Int32
+
+	// stats holds the ANALYZE row counts this node has collected. They are
+	// local and not replicated (ADR-014 decision 5); see stats.go for why that
+	// is safe and what it costs.
+	stats *statsStore
 }
 
 // NewServer wires the PG listener to the shared store and identity stack.
@@ -188,6 +193,7 @@ func NewServer(addr string, store Store, policy *rbac.Store, oauthProvider oauth
 		requirePassHash: requirePassHash,
 		audit:           auditEngine,
 		conns:           map[*pgConn]struct{}{},
+		stats:           newStatsStore(),
 	}
 }
 

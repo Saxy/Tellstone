@@ -2,6 +2,7 @@ package keyspace
 
 import (
 	"bytes"
+	"math"
 	"strings"
 	"testing"
 )
@@ -173,6 +174,71 @@ func TestRowPrefixOfMatchesRowPrefix(t *testing.T) {
 					}
 				}
 			}
+		}
+	}
+}
+
+// The two properties ADR-014's RangeScan depends on, asserted at the layer that
+// owns them. Neither is visible in a unit test of the planner, and losing either
+// turns a range plan into one that quietly returns the wrong rows.
+func TestEncodeIntRowIDIsOrderPreserving(t *testing.T) {
+	prev := ""
+	for v := int64(-4000); v <= 4000; v++ {
+		id := EncodeIntRowID(v)
+		if v > -4000 && prev >= id {
+			t.Fatalf("row ids not ascending: %d -> %q then %d -> %q", v-1, prev, v, id)
+		}
+		if len(id) != intRowIDHexLen {
+			t.Fatalf("row id for %d is %d characters, want %d", v, len(id), intRowIDHexLen)
+		}
+		prev = id
+	}
+}
+
+func TestEncodeIntRowIDIsNeverEscaped(t *testing.T) {
+	for v := int64(-2000); v <= 2000; v++ {
+		id := EncodeIntRowID(v)
+		if got := EscapeRowID(id); got != id {
+			t.Fatalf("row id %q for %d was escaped to %q", id, v, got)
+		}
+	}
+}
+
+func TestEncodeIntRowIDRoundTrips(t *testing.T) {
+	for _, v := range []int64{math.MinInt64, math.MinInt64 + 1, -1, 0, 1, math.MaxInt64 - 1, math.MaxInt64} {
+		id := EncodeIntRowID(v)
+		got, err := DecodeIntRowID(id)
+		if err != nil || got != v {
+			t.Errorf("round trip of %d: got %d, err %v", v, got, err)
+		}
+	}
+}
+
+// A non-hex row id has to be rejected rather than decoded to zero, because zero
+// is a real row id and would address the wrong row.
+func TestDecodeIntRowIDRejectsNonHex(t *testing.T) {
+	for _, s := range []string{"", "0", "000000000000000", "00000000000000001", "000000000000000g", "-1"} {
+		if _, err := DecodeIntRowID(s); err == nil {
+			t.Errorf("DecodeIntRowID(%q) accepted a non-hex row id", s)
+		}
+	}
+}
+
+// IsIntRowID reports shape, and shape alone cannot tell a text key whose value
+// happens to be "0000000000000001" from the row id of the integer 1. It returns
+// true for both, on purpose: the caller holds the column type and must use it,
+// whereas a predicate that tried to disambiguate from the characters would
+// reject a legitimate row id. Only shapes that cannot be a row id are refused.
+func TestIsIntRowIDIsExact(t *testing.T) {
+	if !IsIntRowID(EncodeIntRowID(1)) {
+		t.Error("EncodeIntRowID output not recognised by IsIntRowID")
+	}
+	if !IsIntRowID("0000000000000001") {
+		t.Error("a 16-character lowercase hex string should be recognised")
+	}
+	for _, s := range []string{"", "1", "000000000000000", "00000000000000001", "0000000000000001x", "ABCDEF0123456789", "-000000000000001"} {
+		if IsIntRowID(s) {
+			t.Errorf("IsIntRowID(%q) = true, want false", s)
 		}
 	}
 }

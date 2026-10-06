@@ -26,6 +26,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -155,9 +156,17 @@ func TablePrefixEnd(db, table string) string {
 //
 // The encoding is not order preserving. Escaping only these two bytes keeps
 // '/' and '%' correctly ordered relative to each other but not relative to
-// every other byte, and Phase 9 does not range scan a textual primary key. An
-// integer primary key uses an order-preserving integer encoding instead, which
-// needs no escaping.
+// every other byte: '%' escapes to "%2F", whose leading 0x25 sorts below any
+// byte it replaces, so a row id that needed escaping can land on the wrong side
+// of a bound. A textual primary key is therefore never range scanned.
+//
+// An integer primary key is escaped by nothing, because EncodeIntRowID emits
+// only hex digits -- which are order preserving as well, so it is safe to range
+// on. Note that this is a property of the row id's own alphabet, not of the
+// column's value encoding: an integer value rendered as raw fixed-width bytes
+// is full of escapable bytes, and an integer value rendered as a decimal string
+// is order preserving but not escape-safe in general and not fixed width. Only
+// the hex rendering is both at once.
 func EscapeRowID(id string) string {
 	if !strings.ContainsAny(id, escapeChars) {
 		return id
@@ -263,3 +272,67 @@ func RowPrefixOf(key []byte) (prefix []byte, ok bool) {
 	}
 	return key[:first+1+second+1+third+1], true
 }
+
+// EncodeIntRowID renders an integer row id as 16 lowercase hex digits of the
+// sign-flipped 64-bit value.
+//
+// This is the only row-id encoding that is both order-preserving and escape-free,
+// and a range scan needs both properties at once.
+//
+// **Order-preserving.** The sign flip puts negative values below positive ones
+// without disturbing magnitude order, and fixed-width hex preserves that order
+// as text: the digits run 0-9 then a-f, which is exactly ascending value order,
+// so comparing two hex strings character by character gives the same answer as
+// comparing the two numbers. The width must be fixed -- a variable-width decimal
+// string does not sort numerically ("10" sorts before "9"), which is the reason
+// EncodeOrderableInt is a fixed 8 bytes rather than a decimal rendering.
+//
+// **Escape-free.** Hex digits are 0x30-0x39 and 0x61-0x66, so a hex row id can
+// contain neither the escape byte '%' (0x25) nor the separator '/' (0x2F), and
+// EscapeRowID is a no-op on it. That matters because RowPrefix escapes every row
+// id unconditionally, and the escape is not order-preserving: '%' escapes to the
+// three bytes "%2F", which sort *below* the byte it replaced when that byte was
+// in (0x25, 0x2F) -- so '/' would land before '&'. A row id made only of hex
+// digits avoids the question rather than answering it.
+//
+// Together these are what let ADR-014's RangeScan exist. Without them a range
+// bounded on the encoding returns the wrong rows, which is worse than not
+// offering the plan at all.
+func EncodeIntRowID(v int64) string {
+	return fmt.Sprintf("%016x", uint64(v)^(1<<63))
+}
+
+// DecodeIntRowID is the inverse of EncodeIntRowID. It reports an error rather
+// than a zero value for input that is not a hex row id, because a silently zero
+// row id would address a real -- and unrelated -- row.
+func DecodeIntRowID(s string) (int64, error) {
+	u, err := strconv.ParseUint(s, 16, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%w: %q is not a hex row id", ErrInvalidSegment, s)
+	}
+	if len(s) != intRowIDHexLen {
+		return 0, fmt.Errorf("%w: hex row id must be %d characters, got %d",
+			ErrInvalidSegment, intRowIDHexLen, len(s))
+	}
+	return int64(u ^ (1 << 63)), nil
+}
+
+// IsIntRowID reports whether s has the shape EncodeIntRowID produces, without
+// decoding it. Scans use it to tell an integer row id from a text one, so a text
+// primary key whose value happens to be 16 hex characters is not mistaken for an
+// integer and silently reformatted.
+func IsIntRowID(s string) bool {
+	if len(s) != intRowIDHexLen {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// intRowIDHexLen is the width of a hex row id: two digits per byte, eight bytes.
+const intRowIDHexLen = 16
