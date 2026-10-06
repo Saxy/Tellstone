@@ -180,10 +180,10 @@ func (o *optimizer) plan(filter Expr) (*physicalPlan, error) {
 		// Only produce a point lookup when there is exactly one conjunct and it is primary-key equality.
 		// Otherwise return nil so planning falls through to the existing execution path.
 		if len(conj) != 1 {
-			return nil
+			return nil, nil
 		}
-		if !isPrimaryKeyEquality(conj[0]) {
-			return nil
+		if !o.isPrimaryKeyEquality(conj[0]) {
+			return nil, nil
 		}
 		return o.finish(p)
 	}

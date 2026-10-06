@@ -913,7 +913,7 @@ func (s *Server) execExplain(plan *Plan) (*execOutcome, error) {
 	if err := s.resolvePlan(plan.Inner); err != nil {
 		return nil, err
 	}
-	if err := s.authorize(plan.Inner); err != nil {
+	if err := s.authorize(nil, plan.Inner, nil); err != nil {
 		return nil, err
 	}
 	lines := Explain(plan.Inner.Phys, s.statsFor(plan.Inner.Schema), time.Now())
