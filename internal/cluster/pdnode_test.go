@@ -14,6 +14,8 @@ package cluster
 
 import (
 	"fmt"
+	"math/rand"
+	"net"
 	"testing"
 	"time"
 )
@@ -37,14 +39,43 @@ func waitForAlloc(t *testing.T, pool *TSOPool) uint64 {
 // freeBasePort returns an available base TCP port whose +10000 and +20000
 // derived PD ports stay within the valid range, so StartPDNode can bind all
 // three without overflowing 65535.
+//
+// It cannot be an ephemeral port from freePort: the OS hands those out only in
+// its configured ephemeral range, where base+20000 would overflow, so the
+// bind-until-it-fits loop would never terminate. Each candidate triple is
+// instead probed explicitly, and the scan starts at a random offset so repeated
+// calls within one test run are unlikely to return the same base.
 func freeBasePort(t *testing.T) int {
 	t.Helper()
-	for {
-		base := freePort(t)
-		if base+20000 <= 65535 {
+	const minBase, maxBase = 20000, 45535
+	start := minBase + rand.Intn(maxBase-minBase+1)
+	for step := 0; step <= maxBase-minBase; step++ {
+		base := minBase + (start-minBase+step)%(maxBase-minBase+1)
+		if portsFree(base, base+10000, base+20000) {
 			return base
 		}
 	}
+	t.Fatal("no free base port triple in range")
+	return 0
+}
+
+// portsFree reports whether every port is bindable, and so free.
+func portsFree(ports ...int) bool {
+	ls := make([]net.Listener, 0, len(ports))
+	for _, p := range ports {
+		l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err != nil {
+			for _, open := range ls {
+				open.Close()
+			}
+			return false
+		}
+		ls = append(ls, l)
+	}
+	for _, open := range ls {
+		open.Close()
+	}
+	return true
 }
 
 func TestStartPDNodeHybrid(t *testing.T) {

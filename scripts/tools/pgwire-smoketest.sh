@@ -33,6 +33,18 @@ log()  { printf '\n\033[1m-- %s\033[0m\n' "$*"; }
 ok()   { printf '  \033[32mPASS\033[0m %s\n' "$*"; pass=$((pass+1)); }
 bad()  { printf '  \033[31mFAIL\033[0m %s\n' "$*"; fail=$((fail+1)); }
 
+# run_timeout <seconds> <cmd...> runs cmd and kills it after <seconds>. GNU
+# coreutils `timeout` does not ship on macOS, so this is the portable form.
+run_timeout() {
+	local sec="$1"; shift
+	local pid killer rc
+	"$@" & pid=$!
+	{ sleep "$sec"; kill "$pid" 2>/dev/null; } & killer=$!
+	wait "$pid"; rc=$?
+	kill "$killer" 2>/dev/null
+	return "$rc"
+}
+
 # check <label> <expected-substring> <psql args, e.g. -c "SQL" ...>
 check() {
 	local label="$1" expect="$2"; shift 2
@@ -53,7 +65,7 @@ check() {
 # Tellstone's SQL subset (a WHERE-key SELECT returning zero rows "succeeds").
 wait_pg() {
 	local port="$1" n=0
-	while ! timeout 2 psql -h 127.0.0.1 -p "$port" -U default -d test -X -t -c "SELECT key FROM tellstone WHERE key = 'pgwire-wait'" >/dev/null 2>&1; do
+	while ! run_timeout 2 psql -h 127.0.0.1 -p "$port" -U default -d test -X -t -c "SELECT key FROM tellstone WHERE key = 'pgwire-wait'" >/dev/null 2>&1; do
 		n=$((n+1))
 		[ "$n" -ge 40 ] && { bad "postgres frontend on :$port did not respond"; return 1; }
 		sleep 0.5

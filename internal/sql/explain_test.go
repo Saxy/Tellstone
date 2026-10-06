@@ -292,9 +292,10 @@ func TestExplainRowDescriptionMatchesDataRowWidth(t *testing.T) {
 			t.Errorf("%s: RowDescription would declare %d fields, want 1", q, len(plan.Cols))
 			continue
 		}
-		// execExplain directly rather than through execute, which needs a
-		// connection this test has no reason to build.
-		out, err := srv.execExplain(plan)
+		// execExplain directly rather than through execute, which would
+		// re-plan the statement; an empty connection stands in for a session
+		// with no authentication, so authorize is a no-op here.
+		out, err := srv.execExplain(&pgConn{}, plan)
 		if err != nil {
 			t.Fatalf("%s: execute: %v", q, err)
 		}

@@ -169,7 +169,7 @@ func (s *Server) execute(c *pgConn, plan *Plan, params []paramVal) (*execOutcome
 
 	switch plan.Kind {
 	case StmtExplain:
-		return s.execExplain(plan)
+		return s.execExplain(c, plan)
 	case StmtAnalyze:
 		return s.execAnalyze(plan)
 	case StmtSelect:
@@ -905,15 +905,17 @@ func (p *Plan) predicate() (Expr, error) {
 // same answer dressed as a complete one. Phase 11 adds the streaming pipeline
 // that a range or a scan can be delivered through.
 func (p *physicalPlan) executable() bool {
-	return p != nil && p.Kind == PlanPointLookup && !p.EmptyRange
+	return p != nil && p.Kind == PlanPointLookup && !p.EmptyRange && p.Filter == nil
 }
 
 // execExplain renders the wrapped statement's plan without running it.
-func (s *Server) execExplain(plan *Plan) (*execOutcome, error) {
-	if err := s.resolvePlan(plan.Inner); err != nil {
+func (s *Server) execExplain(c *pgConn, plan *Plan) (*execOutcome, error) {
+	// The inner statement is authorized before its plan is resolved so a
+	// session without permission learns nothing about which tables exist.
+	if err := s.authorize(c, plan.Inner, nil); err != nil {
 		return nil, err
 	}
-	if err := s.authorize(nil, plan.Inner, nil); err != nil {
+	if err := s.resolvePlan(plan.Inner); err != nil {
 		return nil, err
 	}
 	lines := Explain(plan.Inner.Phys, s.statsFor(plan.Inner.Schema), time.Now())
@@ -968,6 +970,16 @@ func (s *Server) execAnalyze(plan *Plan) (*execOutcome, error) {
 func refuseMultiRow(p *physicalPlan) error {
 	if p == nil || p.executable() {
 		return nil
+	}
+	if p.Kind == PlanPointLookup {
+		// The lookup addresses one row, but whether that row qualifies needs
+		// the filter evaluator a scan would apply. Returning the row would
+		// answer the wrong question whenever the residual predicate is false,
+		// so the statement is refused rather than approximated.
+		return &pgError{
+			code: errFeatureNotSupported,
+			msg:  "plan PointLookup cannot be executed: residual filter evaluation is deferred to Phase 11",
+		}
 	}
 	if p.EmptyRange {
 		// An empty range has no rows to return, which is a complete answer and

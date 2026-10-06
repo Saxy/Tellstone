@@ -177,14 +177,6 @@ func (o *optimizer) plan(filter Expr) (*physicalPlan, error) {
 	}
 
 	if p := o.pointLookup(conj); p != nil {
-		// Only produce a point lookup when there is exactly one conjunct and it is primary-key equality.
-		// Otherwise return nil so planning falls through to the existing execution path.
-		if len(conj) != 1 {
-			return nil, nil
-		}
-		if !o.isPrimaryKeyEquality(conj[0]) {
-			return nil, nil
-		}
 		return o.finish(p)
 	}
 	if p := o.rangeScan(conj); p != nil {
@@ -267,15 +259,20 @@ func conjuncts(e Expr) []Expr {
 // pointLookup recognises an equality on the primary key.
 //
 // A point lookup wins over a range even when both are available, because it
-// reads one row rather than a range and needs no bound arithmetic.
+// reads one row rather than a range and needs no bound arithmetic. The equality
+// pins the row; the conjuncts it cannot absorb survive as a residual filter that
+// decides whether that row qualifies.
 func (o *optimizer) pointLookup(conj []Expr) *physicalPlan {
 	pk := o.sch.PrimaryKeyName()
-	for _, c := range conj {
+	for i, c := range conj {
 		cmp, ok := c.(*CmpExpr)
 		if !ok || cmp.Col != pk || cmp.Op != OpEq {
 			continue
 		}
-		return &physicalPlan{Kind: PlanPointLookup, Schema: o.sch, Key: cmp.Val}
+		rest := make([]Expr, 0, len(conj)-1)
+		rest = append(rest, conj[:i]...)
+		rest = append(rest, conj[i+1:]...)
+		return &physicalPlan{Kind: PlanPointLookup, Schema: o.sch, Key: cmp.Val, Filter: orAll(rest)}
 	}
 	return nil
 }
