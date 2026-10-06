@@ -5,13 +5,11 @@ File: optimizer_test.go
 Description: Tests for the planner: which access method a predicate chooses, and
 the bounds a range plan derives.
 
-The range tests are written against a gate that is currently closed, so they
-assert that no primary key yields a range plan and pin the reason. That looks
-backwards until you know the alternative: the integer row-id encoding *is*
-order-preserving, so a range over an integer key looks correct, and the plan it
-produces is wrong anyway, because keyspace.RowPrefix escapes every row id and the
-escape inverts the order of roughly one id in 128. A test that only checked the
-happy path would have passed on a plan that returns the wrong rows.
+The range tests assert that primary keys yield range plans only when the key is
+an integer and the row-id encoding is fixed-width hex (decision 4). The integer
+row-id encoding is order-preserving, and the fixed-width hex layout makes the
+range sound. Tests also assert that text primary keys remain rejected for range
+plans, because `EscapeRowID` does not preserve order.
 */
 package sql
 

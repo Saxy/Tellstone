@@ -177,6 +177,14 @@ func (o *optimizer) plan(filter Expr) (*physicalPlan, error) {
 	}
 
 	if p := o.pointLookup(conj); p != nil {
+		// Only produce a point lookup when there is exactly one conjunct and it is primary-key equality.
+		// Otherwise return nil so planning falls through to the existing execution path.
+		if len(conj) != 1 {
+			return nil
+		}
+		if !isPrimaryKeyEquality(conj[0]) {
+			return nil
+		}
 		return o.finish(p)
 	}
 	if p := o.rangeScan(conj); p != nil {

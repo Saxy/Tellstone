@@ -1,3 +1,7 @@
+/*
+File: stats.go
+*/
+
 package sql
 
 import (

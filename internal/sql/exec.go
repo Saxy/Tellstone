@@ -913,6 +913,9 @@ func (s *Server) execExplain(plan *Plan) (*execOutcome, error) {
 	if err := s.resolvePlan(plan.Inner); err != nil {
 		return nil, err
 	}
+	if err := s.authorize(plan.Inner); err != nil {
+		return nil, err
+	}
 	lines := Explain(plan.Inner.Phys, s.statsFor(plan.Inner.Schema), time.Now())
 	text := strings.Join(textLines(lines), "\n")
 	return &execOutcome{tag: "EXPLAIN", row: [][]byte{[]byte(text)}, selectRows: true}, nil

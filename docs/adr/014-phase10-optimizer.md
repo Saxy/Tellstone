@@ -411,14 +411,13 @@ which is slower and correct.
   executor**: rejected — decision 1. The Phase 9 executor materializes rows
   through the wire, and planning a pipeline over an executor that cannot stream
   would produce plans Phase 11 rewrites.
-- **Treat `LIKE 'A%'` on a text primary key as a range scan and accept the
-  escaping subtlety**: **adopted, as fixed-width hex** (decision 4). Ranging on
-  the unescaped encoding is rejected — `EscapeRowID` does not preserve order,
-  so the range would omit and include the wrong rows — but the layout was
-  changed to make the range sound rather than dropping the criterion. Rejected
-  alternatives: rejecting row ids containing the escape byte (turns a valid
-  text key into an error), and a length-prefixed or byte-stuffed escape (a new
-  format, and a wider rewrite than integers need).
+- **Treat `LIKE 'A%'` on a text primary key as a range scan**: **rejected** —
+`EscapeRowID` does not preserve order, so the range would omit and include the
+wrong rows. Fixed-width hex makes integer-key ranges sound, but text keys
+remain rejected (decision 4). Rejected alternatives: rejecting row ids
+containing the escape byte (turns a valid text key into an error), and a
+length-prefixed or byte-stuffed escape (a new format, and a wider rewrite
+than integers need).
 - **Pull multi-row delivery forward into Phase 10 so `RangeScan` and `FullScan`
   can execute**: deferred, not rejected. It is the right fix and it is Phase 14's
   work; doing it inside the optimizer phase would put a wire-protocol rewrite
