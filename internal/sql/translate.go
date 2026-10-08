@@ -133,6 +133,24 @@ type Plan struct {
 	// a missing or duplicate object from an error into a notice.
 	IfNotExists bool
 	IfExists    bool
+	// Join carries the parsed FROM join of a StmtSelect whose FROM is one.
+	// It is nil for every other statement, and the executor plans it against
+	// the live catalog once both tables' schemas are known -- translation
+	// cannot, because a table named here may be created by another client a
+	// moment after this function returns.
+	Join *joinSpec
+}
+
+// joinSpec is the parsed form of one supported FROM join: two tables, their
+// aliases as the statement writes them (or their names when unaliased), and
+// the two ON operands as columnRef read them -- qualified or bare. Which side
+// each operand names is a schema question, so it is settled in the planner;
+// only the shapes are checked at translation, where a refusal costs no catalog
+// read.
+type joinSpec struct {
+	Left, Right           string
+	LeftAlias, RightAlias string
+	LKey, RKey            string
 }
 
 // ConflictAction is the INSERT conflict behavior the translator extracted from
@@ -230,9 +248,19 @@ func dmlTarget(rv *pg_query.RangeVar) (table string, implicit bool, err error) {
 	return name, false, nil
 }
 
-// columnRef resolves a single-column reference (e.g. key or value). It returns
-// ("*", true) for a bare star and ("", false) when the node is not a plain
+// columnRef resolves a column reference: "key" for a bare column,
+// "table.column" for a qualified one, "table.*" for a qualified star and "*"
+// for a bare one. It returns ("", false) when the node is not a plain
 // single-column reference of the supported shape.
+//
+// The qualified forms exist because a join writes them constantly (`u.id =
+// o.uid`) and refusing them would refuse every join there is. On a
+// single-table statement they are not special: planAccess strips the
+// qualifier when it matches the table, so `WHERE users.id = 1` plans exactly
+// like `WHERE id = 1`, and a qualifier naming some other table is left in
+// place to fail column resolution with 42703 rather than silently reading the
+// bare name from the wrong table. On a join the qualifier is not stripped --
+// it is what tells the planner which side the column belongs to.
 func columnRef(node *pg_query.Node) (string, bool) {
 	if node == nil {
 		return "", false
@@ -245,17 +273,31 @@ func columnRef(node *pg_query.Node) (string, bool) {
 		return "", false
 	}
 	fields := cr.GetFields()
-	if len(fields) != 1 {
-		return "", false
+	switch len(fields) {
+	case 1:
+		if fields[0].GetAStar() != nil {
+			return "*", true
+		}
+		sv := fields[0].GetString_()
+		if sv == nil {
+			return "", false
+		}
+		return sv.GetSval(), true
+	case 2:
+		first := fields[0].GetString_()
+		if first == nil {
+			return "", false
+		}
+		if fields[1].GetAStar() != nil {
+			return first.GetSval() + ".*", true
+		}
+		second := fields[1].GetString_()
+		if second == nil {
+			return "", false
+		}
+		return first.GetSval() + "." + second.GetSval(), true
 	}
-	if fields[0].GetAStar() != nil {
-		return "*", true
-	}
-	sv := fields[0].GetString_()
-	if sv == nil {
-		return "", false
-	}
-	return sv.GetSval(), true
+	return "", false
 }
 
 // valueRef extracts a literal or parameter reference from a node. column names
@@ -433,41 +475,34 @@ func singleRowPredicate(where *pg_query.Node) (col string, ref ValRef, err error
 	return n, ref, nil
 }
 
-func translateSelect(ss *pg_query.SelectStmt) (*Plan, error) {
+// refuseSelectModifiers rejects the SELECT clauses that would change which
+// rows qualify or fold rows together. A projection and an equality filter are
+// the only shapes answerable by reading one row range; anything that can change
+// which rows qualify, or that folds rows together, is refused rather than
+// ignored, because ignoring it would answer a different question from the one
+// asked.
+func refuseSelectModifiers(ss *pg_query.SelectStmt) error {
 	if ss.GetIntoClause() != nil {
-		return nil, fmt.Errorf("%w: SELECT ... INTO is not supported", errUnsupported)
+		return fmt.Errorf("%w: SELECT ... INTO is not supported", errUnsupported)
 	}
 	if ss.GetGroupClause() != nil || ss.GetHavingClause() != nil || ss.GetLimitCount() != nil ||
 		ss.GetLimitOffset() != nil || ss.GetSortClause() != nil || ss.GetDistinctClause() != nil ||
 		len(ss.GetLockingClause()) > 0 {
-		// A projection and an equality filter are the only shapes answerable
-		// by reading one row range. Anything that can change which rows
-		// qualify, or that folds rows together, is refused rather than
-		// ignored, because ignoring it would answer a different question from
-		// the one asked.
-		return nil, fmt.Errorf("%w: grouping, ordering, limiting and DISTINCT are not supported", errUnsupported)
+		return fmt.Errorf("%w: grouping, ordering, limiting and DISTINCT are not supported", errUnsupported)
 	}
-	from := ss.GetFromClause()
-	if len(from) != 1 {
-		return nil, fmt.Errorf("%w: SELECT requires exactly one FROM relation", errUnsupported)
-	}
-	table, implicit, err := dmlTarget(from[0].GetRangeVar())
-	if err != nil {
-		return nil, err
-	}
-	whereCol, key, err := rowPredicateFor(table, implicit, ss.GetWhereClause())
-	if err != nil {
-		return nil, err
-	}
-	plan := &Plan{Kind: StmtSelect, Table: table, WhereCol: whereCol, Key: key,
-		Where: ss.GetWhereClause()}
+	return nil
+}
 
-	// A bare star cannot be expanded here: the column list lives in the
-	// catalog, which only the executor can read. It is carried as "*" and
-	// expanded against the schema once that is known.
+// selectTargets reads a SELECT's target list into a projection, deduped by the
+// name as written. A bare star stays "*"; a qualified star ("t.*") rides as a
+// name, because which table it expands to is known only when the schema is.
+// The star rules are shared by single-table and join statements so one path
+// cannot accept a shape the other refuses.
+func selectTargets(list []*pg_query.Node) ([]string, error) {
+	var cols []string
 	star := false
 	seen := map[string]bool{}
-	for _, t := range ss.GetTargetList() {
+	for _, t := range list {
 		rt := t.GetResTarget()
 		if rt == nil {
 			return nil, fmt.Errorf("%w: unsupported target expression", errUnsupported)
@@ -484,7 +519,7 @@ func translateSelect(ss *pg_query.SelectStmt) (*Plan, error) {
 				continue
 			}
 			star = true
-			plan.Cols = []string{"*"}
+			cols = []string{"*"}
 			continue
 		}
 		if star {
@@ -492,12 +527,41 @@ func translateSelect(ss *pg_query.SelectStmt) (*Plan, error) {
 		}
 		if !seen[name] {
 			seen[name] = true
-			plan.Cols = append(plan.Cols, name)
+			cols = append(cols, name)
 		}
 	}
-	if len(plan.Cols) == 0 {
+	if len(cols) == 0 {
 		return nil, fmt.Errorf("%w: SELECT target list is empty", errUnsupported)
 	}
+	return cols, nil
+}
+
+func translateSelect(ss *pg_query.SelectStmt) (*Plan, error) {
+	if err := refuseSelectModifiers(ss); err != nil {
+		return nil, err
+	}
+	from := ss.GetFromClause()
+	if len(from) != 1 {
+		return nil, fmt.Errorf("%w: SELECT requires exactly one FROM relation", errUnsupported)
+	}
+	if je := from[0].GetJoinExpr(); je != nil {
+		return translateJoinSelect(ss, je)
+	}
+	table, implicit, err := dmlTarget(from[0].GetRangeVar())
+	if err != nil {
+		return nil, err
+	}
+	whereCol, key, err := rowPredicateFor(table, implicit, ss.GetWhereClause())
+	if err != nil {
+		return nil, err
+	}
+	cols, err := selectTargets(ss.GetTargetList())
+	if err != nil {
+		return nil, err
+	}
+	plan := &Plan{Kind: StmtSelect, Table: table, WhereCol: whereCol, Key: key,
+		Where: ss.GetWhereClause(), Cols: cols}
+
 	if implicit {
 		// The implicit table has exactly two columns and stricter projection
 		// rules that predate the catalog.
@@ -509,7 +573,95 @@ func translateSelect(ss *pg_query.SelectStmt) (*Plan, error) {
 	return plan, nil
 }
 
-// checkImplicitSelect applies the implicit table's projection rules: its only
+// translateJoinSelect reads a FROM that is exactly one join: two tables, an
+// INNER equality, and nothing else. Every other join shape is refused here
+// rather than planned wrong: LEFT/RIGHT/FULL need outer-join row semantics
+// this engine does not have, NATURAL and USING need name inference that can
+// silently pick the wrong column, a nested join needs a planner that can choose
+// which side to build, and an ON clause that is not a single column equality is
+// not hashable at all.
+//
+// The shapes are checked here because translation can settle them without a
+// catalog read; which table each ON operand and each WHERE column names is
+// settled later, in planJoin, against the live schemas.
+func translateJoinSelect(ss *pg_query.SelectStmt, je *pg_query.JoinExpr) (*Plan, error) {
+	if err := refuseSelectModifiers(ss); err != nil {
+		return nil, err
+	}
+	if je.GetIsNatural() {
+		return nil, fmt.Errorf("%w: NATURAL JOIN is not supported", errUnsupported)
+	}
+	if je.GetJointype() != pg_query.JoinType_JOIN_INNER {
+		return nil, fmt.Errorf("%w: only INNER JOIN is supported", errUnsupported)
+	}
+	if len(je.GetUsingClause()) > 0 {
+		return nil, fmt.Errorf("%w: JOIN ... USING is not supported", errUnsupported)
+	}
+	if je.GetQuals() == nil {
+		// CROSS JOIN parses as jointype INNER with a nil quals, so it lands
+		// here rather than on the type check above.
+		return nil, fmt.Errorf("%w: JOIN requires an ON condition", errUnsupported)
+	}
+	if je.GetLarg().GetJoinExpr() != nil || je.GetRarg().GetJoinExpr() != nil {
+		return nil, fmt.Errorf("%w: nested joins are not supported", errUnsupported)
+	}
+	lr := je.GetLarg().GetRangeVar()
+	rr := je.GetRarg().GetRangeVar()
+	if lr == nil || rr == nil {
+		return nil, fmt.Errorf("%w: JOIN sides must be simple tables", errUnsupported)
+	}
+	ltable, limplicit, err := dmlTarget(lr)
+	if err != nil {
+		return nil, err
+	}
+	rtable, rimplicit, err := dmlTarget(rr)
+	if err != nil {
+		return nil, err
+	}
+	if limplicit || rimplicit {
+		return nil, fmt.Errorf("%w: the implicit table cannot be joined", errUnsupported)
+	}
+	ae := je.GetQuals().GetAExpr()
+	if ae == nil || ae.GetKind() != pg_query.A_Expr_Kind_AEXPR_OP ||
+		len(ae.GetName()) != 1 || ae.GetName()[0].GetString_().GetSval() != "=" {
+		return nil, fmt.Errorf("%w: ON must be a single equality between two columns", errUnsupported)
+	}
+	lkey, ok := plainColumn(ae.GetLexpr())
+	if !ok {
+		return nil, fmt.Errorf("%w: ON must be a single equality between two columns", errUnsupported)
+	}
+	rkey, ok := plainColumn(ae.GetRexpr())
+	if !ok {
+		return nil, fmt.Errorf("%w: ON must be a single equality between two columns", errUnsupported)
+	}
+	lalias := lr.GetAlias().GetAliasname()
+	if lalias == "" {
+		lalias = ltable
+	}
+	ralias := rr.GetAlias().GetAliasname()
+	if ralias == "" {
+		ralias = rtable
+	}
+	if strings.EqualFold(lalias, ralias) {
+		return nil, fmt.Errorf("%w: table name %q specified more than once", errUnsupported, lalias)
+	}
+	cols, err := selectTargets(ss.GetTargetList())
+	if err != nil {
+		return nil, err
+	}
+	return &Plan{
+		Kind:  StmtSelect,
+		Table: ltable,
+		Where: ss.GetWhereClause(),
+		Cols:  cols,
+		Join: &joinSpec{
+			Left: ltable, Right: rtable,
+			LeftAlias: lalias, RightAlias: ralias,
+			LKey: lkey, RKey: rkey,
+		},
+	}, nil
+}
+
 // two columns, and a filter on key. Kept separate so the catalog path does not
 // inherit the implicit table's restrictions by accident.
 func checkImplicitSelect(plan *Plan, whereCol string) error {

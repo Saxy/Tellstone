@@ -280,13 +280,11 @@ check "node-3 still reports the estimate" "never analyzed" \
 
 log "a planned but unexecutable plan refuses with 0A000, naming plan and phase"
 port=$((base_pg + 1))
-expect_err "range scan refused" "RangeScan" \
+check "range scan executes" "label-2" \
         "SELECT label FROM metrics WHERE id >= 2 AND id <= 8"
-expect_err "range refusal names the phase that will run it" "Phase 11" \
-        "SELECT label FROM metrics WHERE id >= 2 AND id <= 8"
-expect_err "full scan refused" "FullScan" \
+check "full scan executes for non-key filter" "label-4" \
         "SELECT label FROM metrics WHERE label = 'label-4'"
-expect_err "unfiltered query refused" "FullScan" \
+check "unfiltered query executes (multi-row)" "label-1" \
         "SELECT label FROM metrics"
 expect_err "multi-row UPDATE refused" "Phase 11" \
         "UPDATE metrics SET score = 1 WHERE score > 0"

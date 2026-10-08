@@ -826,6 +826,11 @@ func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
 		if plan.Key.Param > 0 {
 			types[plan.Key.Param] = oidOf(plan.Schema.Columns[plan.Schema.PrimaryKey].Type)
 		}
+		// The same is true of the point lookup's key on the physical plan,
+		// which is the primary key by construction.
+		if plan.Phys != nil && plan.Phys.Key.Param > 0 {
+			types[plan.Phys.Key.Param] = oidOf(plan.Schema.Columns[plan.Schema.PrimaryKey].Type)
+		}
 		for i, ref := range plan.Values {
 			if ref.Param <= 0 || i >= len(plan.Columns) {
 				continue
@@ -856,7 +861,10 @@ func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
 // an INSERT has no Key at all, and its parameters arrive among the column values
 // -- so Values has to be scanned too. Leaving it out reported a count of zero
 // for a statement that does take parameters, and the client then sent no
-// Bind values for a query that required them.
+// Bind values for a query that required them. A residual filter's values
+// reference parameters too (`WHERE id > $1`), and a join's operands live
+// entirely in its filter, so the parameter hole spans the whole plan rather
+// than just Key/Val/Values.
 func maxParam(p *Plan) int {
 	m := 0
 	refs := []ValRef{p.Key, p.Val}
@@ -865,6 +873,29 @@ func maxParam(p *Plan) int {
 		if v.Param > m {
 			m = v.Param
 		}
+	}
+	if p.Phys != nil {
+		// The point lookup's key equality lives on the physical plan, not on
+		// the plan: translate leaves plan.Key empty for a predicate it cannot
+		// prove is a single equality, and the optimizer then puts `id = $1`
+		// into Phys.Key while the rest of the AND becomes the filter. Without
+		// this, `WHERE id = $1 AND x = 5` reported zero parameters.
+		if p.Phys.Key.Param > m {
+			m = p.Phys.Key.Param
+		}
+		walkExpr(p.Phys.Filter, func(e Expr) bool {
+			switch t := e.(type) {
+			case *CmpExpr:
+				if t.Val.Param > m {
+					m = t.Val.Param
+				}
+			case *LikeExpr:
+				if t.Val.Param > m {
+					m = t.Val.Param
+				}
+			}
+			return true
+		})
 	}
 	return m
 }
@@ -888,7 +919,16 @@ func (c *pgConn) sendRowDescription(plan *Plan) error {
 	buf.int16(int16(len(plan.Cols)))
 	for i, col := range plan.Cols {
 		oid := int32(oidText)
-		if plan.Schema != nil {
+		if plan.Phys != nil && plan.Phys.Join != nil {
+			// A join's output columns come from both sides' schemas, so the
+			// single-table lookup below cannot type them -- a bare name like
+			// "id" may only exist on one side. The join projection carries the
+			// declaration the wire needs, and resolves that ambiguity at plan
+			// time (join.go).
+			if i < len(plan.Phys.Join.Proj) {
+				oid = oidOf(plan.Phys.Join.Proj[i].Col.Type)
+			}
+		} else if plan.Schema != nil {
 			// A catalog column is typed by its schema, which is the only place
 			// the declared type lives. resolvePlan has already checked that
 			// the projection names real columns.
@@ -964,21 +1004,28 @@ func (c *pgConn) handleClose(payload []byte) error {
 	return c.writeMsg(&buf)
 }
 
-// emitOutcome writes a single DataRow (SELECT) then CommandComplete.
+// emitOutcome writes every row a SELECT produced, then CommandComplete.
+//
+// All rows are folded into one buffer so the result set goes out in a single
+// flush. The buffer can grow large for a big result, which is the materialized
+// delivery the multi-row pipeline was built around: execution fills execOutcome
+// up front, and this drains it without holding a per-row cursor onto the scan.
 func (c *pgConn) emitOutcome(out *execOutcome) error {
 	var buf msgBuilder
-	if out.selectRows && out.row != nil {
-		buf.begin(msgDataRow)
-		buf.int16(int16(len(out.row)))
-		for _, col := range out.row {
-			if col == nil {
-				buf.int32(-1)
-				continue
+	if out.selectRows {
+		for _, row := range out.rows {
+			buf.begin(msgDataRow)
+			buf.int16(int16(len(row)))
+			for _, col := range row {
+				if col == nil {
+					buf.int32(-1)
+					continue
+				}
+				buf.int32(int32(len(col)))
+				buf.bytes(col)
 			}
-			buf.int32(int32(len(col)))
-			buf.bytes(col)
+			buf.end()
 		}
-		buf.end()
 	}
 	var tbuf msgBuilder
 	tbuf.begin(msgCommandComplete)
@@ -1116,11 +1163,25 @@ func frameAuthCleartext() []byte {
 // msgBuilder assembles wire frames into a reusable buffer.
 type msgBuilder struct {
 	buf []byte
+	// cur is the buffer offset where the message under construction began,
+	// where its type byte sits. One buffer can hold several messages, so the
+	// length each message gets is backfilled at its own header, not at the
+	// buffer's (end() used to write buf[1:5], which put the first message's
+	// length over every one after it once a single buffer carried more than
+	// one frame).
+	cur int
 }
 
-func (m *msgBuilder) reset()         { m.buf = m.buf[:0] }
-func (m *msgBuilder) begin(typ byte) { m.buf = append(m.buf, typ, 0, 0, 0, 0) }
-func (m *msgBuilder) byte(v byte)    { m.buf = append(m.buf, v) }
+func (m *msgBuilder) reset() {
+	m.buf = m.buf[:0]
+	m.cur = 0
+}
+
+func (m *msgBuilder) begin(typ byte) {
+	m.cur = len(m.buf)
+	m.buf = append(m.buf, typ, 0, 0, 0, 0)
+}
+func (m *msgBuilder) byte(v byte) { m.buf = append(m.buf, v) }
 func (m *msgBuilder) int16(v int16) {
 	m.buf = append(m.buf, 0, 0)
 	binary.BigEndian.PutUint16(m.buf[len(m.buf)-2:], uint16(v))
@@ -1138,11 +1199,11 @@ func (m *msgBuilder) bytes(b []byte) {
 }
 func (m *msgBuilder) end() {
 	n := len(m.buf)
-	l := n - 1 // length counts everything after the type byte, incl. itself
+	l := n - m.cur - 1 // length counts everything after the type byte, incl. itself
 	if l < 4 || l > maxFrameSize {
 		panic("sql: msgBuilder frame overflows size limit")
 	}
-	binary.BigEndian.PutUint32(m.buf[1:5], uint32(l))
+	binary.BigEndian.PutUint32(m.buf[m.cur+1:m.cur+5], uint32(l))
 }
 func (m *msgBuilder) flush(w io.Writer) error {
 	if _, err := w.Write(m.buf); err != nil {

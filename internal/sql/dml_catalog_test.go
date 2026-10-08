@@ -1,6 +1,7 @@
 package sql
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -20,7 +21,7 @@ statement that is accepted, described, executed and read back consistently.
 */
 
 // queryOK runs a statement and fails unless it succeeded, returning its tag.
-func queryOK(t *testing.T, cl *tclient, q, wantTag string) []frame {
+func queryOK(t testing.TB, cl *tclient, q, wantTag string) []frame {
 	t.Helper()
 	frames := cl.query(q)
 	if code, msg, ok := findError(frames); ok {
@@ -49,16 +50,38 @@ func queryErr(t *testing.T, cl *tclient, q, wantCode string) string {
 // selectRow runs a single-row SELECT and returns its cells.
 func selectRow(t *testing.T, cl *tclient, q string) [][]byte {
 	t.Helper()
-	frames := queryOK(t, cl, q, "SELECT 1")
-	data := findFrame(frames, msgDataRow)
-	if data == nil {
-		t.Fatalf("%s: SELECT 1 returned no DataRow (types %v)", q, frameTypes(frames))
+	rows := selectRows(t, cl, q, 1)
+	return rows[0]
+}
+
+// selectRows runs a SELECT and returns every DataRow it produced, one [][]byte
+// of cells per row, in the order the server sent them (the scan's key order).
+// The tag must carry the row count, which is also how multi-row delivery is
+// pinned: a single-row protocol could not answer "SELECT 2".
+func selectRows(t testing.TB, cl *tclient, q string, want int) [][][]byte {
+	t.Helper()
+	frames := cl.query(q)
+	if code, msg, ok := findError(frames); ok {
+		t.Fatalf("%s: unexpected error %s %s", q, code, msg)
 	}
-	row, err := parseDataRow(data.val)
-	if err != nil {
-		t.Fatalf("%s: parseDataRow: %v", q, err)
+	if tag := findTag(frames); tag != fmt.Sprintf("SELECT %d", want) {
+		t.Fatalf("%s: tag = %q, want SELECT %d", q, tag, want)
 	}
-	return row
+	var rows [][][]byte
+	for _, f := range frames {
+		if f.typ != msgDataRow {
+			continue
+		}
+		row, err := parseDataRow(f.val)
+		if err != nil {
+			t.Fatalf("%s: parseDataRow: %v", q, err)
+		}
+		rows = append(rows, row)
+	}
+	if len(rows) != want {
+		t.Fatalf("%s: %d rows, want %d", q, len(rows), want)
+	}
+	return rows
 }
 
 func TestCatalogTableDMLOverSimpleQuery(t *testing.T) {
@@ -174,54 +197,106 @@ func TestCatalogTableRowIdentity(t *testing.T) {
 	queryErr(t, cl, `SELECT v FROM t WHERE id = 'abc'`, errSyntax)
 	queryErr(t, cl, `INSERT INTO t (id, v) VALUES (99999999999999999999, 'x')`, errSyntax)
 
-	// A filter on a non-key column is planned -- as a full scan, which is what
-	// it needs -- and then refused, because this phase can return only one row
-	// (ADR-014 decision 3). The message says which plan was refused and which
-	// phase is coming, so a client can tell an incomplete engine from a wrong
-	// query.
-	msg := queryErr(t, cl, `SELECT v FROM t WHERE v = 'seven'`, errFeatureNotSupported)
+	// A filter on a non-key column is a real full scan now, not a refusal: the
+	// Phase 11 engine walks the table, evaluates the residual filter on each
+	// row's storage bytes (decision 5, no decode in the hot path), and delivers
+	// what remains. Only the read side was delivered.
+	row := selectRow(t, cl, `SELECT v FROM t WHERE v = 'seven'`)
+	if len(row) != 1 || string(row[0]) != "seven" {
+		t.Fatalf("non-key filter read %q, want [seven]", row)
+	}
+
+	// Writes over a scan stay refused, and stay refused loudly: a write must
+	// not silently widen into a whole-table operation. The message still names
+	// the plan and the phase, as evidence of planning rather than absence of it.
+	msg := queryErr(t, cl, `UPDATE t SET v = 'x' WHERE v = 'seven'`, errFeatureNotSupported)
 	for _, want := range []string{"FullScan", "Phase 11"} {
 		if !strings.Contains(msg, want) {
-			t.Fatalf("non-key filter message should mention %q: %q", want, msg)
+			t.Fatalf("write-over-scan message should mention %q: %q", want, msg)
 		}
 	}
-	queryErr(t, cl, `UPDATE t SET v = 'x' WHERE v = 'seven'`, errFeatureNotSupported)
 	queryErr(t, cl, `DELETE FROM t WHERE v = 'seven'`, errFeatureNotSupported)
 
-	// A range on an integer key plans as a range scan and is refused the same
-	// way. Asserting the plan appears in the message is what pins the fact that
-	// the query was planned at all -- a blanket refusal would pass the checks
-	// above too.
-	msg = queryErr(t, cl, `SELECT v FROM t WHERE id > 1 AND id < 100`, errFeatureNotSupported)
-	if !strings.Contains(msg, "RangeScan") {
-		t.Fatalf("integer range message should name the plan: %q", msg)
+	// A bounded range on an integer key plans as a range scan and is delivered
+	// end to end now, instead of being refused at execution.
+	row = selectRow(t, cl, `SELECT v FROM t WHERE id > 1 AND id < 100`)
+	if len(row) != 1 || string(row[0]) != "seven" {
+		t.Fatalf("range read %q, want [seven]", row)
 	}
 
 	// A column the table does not have is a column error, not a missing table.
 	queryErr(t, cl, `SELECT nosuch FROM t WHERE id = 7`, errUndefinedColumn)
 	queryErr(t, cl, `INSERT INTO t (id, nosuch) VALUES (8, 'x')`, errUndefinedColumn)
 
-	// Statements that address a row without a key are refused, not widened
-	// into a full-table operation.
-	// A statement with no filter is still refused, and still not widened into a
-	// whole-table delete. The planner now classifies it as a full scan and
-	// execution refuses it, so the code moved from 42601 to 0A000 -- and the
-	// message naming the plan is stronger evidence than the old code was,
-	// because "FullScan" shows the unfiltered statement was recognised as one
-	// rather than quietly executed.
+	// Statements that address a row without a key are refused for writes, not
+	// widened into a full-table operation.
+	// A DELETE with no filter is still refused, and still not widened into a
+	// whole-table delete. The planner classifies it as a full scan and write
+	// execution refuses it, so the code moving from 42601 to 0A000 -- and the
+	// "FullScan" in the message showing the unfiltered statement was recognised
+	// as one rather than quietly executed -- still holds.
 	msg = queryErr(t, cl, `DELETE FROM t`, errFeatureNotSupported)
 	if !strings.Contains(msg, "FullScan") {
 		t.Fatalf("unfiltered DELETE should be planned as a full scan: %q", msg)
 	}
-	// A range predicate now *plans* -- the optimizer recognises it, and an
-	// integer key is range-scannable since row ids became order-preserving --
-	// and is refused at execution instead, because this phase returns one row
-	// (ADR-014 decision 3). The code moved from 42601 to 0A000 as a result: this
-	// is no longer a statement the translator cannot express.
-	msg = queryErr(t, cl, `SELECT v FROM t WHERE id > 1`, errFeatureNotSupported)
-	if !strings.Contains(msg, "RangeScan") {
-		t.Fatalf("open-ended range should plan as a range scan: %q", msg)
+	// A range predicate *plans* -- the optimizer recognises it, and an integer
+	// key is range-scannable since row ids became order-preserving -- and on
+	// the read side it executes now, so "[seven]" is the answer rather than
+	// 0A000.
+	row = selectRow(t, cl, `SELECT v FROM t WHERE id > 1`)
+	if len(row) != 1 || string(row[0]) != "seven" {
+		t.Fatalf("open-ended range read %q, want [seven]", row)
 	}
+}
+
+func TestCatalogTableMultiRowSelect(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+	cl := dialServer(t, srv.Addr())
+	cl.startupTrust("default")
+
+	queryOK(t, cl, `CREATE TABLE t (id bigint PRIMARY KEY, v text)`, "CREATE TABLE")
+	// Insertion order is deliberately not key order: a scan must return rows in
+	// key order, not in the order they were written.
+	queryOK(t, cl, `INSERT INTO t (id, v) VALUES (2, 'two')`, "INSERT 0 1")
+	queryOK(t, cl, `INSERT INTO t (id) VALUES (4)`, "INSERT 0 1")
+	queryOK(t, cl, `INSERT INTO t (id, v) VALUES (1, 'one')`, "INSERT 0 1")
+	queryOK(t, cl, `INSERT INTO t (id, v) VALUES (3, '')`, "INSERT 0 1")
+
+	// A full scan delivers every row in key order, with NULL and empty-string
+	// cells distinguishable on the wire.
+	rows := selectRows(t, cl, `SELECT * FROM t`, 4)
+	want := [][]string{{"1", "one"}, {"2", "two"}, {"3", ""}, {"4", ""}}
+	for i, w := range want {
+		if len(rows[i]) != 2 || string(rows[i][0]) != w[0] || string(rows[i][1]) != w[1] {
+			t.Fatalf("row %d = %q, want %q", i, rows[i], w)
+		}
+	}
+	if len(rows[3]) != 2 || rows[3][1] != nil {
+		t.Fatalf("row id 4 v = %q, want NULL", rows[3][1])
+	}
+
+	// A bounded range returns only its rows, and a filtered range keeps only
+	// the rows whose residual predicate is true.
+	got := selectRows(t, cl, `SELECT id FROM t WHERE id >= 2 AND id <= 3`, 2)
+	if string(got[0][0]) != "2" || string(got[1][0]) != "3" {
+		t.Fatalf("bounded range ids = %q %q, want 2 3", got[0][0], got[1][0])
+	}
+	got = selectRows(t, cl, `SELECT id FROM t WHERE id < 4 AND v LIKE 'tw%'`, 1)
+	if len(got) != 1 || string(got[0][0]) != "2" {
+		t.Fatalf("filtered range ids = %q, want [2]", got)
+	}
+	// A residually-filtered lookup that still addresses its row.
+	got = selectRows(t, cl, `SELECT v FROM t WHERE id = 2 AND v = 'two'`, 1)
+	if len(got) != 1 || string(got[0][0]) != "two" {
+		t.Fatalf("filtered lookup = %q, want [two]", got)
+	}
+	// The same lookup with a predicate no stored row satisfies matches nothing,
+	// rather than answering with the row.
+	selectRows(t, cl, `SELECT v FROM t WHERE id = 2 AND v = 'nope'`, 0)
+
+	// An empty answer is a zero-row result, sent as zero DataRows.
+	selectRows(t, cl, `SELECT id FROM t WHERE id > 100`, 0)
+	selectRows(t, cl, `SELECT id FROM t WHERE id = 2 AND id = 3`, 0)
 }
 
 func TestCatalogTableNullsAndDefaults(t *testing.T) {

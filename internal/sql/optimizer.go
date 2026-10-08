@@ -71,6 +71,11 @@ const (
 	// adds an access method rather than widening this planner's switch, and so
 	// that the plan space is visible before anything fills it.
 	PlanIndexScan
+	// PlanHashJoin is an INNER equi-join over two tables: the build side is
+	// hashed into a table in one pass, the probe side streams through it. It
+	// is the first plan with more than one node, so the flat shape this type
+	// was designed around ends here -- Join carries the subtree.
+	PlanHashJoin
 )
 
 func (k PlanKind) String() string {
@@ -83,17 +88,63 @@ func (k PlanKind) String() string {
 		return "FullScan"
 	case PlanIndexScan:
 		return "IndexScan"
+	case PlanHashJoin:
+		return "HashJoin"
 	}
 	return "Unknown"
 }
 
-// physicalPlan is the planner's output: an access method over one table.
+// joinProj is one output column of a join: where its cell sits in the merged
+// row (the build side's columns first, then the probe side's) and the column
+// declaration the wire needs to render it.
 //
-// It is a flat structure rather than a tree because no plan has more than one
-// node yet. EXPLAIN renders an indented tree, and a tree-shaped renderer over a
-// single node would be a lie about the shape that the first multi-node plan -- a
-// join, or an index scan with a residual filter -- then has to be retrofitted
-// into.
+// The side is a merged-row index rather than a schema pointer because a
+// self-join gives both sides the same *Schema, so pointer identity cannot tell
+// them apart; the merged index can, and it is the index the executor reads
+// anyway.
+type joinProj struct {
+	Idx int    // index of the column's cell in the merged row
+	Col Column // the declaration, for RowDescription and the wire render
+}
+
+// JoinPlan is the physical form of PlanHashJoin: the two child plans, the
+// equality that connects them, and the output projection. The post-join
+// residual filter (the statement's WHERE, with every column qualified against
+// the merged row) lives on the surrounding physicalPlan's Filter like every
+// other access method's -- a join node is not a different kind of place to
+// keep one.
+type JoinPlan struct {
+	// Build is the left table, probed against from the right. The build side
+	// is fixed at the statement's left table rather than chosen by size:
+	// choosing the smaller side needs a row count before the scan runs, and
+	// this phase's statistics may not exist at all. A future ANALYZE-aware
+	// choice belongs here and changes nothing above it.
+	Build, Probe *physicalPlan
+	// BuildKey and ProbeKey are the join key ordinals within their own
+	// sides' schemas.
+	BuildKey, ProbeKey int
+	// BuildName and ProbeName are the qualifiers the statement used for each
+	// side (its alias, or its table name when unaliased), and CondText is the
+	// equality rendered with them for EXPLAIN's Hash Cond line.
+	BuildName, ProbeName string
+	CondText             string
+	// Merged is the row shape the filter and the projection are expressed
+	// against: the build side's columns named "qualifier.column", then the
+	// probe side's.
+	Merged *Schema
+	Proj   []joinProj
+	// OutWidth is the projected row's byte width, carried because a join node
+	// has no schema of its own for EXPLAIN's width column to read.
+	OutWidth float64
+}
+
+// physicalPlan is the planner's output: an access method over one table, or a
+// join over two.
+//
+// It stayed flat while no plan had more than one node, and the first
+// multi-node plan -- the Phase 11 join -- arrives as a Join field on exactly
+// this struct rather than as a separate tree type, so that EXPLAIN's renderer,
+// the cost model and the executor's switches keep one shape to switch on.
 type physicalPlan struct {
 	Kind   PlanKind
 	Schema *Schema
@@ -131,6 +182,11 @@ type physicalPlan struct {
 	// CostNote is a short caveat for EXPLAIN, empty when there is nothing to
 	// qualify.
 	CostNote string
+
+	// Join carries the subtree for PlanHashJoin and is nil for every
+	// single-table plan. Schema is nil on a join node too: the node addresses
+	// two tables, and each child names its own.
+	Join *JoinPlan
 }
 
 // optimizer is the planner's input beyond the statement itself: the resolved
@@ -460,12 +516,18 @@ func planSelectStatement(ss *pg_query.SelectStmt, sch *Schema, stats *TableStats
 	return o.plan(filter)
 }
 
-// walkPlan is the counterpart to walkExpr for the planned form. The planner
-// hands back one node today, so this exists to make the shape of the future
-// explicit rather than so a caller can recurse over it.
+// walkPlan is the counterpart to walkExpr for the planned form, parents before
+// children. A join is the only plan with children, so the recursion happens
+// there and a single-table plan is still a one-node walk.
 func walkPlan(p *physicalPlan, fn func(*physicalPlan) bool) bool {
 	if p == nil {
 		return true
 	}
-	return fn(p)
+	if !fn(p) {
+		return false
+	}
+	if p.Join != nil {
+		return walkPlan(p.Join.Build, fn) && walkPlan(p.Join.Probe, fn)
+	}
+	return true
 }
