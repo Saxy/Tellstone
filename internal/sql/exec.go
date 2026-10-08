@@ -11,6 +11,7 @@ trail are decided.
 package sql
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strconv"
@@ -24,9 +25,18 @@ import (
 )
 
 // execOutcome is the materialized result of one statement execution.
+//
+// rows carries every row a SELECT returns, one []byte of wire-encoded column
+// cells per row (nil cell = NULL). It is the buffer the wire layer emits many
+// DataRows from: execution fills it, emitOutcome drains it. Keeping it here
+// rather than streaming per row is what lets a multi-row scan deliver a whole
+// result set through the same single-point seam the single-row Phase 8 path
+// used, so the extended-protocol portal path needs no separate cursor. Zero
+// rows is an empty result set, which a statement that matched nothing
+// produces rather than a nil rows.
 type execOutcome struct {
 	tag        string
-	row        [][]byte // SELECT: column cells (wire-encoded, nil = NULL); nil = empty result
+	rows       [][][]byte
 	selectRows bool
 }
 
@@ -94,6 +104,26 @@ func authKey(plan *Plan, params []paramVal) ([]byte, error) {
 	return []byte(TablePrefix(DefaultDB, plan.Table)), nil
 }
 
+// authKeys is the set of RBAC keys a plan is checked against, with the table
+// each names for the denial message. authKey covers a single table; a join adds
+// its second table, because a session allowed to read one side must not learn
+// the other side's rows by joining it with a table it owns.
+func authKeys(plan *Plan, params []paramVal) (keys [][]byte, tables []string, err error) {
+	if plan.Join == nil {
+		key, err := authKey(plan, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		return [][]byte{key}, []string{plan.Table}, nil
+	}
+	return [][]byte{
+			[]byte(TablePrefix(DefaultDB, plan.Join.Left)),
+			[]byte(TablePrefix(DefaultDB, plan.Join.Right)),
+		},
+		[]string{plan.Join.Left, plan.Join.Right},
+		nil
+}
+
 // authorize applies the session's command bit and key prefixes to a plan and
 // records the attempt. It is a no-op for a session with no authentication.
 //
@@ -105,20 +135,24 @@ func (s *Server) authorize(c *pgConn, plan *Plan, params []paramVal) error {
 	if c.auth == nil || c.auth.session == nil {
 		return nil
 	}
-	key, err := authKey(plan, params)
+	keys, tables, err := authKeys(plan, params)
 	if err != nil {
 		return err
 	}
 	cmd, name := plan.Kind.command()
-	if !c.auth.session.IsAllowed(cmd, key) {
-		if s.policy != nil {
-			s.policy.LogDenied(c.user, c.remoteAddr, name, string(key))
+	for i, key := range keys {
+		if !c.auth.session.IsAllowed(cmd, key) {
+			if s.policy != nil {
+				s.policy.LogDenied(c.user, c.remoteAddr, name, string(key))
+			}
+			s.auditDenied(c, name, key)
+			return &pgError{code: errInsufficientPrivilege, msg: "permission denied for table " + tables[i]}
 		}
-		s.auditDenied(c, name, key)
-		return &pgError{code: errInsufficientPrivilege, msg: "permission denied for table " + plan.Table}
 	}
 	c.auth.session.CountCommand()
-	s.auditCommand(c, name, key)
+	for _, key := range keys {
+		s.auditCommand(c, name, key)
+	}
 	return nil
 }
 
@@ -239,7 +273,7 @@ func (s *Server) execSelect(c *pgConn, plan *Plan, params []paramVal) (*execOutc
 			row[i] = encodeByteaText(val)
 		}
 	}
-	return &execOutcome{tag: "SELECT 1", row: row, selectRows: true}, nil
+	return &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}, nil
 }
 
 func (s *Server) execInsert(plan *Plan, params []paramVal) (*execOutcome, error) {
@@ -482,22 +516,51 @@ func (s *Server) schemaError(err error) error {
 // predates the catalog, its rows are one key, and its RBAC and audit behaviour
 // is already covered by tests that must not shift.
 
-// execSelectRow reconstructs a row by range scan and projects it.
+// execSelectRow runs a SELECT against a catalog table.
+//
+// A point lookup is still the fast path: the row is read by its key range and
+// projected, with the D5 residual filter (a predicate the lookup could not
+// absorb) evaluated on the row's storage bytes. A range or full scan uses the
+// Phase 11 scan engine instead, which assembles rows from the key stream,
+// filters them in the callback, and delivers them in batches. A join is a
+// third shape, executed in join.go: two scans through one hash table.
 func (s *Server) execSelectRow(plan *Plan, params []paramVal) (*execOutcome, error) {
-	if err := refuseMultiRow(plan.Phys); err != nil {
-		return nil, err
+	sch := plan.Schema
+	switch {
+	case plan.Phys == nil:
+		// A resolved catalog SELECT always carries a plan; a nil one is a bug
+		// that must not read the row as if unguided.
+		return nil, &pgError{code: errInternal, msg: "SELECT has no physical plan"}
+	case plan.Phys.Kind == PlanHashJoin:
+		return s.execJoin(plan, params)
+	case plan.Phys.Kind == PlanRangeScan, plan.Phys.Kind == PlanFullScan:
+		return s.execScan(plan, params)
 	}
-	rowID, err := plan.rowID(params)
+	// The equality a point lookup walks is on the physical plan: translate only
+	// sets the plan key for a predicate it can prove to be a single equality,
+	// while a lookup with a residual filter arrives as an AND.
+	rowID, err := canonicalRowID(plan.Phys.Key, sch, params)
 	if err != nil {
 		return nil, err
 	}
-	sch := plan.Schema
 	cells, found, err := s.readRow(sch, rowID)
 	if err != nil {
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}
 	if !found {
 		return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
+	}
+	// A residual filter decides whether the one row the lookup addresses
+	// qualifies. Before Phase 11 this was refused; now it is evaluated on the
+	// row's storage bytes (D5), with no decode.
+	if plan.Phys.Filter != nil {
+		filt, err := s.compileFilter(plan.Phys.Filter, sch, params)
+		if err != nil {
+			return nil, err
+		}
+		if filt.alwaysFalse() || !filt.eval(cells) {
+			return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
+		}
 	}
 	row := make([][]byte, len(plan.Cols))
 	for i, name := range plan.Cols {
@@ -514,7 +577,136 @@ func (s *Server) execSelectRow(plan *Plan, params []paramVal) (*execOutcome, err
 		}
 		row[i] = cell
 	}
-	return &execOutcome{tag: "SELECT 1", row: row, selectRows: true}, nil
+	return &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}, nil
+}
+
+// execScan runs a full-table or primary-key-range SELECT end to end, filling
+// the outcome's result set from the scan's batches.
+func (s *Server) execScan(plan *Plan, params []paramVal) (*execOutcome, error) {
+	sch := plan.Schema
+	phys := plan.Phys
+	// A range that provably covers nothing (its bound overflowed the column's
+	// domain) or a filter that admits no row is answered without touching the
+	// store.
+	if phys.EmptyRange {
+		return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
+	}
+	proj := make([]int, len(plan.Cols))
+	for i, name := range plan.Cols {
+		idx, ok := sch.columnIndex(name)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", name)}
+		}
+		proj[i] = idx
+	}
+	// The batch carries the projection with the column declarations attached,
+	// which is what the drain that renders it reads. A join reuses the same
+	// drain with the join's own projection declarations.
+	cols := make([]Column, len(proj))
+	for i, ord := range proj {
+		cols[i] = sch.Columns[ord]
+	}
+	filt, err := s.compileFilter(phys.Filter, sch, params)
+	if err != nil {
+		return nil, err
+	}
+	if filt.alwaysFalse() {
+		return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
+	}
+	out := &execOutcome{selectRows: true}
+	// As the scan fills each batch, drain it into the outcome's result set:
+	// each surviving cell is rendered to its wire form exactly once, and the
+	// bytes are the sink's (they outlive the scan's reused buffers).
+	err = s.newScan(phys, sch, proj, filt).run(func(c *Chunk) error {
+		return drainChunk(c, cols, out)
+	})
+	if err != nil {
+		return nil, &pgError{code: errDataCorrupt, msg: err.Error()}
+	}
+	out.tag = fmt.Sprintf("SELECT %d", len(out.rows))
+	return out, nil
+}
+
+// newScan builds the scanning operator for one side of an access method: the
+// seek prefix the store starts from, the row assembler that turns the key
+// stream into cells, and a fresh batch for the projection.
+//
+// The store seeks by prefix, so the scan's prefix must be shared by every key
+// it wants, and a lower row bound need not be a prefix of the rows after it.
+// The longest common prefix of the plan's two row bounds is the tightest such
+// prefix; the callback's bound filters do the rest, so the yielded set is exact
+// either way. A single-table scan and each side of a join share this operator;
+// they differ only in what they do with each batch.
+func (s *Server) newScan(phys *physicalPlan, sch *Schema, proj []int, filt *compiledNode) *tableScan {
+	beg := phys.Lo
+	if beg == nil {
+		// A plan without a lower bound must not scan the store from its start,
+		// which would run into the catalog subtree. The table prefix is always
+		// the conservative bound.
+		beg = []byte(TablePrefix(sch.DB, sch.Table))
+	}
+	seek := commonPrefix(beg, phys.Hi)
+	if len(seek) == 0 {
+		// The bounds share nothing (they cannot, in practice -- both start with
+		// the table prefix); scanning must not start at the store's root.
+		seek = []byte(TablePrefix(sch.DB, sch.Table))
+	}
+	ts := &tableScan{
+		store: s.store,
+		sch:   sch,
+		seek:  seek,
+		beg:   beg,
+		hi:    phys.Hi,
+		proj:  proj,
+		filt:  filt,
+		as: &rowAssembler{
+			sch:    sch,
+			prefix: TablePrefix(sch.DB, sch.Table),
+			cells:  make([]rowValue, len(sch.Columns)),
+			proj:   proj,
+			filt:   filt,
+		},
+	}
+	ts.chunk = newChunk(int(ts.projLen()))
+	return ts
+}
+
+// newChunk prepares a scan batch wide enough for proj columns and the whole
+// batch, with a data buffer sized for a typical row.
+func newChunk(ncols int) *Chunk {
+	c := &Chunk{NCols: uint16(ncols)}
+	c.ensureNulls(uint16(ncols))
+	c.data = make([]byte, 0, ncols*64*BatchRows)
+	return c
+}
+
+// drainChunk renders one filled batch into the outcome's result set, walking
+// the chunk's cell framing and converting each present cell to its wire text.
+// A NULL cell stays nil; a present empty string stays an empty cell. cols gives
+// every cell its column declaration: a single-table scan passes the schema's
+// columns by projection, and a join passes the join projection's declarations,
+// which may come from either side's schema.
+func drainChunk(c *Chunk, cols []Column, out *execOutcome) error {
+	off := 0
+	for row := uint32(0); row < c.Rows; row++ {
+		wire := make([][]byte, len(cols))
+		for j := range cols {
+			if c.isNull(row, uint32(j)) {
+				wire[j] = nil
+				continue
+			}
+			l := binary.BigEndian.Uint32(c.data[off:])
+			off += 4
+			cell, err := wireCell(cols[j].Type, c.data[off:off+int(l)])
+			if err != nil {
+				return fmt.Errorf("column %q: %v", cols[j].Name, err)
+			}
+			off += int(l)
+			wire[j] = cell
+		}
+		out.rows = append(out.rows, wire)
+	}
+	return nil
 }
 
 // execInsertRow writes a multi-column row, failing on a duplicate row id.
@@ -649,7 +841,23 @@ func (p *Plan) rowID(params []paramVal) (string, error) {
 	if p.Schema == nil {
 		return string(key), nil
 	}
-	pk := p.Schema.Columns[p.Schema.PrimaryKey]
+	return canonicalRowID(p.Key, p.Schema, params)
+}
+
+// canonicalRowID renders a primary-key equality's value as the row id a catalog
+// row addresses. It is rowID's second half, which the scan engine also needs:
+// a point lookup with a residual filter carries its equality on the physical
+// plan's Key, not the plan's, because translate populates the plan key only for
+// a predicate it can prove is a single equality.
+func canonicalRowID(v ValRef, sch *Schema, params []paramVal) (string, error) {
+	key, err := v.resolve(params)
+	if err != nil {
+		return "", err
+	}
+	if len(key) == 0 {
+		return "", &pgError{code: errNotNullViolation, msg: "primary key must not be empty"}
+	}
+	pk := sch.Columns[sch.PrimaryKey]
 	if pk.Type == TypeVarchar {
 		// Text is already canonical. Parsing it would only risk a rejection of
 		// a value the column can hold.
@@ -870,13 +1078,37 @@ func (s *Server) resolvePlan(plan *Plan) error {
 // under EXPLAIN is produced by the same call that would decide execution, so
 // the two cannot disagree about which method was chosen.
 func (s *Server) planAccess(plan *Plan) error {
+	// A join is planned against both tables rather than one, and cannot share
+	// the single-table decision below: planJoin resolves the ON operands, the
+	// WHERE clause and the projection against two schemas (join.go).
+	if plan.Join != nil {
+		return s.planJoin(plan)
+	}
 	if plan.Schema == nil {
 		return nil
+	}
+	// A qualified column name arrives from `WHERE users.id = 1` or
+	// `SELECT users.id, users.*`. The qualifier named this table at
+	// translation, and a single-table statement has no static need to keep it:
+	// the projection and the predicate are expressed in bare names here, the
+	// way the planner and the executor look columns up. A qualifier naming
+	// some other table is left in place, to be refused with 42703 rather than
+	// silently read from the wrong table.
+	var err error
+	plan.Cols, err = stripOwnQualifier(plan.Cols, plan.Schema)
+	if err != nil {
+		return err
+	}
+	filter, err := plan.predicate()
+	if err != nil {
+		return err
 	}
 	// The point-lookup path is already carried on the plan as WhereCol/Key and
 	// is what this phase executes. It is planned too, so EXPLAIN reports it and
 	// the refusal below has something to compare against.
-	filter, err := plan.predicate()
+	filter, err = mapExprCols(filter, func(col string) (string, error) {
+		return stripColumnQualifier(col, plan.Table), nil
+	})
 	if err != nil {
 		return err
 	}
@@ -887,6 +1119,63 @@ func (s *Server) planAccess(plan *Plan) error {
 	}
 	plan.Phys = phys
 	return nil
+}
+
+// stripColumnQualifier drops a table qualifier a column name carries when it
+// names table, and leaves the name alone otherwise: `users.id` with table
+// "users" becomes `id`, and `other.id` stays `other.id` so the planner refuses
+// it with 42703 instead of reading the bare name from the wrong table. The
+// comparison is case-insensitive, matching PostgreSQL's normalization of
+// identifiers (`WHERE USERS.ID = 1` names the same column).
+func stripColumnQualifier(col, table string) string {
+	if i := strings.IndexByte(col, '.'); i > 0 {
+		if strings.EqualFold(col[:i], table) {
+			return col[i+1:]
+		}
+	}
+	return col
+}
+
+// stripOwnQualifier normalizes a single-table projection the way
+// stripColumnQualifier normalizes one filter column. A qualifier naming this
+// table is dropped (`users.id` becomes `id`), and a qualified star naming it
+// expands to the table's columns. The star rules are the target list's own,
+// applied a second time now that the qualifier can be recognized: one star and
+// nothing else, or the projection is ambiguous.
+func stripOwnQualifier(cols []string, sch *Schema) ([]string, error) {
+	if len(cols) == 0 {
+		return cols, nil
+	}
+	if len(cols) == 1 && cols[0] == "*" {
+		// A bare "*" is expanded by resolvePlan after planning, and has no
+		// qualifier to strip.
+		return cols, nil
+	}
+	if strings.HasSuffix(cols[0], ".*") {
+		if len(cols) != 1 {
+			return nil, fmt.Errorf("%w: * cannot be combined with named columns", errUnsupported)
+		}
+		if q := cols[0][:len(cols[0])-2]; strings.EqualFold(q, sch.Table) {
+			return sch.RowIDColumns(), nil
+		}
+		// A starred qualifier naming some other table is left for column
+		// resolution to refuse with 42703.
+		return cols, nil
+	}
+	// Drop the qualifier, deduped afterwards: the target list dedupes by the
+	// name as written, and `id, users.id` survives that and would otherwise
+	// emit the same column twice.
+	seen := map[string]bool{}
+	out := make([]string, 0, len(cols))
+	for _, c := range cols {
+		c = stripColumnQualifier(c, sch.Table)
+		if seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out, nil
 }
 
 // predicate returns the statement's WHERE clause as an expression tree.
@@ -918,9 +1207,9 @@ func (s *Server) execExplain(c *pgConn, plan *Plan) (*execOutcome, error) {
 	if err := s.resolvePlan(plan.Inner); err != nil {
 		return nil, err
 	}
-	lines := Explain(plan.Inner.Phys, s.statsFor(plan.Inner.Schema), time.Now())
+	lines := Explain(plan.Inner.Phys, s.statsFor, time.Now())
 	text := strings.Join(textLines(lines), "\n")
-	return &execOutcome{tag: "EXPLAIN", row: [][]byte{[]byte(text)}, selectRows: true}, nil
+	return &execOutcome{tag: "EXPLAIN", rows: [][][]byte{{[]byte(text)}}, selectRows: true}, nil
 }
 
 // textLines renders already-encoded cells as one string per line.

@@ -299,13 +299,15 @@ func TestExplainRowDescriptionMatchesDataRowWidth(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: execute: %v", q, err)
 		}
-		if len(out.row) != len(plan.Cols) {
+		// EXPLAIN produces exactly one row, whose single cell is the plan text.
+		row := out.rows[0]
+		if len(row) != len(plan.Cols) {
 			t.Errorf("%s: RowDescription declares %d fields but the DataRow carries %d",
-				q, len(plan.Cols), len(out.row))
+				q, len(plan.Cols), len(row))
 		}
-		// out.row[0] is the single cell's *bytes*, not a column count, so this
+		// row[0] is the single cell's *bytes*, not a column count, so this
 		// only asserts the plan is non-empty.
-		if len(out.row[0]) == 0 {
+		if len(row[0]) == 0 {
 			t.Errorf("%s: plan text is empty", q)
 		}
 	}

@@ -41,6 +41,7 @@ const (
 	errDuplicateKey             = "23505"
 	errDuplicateTable           = "42P07"
 	errUndefinedColumn          = "42703"
+	errAmbiguousColumn          = "42702"
 	errDataCorrupt              = "22P03"
 	errInternal                 = "XX000"
 	errNotNullViolation         = "23502"

@@ -31,8 +31,13 @@ import (
 // One row per line is deliberate: it is what PostgreSQL does, and it means a
 // client that does not understand the format still shows a readable plan rather
 // than one opaque cell.
-func Explain(p *physicalPlan, stats *TableStats, now time.Time) [][]byte {
-	t := &explainTree{now: now, stats: stats}
+//
+// statsOf supplies the statistics line for a node that has statistics. It is
+// passed as a function rather than called once up front because a join node has
+// no schema of its own, and its children do; resolving the caller's statistics
+// eagerly against the root schema would panic when the root is a join.
+func Explain(p *physicalPlan, statsOf func(*Schema) *TableStats, now time.Time) [][]byte {
+	t := &explainTree{now: now, statsOf: statsOf}
 	t.render(p, 0)
 	out := make([][]byte, len(t.lines))
 	for i, line := range t.lines {
@@ -44,9 +49,9 @@ func Explain(p *physicalPlan, stats *TableStats, now time.Time) [][]byte {
 // explainTree accumulates rendered lines. Rows come back from EXPLAIN already
 // escaped as text cells by the caller; nothing here needs to know the wire.
 type explainTree struct {
-	lines []string
-	now   time.Time
-	stats *TableStats
+	lines   []string
+	now     time.Time
+	statsOf func(*Schema) *TableStats
 }
 
 func (t *explainTree) emit(indent int, format string, args ...any) {
@@ -65,7 +70,8 @@ func (t *explainTree) render(p *physicalPlan, depth int) {
 	c := p.Cost
 	// Startup..Total, and rows and width. Width is the same for every method on
 	// one table, so it is printed once per line rather than repeated as if it
-	// were a per-method number.
+	// were a per-method number. A join has no schema, so its width is the
+	// estimate the cost model carried on the node.
 	line := fmt.Sprintf("%s%s  (cost=%.2f..%.2f rows=%d width=%d)",
 		name, ind, c.Startup, c.Total, int64(c.Rows), int(rowWidth(p)))
 	if p.EmptyRange {
@@ -76,6 +82,11 @@ func (t *explainTree) render(p *physicalPlan, depth int) {
 	}
 	t.emit(depth, "%s", line)
 
+	if p.Join != nil {
+		// A join node's equality names both tables, so it sits at the node's
+		// already-indented depth, above the two scans the cost is spent on.
+		t.emit(depth+1, "Hash Cond: (%s)", p.Join.CondText)
+	}
 	switch p.Kind {
 	case PlanPointLookup:
 		t.emit(depth+1, "Index Cond: (%s = %s)", p.Schema.PrimaryKeyName(), valRefText(p.Key))
@@ -85,8 +96,16 @@ func (t *explainTree) render(p *physicalPlan, depth int) {
 	if p.Filter != nil {
 		t.emit(depth+1, "Filter: (%s)", exprText(p.Filter))
 	}
-	if p.Measured && t.stats != nil {
-		t.emit(depth+1, "(statistics: %s, %s)", statsAge(t.stats, t.now), pluralRows(t.stats.Rows))
+	// The statistics line names a table's row count, so it exists only where a
+	// node has a schema to carry one and actual statistics to report: a join's
+	// estimate is derived from its children, not read from a table.
+	if p.Schema != nil && p.Measured && t.statsOf != nil {
+		stats := t.statsOf(p.Schema)
+		t.emit(depth+1, "(statistics: %s, %s)", statsAge(stats, t.now), pluralRows(stats.Rows))
+	}
+	if p.Join != nil {
+		t.render(p.Join.Build, depth+1)
+		t.render(p.Join.Probe, depth+1)
 	}
 }
 
@@ -141,6 +160,11 @@ func trimExclusiveEnd(bound []byte) []byte {
 // rowWidth is the estimated bytes per output row, which the estimator has
 // already computed for the whole row.
 func rowWidth(p *physicalPlan) float64 {
+	if p.Join != nil {
+		// A join projects from both sides and carries no schema of its own, so
+		// the estimator's projected-row width lives on the join node.
+		return p.Join.OutWidth
+	}
 	if p.Schema == nil {
 		return 0
 	}
@@ -167,6 +191,8 @@ func (k PlanKind) explainName() string {
 		return "Range Scan"
 	case PlanFullScan:
 		return "Seq Scan"
+	case PlanHashJoin:
+		return "Hash Join"
 	}
 	return "Node"
 }

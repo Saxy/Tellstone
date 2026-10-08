@@ -25,6 +25,7 @@ package sql
 
 import (
 	"fmt"
+	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
@@ -312,10 +313,7 @@ func dropFalse(args []Expr) []Expr {
 
 func translateNullTest(nt *pg_query.NullTest) (Expr, error) {
 	col, ok := columnRef(nt.GetArg())
-	if !ok {
-		return nil, fmt.Errorf("%w: IS NULL tests a plain column", errUnsupported)
-	}
-	if col == "*" {
+	if !ok || col == "*" || strings.HasSuffix(col, ".*") {
 		return nil, fmt.Errorf("%w: IS NULL tests a plain column", errUnsupported)
 	}
 	switch nt.GetNulltesttype() {
@@ -471,11 +469,11 @@ func checkLikePrefix(pattern []byte) error {
 }
 
 // plainColumn reports the column a node names, and false for anything else --
-// including a `*`, which `columnRef` accepts for projections but which cannot be
-// compared to a value.
+// including a star, which `columnRef` accepts for projections but which cannot
+// be compared to a value. A qualified star ("t.*") is a star too.
 func plainColumn(node *pg_query.Node) (string, bool) {
 	col, ok := columnRef(node)
-	if !ok || col == "*" {
+	if !ok || col == "*" || strings.HasSuffix(col, ".*") {
 		return "", false
 	}
 	return col, true
@@ -546,6 +544,50 @@ func exprColumns(e Expr) []string {
 		return true
 	})
 	return out
+}
+
+// mapExprCols returns e with every column name rewritten by fn, as a fresh
+// tree so callers can hold both forms (the single-table planner strips a
+// matching qualifier off its predicate; the join planner resolves every name
+// to the merged row). A terminal that carries no column passes through; the
+// nodes that carry one are rebuilt so the rewrite never aliases its input.
+func mapExprCols(e Expr, fn func(string) (string, error)) (Expr, error) {
+	switch t := e.(type) {
+	case nil:
+		return nil, nil
+	case *TrueExpr, *FalseExpr:
+		return e, nil
+	case *CmpExpr:
+		col, err := fn(t.Col)
+		if err != nil {
+			return nil, err
+		}
+		return &CmpExpr{Col: col, Op: t.Op, Val: t.Val}, nil
+	case *NullTestExpr:
+		col, err := fn(t.Col)
+		if err != nil {
+			return nil, err
+		}
+		return &NullTestExpr{Col: col, Not: t.Not}, nil
+	case *LikeExpr:
+		col, err := fn(t.Col)
+		if err != nil {
+			return nil, err
+		}
+		return &LikeExpr{Col: col, Val: t.Val}, nil
+	case *BoolExpr:
+		args := make([]Expr, 0, len(t.Args))
+		for _, a := range t.Args {
+			m, err := mapExprCols(a, fn)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, m)
+		}
+		return &BoolExpr{Op: t.Op, Args: args}, nil
+	default:
+		return e, nil
+	}
 }
 
 // exprHasLiteralOnly reports whether every value in the tree is a literal, with
