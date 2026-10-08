@@ -70,19 +70,22 @@ func (s *Server) planJoin(plan *Plan) error {
 	// resolve names one reference: an ON operand, a WHERE column or a
 	// projection. The reference shapes are the translator's: qualified
 	// ("u.name") or bare ("name"). A qualified reference finds its side by the
-	// statement's alias or table name; a bare one holds iff exactly one side
-	// has the column, and is the one reference PostgreSQL reports as ambiguous.
+	// statement's alias, which is the only qualifier PostgreSQL accepts once a
+	// table is aliased -- the underlying table name is hidden, so a qualifier
+	// naming it reports the missing FROM-clause entry rather than resolving to
+	// the side an alias shadows. A bare one holds iff exactly one side has the
+	// column, and is the one reference PostgreSQL reports as ambiguous.
 	resolve := func(name string) (*joinOperand, error) {
 		if i := strings.IndexByte(name, '.'); i > 0 {
 			q, rest := name[:i], name[i+1:]
 			switch {
-			case strings.EqualFold(q, js.LeftAlias) || strings.EqualFold(q, js.Left):
+			case strings.EqualFold(q, js.LeftAlias):
 				idx, ok := left.columnIndex(rest)
 				if !ok {
 					return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", rest)}
 				}
 				return &joinOperand{side: 0, idx: idx, col: left.Columns[idx]}, nil
-			case strings.EqualFold(q, js.RightAlias) || strings.EqualFold(q, js.Right):
+			case strings.EqualFold(q, js.RightAlias):
 				idx, ok := right.columnIndex(rest)
 				if !ok {
 					return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", rest)}
@@ -173,12 +176,12 @@ func (s *Server) planJoin(plan *Plan) error {
 		case strings.HasSuffix(c, ".*"):
 			q := c[:len(c)-2]
 			switch {
-			case strings.EqualFold(q, js.LeftAlias) || strings.EqualFold(q, js.Left):
+			case strings.EqualFold(q, js.LeftAlias):
 				for i, col := range left.Columns {
 					proj = append(proj, joinProj{Idx: i, Col: col})
 					disp = append(disp, col.Name)
 				}
-			case strings.EqualFold(q, js.RightAlias) || strings.EqualFold(q, js.Right):
+			case strings.EqualFold(q, js.RightAlias):
 				for i, col := range right.Columns {
 					proj = append(proj, joinProj{Idx: nb + i, Col: col})
 					disp = append(disp, col.Name)
@@ -199,8 +202,6 @@ func (s *Server) planJoin(plan *Plan) error {
 			disp = append(disp, op.col.Name)
 		}
 	}
-	plan.Cols = disp
-
 	// Both sides are full scans. Nothing narrower is possible: the join
 	// equality is between two columns rather than against a constant, so no
 	// bound can be derived from the statement before the join runs. Planning
@@ -251,6 +252,12 @@ func (s *Server) planJoin(plan *Plan) error {
 	if !meas {
 		phys.CostNote = "rows estimated, table never analyzed"
 	}
+	// The display names land on the plan only now, when both child optimizers
+	// have succeeded and the physical plan is complete. planJoin re-runs after
+	// a failure (its idempotence test is plan.Phys), and a plan.Cols already
+	// rewritten to display names would be re-resolved as if the statement had
+	// written them -- losing the "*" expansion it was meant to produce.
+	plan.Cols = disp
 	plan.Phys = phys
 	return nil
 }

@@ -826,6 +826,11 @@ func (c *pgConn) sendStatementParamDesc(plan *Plan) error {
 		if plan.Key.Param > 0 {
 			types[plan.Key.Param] = oidOf(plan.Schema.Columns[plan.Schema.PrimaryKey].Type)
 		}
+		// The same is true of the point lookup's key on the physical plan,
+		// which is the primary key by construction.
+		if plan.Phys != nil && plan.Phys.Key.Param > 0 {
+			types[plan.Phys.Key.Param] = oidOf(plan.Schema.Columns[plan.Schema.PrimaryKey].Type)
+		}
 		for i, ref := range plan.Values {
 			if ref.Param <= 0 || i >= len(plan.Columns) {
 				continue
@@ -870,6 +875,14 @@ func maxParam(p *Plan) int {
 		}
 	}
 	if p.Phys != nil {
+		// The point lookup's key equality lives on the physical plan, not on
+		// the plan: translate leaves plan.Key empty for a predicate it cannot
+		// prove is a single equality, and the optimizer then puts `id = $1`
+		// into Phys.Key while the rest of the AND becomes the filter. Without
+		// this, `WHERE id = $1 AND x = 5` reported zero parameters.
+		if p.Phys.Key.Param > m {
+			m = p.Phys.Key.Param
+		}
 		walkExpr(p.Phys.Filter, func(e Expr) bool {
 			switch t := e.(type) {
 			case *CmpExpr:

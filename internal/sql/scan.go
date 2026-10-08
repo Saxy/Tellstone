@@ -220,7 +220,15 @@ func (as *rowAssembler) add(key, value []byte) error {
 	// names cannot contain a separator, so the remainder is exactly the name.
 	for ord := range as.sch.Columns {
 		if matchNameBytes(as.sch.Columns[ord].Name, rest[i+1:]) {
-			as.cells[ord] = rowValue{value: value, set: true}
+			// The value is the store's callback buffer, which the next key may
+			// overwrite and which the scan may recycle when it returns, while
+			// this cell is read at the next row boundary (or after the scan for
+			// the last row). It is copied into the column's own buffer, which
+			// is reused across rows and so stops allocating once it has seen
+			// the column's widest value.
+			v := append(as.owned[ord][:0], value...)
+			as.owned[ord] = v
+			as.cells[ord] = rowValue{value: v, set: true}
 			break
 		}
 	}

@@ -1,3 +1,12 @@
+/*
+Package sql
+Tellstone PostgreSQL Wire Frontend
+File: executor_bench_test.go
+Description: The Phase 11 executor benchmarks: the scan engine's full-table read
+(BenchmarkScanSelect) and the hash join's build and probe over the real server
+(BenchmarkHashJoin). Both seed their tables through production paths so the key
+layout, scan order and wire delivery they measure are the ones a client sees.
+*/
 package sql
 
 import (
@@ -76,18 +85,18 @@ func BenchmarkScanSelect(b *testing.B) {
 }
 
 func BenchmarkHashJoin(b *testing.B) {
-	srv, _ := newTestServer(nil, srvOpts{})
-	cl := dialServer(nil, srv.Addr())
+	srv, _ := newTestServer(b, srvOpts{})
+	cl := dialServer(b, srv.Addr())
 	cl.startupTrust("default")
-	queryOK(nil, cl, `CREATE TABLE j1 (id BIGINT PRIMARY KEY, x BIGINT)`, "CREATE TABLE")
-	queryOK(nil, cl, `CREATE TABLE j2 (id BIGINT PRIMARY KEY, j1_id BIGINT)`, "CREATE TABLE")
+	queryOK(b, cl, `CREATE TABLE j1 (id BIGINT PRIMARY KEY, x BIGINT)`, "CREATE TABLE")
+	queryOK(b, cl, `CREATE TABLE j2 (id BIGINT PRIMARY KEY, j1_id BIGINT)`, "CREATE TABLE")
 	for i := int64(1); i <= 1000; i++ {
-		queryOK(nil, cl, fmt.Sprintf(`INSERT INTO j1 (id, x) VALUES (%d, %d)`, i, i), "INSERT 0 1")
-		queryOK(nil, cl, fmt.Sprintf(`INSERT INTO j2 (id, j1_id) VALUES (%d, %d)`, i, i), "INSERT 0 1")
+		queryOK(b, cl, fmt.Sprintf(`INSERT INTO j1 (id, x) VALUES (%d, %d)`, i, i), "INSERT 0 1")
+		queryOK(b, cl, fmt.Sprintf(`INSERT INTO j2 (id, j1_id) VALUES (%d, %d)`, i, i), "INSERT 0 1")
 	}
 	q := `SELECT j1.x FROM j1 JOIN j2 ON j1.id = j2.j1_id WHERE j2.id <= 1000`
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		selectRows(nil, cl, q, 1000)
+		selectRows(b, cl, q, 1000)
 	}
 }

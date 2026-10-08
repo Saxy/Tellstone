@@ -21,7 +21,7 @@ statement that is accepted, described, executed and read back consistently.
 */
 
 // queryOK runs a statement and fails unless it succeeded, returning its tag.
-func queryOK(t *testing.T, cl *tclient, q, wantTag string) []frame {
+func queryOK(t testing.TB, cl *tclient, q, wantTag string) []frame {
 	t.Helper()
 	frames := cl.query(q)
 	if code, msg, ok := findError(frames); ok {
@@ -58,7 +58,7 @@ func selectRow(t *testing.T, cl *tclient, q string) [][]byte {
 // of cells per row, in the order the server sent them (the scan's key order).
 // The tag must carry the row count, which is also how multi-row delivery is
 // pinned: a single-row protocol could not answer "SELECT 2".
-func selectRows(t *testing.T, cl *tclient, q string, want int) [][][]byte {
+func selectRows(t testing.TB, cl *tclient, q string, want int) [][][]byte {
 	t.Helper()
 	frames := cl.query(q)
 	if code, msg, ok := findError(frames); ok {

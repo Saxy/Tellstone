@@ -125,6 +125,13 @@ type rowAssembler struct {
 	// the row id always sits directly under this prefix.
 	prefix string
 	cells  []rowValue
+	// owned backs cells' values. The store's callback buffers are valid only
+	// for the duration of that call (Store.ScanPrefix), and a row's cells
+	// outlive the call that delivered its last column: the flush that reads
+	// them runs when the next row's first key arrives, and for the table's last
+	// row after the scan has returned. One buffer per column, reused across
+	// rows, is what makes the copy free of steady-state allocation.
+	owned [][]byte
 	// cur is the escaped row id of the row being assembled. Its bytes are a
 	// copy: the scan buffer they came from is only valid for the callback.
 	cur []byte

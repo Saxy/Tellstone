@@ -663,6 +663,7 @@ func (s *Server) newScan(phys *physicalPlan, sch *Schema, proj []int, filt *comp
 			sch:    sch,
 			prefix: TablePrefix(sch.DB, sch.Table),
 			cells:  make([]rowValue, len(sch.Columns)),
+			owned:  make([][]byte, len(sch.Columns)),
 			proj:   proj,
 			filt:   filt,
 		},

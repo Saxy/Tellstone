@@ -126,12 +126,12 @@ type frame struct {
 }
 
 type tclient struct {
-	t  *testing.T
+	t  testing.TB
 	cn net.Conn
 	r  *bufio.Reader
 }
 
-func dialServer(t *testing.T, addr string) *tclient {
+func dialServer(t testing.TB, addr string) *tclient {
 	t.Helper()
 	cn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -378,7 +378,7 @@ func findError(frames []frame) (code, msg string, ok bool) {
 
 // ---- TLS + RBAC fixtures ----
 
-func writeSelfSignedCert(t *testing.T) (certPath, keyPath string) {
+func writeSelfSignedCert(t testing.TB) (certPath, keyPath string) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -421,7 +421,7 @@ type srvOpts struct {
 	requireTLS  bool
 }
 
-func newTestServer(t *testing.T, o srvOpts) (*Server, *testStore) {
+func newTestServer(t testing.TB, o srvOpts) (*Server, *testStore) {
 	t.Helper()
 	store := newTestStore()
 	var passHash []byte
@@ -1449,6 +1449,50 @@ func TestParameterDescriptionCountsCatalogColumnParameters(t *testing.T) {
 	sess.send(msgExecute, concat(cstring(""), four(0)))
 	if tag := findTag([]frame{sess.expectLine(msgCommandComplete)}); tag != "INSERT 0 1" {
 		t.Fatalf("parameterized insert tag = %q", tag)
+	}
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+}
+
+// ParameterDescription also has to count a parameter the point lookup carries on
+// the physical plan. `WHERE id = $1 AND id > 0` is not the single equality
+// translate copies onto plan.Key, so the optimizer puts `id = $1` into Phys.Key
+// instead, and maxParam that reads only Key/Val/Values/filter reports zero
+// parameters for a statement that needs one -- leaving a client to send no Bind
+// value for it.
+func TestParameterDescriptionCountsPhysicalKeyParameters(t *testing.T) {
+	srv, store := newTestServer(t, srvOpts{})
+	blob, err := EncodeSchema(&Schema{DB: DefaultDB, Table: "users",
+		Columns: []Column{{Name: "id", Type: TypeBigInt}, {Name: "name", Type: TypeVarchar, Nullable: true}}, PrimaryKey: 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(MetaTableKey(DefaultDB, "users"), blob, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(ColumnKey(DefaultDB, "users", keyspace.EncodeIntRowID(1), "id"), EncodeOrderableInt(1), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	sess := dialServer(t, srv.Addr())
+	sess.startupTrust("default")
+
+	sess.send(msgParse, concat(cstring("q"), cstring(`SELECT name FROM users WHERE id = $1 AND id > 0`), two(0)))
+	sess.expectLine(msgParseComplete)
+	sess.send(msgDescribe, concat([]byte{'S'}, cstring("q")))
+	pd := sess.expectLine(msgParameterDesc)
+	// One parameter, typed as the primary key column rather than as text.
+	assertParameterDescription(t, pd.val, []int32{oidInt8})
+	sess.expectLine(msgRowDescription)
+	sess.send(msgSync, nil)
+	sess.expectLine(msgReadyForQuery)
+
+	// And the described statement binds and runs with that one value.
+	sess.send(msgBind, concat(cstring(""), cstring("q"), two(0), two(1), four(1), []byte("1"), two(0)))
+	sess.expectLine(msgBindComplete)
+	sess.send(msgExecute, concat(cstring(""), four(0)))
+	if tag := findTag(sess.recvUntil(msgCommandComplete)); tag != "SELECT 1" {
+		t.Fatalf("parameterized point lookup tag = %q", tag)
 	}
 	sess.send(msgSync, nil)
 	sess.expectLine(msgReadyForQuery)
