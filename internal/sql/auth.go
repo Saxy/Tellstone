@@ -50,6 +50,8 @@ const (
 	errTooManyConnections       = "53300"
 	errInvalidSQLStatement      = "26000"
 	errInvalidCursorName        = "26P01"
+	errSerializationFailure     = "40001"
+	errInFailedSQLTransaction   = "25P02"
 )
 
 // authState is the verified identity attached to a connection.

@@ -66,12 +66,12 @@ func TestRowRoundTrip(t *testing.T) {
 	srv, _ := newRowServer(t, sch)
 	// Declaration order is id, age, name. Key order is age, id, name, so a
 	// reconstruction that trusted scan position would swap age and name.
-	if err := srv.insertRow(sch, "7", cellsFor(t, sch, map[string]any{
+	if err := insertRow(srv.store, sch, "7", cellsFor(t, sch, map[string]any{
 		"id": int64(7), "age": int64(42), "name": "ada",
 	})); err != nil {
 		t.Fatal(err)
 	}
-	cells, found, err := srv.readRow(sch, "7")
+	cells, found, err := readRow(srv.store, sch, "7")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -103,17 +103,17 @@ func TestRowExistenceIsThePrimaryKey(t *testing.T) {
 	if err := store.Set(ColumnKey(DefaultDB, "users", "7", "name"), []byte("orphan"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := srv.rowExists(sch, "7"); err != nil || ok {
+	if ok, err := rowExists(srv.store, sch, "7"); err != nil || ok {
 		t.Fatalf("a row with only an orphan column reported present: %v, %v", ok, err)
 	}
-	if _, found, err := srv.readRow(sch, "7"); err != nil || found {
+	if _, found, err := readRow(srv.store, sch, "7"); err != nil || found {
 		t.Fatalf("readRow returned a row built from an orphan column: %v, %v", found, err)
 	}
 	// Once the primary key lands, the same row is present.
 	if err := store.Set(ColumnKey(DefaultDB, "users", "7", "id"), []byte("x"), 0); err != nil {
 		t.Fatal(err)
 	}
-	if ok, err := srv.rowExists(sch, "7"); err != nil || !ok {
+	if ok, err := rowExists(srv.store, sch, "7"); err != nil || !ok {
 		t.Fatalf("row with a primary key reported absent: %v, %v", ok, err)
 	}
 }
@@ -122,19 +122,19 @@ func TestRowInsertRejectsDuplicate(t *testing.T) {
 	sch := rowTestSchema()
 	srv, _ := newRowServer(t, sch)
 	first := cellsFor(t, sch, map[string]any{"id": int64(1), "name": "first"})
-	if err := srv.insertRow(sch, "1", first); err != nil {
+	if err := insertRow(srv.store, sch, "1", first); err != nil {
 		t.Fatal(err)
 	}
 	// A second insert must not overwrite the first: two concurrent inserts of
 	// the same row id cannot both report success.
-	err := srv.insertRow(sch, "1", cellsFor(t, sch, map[string]any{"id": int64(1), "name": "second"}))
+	err := insertRow(srv.store, sch, "1", cellsFor(t, sch, map[string]any{"id": int64(1), "name": "second"}))
 	if err == nil {
 		t.Fatal("duplicate insert was accepted")
 	}
 	if !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("duplicate insert reported %v", err)
 	}
-	cells, _, err := srv.readRow(sch, "1")
+	cells, _, err := readRow(srv.store, sch, "1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestRowNullAndNotNull(t *testing.T) {
 	srv, _ := newRowServer(t, sch)
 
 	// age omitted entirely on an insert: no default, NOT NULL, so refused.
-	err := srv.insertRow(sch, "1", cellsFor(t, sch, map[string]any{"id": int64(1)}))
+	err := insertRow(srv.store, sch, "1", cellsFor(t, sch, map[string]any{"id": int64(1)}))
 	if err == nil {
 		t.Fatal("insert with an unset NOT NULL column was accepted")
 	}
@@ -160,14 +160,14 @@ func TestRowNullAndNotNull(t *testing.T) {
 	// An explicit NULL is the same violation.
 	cells := cellsFor(t, sch, map[string]any{"id": int64(1)})
 	cells[1] = rowValue{value: nil, set: true}
-	if err := srv.insertRow(sch, "1", cells); err == nil {
+	if err := insertRow(srv.store, sch, "1", cells); err == nil {
 		t.Fatal("insert with a NULL NOT NULL column was accepted")
 	}
 	// The nullable column may be absent, and reads back as NULL.
-	if err := srv.insertRow(sch, "2", cellsFor(t, sch, map[string]any{"id": int64(2), "age": int64(1)})); err != nil {
+	if err := insertRow(srv.store, sch, "2", cellsFor(t, sch, map[string]any{"id": int64(2), "age": int64(1)})); err != nil {
 		t.Fatal(err)
 	}
-	got, found, err := srv.readRow(sch, "2")
+	got, found, err := readRow(srv.store, sch, "2")
 	if err != nil || !found {
 		t.Fatalf("read %v, %v", found, err)
 	}
@@ -179,7 +179,7 @@ func TestRowNullAndNotNull(t *testing.T) {
 func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 	sch := rowTestSchema()
 	srv, _ := newRowServer(t, sch)
-	if err := srv.insertRow(sch, "1", cellsFor(t, sch, map[string]any{
+	if err := insertRow(srv.store, sch, "1", cellsFor(t, sch, map[string]any{
 		"id": int64(1), "age": int64(30), "name": "ada",
 	})); err != nil {
 		t.Fatal(err)
@@ -189,10 +189,10 @@ func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 	// both operations.
 	cells := make(rowCells, len(sch.Columns))
 	cells[2] = rowValue{value: nil, set: true} // name -> NULL
-	if err := srv.updateRow(sch, "1", cells); err != nil {
+	if err := updateRow(srv.store, sch, "1", cells); err != nil {
 		t.Fatal(err)
 	}
-	got, _, err := srv.readRow(sch, "1")
+	got, _, err := readRow(srv.store, sch, "1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,10 +205,10 @@ func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 	}
 	// An update to a row that is not there reports no affected row rather than
 	// creating one.
-	if err := srv.updateRow(sch, "missing", cells); err != nil {
+	if err := updateRow(srv.store, sch, "missing", cells); err != nil {
 		t.Fatal(err)
 	}
-	if ok, _ := srv.rowExists(sch, "missing"); ok {
+	if ok, _ := rowExists(srv.store, sch, "missing"); ok {
 		t.Fatal("update created a row that did not exist")
 	}
 }
@@ -221,7 +221,7 @@ func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 func TestRowUpdateCreatesAnAbsentColumn(t *testing.T) {
 	sch := rowTestSchema()
 	srv, _ := newRowServer(t, sch)
-	if err := srv.insertRow(sch, "1", cellsFor(t, sch, map[string]any{
+	if err := insertRow(srv.store, sch, "1", cellsFor(t, sch, map[string]any{
 		"id": int64(1),
 	})); err != nil {
 		t.Fatal(err)
@@ -234,11 +234,11 @@ func TestRowUpdateCreatesAnAbsentColumn(t *testing.T) {
 
 	cells := make(rowCells, len(sch.Columns))
 	cells[1] = rowValue{value: EncodeOrderableInt(41), set: true}
-	if err := srv.updateRow(sch, "1", cells); err != nil {
+	if err := updateRow(srv.store, sch, "1", cells); err != nil {
 		t.Fatal(err)
 	}
 
-	got, _, err := srv.readRow(sch, "1")
+	got, _, err := readRow(srv.store, sch, "1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,12 +260,12 @@ func TestRowUpdateCreatesAnAbsentColumn(t *testing.T) {
 func TestRowDeleteRemovesEveryKey(t *testing.T) {
 	sch := rowTestSchema()
 	srv, store := newRowServer(t, sch)
-	if err := srv.insertRow(sch, "1", cellsFor(t, sch, map[string]any{
+	if err := insertRow(srv.store, sch, "1", cellsFor(t, sch, map[string]any{
 		"id": int64(1), "age": int64(30), "name": "ada",
 	})); err != nil {
 		t.Fatal(err)
 	}
-	ok, err := srv.deleteRow(sch, "1")
+	ok, err := deleteRow(srv.store, sch, "1")
 	if err != nil || !ok {
 		t.Fatalf("delete = %v, %v", ok, err)
 	}
@@ -277,7 +277,7 @@ func TestRowDeleteRemovesEveryKey(t *testing.T) {
 	if remaining != 0 {
 		t.Fatalf("delete left %d keys behind", remaining)
 	}
-	ok, err = srv.deleteRow(sch, "1")
+	ok, err = deleteRow(srv.store, sch, "1")
 	if err != nil || ok {
 		t.Fatalf("second delete = %v, %v; want no row and no error", ok, err)
 	}
@@ -290,7 +290,7 @@ func TestRowIDContainingTheSeparator(t *testing.T) {
 	sch := rowTestSchema()
 	srv, _ := newRowServer(t, sch)
 	for _, id := range []string{"a/b", "a%b", "%2F", "plain"} {
-		if err := srv.insertRow(sch, id, cellsFor(t, sch, map[string]any{
+		if err := insertRow(srv.store, sch, id, cellsFor(t, sch, map[string]any{
 			"id": int64(1), "name": "row-" + id,
 		})); err != nil {
 			t.Fatalf("insert %q: %v", id, err)
@@ -298,7 +298,7 @@ func TestRowIDContainingTheSeparator(t *testing.T) {
 	}
 	// Each id must read back as its own row, not as a neighbour's.
 	for _, id := range []string{"a/b", "a%b", "%2F", "plain"} {
-		cells, found, err := srv.readRow(sch, id)
+		cells, found, err := readRow(srv.store, sch, id)
 		if err != nil {
 			t.Fatalf("read %q: %v", id, err)
 		}
@@ -324,13 +324,13 @@ func TestRowIDContainingTheSeparator(t *testing.T) {
 func TestRowIDIsNotConfusedWithALongerID(t *testing.T) {
 	sch := rowTestSchema()
 	srv, _ := newRowServer(t, sch)
-	if err := srv.insertRow(sch, "1", cellsFor(t, sch, map[string]any{"id": int64(1), "name": "one"})); err != nil {
+	if err := insertRow(srv.store, sch, "1", cellsFor(t, sch, map[string]any{"id": int64(1), "name": "one"})); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.insertRow(sch, "10", cellsFor(t, sch, map[string]any{"id": int64(10), "name": "ten"})); err != nil {
+	if err := insertRow(srv.store, sch, "10", cellsFor(t, sch, map[string]any{"id": int64(10), "name": "ten"})); err != nil {
 		t.Fatal(err)
 	}
-	one, _, err := srv.readRow(sch, "1")
+	one, _, err := readRow(srv.store, sch, "1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,12 +357,12 @@ func TestRowInsertCompensatesOnFailure(t *testing.T) {
 	srv.store = fail
 
 	cells := cellsFor(t, sch, map[string]any{"id": int64(1), "age": int64(30), "name": "ada"})
-	if err := srv.insertRow(sch, "1", cells); err == nil {
+	if err := insertRow(srv.store, sch, "1", cells); err == nil {
 		t.Fatal("insert reported success despite a failing store")
 	}
 	// Nothing may be left behind, or the next insert of the same row id would
 	// report a duplicate against a row that does not exist.
-	if ok, _ := srv.rowExists(sch, "1"); ok {
+	if ok, _ := rowExists(srv.store, sch, "1"); ok {
 		t.Fatal("a failed insert left the primary key behind")
 	}
 	remaining := 0
@@ -413,7 +413,7 @@ func TestRowRejectsUndecodableValues(t *testing.T) {
 	// write time, not stored and left to fail on the next read.
 	cells := cellsFor(t, sch, map[string]any{"id": int64(1), "name": "ada"})
 	cells[1] = rowValue{value: []byte("not an int"), set: true}
-	if err := srv.insertRow(sch, "1", cells); err == nil {
+	if err := insertRow(srv.store, sch, "1", cells); err == nil {
 		t.Fatal("insert stored a value that does not decode as int")
 	}
 }

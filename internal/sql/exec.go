@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -40,23 +41,63 @@ type execOutcome struct {
 	selectRows bool
 }
 
-// isWrite reports whether a statement mutates data. Transaction statements are
-// excluded: they carry no key and touch no data. DDL is excluded too, and
-// handled separately: it writes a catalog key rather than row data, so it is
-// governed by the catalog's own rules rather than by the row transaction
-// restriction.
-func (k StmtKind) isWrite() bool {
-	switch k {
-	case StmtInsert, StmtUpdate, StmtDelete:
-		return true
-	default:
-		return false
-	}
-}
-
 // isDDL reports whether a statement changes the schema.
 func (k StmtKind) isDDL() bool {
 	return k == StmtCreateTable || k == StmtDropTable
+}
+
+// isTxnControl reports whether a statement opens, ends or discards a transaction
+// block. Such a statement is never refused for being inside a failed block, and
+// its own failure must not poison the block.
+func (k StmtKind) isTxnControl() bool {
+	return k == StmtBegin || k == StmtCommit || k == StmtRollback
+}
+
+// readsRows reports whether a statement runs through the row executor, and so
+// takes a store: SELECT and the three writes. EXPLAIN, ANALYZE and DDL have
+// their own paths and never touch catalog rows as data.
+func (k StmtKind) readsRows() bool {
+	return k == StmtSelect || k == StmtInsert || k == StmtUpdate || k == StmtDelete
+}
+
+// usesCatalogRows reports whether a plan addresses a catalog table rather than
+// the implicit "tellstone" table. A catalog statement carries the table's schema
+// (SELECT/INSERT/UPDATE/DELETE) or, for a join, the two catalog tables; the
+// implicit table carries neither.
+func (p *Plan) usesCatalogRows() bool {
+	return p.Join != nil || p.Schema != nil
+}
+
+// mvccStore builds the versioned view a catalog statement executes against.
+//
+// Inside a transaction block the view reads at the block's start timestamp and
+// buffers its writes into the block, so a later commit stamps them together.
+// Autocommit reads at the latest snapshot and needs no timestamp of its own;
+// an autocommit write allocates one commit timestamp for the statement, from
+// the serialized oracle, so its version orders correctly against every other
+// write in the cluster.
+func (s *Server) mvccStore(c *pgConn, kind StmtKind) (Store, error) {
+	if c.txn != nil {
+		return &mvccView{
+			base:     c.txn.base,
+			overlay:  c.txn,
+			commit:   s.commit,
+			snapshot: c.txn.startTS,
+		}, nil
+	}
+	view := &mvccView{
+		base:     s.store,
+		commit:   s.commit,
+		snapshot: math.MaxUint64,
+	}
+	if kind != StmtSelect {
+		ts, err := s.nextTS()
+		if err != nil {
+			return nil, err
+		}
+		view.writeTS = ts
+	}
+	return view, nil
 }
 
 // command maps a statement onto the RBAC command it needs, plus the lowercase
@@ -156,39 +197,60 @@ func (s *Server) authorize(c *pgConn, plan *Plan, params []paramVal) error {
 	return nil
 }
 
-// execute runs a translated plan against the shared store with the bound
-// parameters. RBAC enforcement mirrors the binary frontend: the session's
-// command bit and key prefixes are consulted on every data statement.
+// execute runs a translated plan with the bound parameters. RBAC enforcement
+// mirrors the binary frontend: the session's command bit and key prefixes are
+// consulted on every data statement.
+//
+// It is the wrapper that gives a transaction block its PostgreSQL failure
+// semantics: any error raised by a data statement inside the block poisons it,
+// and every later statement is refused until the block ends. Transaction
+// control statements are exempt -- their own failure must not poison a block
+// they are about to end.
 func (s *Server) execute(c *pgConn, plan *Plan, params []paramVal) (*execOutcome, error) {
+	out, err := s.executeStmt(c, plan, params)
+	if err != nil && c.txn != nil && !plan.Kind.isTxnControl() {
+		c.txn.failed = true
+	}
+	return out, err
+}
+
+// executeStmt dispatches one statement. A transaction block executes against the
+// connection's overlay store (see txn.go), so its writes are buffered until
+// COMMIT and its reads see its own uncommitted effects.
+func (s *Server) executeStmt(c *pgConn, plan *Plan, params []paramVal) (*execOutcome, error) {
 	switch plan.Kind {
 	case StmtBegin:
-		c.inTxn = true
-		return &execOutcome{tag: "BEGIN"}, nil
+		return s.execBegin(c)
 	case StmtCommit:
-		c.inTxn = false
-		return &execOutcome{tag: "COMMIT"}, nil
+		return s.execCommit(c)
 	case StmtRollback:
-		c.inTxn = false
-		return &execOutcome{tag: "ROLLBACK"}, nil
+		return s.execRollback(c)
+	}
+
+	// A block that has already failed refuses every statement until it ends.
+	// This is PostgreSQL's rule and it is what makes a half-applied statement
+	// inside a block unusable: the client cannot continue on a state it cannot
+	// see, so it is told to roll back.
+	if c.txn != nil && c.txn.failed {
+		return nil, &pgError{
+			code: errInFailedSQLTransaction,
+			msg:  "current transaction is aborted, commands ignored until end of transaction block",
+		}
 	}
 
 	// DDL is dispatched before the RBAC and transaction machinery below, both
-	// of which are row-oriented: the RBAC check needs a key predicate, and the
-	// transaction restriction exists because a row write would already be
-	// durable when ROLLBACK ran. A catalog write has neither shape.
+	// of which are row-oriented: the RBAC check needs a key predicate, and a
+	// catalog write is not a row write. A schema change inside a transaction
+	// block is refused rather than silently applied outside the block, because
+	// the store cannot roll a catalog mutation back.
 	if plan.Kind.isDDL() {
-		return s.execDDL(c, plan)
-	}
-
-	// The store exposes single-key operations with no enclosing transaction,
-	// so a write issued inside a transaction block would already be durable by
-	// the time ROLLBACK ran. Refusing the write is the only way to keep the
-	// block's promise: a ROLLBACK then genuinely has nothing to undo.
-	if c.inTxn && plan.Kind.isWrite() {
-		return nil, &pgError{
-			code: errFeatureNotSupported,
-			msg:  "data statements are not supported inside a transaction block",
+		if c.txn != nil {
+			return nil, &pgError{
+				code: errFeatureNotSupported,
+				msg:  "schema changes are not supported inside a transaction block",
+			}
 		}
+		return s.execDDL(c, plan)
 	}
 
 	if err := s.authorize(c, plan, params); err != nil {
@@ -201,22 +263,75 @@ func (s *Server) execute(c *pgConn, plan *Plan, params []paramVal) (*execOutcome
 		return nil, err
 	}
 
+	st := c.store()
+	// A statement that reads or writes catalog-table rows runs against an MVCC
+	// view instead of the raw store, so it resolves column values at a snapshot
+	// and stamps its writes with a commit timestamp (see mvcc.go). The implicit
+	// "tellstone" table is a raw single-key table shared with the binary
+	// frontend and keeps the plain store.
+	if plan.Kind.readsRows() && plan.usesCatalogRows() {
+		var err error
+		if st, err = s.mvccStore(c, plan.Kind); err != nil {
+			return nil, err
+		}
+	}
 	switch plan.Kind {
 	case StmtExplain:
 		return s.execExplain(c, plan)
 	case StmtAnalyze:
 		return s.execAnalyze(plan)
 	case StmtSelect:
-		return s.execSelect(c, plan, params)
+		return s.execSelect(c, st, plan, params)
 	case StmtInsert:
-		return s.execInsert(plan, params)
+		return s.execInsert(st, plan, params)
 	case StmtUpdate:
-		return s.execUpdate(plan, params)
+		return s.execUpdate(st, plan, params)
 	case StmtDelete:
-		return s.execDelete(plan, params)
+		return s.execDelete(st, plan, params)
 	default:
 		return nil, &pgError{code: errFeatureNotSupported, msg: "unhandled statement kind"}
 	}
+}
+
+// execBegin opens a transaction block. A BEGIN inside an already-open block is
+// a no-op that keeps the existing transaction, matching PostgreSQL's warning
+// behaviour without surfacing the warning: the block's identity and start
+// timestamp do not change.
+func (s *Server) execBegin(c *pgConn) (*execOutcome, error) {
+	if c.txn != nil {
+		return &execOutcome{tag: "BEGIN"}, nil
+	}
+	ts, err := s.nextTS()
+	if err != nil {
+		return nil, err
+	}
+	c.txn = newTxnState(ts, s.store)
+	return &execOutcome{tag: "BEGIN"}, nil
+}
+
+// execCommit ends a block, applying its write set after conflict detection. A
+// COMMIT outside a block is a successful no-op, as in PostgreSQL. A COMMIT of a
+// failed block reports ROLLBACK and applies nothing.
+func (s *Server) execCommit(c *pgConn) (*execOutcome, error) {
+	if c.txn == nil {
+		return &execOutcome{tag: "COMMIT"}, nil
+	}
+	t := c.txn
+	c.txn = nil
+	if t.failed {
+		return &execOutcome{tag: "ROLLBACK"}, nil
+	}
+	if err := s.commitTxn(t); err != nil {
+		return nil, err
+	}
+	return &execOutcome{tag: "COMMIT"}, nil
+}
+
+// execRollback discards a block's buffered writes. A ROLLBACK outside a block
+// is a successful no-op.
+func (s *Server) execRollback(c *pgConn) (*execOutcome, error) {
+	c.txn = nil
+	return &execOutcome{tag: "ROLLBACK"}, nil
 }
 
 // auditCommand records one authorized statement with the same field set and
@@ -249,15 +364,15 @@ func (s *Server) auditDenied(c *pgConn, command string, key []byte) {
 	)
 }
 
-func (s *Server) execSelect(c *pgConn, plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execSelect(c *pgConn, st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	if plan.Schema != nil {
-		return s.execSelectRow(plan, params)
+		return s.execSelectRow(st, plan, params)
 	}
 	key, err := plan.Key.resolve(params)
 	if err != nil {
 		return nil, err
 	}
-	val, found, serr := s.store.GetErr(string(key))
+	val, found, serr := st.GetErr(string(key))
 	if serr != nil {
 		return nil, &pgError{code: errIoError, msg: serr.Error()}
 	}
@@ -276,9 +391,9 @@ func (s *Server) execSelect(c *pgConn, plan *Plan, params []paramVal) (*execOutc
 	return &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}, nil
 }
 
-func (s *Server) execInsert(plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execInsert(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	if plan.Schema != nil {
-		return s.execInsertRow(plan, params)
+		return s.execInsertRow(st, plan, params)
 	}
 	key, err := plan.Key.resolve(params)
 	if err != nil {
@@ -293,14 +408,14 @@ func (s *Server) execInsert(plan *Plan, params []paramVal) (*execOutcome, error)
 		// ON CONFLICT DO UPDATE SET value = excluded.value replaces the whole
 		// proposed row, so an unconditional write is exactly the semantics:
 		// it creates the row when absent and overwrites it when present.
-		if serr := s.store.Set(string(key), val, 0); serr != nil {
+		if serr := st.Set(string(key), val, 0); serr != nil {
 			return nil, &pgError{code: errIoError, msg: serr.Error()}
 		}
 		return &execOutcome{tag: "INSERT 0 1"}, nil
 	case ConflictDoNothing:
 		// The existing row must survive, so the write may only create. A
 		// conflicting key is a successful no-op, reported as zero rows.
-		applied, serr := s.store.SetIfAbsent(string(key), val, 0)
+		applied, serr := st.SetIfAbsent(string(key), val, 0)
 		if serr != nil {
 			return nil, &pgError{code: errIoError, msg: serr.Error()}
 		}
@@ -313,7 +428,7 @@ func (s *Server) execInsert(plan *Plan, params []paramVal) (*execOutcome, error)
 		// not overwrite one that already exists. The create-if-absent
 		// precondition and the write are one atomic store operation, so two
 		// concurrent inserts of the same key cannot both report success.
-		applied, serr := s.store.SetIfAbsent(string(key), val, 0)
+		applied, serr := st.SetIfAbsent(string(key), val, 0)
 		if serr != nil {
 			return nil, &pgError{code: errIoError, msg: serr.Error()}
 		}
@@ -324,9 +439,9 @@ func (s *Server) execInsert(plan *Plan, params []paramVal) (*execOutcome, error)
 	}
 }
 
-func (s *Server) execUpdate(plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execUpdate(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	if plan.Schema != nil {
-		return s.execUpdateRow(plan, params)
+		return s.execUpdateRow(st, plan, params)
 	}
 	key, err := plan.Key.resolve(params)
 	if err != nil {
@@ -339,7 +454,7 @@ func (s *Server) execUpdate(plan *Plan, params []paramVal) (*execOutcome, error)
 	// UPDATE may only modify a row that exists. Folding the existence check into
 	// the write keeps the affected-row count honest: a row deleted
 	// concurrently reports zero rows instead of being silently resurrected.
-	applied, serr := s.store.SetIfPresent(string(key), val, 0)
+	applied, serr := st.SetIfPresent(string(key), val, 0)
 	if serr != nil {
 		return nil, &pgError{code: errIoError, msg: serr.Error()}
 	}
@@ -349,15 +464,15 @@ func (s *Server) execUpdate(plan *Plan, params []paramVal) (*execOutcome, error)
 	return &execOutcome{tag: "UPDATE 1"}, nil
 }
 
-func (s *Server) execDelete(plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execDelete(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	if plan.Schema != nil {
-		return s.execDeleteRow(plan, params)
+		return s.execDeleteRow(st, plan, params)
 	}
 	key, err := plan.Key.resolve(params)
 	if err != nil {
 		return nil, err
 	}
-	ok, serr := s.store.Delete(string(key))
+	ok, serr := st.Delete(string(key))
 	if serr != nil {
 		return nil, &pgError{code: errIoError, msg: serr.Error()}
 	}
@@ -524,7 +639,7 @@ func (s *Server) schemaError(err error) error {
 // Phase 11 scan engine instead, which assembles rows from the key stream,
 // filters them in the callback, and delivers them in batches. A join is a
 // third shape, executed in join.go: two scans through one hash table.
-func (s *Server) execSelectRow(plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execSelectRow(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	sch := plan.Schema
 	switch {
 	case plan.Phys == nil:
@@ -532,9 +647,9 @@ func (s *Server) execSelectRow(plan *Plan, params []paramVal) (*execOutcome, err
 		// that must not read the row as if unguided.
 		return nil, &pgError{code: errInternal, msg: "SELECT has no physical plan"}
 	case plan.Phys.Kind == PlanHashJoin:
-		return s.execJoin(plan, params)
+		return s.execJoin(st, plan, params)
 	case plan.Phys.Kind == PlanRangeScan, plan.Phys.Kind == PlanFullScan:
-		return s.execScan(plan, params)
+		return s.execScan(st, plan, params)
 	}
 	// The equality a point lookup walks is on the physical plan: translate only
 	// sets the plan key for a predicate it can prove to be a single equality,
@@ -543,7 +658,7 @@ func (s *Server) execSelectRow(plan *Plan, params []paramVal) (*execOutcome, err
 	if err != nil {
 		return nil, err
 	}
-	cells, found, err := s.readRow(sch, rowID)
+	cells, found, err := readRow(st, sch, rowID)
 	if err != nil {
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}
@@ -582,7 +697,7 @@ func (s *Server) execSelectRow(plan *Plan, params []paramVal) (*execOutcome, err
 
 // execScan runs a full-table or primary-key-range SELECT end to end, filling
 // the outcome's result set from the scan's batches.
-func (s *Server) execScan(plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execScan(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	sch := plan.Schema
 	phys := plan.Phys
 	// A range that provably covers nothing (its bound overflowed the column's
@@ -617,7 +732,7 @@ func (s *Server) execScan(plan *Plan, params []paramVal) (*execOutcome, error) {
 	// As the scan fills each batch, drain it into the outcome's result set:
 	// each surviving cell is rendered to its wire form exactly once, and the
 	// bytes are the sink's (they outlive the scan's reused buffers).
-	err = s.newScan(phys, sch, proj, filt).run(func(c *Chunk) error {
+	err = newScan(st, phys, sch, proj, filt).run(func(c *Chunk) error {
 		return drainChunk(c, cols, out)
 	})
 	if err != nil {
@@ -637,7 +752,7 @@ func (s *Server) execScan(plan *Plan, params []paramVal) (*execOutcome, error) {
 // prefix; the callback's bound filters do the rest, so the yielded set is exact
 // either way. A single-table scan and each side of a join share this operator;
 // they differ only in what they do with each batch.
-func (s *Server) newScan(phys *physicalPlan, sch *Schema, proj []int, filt *compiledNode) *tableScan {
+func newScan(st Store, phys *physicalPlan, sch *Schema, proj []int, filt *compiledNode) *tableScan {
 	beg := phys.Lo
 	if beg == nil {
 		// A plan without a lower bound must not scan the store from its start,
@@ -652,7 +767,7 @@ func (s *Server) newScan(phys *physicalPlan, sch *Schema, proj []int, filt *comp
 		seek = []byte(TablePrefix(sch.DB, sch.Table))
 	}
 	ts := &tableScan{
-		store: s.store,
+		store: st,
 		sch:   sch,
 		seek:  seek,
 		beg:   beg,
@@ -711,7 +826,7 @@ func drainChunk(c *Chunk, cols []Column, out *execOutcome) error {
 }
 
 // execInsertRow writes a multi-column row, failing on a duplicate row id.
-func (s *Server) execInsertRow(plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execInsertRow(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	sch := plan.Schema
 	rowID, err := plan.rowID(params)
 	if err != nil {
@@ -753,7 +868,7 @@ func (s *Server) execInsertRow(plan *Plan, params []paramVal) (*execOutcome, err
 		}
 	}
 	cells[sch.PrimaryKey] = rowValue{value: pkCell, set: true}
-	if err := s.insertRow(sch, rowID, cells); err != nil {
+	if err := insertRow(st, sch, rowID, cells); err != nil {
 		if errors.Is(err, ErrDuplicateRow) {
 			return nil, &pgError{
 				code: errDuplicateKey,
@@ -773,8 +888,15 @@ func (s *Server) execInsertRow(plan *Plan, params []paramVal) (*execOutcome, err
 
 // execUpdateRow rewrites the listed columns of an existing row, reporting zero
 // affected rows when it is not there.
-func (s *Server) execUpdateRow(plan *Plan, params []paramVal) (*execOutcome, error) {
-	sch := plan.Schema
+// execUpdateRow rewrites columns of rows matched by the plan.
+func (s *Server) execUpdateRow(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
+	if plan.Phys != nil && (plan.Phys.Kind == PlanRangeScan || plan.Phys.Kind == PlanFullScan) {
+		res, err := s.execUpdateMulti(st, plan, params)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 	if err := refuseMultiRow(plan.Phys); err != nil {
 		return nil, err
 	}
@@ -782,20 +904,16 @@ func (s *Server) execUpdateRow(plan *Plan, params []paramVal) (*execOutcome, err
 	if err != nil {
 		return nil, err
 	}
-	ok, err := s.rowExists(sch, rowID)
-	if err != nil {
-		return nil, &pgError{code: errIoError, msg: err.Error()}
-	}
-	if !ok {
-		return &execOutcome{tag: "UPDATE 0"}, nil
-	}
 	cells, err := plan.buildCells(params, false)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.updateRow(sch, rowID, cells); err != nil {
+	if err := updateRow(st, plan.Schema, rowID, cells); err != nil {
 		if errors.Is(err, ErrNotNull) {
 			return nil, &pgError{code: errNotNullViolation, msg: err.Error()}
+		}
+		if errors.Is(err, ErrBadSchema) {
+			return nil, &pgError{code: errSyntax, msg: err.Error()}
 		}
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}
@@ -803,7 +921,15 @@ func (s *Server) execUpdateRow(plan *Plan, params []paramVal) (*execOutcome, err
 }
 
 // execDeleteRow removes a row and every one of its column keys.
-func (s *Server) execDeleteRow(plan *Plan, params []paramVal) (*execOutcome, error) {
+// execDeleteRow removes rows matched by the plan.
+func (s *Server) execDeleteRow(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
+	if plan.Phys != nil && (plan.Phys.Kind == PlanRangeScan || plan.Phys.Kind == PlanFullScan) {
+		res, err := s.execDeleteMulti(st, plan, params)
+		if err != nil {
+			return nil, err
+		}
+		return res, nil
+	}
 	if err := refuseMultiRow(plan.Phys); err != nil {
 		return nil, err
 	}
@@ -811,7 +937,7 @@ func (s *Server) execDeleteRow(plan *Plan, params []paramVal) (*execOutcome, err
 	if err != nil {
 		return nil, err
 	}
-	ok, serr := s.deleteRow(plan.Schema, rowID)
+	ok, serr := deleteRow(st, plan.Schema, rowID)
 	if serr != nil {
 		return nil, &pgError{code: errIoError, msg: serr.Error()}
 	}

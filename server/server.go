@@ -185,6 +185,22 @@ type Server struct {
 	gateway *cluster.Gateway
 }
 
+// tsoOracle adapts the placement driver's timestamp source to the SQL
+// frontend's transaction timestamp source (Phase 12). It allocates through the
+// etcd watermark rather than the pre-allocated pool: MVCC snapshots and commits
+// require a total order that matches real time, and only the serialized
+// watermark provides it. The round-trip is the price of that guarantee; a
+// pool-derived timestamp can be handed out below one another node already
+// issued, which would let a delete lose to the insert it removes. See ADR-015
+// (docs/adr/015-serialized-tso-mvcc-ordering.md).
+type tsoOracle struct{ pd *cluster.PDNode }
+
+func (o tsoOracle) Next() (uint64, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return o.pd.NextTimestamp(ctx)
+}
+
 func NewServer(app *tellstone.App) *Server {
 	return &Server{
 		app: app,
@@ -296,6 +312,13 @@ func (s *Server) Run() error {
 			}
 		}
 		s.pgSrv = sqlpkg.NewServer(cfg.GetPGAddr(), s.store, s.policy, s.oauth, s.audit, passHash, s.tlsConfigs, logger, cfg.PGTLS())
+		// Phase 12: transaction start and commit timestamps come from the
+		// placement driver's TSO in cluster mode, so transactions from every
+		// node order against one another. Standalone keeps the sql package's
+		// local fallback oracle.
+		if s.pdNode != nil {
+			s.pgSrv.SetTimestampOracle(tsoOracle{pd: s.pdNode})
+		}
 		if _, err := s.pgSrv.Start(); err != nil {
 			return fmt.Errorf("sql listener: %w", err)
 		}

@@ -706,16 +706,21 @@ func TestTransactions(t *testing.T) {
 		t.Fatalf("BEGIN must leave tx state 'T', got %q", f.val[0])
 	}
 
-	// A write inside a transaction block is refused: the store has no
-	// enclosing transaction, so such a write would already be committed by the
-	// time ROLLBACK ran and the block's promise could not be kept.
+	// A write inside a block is buffered, not committed: the block itself sees
+	// it (read-your-writes), but the shared store does not until COMMIT.
 	frames = sess.query(`INSERT INTO tellstone (key, value) VALUES ('tx', 'ok')`)
-	if code, _, ok := findError(frames); !ok || code != errFeatureNotSupported {
-		t.Fatalf("write inside a transaction block: code = %q ok = %v, want %s", code, ok, errFeatureNotSupported)
+	if tag := findTag(frames); tag != "INSERT 0 1" {
+		t.Fatalf("write inside a transaction block tag = %q", tag)
+	}
+	if _, ok, _ := store.GetErr("tx"); ok {
+		t.Fatalf("uncommitted write inside a transaction block is visible outside it")
+	}
+	if tag := findTag(sess.query(`SELECT * FROM tellstone WHERE key = 'tx'`)); tag != "SELECT 1" {
+		t.Fatalf("read-your-writes inside the block: tag = %q", tag)
 	}
 
-	// Nothing was written, so the ROLLBACK reports success honestly and the
-	// row it claimed to roll back is genuinely absent.
+	// ROLLBACK discards the buffered write, so the row it claimed to roll back
+	// is genuinely absent.
 	frames = sess.query(`ROLLBACK`)
 	if tag := findTag(frames); tag != "ROLLBACK" {
 		t.Fatalf("ROLLBACK tag = %q", tag)
@@ -725,6 +730,26 @@ func TestTransactions(t *testing.T) {
 	}
 	if _, ok, _ := store.GetErr("tx"); ok {
 		t.Fatalf("row written inside the rolled-back transaction block survived")
+	}
+
+	// COMMIT applies the buffered write to the shared store.
+	if tag := findTag(sess.query(`BEGIN`)); tag != "BEGIN" {
+		t.Fatalf("BEGIN tag = %q", tag)
+	}
+	if tag := findTag(sess.query(`INSERT INTO tellstone (key, value) VALUES ('committed', 'yes')`)); tag != "INSERT 0 1" {
+		t.Fatalf("insert inside committed block tag = %q", tag)
+	}
+	if _, ok, _ := store.GetErr("committed"); ok {
+		t.Fatalf("uncommitted write visible before COMMIT")
+	}
+	if tag := findTag(sess.query(`COMMIT`)); tag != "COMMIT" {
+		t.Fatalf("COMMIT tag = %q", tag)
+	}
+	if _, ok, _ := store.GetErr("committed"); !ok {
+		t.Fatalf("committed write did not land")
+	}
+	if tag := findTag(sess.query(`DELETE FROM tellstone WHERE key = 'committed'`)); tag != "DELETE 1" {
+		t.Fatalf("cleanup delete tag = %q", tag)
 	}
 
 	// Outside a transaction the same INSERT applies and can be read back.
@@ -1648,11 +1673,12 @@ func TestDDLRejectsUnusableStatementsOverTheWire(t *testing.T) {
 	}
 }
 
-// TestDDLInsideTransactionIsNotBlocked checks the transaction restriction kept
-// its meaning: it exists because a row write would already be durable when
-// ROLLBACK ran, and it must not start applying to catalog writes without that
-// reasoning being revisited.
-func TestDDLInsideTransactionIsNotBlocked(t *testing.T) {
+// TestDDLInsideTransactionIsRefused pins the Phase 12 boundary: row writes are
+// transactional, catalog writes are not. A schema change inside a block is
+// refused rather than applied outside the block, because the store cannot roll
+// a catalog mutation back and committing it anyway would break the block's
+// promise.
+func TestDDLInsideTransactionIsRefused(t *testing.T) {
 	srv, _ := newTestServer(t, srvOpts{})
 	sess := dialServer(t, srv.Addr())
 	sess.startupTrust("default")
@@ -1660,12 +1686,16 @@ func TestDDLInsideTransactionIsNotBlocked(t *testing.T) {
 	if tag := findTag(sess.query(`BEGIN`)); tag != "BEGIN" {
 		t.Fatal("BEGIN did not take")
 	}
-	// A row write inside the block is still refused.
-	frames := sess.query(`INSERT INTO tellstone (key, value) VALUES ('a', 'b')`)
-	if _, _, ok := findError(frames); !ok {
-		t.Fatal("a row write inside a transaction block was accepted")
+	// A row write inside the block is accepted and buffered.
+	if tag := findTag(sess.query(`INSERT INTO tellstone (key, value) VALUES ('a', 'b')`)); tag != "INSERT 0 1" {
+		t.Fatalf("a row write inside a transaction block reported %q", tag)
 	}
-	if tag := findTag(sess.query(`CREATE TABLE t (id int PRIMARY KEY)`)); tag != "CREATE TABLE" {
-		t.Fatalf("CREATE TABLE inside a block reported %q", tag)
+	// A schema change inside the block is refused.
+	frames := sess.query(`CREATE TABLE t (id int PRIMARY KEY)`)
+	if code, _, ok := findError(frames); !ok || code != errFeatureNotSupported {
+		t.Fatalf("CREATE TABLE inside a block: code = %q ok = %v, want %s", code, ok, errFeatureNotSupported)
+	}
+	if tag := findTag(sess.query(`ROLLBACK`)); tag != "ROLLBACK" {
+		t.Fatalf("ROLLBACK tag = %q", tag)
 	}
 }

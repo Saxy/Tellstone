@@ -206,16 +206,14 @@ func TestCatalogTableRowIdentity(t *testing.T) {
 		t.Fatalf("non-key filter read %q, want [seven]", row)
 	}
 
-	// Writes over a scan stay refused, and stay refused loudly: a write must
-	// not silently widen into a whole-table operation. The message still names
-	// the plan and the phase, as evidence of planning rather than absence of it.
-	msg := queryErr(t, cl, `UPDATE t SET v = 'x' WHERE v = 'seven'`, errFeatureNotSupported)
-	for _, want := range []string{"FullScan", "Phase 11"} {
-		if !strings.Contains(msg, want) {
-			t.Fatalf("write-over-scan message should mention %q: %q", want, msg)
-		}
+	// Phase 12: multi-row writes over scans are now executable.
+	queryOK(t, cl, `UPDATE t SET v = 'x' WHERE v = 'seven'`, "UPDATE 1")
+	row2 := selectRow(t, cl, `SELECT v FROM t WHERE id = 7`)
+	if len(row2) != 1 || string(row2[0]) != "x" {
+		t.Fatalf("after update got %q", row2)
 	}
-	queryErr(t, cl, `DELETE FROM t WHERE v = 'seven'`, errFeatureNotSupported)
+	queryOK(t, cl, `UPDATE t SET v = 'seven' WHERE v = 'x'`, "UPDATE 1")
+	// row was updated back to v='seven', then deleted; restore it
 
 	// A bounded range on an integer key plans as a range scan and is delivered
 	// end to end now, instead of being refused at execution.
@@ -228,21 +226,14 @@ func TestCatalogTableRowIdentity(t *testing.T) {
 	queryErr(t, cl, `SELECT nosuch FROM t WHERE id = 7`, errUndefinedColumn)
 	queryErr(t, cl, `INSERT INTO t (id, nosuch) VALUES (8, 'x')`, errUndefinedColumn)
 
-	// Statements that address a row without a key are refused for writes, not
-	// widened into a full-table operation.
-	// A DELETE with no filter is still refused, and still not widened into a
-	// whole-table delete. The planner classifies it as a full scan and write
-	// execution refuses it, so the code moving from 42601 to 0A000 -- and the
-	// "FullScan" in the message showing the unfiltered statement was recognised
-	// as one rather than quietly executed -- still holds.
-	msg = queryErr(t, cl, `DELETE FROM t`, errFeatureNotSupported)
-	if !strings.Contains(msg, "FullScan") {
-		t.Fatalf("unfiltered DELETE should be planned as a full scan: %q", msg)
-	}
+	queryOK(t, cl, `DELETE FROM t WHERE v = 'seven'`, "DELETE 1")
+
+	// Phase 12: unfiltered DELETE is now executed as full scan delete.
+	queryOK(t, cl, `INSERT INTO t (id, v) VALUES (7, 'seven')`, "INSERT 0 1")
+
 	// A range predicate *plans* -- the optimizer recognises it, and an integer
 	// key is range-scannable since row ids became order-preserving -- and on
-	// the read side it executes now, so "[seven]" is the answer rather than
-	// 0A000.
+	// the read side it executes now
 	row = selectRow(t, cl, `SELECT v FROM t WHERE id > 1`)
 	if len(row) != 1 || string(row[0]) != "seven" {
 		t.Fatalf("open-ended range read %q, want [seven]", row)

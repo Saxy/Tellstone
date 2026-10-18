@@ -60,8 +60,8 @@ func primaryKeyKey(s *Schema, rowID string) string { return rowKey(s, rowID, s.P
 
 // rowExists reports whether a row is present, which is a single read of the
 // primary key rather than a scan of the row's range.
-func (s *Server) rowExists(sch *Schema, rowID string) (bool, error) {
-	_, ok, err := s.store.GetErr(primaryKeyKey(sch, rowID))
+func rowExists(st Store, sch *Schema, rowID string) (bool, error) {
+	_, ok, err := st.GetErr(primaryKeyKey(sch, rowID))
 	if err != nil {
 		return false, err
 	}
@@ -75,8 +75,8 @@ func (s *Server) rowExists(sch *Schema, rowID string) (bool, error) {
 // by position. Key order is lexicographic, so the range scan returns columns
 // sorted by name and in no particular relation to declaration order: a table
 // declared (id, age, name) scans back age, id, name.
-func (s *Server) readRow(sch *Schema, rowID string) (rowCells, bool, error) {
-	ok, err := s.rowExists(sch, rowID)
+func readRow(st Store, sch *Schema, rowID string) (rowCells, bool, error) {
+	ok, err := rowExists(st, sch, rowID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -85,7 +85,7 @@ func (s *Server) readRow(sch *Schema, rowID string) (rowCells, bool, error) {
 	}
 	prefix := RowPrefix(sch.DB, sch.Table, rowID)
 	cells := make(rowCells, len(sch.Columns))
-	_, err = s.store.ScanPrefix(prefix, func(key, value []byte) bool {
+	_, err = st.ScanPrefix(prefix, func(key, value []byte) bool {
 		name := columnNameFromKey(prefix, key)
 		if col, found := sch.columnIndex(name); found {
 			// The value is copied because the scan's buffers are only valid for
@@ -119,12 +119,12 @@ func columnNameFromKey(prefix string, key []byte) string {
 // the same row id cannot both report success. Writing the other columns first
 // would be worse than non-atomic -- a losing insert would have already
 // overwritten the winner's columns before discovering the conflict.
-func (s *Server) insertRow(sch *Schema, rowID string, cells rowCells) error {
+func insertRow(st Store, sch *Schema, rowID string, cells rowCells) error {
 	if err := validateRowCells(sch, cells, true); err != nil {
 		return err
 	}
 	pk := primaryKeyKey(sch, rowID)
-	applied, err := s.store.SetIfAbsent(pk, cells[sch.PrimaryKey].value, 0)
+	applied, err := st.SetIfAbsent(pk, cells[sch.PrimaryKey].value, 0)
 	if err != nil {
 		return err
 	}
@@ -145,8 +145,8 @@ func (s *Server) insertRow(sch *Schema, rowID string, cells rowCells) error {
 		// than updated; a conditional update would simply decline to write keys
 		// that do not exist yet, leaving a row that existed but had none of its
 		// non-key columns.
-		if err := s.store.Set(rowKey(sch, rowID, i), cell.value, 0); err != nil {
-			s.compensateRow(sch, rowID)
+		if err := st.Set(rowKey(sch, rowID, i), cell.value, 0); err != nil {
+			compensateRow(st, sch, rowID)
 			return err
 		}
 	}
@@ -158,11 +158,11 @@ func (s *Server) insertRow(sch *Schema, rowID string, cells rowCells) error {
 // the absence of its key; a cell that is not set is left untouched. The primary
 // key column is not updatable: it is the row's identity, and changing it would
 // make this a different row.
-func (s *Server) updateRow(sch *Schema, rowID string, cells rowCells) error {
+func updateRow(st Store, sch *Schema, rowID string, cells rowCells) error {
 	if err := validateRowCells(sch, cells, false); err != nil {
 		return err
 	}
-	ok, err := s.rowExists(sch, rowID)
+	ok, err := rowExists(st, sch, rowID)
 	if err != nil {
 		return err
 	}
@@ -177,7 +177,7 @@ func (s *Server) updateRow(sch *Schema, rowID string, cells rowCells) error {
 		}
 		key := rowKey(sch, rowID, i)
 		if cell.value == nil {
-			if _, err := s.store.Delete(key); err != nil {
+			if _, err := st.Delete(key); err != nil {
 				return err
 			}
 			continue
@@ -188,7 +188,7 @@ func (s *Server) updateRow(sch *Schema, rowID string, cells rowCells) error {
 		// never written. A write conditional on that column's own existence would
 		// decline, and this method has no way to report the affected-row count, so
 		// the UPDATE would silently do nothing and still succeed.
-		if err := s.store.Set(key, cell.value, 0); err != nil {
+		if err := st.Set(key, cell.value, 0); err != nil {
 			return err
 		}
 	}
@@ -201,13 +201,13 @@ func (s *Server) updateRow(sch *Schema, rowID string, cells rowCells) error {
 // its remaining columns are swept. Doing it the other way round would leave a
 // window in which the row is still visible but has lost columns, which is the
 // worse failure: a reader would see a truncated row rather than none.
-func (s *Server) deleteRow(sch *Schema, rowID string) (bool, error) {
+func deleteRow(st Store, sch *Schema, rowID string) (bool, error) {
 	pk := primaryKeyKey(sch, rowID)
-	ok, err := s.store.Delete(pk)
+	ok, err := st.Delete(pk)
 	if err != nil || !ok {
 		return false, err
 	}
-	if _, err := s.sweepRow(sch, rowID); err != nil {
+	if _, err := sweepRow(st, sch, rowID); err != nil {
 		return true, err
 	}
 	return true, nil
@@ -216,34 +216,21 @@ func (s *Server) deleteRow(sch *Schema, rowID string) (bool, error) {
 // sweepRow removes every key of a row except the primary key, which the caller
 // has already dealt with.
 //
-// The keys are collected first and deleted afterwards, rather than deleting from
-// inside the scan callback. That is not a style preference: a scan callback runs
-// under the storage engine's read lock, and a write issued from inside it would
-// need the write lock that the read lock is holding. The cluster and router
-// stores happen to materialise their runs before invoking the callback, so the
-// callback there is already outside the lock and this code was safe -- but
-// nothing in the Store contract promises that, and a direct engine-backed store
-// would have deadlocked on the first row delete. Materialising makes the
-// requirement local instead of relying on every implementation getting it right.
-func (s *Server) sweepRow(sch *Schema, rowID string) (int, error) {
-	prefix := RowPrefix(sch.DB, sch.Table, rowID)
-	pk := primaryKeyKey(sch, rowID)
-	keys := make([]string, 0, 8)
-	_, err := s.store.ScanPrefix(prefix, func(key, _ []byte) bool {
-		// The key is copied because the scan's buffer is only valid for the
-		// duration of the callback, and these are deleted after it returns.
-		if string(key) != pk {
-			keys = append(keys, string(key))
-		}
-		return true
-	})
-	if err != nil {
-		return 0, err
-	}
+// The key set is taken from the schema rather than from a scan of the row
+// prefix. A range read may be served best-effort and miss a key, and a missed
+// column would then survive as an orphan that a later reader or the DROP TABLE
+// emptiness guard would still see. Iterating the schema makes the sweep
+// complete by construction. Any column key that is already absent is deleted
+// harmlessly, which also cleans up orphans left by an earlier partial sweep.
+func sweepRow(st Store, sch *Schema, rowID string) (int, error) {
 	deleted := 0
 	var firstErr error
-	for _, key := range keys {
-		if _, err := s.store.Delete(key); err != nil {
+	for i := range sch.Columns {
+		if i == sch.PrimaryKey {
+			continue
+		}
+		ok, err := st.Delete(ColumnKey(sch.DB, sch.Table, rowID, sch.Columns[i].Name))
+		if err != nil {
 			// A delete failure mid-sweep leaves orphan column keys. They are
 			// invisible because the primary key is gone, so this is reported
 			// but not compensated: there is no row left to protect. The rest of
@@ -254,7 +241,9 @@ func (s *Server) sweepRow(sch *Schema, rowID string) (int, error) {
 			}
 			continue
 		}
-		deleted++
+		if ok {
+			deleted++
+		}
 	}
 	return deleted, firstErr
 }
@@ -262,11 +251,11 @@ func (s *Server) sweepRow(sch *Schema, rowID string) (int, error) {
 // compensateRow removes a partially inserted row, best effort. It is called when
 // insertRow has already committed the primary key and then failed, so the row
 // must not be left behind.
-func (s *Server) compensateRow(sch *Schema, rowID string) {
-	if _, err := s.store.Delete(primaryKeyKey(sch, rowID)); err != nil {
+func compensateRow(st Store, sch *Schema, rowID string) {
+	if _, err := st.Delete(primaryKeyKey(sch, rowID)); err != nil {
 		return
 	}
-	_, _ = s.sweepRow(sch, rowID)
+	_, _ = sweepRow(st, sch, rowID)
 }
 
 // validateRowCells rejects a cell set that could not be stored as a row: the

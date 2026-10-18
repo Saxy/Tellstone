@@ -56,7 +56,7 @@ func BenchmarkScanSelect(b *testing.B) {
 					{value: []byte(fmt.Sprintf("row-%d", i)), set: true},
 					{value: bv, set: true},
 				}
-				if err := srv.insertRow(sch, keyspace.EncodeIntRowID(int64(i)), cells); err != nil {
+				if err := insertRow(srv.store, sch, keyspace.EncodeIntRowID(int64(i)), cells); err != nil {
 					b.Fatalf("insertRow: %v", err)
 				}
 			}
@@ -71,7 +71,7 @@ func BenchmarkScanSelect(b *testing.B) {
 			n := 0
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				out, err := srv.execScan(plan, nil)
+				out, err := srv.execScan(srv.store, plan, nil)
 				if err != nil {
 					b.Fatalf("execScan: %v", err)
 				}

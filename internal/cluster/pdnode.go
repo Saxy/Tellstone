@@ -61,6 +61,21 @@ type PDNode struct {
 // Pool returns the local timestamp pool.
 func (p *PDNode) Pool() *TSOPool { return p.pool }
 
+// NextTimestamp allocates one globally ordered timestamp by advancing the etcd
+// watermark, whose compare-and-swap serializes every allocation across all
+// nodes. It costs a control-plane round-trip, unlike the pre-allocated pool,
+// but it guarantees the property MVCC snapshots need and the pool cannot give:
+// an allocation that completes later in real time is strictly greater, so a
+// tombstone can never be stamped below the live version it deletes. See
+// ADR-015 (docs/adr/015-serialized-tso-mvcc-ordering.md).
+func (p *PDNode) NextTimestamp(ctx context.Context) (uint64, error) {
+	start, _, err := p.granter.GrantRange(ctx, 1)
+	if err != nil {
+		return 0, err
+	}
+	return start, nil
+}
+
 // Client exposes the etcd client backing this PD node. It is used by the
 // Phase 3 RegionManager to persist and watch region metadata.
 func (p *PDNode) Client() *clientv3.Client { return p.cli }

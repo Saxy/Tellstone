@@ -336,3 +336,60 @@ func IsIntRowID(s string) bool {
 
 // intRowIDHexLen is the width of a hex row id: two digits per byte, eight bytes.
 const intRowIDHexLen = 16
+
+const (
+	// IntentSuffix is the system suffix for row-level write intents.
+	IntentSuffix = "/_intent"
+)
+
+// IntentKey builds the write-intent key for a row id.
+func IntentKey(db, table, rowID string) string {
+	return RowPrefix(db, table, rowID) + IntentSuffix
+}
+
+// IsIntentKey reports whether the key is a row-level intent key.
+func IsIntentKey(key string) bool {
+	if !strings.HasSuffix(key, IntentSuffix) {
+		return false
+	}
+	base := key[:len(key)-len(IntentSuffix)]
+	// base must be a row prefix <db>/<table>/<rowID>/
+	if base == "" || base[len(base)-1] != '/' {
+		return false
+	}
+	// ensure it parses as row prefix
+	if _, ok := RowIDFromRowPrefix(base + "x"); !ok {
+		return false
+	}
+	return true
+}
+
+// RowIDFromIntentKey extracts the row id from an intent key.
+func RowIDFromIntentKey(key string) (string, bool) {
+	if !strings.HasSuffix(key, IntentSuffix) {
+		return "", false
+	}
+	base := key[:len(key)-len(IntentSuffix)]
+	if base == "" || base[len(base)-1] != '/' {
+		return "", false
+	}
+	return RowIDFromRowPrefix(base)
+}
+
+// RowIDFromRowPrefix extracts row id from <db>/<table>/<rowID>/ form.
+func RowIDFromRowPrefix(prefix string) (string, bool) {
+	if prefix == "" || prefix[len(prefix)-1] != '/' {
+		return "", false
+	}
+	rest := prefix[:len(prefix)-1]
+	// last segment after last /
+	i := strings.LastIndex(rest, "/")
+	if i < 0 {
+		return "", false
+	}
+	id, err := UnescapeRowID(rest[i+1:])
+	if err != nil {
+		return "", false
+	}
+	return id, true
+}

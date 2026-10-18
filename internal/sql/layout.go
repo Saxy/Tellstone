@@ -414,3 +414,18 @@ const GeneratedRowIDWidth = 20
 func FormatGeneratedRowID(tso uint64) string {
 	return fmt.Sprintf("%0*d", GeneratedRowIDWidth, tso)
 }
+
+// IntentKey builds the row-level write-intent key for a row id.
+func IntentKey(db, table, rowID string) string {
+	return keyspace.IntentKey(db, table, rowID)
+}
+
+// IsIntentKey reports whether the key is a write-intent key.
+func IsIntentKey(key string) bool {
+	return keyspace.IsIntentKey(key)
+}
+
+// RowIDFromIntentKey extracts the row id from an intent key.
+func RowIDFromIntentKey(key string) (string, bool) {
+	return keyspace.RowIDFromIntentKey(key)
+}
