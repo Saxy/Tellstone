@@ -908,7 +908,8 @@ func (s *Server) execUpdateRow(st Store, plan *Plan, params []paramVal) (*execOu
 	if err != nil {
 		return nil, err
 	}
-	if err := updateRow(st, plan.Schema, rowID, cells); err != nil {
+	existed, err := updateRow(st, plan.Schema, rowID, cells)
+	if err != nil {
 		if errors.Is(err, ErrNotNull) {
 			return nil, &pgError{code: errNotNullViolation, msg: err.Error()}
 		}
@@ -917,7 +918,10 @@ func (s *Server) execUpdateRow(st Store, plan *Plan, params []paramVal) (*execOu
 		}
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}
-	return &execOutcome{tag: "UPDATE 1"}, nil
+	if existed {
+		return &execOutcome{tag: "UPDATE 1"}, nil
+	}
+	return &execOutcome{tag: "UPDATE 0"}, nil
 }
 
 // execDeleteRow removes a row and every one of its column keys.

@@ -467,3 +467,59 @@ func TestCatalogTableDropRefusesNonEmptyTable(t *testing.T) {
 	// by a name.
 	queryErr(t, cl, `SELECT * FROM t WHERE id = 'a'`, errUndefinedTable)
 }
+
+// TestCatalogTableMultiRowNonIntegerKey covers scan-driven UPDATE and DELETE on
+// a table whose primary key is neither an integer nor text. Those writes walk
+// the table and derive each matched row's key from the projected primary-key
+// value, so that derivation must agree with the one used when the row was
+// written. A float or timestamp key is the case that catches a mismatch: its
+// row id is the canonical wire text of the stored value, and reading the raw
+// stored bytes instead addresses a key no row has, so the write silently
+// affects nothing.
+func TestCatalogTableMultiRowNonIntegerKey(t *testing.T) {
+	for _, tc := range []struct {
+		typ    string
+		quote  bool
+		values []string
+	}{
+		{"float8", false, []string{"1.5", "2.5", "3.5"}},
+		{"timestamptz", true, []string{
+			"2020-01-01 00:00:00+00",
+			"2021-06-15 12:30:00+00",
+			"2022-12-31 23:59:59+00",
+		}},
+	} {
+		t.Run(tc.typ, func(t *testing.T) {
+			srv, _ := newTestServer(t, srvOpts{})
+			cl := dialServer(t, srv.Addr())
+			cl.startupTrust("default")
+
+			table := "k"
+			queryOK(t, cl, fmt.Sprintf(`CREATE TABLE %s (id %s PRIMARY KEY, v text)`, table, tc.typ), "CREATE TABLE")
+			for _, v := range tc.values {
+				lit := v
+				if tc.quote {
+					lit = "'" + v + "'"
+				}
+				queryOK(t, cl, fmt.Sprintf(`INSERT INTO %s (id, v) VALUES (%s, 'a')`, table, lit), "INSERT 0 1")
+			}
+
+			// A point lookup by the non-integer key still finds the row, proving
+			// the write and the identity agree.
+			first := tc.values[0]
+			if tc.quote {
+				first = "'" + first + "'"
+			}
+			if got := selectRow(t, cl, fmt.Sprintf(`SELECT v FROM %s WHERE id = %s`, table, first)); string(got[0]) != "a" {
+				t.Fatalf("point read = %q, want a", got[0])
+			}
+
+			// Every row matches the non-key filter, so a full-scan UPDATE must
+			// address all three and a full-scan DELETE must remove all three.
+			queryOK(t, cl, fmt.Sprintf(`UPDATE %s SET v = 'b' WHERE v = 'a'`, table), "UPDATE 3")
+			selectRows(t, cl, fmt.Sprintf(`SELECT id FROM %s WHERE v = 'b'`, table), 3)
+			queryOK(t, cl, fmt.Sprintf(`DELETE FROM %s WHERE v = 'b'`, table), "DELETE 3")
+			selectRows(t, cl, fmt.Sprintf(`SELECT id FROM %s`, table), 0)
+		})
+	}
+}

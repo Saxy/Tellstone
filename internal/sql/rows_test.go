@@ -189,8 +189,10 @@ func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 	// both operations.
 	cells := make(rowCells, len(sch.Columns))
 	cells[2] = rowValue{value: nil, set: true} // name -> NULL
-	if err := updateRow(srv.store, sch, "1", cells); err != nil {
+	if ok, err := updateRow(srv.store, sch, "1", cells); err != nil {
 		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("UPDATE of an existing row reported it as missing")
 	}
 	got, _, err := readRow(srv.store, sch, "1")
 	if err != nil {
@@ -205,8 +207,10 @@ func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 	}
 	// An update to a row that is not there reports no affected row rather than
 	// creating one.
-	if err := updateRow(srv.store, sch, "missing", cells); err != nil {
+	if ok, err := updateRow(srv.store, sch, "missing", cells); err != nil {
 		t.Fatal(err)
+	} else if ok {
+		t.Fatal("UPDATE of a missing row reported it as updated")
 	}
 	if ok, _ := rowExists(srv.store, sch, "missing"); ok {
 		t.Fatal("update created a row that did not exist")
@@ -234,8 +238,10 @@ func TestRowUpdateCreatesAnAbsentColumn(t *testing.T) {
 
 	cells := make(rowCells, len(sch.Columns))
 	cells[1] = rowValue{value: EncodeOrderableInt(41), set: true}
-	if err := updateRow(srv.store, sch, "1", cells); err != nil {
+	if ok, err := updateRow(srv.store, sch, "1", cells); err != nil {
 		t.Fatal(err)
+	} else if !ok {
+		t.Fatal("UPDATE of an existing row reported it as missing")
 	}
 
 	got, _, err := readRow(srv.store, sch, "1")

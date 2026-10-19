@@ -153,21 +153,23 @@ func insertRow(st Store, sch *Schema, rowID string, cells rowCells) error {
 	return nil
 }
 
-// updateRow rewrites the columns the statement named on an existing row. A
-// cell that is set with a nil value clears the column, since a null column is
-// the absence of its key; a cell that is not set is left untouched. The primary
-// key column is not updatable: it is the row's identity, and changing it would
-// make this a different row.
-func updateRow(st Store, sch *Schema, rowID string, cells rowCells) error {
+// updateRow rewrites the columns the statement named on an existing row and
+// reports whether the row existed. A cell that is set with a nil value clears
+// the column, since a null column is the absence of its key; a cell that is not
+// set is left untouched. The primary key column is not updatable: it is the
+// row's identity, and changing it would make this a different row. The caller
+// needs the existence result because PostgreSQL reports it as the affected-row
+// count, so an UPDATE that matches nothing must say UPDATE 0.
+func updateRow(st Store, sch *Schema, rowID string, cells rowCells) (bool, error) {
 	if err := validateRowCells(sch, cells, false); err != nil {
-		return err
+		return false, err
 	}
 	ok, err := rowExists(st, sch, rowID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if !ok {
-		return nil
+		return false, nil
 	}
 	for i, cell := range cells {
 		// A column the statement did not name keeps whatever it has, so its
@@ -178,7 +180,7 @@ func updateRow(st Store, sch *Schema, rowID string, cells rowCells) error {
 		key := rowKey(sch, rowID, i)
 		if cell.value == nil {
 			if _, err := st.Delete(key); err != nil {
-				return err
+				return false, err
 			}
 			continue
 		}
@@ -186,13 +188,13 @@ func updateRow(st Store, sch *Schema, rowID string, cells rowCells) error {
 		// rowExists checked the primary key above -- but the column being named
 		// may have no key yet, because a nullable column the INSERT omitted was
 		// never written. A write conditional on that column's own existence would
-		// decline, and this method has no way to report the affected-row count, so
-		// the UPDATE would silently do nothing and still succeed.
+		// decline, and a per-column decline could not be told apart from a real
+		// failure, so the UPDATE would silently skip the column and still succeed.
 		if err := st.Set(key, cell.value, 0); err != nil {
-			return err
+			return false, err
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // deleteRow removes a row, reporting whether it existed.

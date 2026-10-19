@@ -15,7 +15,6 @@ import (
 )
 
 // execDeleteMulti deletes all rows matched by the plan, returning DELETE n.
-// execDeleteMulti deletes all rows matched by the plan, returning DELETE n.
 func (s *Server) execDeleteMulti(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	if plan.Schema == nil || plan.Phys == nil {
 		return &execOutcome{tag: "DELETE 0"}, nil
@@ -69,43 +68,14 @@ func (s *Server) execDeleteMulti(st Store, plan *Plan, params []paramVal) (*exec
 	return &execOutcome{tag: fmt.Sprintf("DELETE %d", n)}, nil
 }
 
-// rowIDFromRow extracts row id from materialized row cells.
-func rowIDFromRow(row [][]byte, sch *Schema) (string, bool) {
-	if sch == nil || len(row) <= sch.PrimaryKey {
-		return "", false
-	}
-	cell := row[sch.PrimaryKey]
-	if cell == nil {
-		return "", false
-	}
-	// Re-encode as row id string using same logic as rowID()
-	pkType := sch.Columns[sch.PrimaryKey].Type
-	switch pkType {
-	case TypeInt, TypeBigInt:
-		v, err := DecodeValue(pkType, cell)
-		if err != nil {
-			return "", false
-		}
-		n, ok := v.(int64)
-		if !ok {
-			return "", false
-		}
-		return keyspace.EncodeIntRowID(n), true
-	default:
-		v, err := DecodeValue(pkType, cell)
-		if err != nil {
-			return "", false
-		}
-		switch x := v.(type) {
-		case string:
-			return x, true
-		case []byte:
-			return string(x), true
-		}
-		return string(cell), true
-	}
-}
-
+// pkBytesToRowID turns a projected primary-key value into the row id used in
+// keys. It must agree with canonicalRowID, which produced the row id when the
+// row was written: an integer primary key is the sign-flipped hex form, a text
+// primary key is the text itself, and every other type is the canonical wire
+// text of the stored value. Deriving it any other way, such as from the raw
+// stored bytes, addresses a different key, so a scan-driven UPDATE or DELETE
+// would match nothing. The stored bytes are the primary-key column's value as
+// the scan read it, which is the same encoding canonicalRowID fed to wireCell.
 func pkBytesToRowID(pkb []byte, sch *Schema) (string, bool) {
 	if sch == nil {
 		return "", false
@@ -122,17 +92,13 @@ func pkBytesToRowID(pkb []byte, sch *Schema) (string, bool) {
 			return "", false
 		}
 		return keyspace.EncodeIntRowID(n), true
+	case TypeVarchar:
+		return string(pkb), true
 	default:
-		v, err := DecodeValue(pkType, pkb)
+		canon, err := wireCell(pkType, pkb)
 		if err != nil {
 			return "", false
 		}
-		switch x := v.(type) {
-		case string:
-			return x, true
-		case []byte:
-			return string(x), true
-		}
-		return string(pkb), true
+		return string(canon), true
 	}
 }

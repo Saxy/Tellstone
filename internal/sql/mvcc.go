@@ -95,7 +95,13 @@ func (v *mvccView) Set(key string, value []byte, _ time.Duration) error {
 
 func (v *mvccView) SetIfAbsent(key string, value []byte, _ time.Duration) (bool, error) {
 	if v.overlay != nil {
-		if _, ok, err := v.overlay.lookup(key); err != nil || ok {
+		// Existence is checked through the view, not the overlay's raw base:
+		// the base still holds a version that the snapshot resolves absent (a
+		// row deleted before the block started, or deleted then re-inserted
+		// inside it), and a raw read would call that present and refuse an
+		// insert PostgreSQL allows. GetErr also records the read for commit
+		// validation.
+		if _, ok, err := v.GetErr(key); err != nil || ok {
 			return false, err
 		}
 		v.overlay.record(key, &txnWrite{value: append([]byte(nil), value...), mvcc: true})
@@ -113,7 +119,9 @@ func (v *mvccView) SetIfAbsent(key string, value []byte, _ time.Duration) (bool,
 
 func (v *mvccView) SetIfPresent(key string, value []byte, _ time.Duration) (bool, error) {
 	if v.overlay != nil {
-		if _, ok, err := v.overlay.lookup(key); err != nil || !ok {
+		// As in SetIfAbsent, the check goes through the view so a row whose
+		// latest version the snapshot resolves absent is not treated as present.
+		if _, ok, err := v.GetErr(key); err != nil || !ok {
 			return false, err
 		}
 		v.overlay.record(key, &txnWrite{value: append([]byte(nil), value...), mvcc: true})

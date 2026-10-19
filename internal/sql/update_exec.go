@@ -50,10 +50,13 @@ func (s *Server) execUpdateMulti(st Store, plan *Plan, params []paramVal) (*exec
 			if !ok {
 				continue
 			}
-			if err := updateRow(st, sch, id, cells); err != nil {
+			existed, err := updateRow(st, sch, id, cells)
+			if err != nil {
 				return err
 			}
-			n++
+			if existed {
+				n++
+			}
 		}
 		return nil
 	})

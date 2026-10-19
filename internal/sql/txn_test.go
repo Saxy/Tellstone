@@ -255,3 +255,45 @@ func TestTxnCommitVisibility(t *testing.T) {
 		t.Fatalf("rolled-back delete removed the row")
 	}
 }
+
+// TestMVCCReinsertDeletedRow checks that a primary key whose latest committed
+// version the snapshot resolves absent can be claimed again. The conditional
+// insert must judge existence by the snapshot's resolved value, not by the raw
+// store: the store still holds the row's tombstone, and reading that directly
+// reports the key as present, so an INSERT PostgreSQL allows is refused as a
+// duplicate. Both directions are covered: a row deleted before the block began,
+// and a row the block itself deletes and re-creates.
+func TestMVCCReinsertDeletedRow(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+	cl := dialServer(t, srv.Addr())
+	cl.startupTrust("default")
+
+	queryOK(t, cl, `CREATE TABLE users (id bigint PRIMARY KEY, name text)`, "CREATE TABLE")
+	queryOK(t, cl, `INSERT INTO users (id, name) VALUES (1, 'v0')`, "INSERT 0 1")
+	queryOK(t, cl, `DELETE FROM users WHERE id = 1`, "DELETE 1")
+
+	// The row is gone, but its tombstone version remains in the store. A block
+	// that starts now resolves the key absent and may insert it again.
+	queryOK(t, cl, `BEGIN`, "BEGIN")
+	queryOK(t, cl, `INSERT INTO users (id, name) VALUES (1, 'v1')`, "INSERT 0 1")
+	if got := selectRow(t, cl, `SELECT name FROM users WHERE id = 1`); string(got[0]) != "v1" {
+		t.Fatalf("reinserted row = %q, want v1", got[0])
+	}
+	queryOK(t, cl, `COMMIT`, "COMMIT")
+	if got := selectRow(t, cl, `SELECT name FROM users WHERE id = 1`); string(got[0]) != "v1" {
+		t.Fatalf("committed reinsert = %q, want v1", got[0])
+	}
+
+	// The same within one block: the block's own delete hides the key, and a
+	// later insert in that block must be allowed to claim it again.
+	queryOK(t, cl, `BEGIN`, "BEGIN")
+	queryOK(t, cl, `DELETE FROM users WHERE id = 1`, "DELETE 1")
+	queryOK(t, cl, `INSERT INTO users (id, name) VALUES (1, 'v2')`, "INSERT 0 1")
+	if got := selectRow(t, cl, `SELECT name FROM users WHERE id = 1`); string(got[0]) != "v2" {
+		t.Fatalf("reinsert after delete in block = %q, want v2", got[0])
+	}
+	queryOK(t, cl, `COMMIT`, "COMMIT")
+	if got := selectRow(t, cl, `SELECT name FROM users WHERE id = 1`); string(got[0]) != "v2" {
+		t.Fatalf("committed reinsert after delete = %q, want v2", got[0])
+	}
+}

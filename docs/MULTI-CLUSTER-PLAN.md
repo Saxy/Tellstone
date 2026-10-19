@@ -587,7 +587,12 @@ emulation of the system catalogs.
 
 - `SET` / `SET SESSION` / `SET LOCAL` / `RESET` / `RESET ALL`
   accepted for every GUC name: known ones stored per session, unknown
-  ones accepted and ignored, all replying `SET`. Multi-statement
+  ones accepted and ignored, all replying `SET`. A plain `SET` and
+  `SET SESSION` are session-scoped. `SET LOCAL` is stored only for the
+  active transaction and reverted at `COMMIT`/`ROLLBACK`; issued
+  outside a transaction block it changes nothing, and PostgreSQL
+  reports that with a `WARNING` (`no transaction in progress`,
+  SQLSTATE `25P01`). Multi-statement
   batches of `SET`s (what pgJDBC sends on connect) are parsed and
   answered.
 - `SHOW <guc>` and `SHOW ALL` return the session value or a sensible
@@ -603,9 +608,12 @@ emulation of the system catalogs.
 
 - FROM-less `SELECT` — `SELECT 1`, `SELECT 'text'`, arithmetic,
   `current_timestamp`.
-- Multi-statement simple query: split the `Q` payload on `;` and emit
-  one `CommandComplete`/`ResultSet` per statement (`translate.go`
-  currently rejects more than one).
+- Multi-statement simple query: use the statement list the parser
+  already produces rather than splitting the `Q` payload on `;` (a
+  semicolon inside a string literal or comment is not a separator),
+  emit one `CommandComplete`/`ResultSet` per parsed statement, and
+  answer an empty or `;`-only query with `EmptyQueryResponse`
+  (`translate.go` currently rejects more than one statement).
 - Scalar and constant functions clients call, including `version()`,
   `current_database()`, `current_schema()`, `current_schemas()`,
   `current_user`, `session_user`, `current_setting(name[, missing_ok])`,
@@ -651,11 +659,16 @@ dependent on, Phase 15)*
   `parameters`, `sequences`, `domains`, `character_sets`,
   `table_privileges`, `column_privileges`, `enabled_roles`,
   `applicable_roles`.
-- **Stable OIDs.** System objects get fixed OIDs; user tables, columns
-  and types get OIDs derived deterministically (hashed name or a
-  persisted catalog counter) so they survive reconnects — unstable OIDs
-  break client caches and the joins between `pg_class`, `pg_attribute`
-  and `pg_type`.
+- **Stable OIDs.** System objects get fixed OIDs. User tables, columns
+  and types get OIDs allocated from a persisted catalog counter and
+  stored with the object, so the allocation is collision-free, stable
+  across reconnects, and independent of the object's name — unstable
+  OIDs break client caches and the joins between `pg_class`,
+  `pg_attribute` and `pg_type`. A name-derived hash is rejected: it can
+  collide and it changes identity on `ALTER ... RENAME`. Renaming an
+  object keeps its OID; dropping one retires its OID (never reused), so
+  a later `CREATE` of the same name gets a fresh OID — the same rule
+  PostgreSQL follows.
 - The catalog is self-describing: `pg_class`/`pg_type` describe the
   catalog relations themselves, as real PostgreSQL does.
 - Reuse and extend `internal/sql/wiretype.go` for the `pg_type` ↔
