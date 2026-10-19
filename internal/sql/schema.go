@@ -25,6 +25,7 @@ import (
 
 	"github.com/Saxy/Tellstone/internal/cluster"
 	"github.com/Saxy/Tellstone/internal/keyspace"
+	"github.com/Saxy/Tellstone/internal/mvcc"
 )
 
 // Column is one declared column, in declaration order. Ordinal is implied by
@@ -565,7 +566,14 @@ func (c *Catalog) RowCount(table string) (int, error) {
 	prefix := TablePrefix(c.db, table)
 	rows := 0
 	var last string
-	_, err := c.store.ScanPrefix(prefix, func(key, _ []byte) bool {
+	_, err := c.store.ScanPrefix(prefix, func(key, value []byte) bool {
+		// A catalog column is a versioned key, so a row that was deleted leaves
+		// a tombstone rather than removing the key. Resolve at the latest
+		// snapshot and skip a key absent there, or a dropped row's stale keys
+		// would make the table look non-empty forever.
+		if _, present := mvcc.Resolve(value, ^uint64(0)); !present {
+			return true
+		}
 		rest := strings.TrimPrefix(string(key), prefix)
 		slash := strings.IndexByte(rest, '/')
 		if slash < 0 {

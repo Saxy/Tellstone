@@ -99,7 +99,7 @@ func TestSweepRowDoesNotDeadlockUnderEngineLock(t *testing.T) {
 		cells[i] = rowValue{value: []byte("v"), set: true}
 	}
 	cells[sch.PrimaryKey] = rowValue{value: id, set: true}
-	if err := srv.insertRow(sch, "7", cells); err != nil {
+	if err := insertRow(srv.store, sch, "7", cells); err != nil {
 		t.Fatalf("insertRow: %v", err)
 	}
 	// Four column keys, so the sweep has something to delete.
@@ -110,7 +110,7 @@ func TestSweepRowDoesNotDeadlockUnderEngineLock(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_, _ = srv.sweepRow(sch, "7")
+		_, _ = sweepRow(srv.store, sch, "7")
 	}()
 	select {
 	case <-done:
@@ -146,14 +146,14 @@ func TestCompensateRowDoesNotDeadlockUnderEngineLock(t *testing.T) {
 		{value: id, set: true},
 		{value: []byte("x"), set: true},
 	}
-	if err := srv.insertRow(sch, "1", cells); err != nil {
+	if err := insertRow(srv.store, sch, "1", cells); err != nil {
 		t.Fatalf("insertRow: %v", err)
 	}
 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		srv.compensateRow(sch, "1")
+		compensateRow(srv.store, sch, "1")
 	}()
 	select {
 	case <-done:

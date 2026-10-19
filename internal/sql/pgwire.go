@@ -136,10 +136,35 @@ type pgConn struct {
 
 	stmts   map[string]*Plan        // prepared statements by name
 	portals map[string]*portalState // bound portals by name
-	inTxn   bool
+	// txn is the open transaction block, or nil outside one. It is the store
+	// statements in the block read and write through (Phase 12), and its state
+	// is what the ReadyForQuery transaction status byte reports.
+	txn *txnState
 	// inError suspends extended-protocol processing until the client Syncs,
 	// which is how the protocol recovers from an error mid-transaction.
 	inError bool
+}
+
+// store is the store the current statement executes against: the transaction's
+// overlay inside a transaction block, the shared store otherwise.
+func (c *pgConn) store() Store {
+	if c.txn != nil {
+		return c.txn
+	}
+	return c.srv.store
+}
+
+// txnStatusByte is the ReadyForQuery transaction status: 'I' idle outside a
+// block, 'T' inside a healthy block, 'E' inside a failed one.
+func (c *pgConn) txnStatusByte() byte {
+	switch {
+	case c.txn == nil:
+		return 'I'
+	case c.txn.failed:
+		return 'E'
+	default:
+		return 'T'
+	}
 }
 
 type portalState struct {
@@ -170,6 +195,14 @@ type Server struct {
 
 	backendSecret atomic.Int32
 
+	// tso supplies transaction start and commit timestamps. It defaults to the
+	// standalone local oracle and is replaced by the cluster TSO through
+	// SetTimestampOracle when this node runs in a cluster (Phase 12).
+	tso TimestampOracle
+	// commit is the node-local conflict oracle transactions validate against on
+	// commit (Phase 12). See txn.go for its scope and limits.
+	commit *commitTable
+
 	// stats holds the ANALYZE row counts this node has collected. They are
 	// local and not replicated (ADR-014 decision 5); see stats.go for why that
 	// is safe and what it costs.
@@ -194,6 +227,8 @@ func NewServer(addr string, store Store, policy *rbac.Store, oauthProvider oauth
 		audit:           auditEngine,
 		conns:           map[*pgConn]struct{}{},
 		stats:           newStatsStore(),
+		tso:             &localOracle{},
+		commit:          newCommitTable(),
 	}
 }
 
@@ -583,16 +618,9 @@ func (c *pgConn) resetUnnamed() {
 func (c *pgConn) ready() error {
 	var buf msgBuilder
 	buf.begin(msgReadyForQuery)
-	buf.byte(txnStatus(c.inTxn))
+	buf.byte(c.txnStatusByte())
 	buf.end()
 	return c.writeMsg(&buf)
-}
-
-func txnStatus(inTxn bool) byte {
-	if inTxn {
-		return 'T'
-	}
-	return 'I'
 }
 
 // ---- message handlers ----

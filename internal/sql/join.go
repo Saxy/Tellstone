@@ -279,7 +279,7 @@ type joinOperand struct {
 // merged row is checked against the WHERE filter, and survivors fill the output
 // chunk. The store offers no resume point on either side, so materializing the
 // build side once and streaming the probe once is the whole cost.
-func (s *Server) execJoin(plan *Plan, params []paramVal) (*execOutcome, error) {
+func (s *Server) execJoin(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	jp := plan.Phys.Join
 
 	filt, err := s.compileFilter(plan.Phys.Filter, jp.Merged, params)
@@ -303,7 +303,7 @@ func (s *Server) execJoin(plan *Plan, params []paramVal) (*execOutcome, error) {
 	// alias its reused chunk, and insertRow copies each row into the region
 	// before the chunk is reused for the next batch.
 	buildCells := make([]rowValue, len(jp.Build.Schema.Columns))
-	if err := s.newScan(jp.Build, jp.Build.Schema, identityProj(jp.Build.Schema), nil).run(func(c *Chunk) error {
+	if err := newScan(st, jp.Build, jp.Build.Schema, identityProj(jp.Build.Schema), nil).run(func(c *Chunk) error {
 		return forEachChunkRow(c, buildCells, func(_ uint32, cells []rowValue) error {
 			hj.insertRow(ctx.arena, cells)
 			return nil
@@ -323,7 +323,7 @@ func (s *Server) execJoin(plan *Plan, params []paramVal) (*execOutcome, error) {
 	probeCells := make([]rowValue, len(jp.Probe.Schema.Columns))
 	jc := newChunk(len(jp.Proj))
 
-	err = s.newScan(jp.Probe, jp.Probe.Schema, identityProj(jp.Probe.Schema), nil).run(func(c *Chunk) error {
+	err = newScan(st, jp.Probe, jp.Probe.Schema, identityProj(jp.Probe.Schema), nil).run(func(c *Chunk) error {
 		if err := forEachChunkRow(c, probeCells, func(_ uint32, pcells []rowValue) error {
 			key := pcells[hj.pKey]
 			if !key.set {

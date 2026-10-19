@@ -24,6 +24,7 @@ import (
 	"github.com/Saxy/Tellstone/internal/cluster"
 	"github.com/Saxy/Tellstone/internal/cluster/network"
 	"github.com/Saxy/Tellstone/internal/log"
+	"github.com/Saxy/Tellstone/internal/mvcc"
 	"github.com/Saxy/Tellstone/internal/router"
 	"github.com/Saxy/Tellstone/internal/shard"
 )
@@ -833,7 +834,16 @@ func (cs *clusterStore) PrefixExists(prefix string) (bool, error) {
 		if len(route.EndKey) > 0 && bytes.Compare(route.EndKey, segUpper) < 0 {
 			segUpper = route.EndKey
 		}
-		if err := cs.scanRegionStrict(&route, prefix, segLower, segUpper, func(k, _ []byte) {
+		if err := cs.scanRegionStrict(&route, prefix, segLower, segUpper, func(k, v []byte) {
+			// A versioned catalog cell that resolves absent at the latest
+			// snapshot is a deleted row: its key survives only as a tombstone
+			// so older snapshots can still read the row, and it must not make
+			// the table look non-empty and block the drop forever.
+			if mvcc.Versioned(v) {
+				if _, present := mvcc.Resolve(v, ^uint64(0)); !present {
+					return
+				}
+			}
 			found = true
 		}); err != nil {
 			return false, err

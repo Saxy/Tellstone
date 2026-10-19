@@ -555,6 +555,162 @@ complex queries. COPY loads 1M rows in <5 seconds.
 **Verification:** TPC-H-inspired analytical queries run correctly.
 Complex nested CTEs with window functions produce correct results.
 
+### Phase 16: PostgreSQL Catalog & Client Compatibility
+
+**Goal:** Standard PostgreSQL clients and tools — DataGrip, pgAdmin,
+DBeaver, ORMs, `psql`, `pg_dump` — connect over the PG wire, complete
+their startup and introspection sequences without a single error, and
+browse the database tree. This is the "basic support" tier that
+YugabyteDB, TiDB and CockroachDB reach by being PostgreSQL-catalog
+compatible; it is what makes an IDE usable rather than merely
+wire-reachable.
+
+Two gaps stand between the current wire protocol and that goal:
+
+1. **Connect-time SQL.** GUIs run session setup (`SET
+   extra_float_digits`, `SHOW`, `SELECT 1`, `SELECT version()`) before
+   anything else. Today `SET`/`SHOW` and FROM-less `SELECT` are refused,
+   so the connection is marked broken at the first statement.
+2. **Introspection.** Every GUI enumerates the schema through
+   `pg_catalog`/`information_schema`. Those relations do not exist, and
+   the queries that read them use joins, aggregates, `ORDER BY`,
+   `DISTINCT`, outer joins and subqueries, several of which the engine
+   refuses.
+
+The phase therefore has three parts: session/GUC compatibility, the SQL
+surface those queries need (shared with Phase 15), and a read-only
+emulation of the system catalogs.
+
+**Deliverables:**
+
+**Session and GUC compatibility**
+
+- `SET` / `SET SESSION` / `SET LOCAL` / `RESET` / `RESET ALL`
+  accepted for every GUC name: known ones stored per session, unknown
+  ones accepted and ignored, all replying `SET`. A plain `SET` and
+  `SET SESSION` are session-scoped. `SET LOCAL` is stored only for the
+  active transaction and reverted at `COMMIT`/`ROLLBACK`; issued
+  outside a transaction block it changes nothing, and PostgreSQL
+  reports that with a `WARNING` (`no transaction in progress`,
+  SQLSTATE `25P01`). Multi-statement
+  batches of `SET`s (what pgJDBC sends on connect) are parsed and
+  answered.
+- `SHOW <guc>` and `SHOW ALL` return the session value or a sensible
+  default.
+- StartupMessage parameters (`application_name`, `extra_float_digits`,
+  `search_path`, `client_encoding`, `DateStyle`, `TimeZone`,
+  `standard_conforming_strings`) captured into the session at connect.
+- `ParameterStatus` emitted or updated when a reported GUC changes.
+- Session state stored on `pgConn` (`internal/sql/pgwire.go`) alongside
+  `txn`.
+
+**Expression and statement surface**
+
+- FROM-less `SELECT` — `SELECT 1`, `SELECT 'text'`, arithmetic,
+  `current_timestamp`.
+- Multi-statement simple query: use the statement list the parser
+  already produces rather than splitting the `Q` payload on `;` (a
+  semicolon inside a string literal or comment is not a separator),
+  emit one `CommandComplete`/`ResultSet` per parsed statement, and
+  answer an empty or `;`-only query with `EmptyQueryResponse`
+  (`translate.go` currently rejects more than one statement).
+- Scalar and constant functions clients call, including `version()`,
+  `current_database()`, `current_schema()`, `current_schemas()`,
+  `current_user`, `session_user`, `current_setting(name[, missing_ok])`,
+  `pg_backend_pid()`, `pg_postmaster_start_time()`, `now()` /
+  `current_timestamp`, `format_type()`, `pg_get_expr()`,
+  `pg_get_indexdef()`, `pg_get_constraintdef()`, `pg_get_userbyid()`,
+  `pg_get_serial_sequence()`, `pg_table_is_visible()`,
+  `has_schema_privilege()`, `has_table_privilege()`, `obj_description()`,
+  `col_description()`, `pg_encoding_to_char()`, `pg_get_keywords()`,
+  `unnest()`, `generate_series()`.
+- Casts and pseudo-types: `::regclass`, `::regtype`, `::oid`,
+  `'name'::text`, `ANY(...)`, `IN`, `LIKE`/`ILIKE`, `IS [NOT] NULL`.
+- Name resolution: unqualified `pg_catalog` names resolve implicitly,
+  exactly as in real PostgreSQL.
+
+**SQL surface required by introspection queries** *(shared with, and
+dependent on, Phase 15)*
+
+- Aggregates `count`, `array_agg`, `string_agg`, `max`/`min`/`sum`/`avg`,
+  with `ORDER BY`/`DISTINCT` inside aggregates.
+- `GROUP BY`, `HAVING`, `ORDER BY`, `LIMIT`/`OFFSET`, `DISTINCT`.
+- `LEFT`/`RIGHT`/`FULL OUTER JOIN`, `CROSS JOIN`, `UNION
+  [ALL]`/`INTERSECT`/`EXCEPT`.
+- Scalar, `IN (SELECT ...)`, `EXISTS` and correlated subqueries.
+- `CAST`/`::` coercion, `COALESCE`, `NULLIF`, `CASE`.
+- Set-returning functions in `FROM`.
+
+**System catalogs (`pg_catalog` + `information_schema`)**
+
+- A reserved, read-only `pg_catalog` schema searched implicitly,
+  projected from Tellstone's existing schema catalog at query time (no
+  stored rows, or hidden materialized tables) so it never diverges from
+  the real schema.
+- Minimum `pg_catalog` relations for pgJDBC/DataGrip: `pg_namespace`,
+  `pg_class`, `pg_attribute`, `pg_type`, `pg_attrdef`, `pg_constraint`,
+  `pg_index`, `pg_proc`, `pg_description`, `pg_database`,
+  `pg_roles`/`pg_authid`, `pg_am`, `pg_tablespace`, `pg_inherits`,
+  `pg_collation`, `pg_enum`, `pg_range`, `pg_settings`; plus views
+  `pg_tables`, `pg_views`, `pg_matviews`, `pg_sequences`, `pg_stat_*`.
+- `information_schema` relations: `tables`, `columns`, `views`,
+  `schemata`, `table_constraints`, `key_column_usage`,
+  `referential_constraints`, `check_constraints`, `routines`,
+  `parameters`, `sequences`, `domains`, `character_sets`,
+  `table_privileges`, `column_privileges`, `enabled_roles`,
+  `applicable_roles`.
+- **Stable OIDs.** System objects get fixed OIDs. User tables, columns
+  and types get OIDs allocated from a persisted catalog counter and
+  stored with the object, so the allocation is collision-free, stable
+  across reconnects, and independent of the object's name — unstable
+  OIDs break client caches and the joins between `pg_class`,
+  `pg_attribute` and `pg_type`. A name-derived hash is rejected: it can
+  collide and it changes identity on `ALTER ... RENAME`. Renaming an
+  object keeps its OID; dropping one retires its OID (never reused), so
+  a later `CREATE` of the same name gets a fresh OID — the same rule
+  PostgreSQL follows.
+- The catalog is self-describing: `pg_class`/`pg_type` describe the
+  catalog relations themselves, as real PostgreSQL does.
+- Reuse and extend `internal/sql/wiretype.go` for the `pg_type` ↔
+  Tellstone-type mapping (`data_type`, `udt_name`,
+  `character_maximum_length`, `numeric_precision`).
+
+**Wire-protocol gaps that block clients**
+
+- Multi-statement simple-query batches; `EmptyQueryResponse` for an
+  empty or `;`-only query.
+- `SET`/`SHOW` and the new functions through the extended
+  (Parse/Bind/Execute) path, including parameter-type inference for
+  introspection statements.
+- Binary result format (`resultFormat = 1`) either implemented or
+  explicitly negotiated to text so tooling that requests binary still
+  works.
+- Correct `Describe`/`NoData`/`ParameterDescription` for the new
+  statement classes.
+
+**Verification:** DataGrip (stock PostgreSQL data source, no custom
+driver) connects, finishes introspection, and lists every user table,
+column and type with no errors in the client log; a query console runs
+SELECT/INSERT/UPDATE/DELETE/DDL. `psql` `\dt`, `\d <table>`, `\l` and
+`pg_dump --schema-only` succeed, as do pgAdmin and DBeaver. Recorded
+pgJDBC startup and introspection transcripts — the exact SQL the driver
+emits — replay green in CI as golden tests, and a `scripts/` smoke test
+asserts a clean connect against each tool's query set.
+
+**Sequencing and dependencies:** depends on Phase 13 (for `pg_index`
+fidelity), Phase 14 (extended query protocol for prepared introspection
+statements) and Phase 15 (joins, aggregates, `ORDER BY`, subqueries,
+set operations). The session/GUC work and FROM-less `SELECT` can land
+early and independently; the catalog work needs the SQL surface from
+Phase 15. A companion ADR should record the catalog-emulation approach,
+the OID scheme, and the fidelity boundary.
+
+**Non-goals:** byte-for-byte fidelity of every `pg_catalog` column;
+exotic catalogs (`pg_stat_*`, replication, extensions) may be static or
+empty stubs. Full "*complete support*" (rich completion and inspections)
+is a JetBrains-side decision and is not promised here — the target is a
+correct, error-free "basic support" tree and console.
+
 ## Redis Compatibility Deprecation Plan
 
 Tellstone started as a Redis-compatible in-memory store. As the product
