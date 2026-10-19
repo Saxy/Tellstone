@@ -1,0 +1,44 @@
+internal/sql/delete_exec.go
+  s_c2c23bbc940964::t_9bf3c6c7662f9e 98,102
+  s_c2c23bbc940964::t_c38f0dc3a72748 71-78,95-96
+docs/MULTI-CLUSTER-PLAN.md
+  s_c2c23bbc940964::t_137aefb0ff93f9 590-595
+  s_c2c23bbc940964::t_4a0d7a3f8496c4 662-671
+  s_c2c23bbc940964::t_e03b3e8ea50d43 611-616
+internal/sql/rows.go
+  s_c2c23bbc940964::t_f6d50c3eed8168 156-163,165,169,172,183,194,197
+  s_c2c23bbc940964::t_5c5e4c512cbc1d 191-192
+internal/sql/exec.go
+  s_c2c23bbc940964::t_ce87ea1989d521 912,922-924
+  s_c2c23bbc940964::t_7c7d29dc9f9454 911,921
+internal/sql/update_exec.go
+  s_c2c23bbc940964::t_4132813bc3f8bc 54,58-59
+  s_c2c23bbc940964::t_d6378c07694d24 53,57
+internal/sql/mvcc.go
+  s_c2c23bbc940964::t_2766464f3df15c 98-103,122-123
+  s_c2c23bbc940964::t_0b7e6f8b6f2ba9 104,124
+internal/sql/txn_test.go
+  s_c2c23bbc940964::t_a5328683287668 258-299
+internal/sql/dml_catalog_test.go
+  s_c2c23bbc940964::t_d86ed1a2f548f1 470-525
+internal/sql/rows_test.go
+  s_c2c23bbc940964::t_2e87fc66bc4282 210,212-213
+  s_c2c23bbc940964::t_a78b0bb6187f23 192,194-195
+  s_c2c23bbc940964::t_946d77a16119eb 241,243-244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "003a0d0358d5ed987864daa9ff8c31eede1a7ab6",
+  "prompts": {},
+  "sessions": {
+    "s_c2c23bbc940964": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_f21084331ffeWdPwPcacLO1zfT",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
