@@ -20,7 +20,10 @@ and the D1 batch/dst shape that makes the rest possible.
 */
 package sql
 
-import "hash/maphash"
+import (
+	"hash/maphash"
+	"regexp"
+)
 
 // ExecCtx is the ownership boundary of one statement execution. Everything an
 // operator needs that is not the row data itself lives here: the bump arena
@@ -139,7 +142,11 @@ type rowAssembler struct {
 	// applied at flush time.
 	proj []int
 	filt *compiledNode
-	dst  *Chunk
+	// cases are the statement's compiled CASE targets, evaluated on the same
+	// schema-width cells the filter reads: a CASE condition may name any
+	// column of the row whether or not the projection returns it.
+	cases []*compiledCase
+	dst   *Chunk
 	// err carries a store or emit failure out of the scan callback, so the
 	// pass can stop as soon as one happens and still report it afterwards.
 	err error
@@ -197,17 +204,30 @@ type Operator interface {
 // per plan (at Bind when the value is a parameter), and evaluation then
 // compares the raw bytes of the assembled cell against that encoding: equality
 // is a byte compare, order is a byte compare because the encodings are
-// order-preserving (ADR-013 §4), and a prefix LIKE is a HasPrefix. A null test
+// order-preserving (ADR-013 §4), a prefix LIKE is a HasPrefix, a general LIKE
+// is the pattern matcher, and an inequality is one byte compare. A null test
 // reads whether the column's key is present. No DecodeValue, no boxing, no
 // allocation — a row that fails the filter never leaves the assembler as a
 // value.
 type compiledFilter struct {
-	enc  []byte // storage encoding of the literal side (CmpExpr)
+	enc  []byte // storage encoding of the literal side (CmpExpr / NeExpr)
 	col  int    // schema ordinal the filter reads
 	op   CmpOp  // OpEq / OpLt / OpLe / OpGt / OpGe
-	like []byte // LikeExpr prefix (trailing % stripped), when this is a LIKE
+	like []byte // LikeExpr prefix (trailing % stripped), when this is a prefix LIKE
+	pat  []byte // full LIKE pattern, when the shape needs the general matcher
+	ne   bool   // set for a NeExpr: inequality, which op cannot express
 	null bool   // set for a NullTestExpr: test presence instead of a value
-	not  bool   // NullTestExpr direction: true is IS NOT NULL
+	not  bool   // direction: true is IS NOT NULL, or NOT LIKE
+	// twoCol marks a comparison between two columns of the same row: the
+	// second side is col2, and the cells are compared with each other
+	// rather than with a literal's encoding.
+	twoCol bool
+	col2   int
+	// boolCol marks a boolean column read as a condition: the cell is the
+	// condition, and a NULL cell is UNKNOWN, which drops the row.
+	boolCol bool
+	// re is a regular expression matched against the cell's text.
+	re *regexp.Regexp
 }
 
 // compiledNode is the compiled residual filter: a boolean tree over the leaf
@@ -252,6 +272,7 @@ type tableScan struct {
 	hi    []byte // exclusive key cutoff; nil = scan to the end
 	proj  []int
 	filt  *compiledNode
+	cases []*compiledCase
 	as    *rowAssembler
 	chunk *Chunk
 }
@@ -316,6 +337,12 @@ type hashNode struct {
 	off  uint32 // serialized row start within the region
 	koff uint32 // key cell's value bytes within the region
 	klen uint32
+	// matched records that some probe row's key equaled this row's -- the ON
+	// equality alone, before the WHERE clause. An outer join needs the
+	// distinction: a left row whose match the filter rejected is not an
+	// unmatched left row, and re-emitting it as one would return the pair
+	// twice, once with the partner NULLed.
+	matched bool
 }
 
 // hashAgg is the D3 grouping operator: numeric accumulators (int64/float64)

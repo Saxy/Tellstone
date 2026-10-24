@@ -12,14 +12,16 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
 
 // ByteSize represents a size in bytes but can be parsed from human‑readable strings
 // such as "16MiB", "1GiB", "256KB", etc. It implements flag.Value so it can be used
-// directly with the standard flag package.
-type ByteSize uint32
+// directly with the standard flag package. The underlying type is uint64 so memory
+// ceilings above 4GiB are representable.
+type ByteSize uint64
 
 // String returns the size as a plain integer (bytes). The flag package uses this for
 // printing default values in the usage output.
@@ -81,10 +83,10 @@ func (b *ByteSize) Set(s string) error {
 	if err != nil {
 		return fmt.Errorf("invalid size %q: %w", s, err)
 	}
-	v *= mul
-	if v > uint64(^uint32(0)) { // overflow beyond uint32
-		return fmt.Errorf("size %q overflows uint32", s)
+	if mul > 1 && v > math.MaxUint64/mul {
+		return fmt.Errorf("size %q overflows uint64", s)
 	}
+	v *= mul
 	*b = ByteSize(v)
 	return nil
 }

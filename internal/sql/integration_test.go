@@ -678,7 +678,9 @@ func TestSimpleErrors(t *testing.T) {
 		{`SELECT value FROM tellstone`, errSyntax},
 		{`INSERT INTO tellstone (key, value) VALUES ('a')`, errSyntax},
 		{`SELECT count(*) FROM tellstone WHERE key = 'a'`, errSyntax},
-		{`BEGIN; COMMIT`, errSyntax},
+		// Multi-statement simple queries are accepted since Stage A
+		// (ADR-016), so `BEGIN; COMMIT` no longer belongs here; it is covered
+		// by TestMultiStatementSimpleQuery.
 	}
 	for _, tc := range cases {
 		frames := sess.query(tc.q)
