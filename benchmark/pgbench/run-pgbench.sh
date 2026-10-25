@@ -98,12 +98,15 @@ run_mode() {
 		local j=$c
 		[ "$j" -gt "$THREADS" ] && j=$THREADS
 		out=$("$PGBENCH" "${pgbench_args[@]}" -c "$c" -j "$j" -f "$work/$script" 2>&1) || true
-		local tps lat fails
+		local tps lat fails fcount
 		tps=$(sed -n 's/^tps = \([0-9.]*\).*/\1/p' <<<"$out" | tail -1)
 		lat=$(sed -n 's/^latency average = \([0-9.]*\) ms.*/\1/p' <<<"$out" | tail -1)
 		fails=$(sed -n 's/^number of failed transactions: [0-9]* (\([0-9.]*\)%).*/\1/p' <<<"$out" | tail -1)
+		fcount=$(sed -n 's/^number of failed transactions: \([0-9]*\).*/\1/p' <<<"$out" | tail -1)
 		[ -z "$tps" ] && { printf '%s\n' "$out" >&2; die "pgbench run failed"; }
-		[ -n "$fails" ] && failed=1
+		if [ -n "${fcount:-}" ] && [ "$fcount" -gt 0 ] 2>/dev/null; then
+			failed=1
+		fi
 		printf '%-8s %10s %14s %9s%%\n' "$c" "$tps" "$lat" "${fails:-0}"
 	done
 	return "$failed"

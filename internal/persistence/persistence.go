@@ -107,7 +107,7 @@ func writeNonceSidecar(path string, ctr uint64) error {
 // shardHandle holds the WAL file and its per-shard mutex for a single shard.
 // When encryption is enabled, crypto holds the DEK engine and nonceCtr tracks
 // the next counter-based nonce value. The counter is durable: it is recovered
-// from the WAL on replay so nonces never repeat across crashes.
+// from the WAL on restart so nonces never repeat across crashes.
 type shardHandle struct {
 	file          *os.File
 	mu            sync.Mutex
@@ -117,17 +117,20 @@ type shardHandle struct {
 	shardID       uint32
 	needsMigrate  bool           // plaintext WAL opened with crypto — migrate after replay
 	pendingCrypto *crypto.Engine // crypto engine waiting for migration
+	gc            *groupCommitter
+	syncMode      string
 }
 
 // Storage provides a per-shard, append-only write-ahead log (WAL) for crash recovery.
 // Each shard owns an independent file, eliminating cross-shard coordination during writes.
 // When disabled, Write and Delete are no-ops and no files are opened.
 type Storage struct {
-	dir     string
-	enabled bool
-	logger  log.Logger
-	shards  map[uint32]*shardHandle
-	mapMu   sync.RWMutex
+	dir       string
+	enabled   bool
+	logger    log.Logger
+	shards    map[uint32]*shardHandle
+	mapMu     sync.RWMutex
+	syncCfg   SyncConfig
 }
 
 // NewStorage creates a new persistence Storage. If enabled is false, a pass-through
@@ -160,6 +163,7 @@ func NewStorage(enabled bool, logger log.Logger, dir string) (*Storage, error) {
 		enabled: true,
 		logger:  logger,
 		shards:  make(map[uint32]*shardHandle),
+		syncCfg: loadSyncConfig(),
 	}
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		if logger.Enabled(log.LevelError) {
@@ -188,55 +192,146 @@ func (s *Storage) getShard(shardID uint32) *shardHandle {
 	return h
 }
 
-// appendRecord is the shared writing path for both SET and tombstone records.
-// It acquires the shard mutex, writes the header, key, value, and syncs.
-// When the shard's WAL version is 1 (encrypted), the entire plaintext record
-// is encrypted with a counter-based nonce before writing.
 func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, value []byte, op string) error {
 	h := s.getShard(shardID)
 	if h == nil {
 		return fmt.Errorf("persistence: shard %d not opened", shardID)
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	if h.needsMigrate {
 		return fmt.Errorf("persistence: shard %d migration in progress, writes blocked", shardID)
 	}
 
-	if h.walVer == 1 {
-		return s.appendRecordEncrypted(h, shardID, header, key, value, op)
+	mode := h.syncMode
+	if mode == "" {
+		mode = s.syncCfg.Mode
 	}
 
-	if _, err := h.file.Write(header[:]); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write "+op+" header failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+	if h.walVer == 1 {
+		data, err := s.prepareEncryptedRecord(h, shardID, header, key, value, op)
+		if err != nil {
+			return err
 		}
-		return err
+		if mode == SyncModePerCommit {
+			h.mu.Lock()
+			defer h.mu.Unlock()
+			if _, err := h.file.Write(data); err != nil {
+				if s.logger.Enabled(log.LevelError) {
+					s.logger.Log(log.LevelError, "persistence: write encrypted "+op+" failed",
+						log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+				}
+				return err
+			}
+			if err := h.file.Sync(); err != nil {
+				if s.logger.Enabled(log.LevelError) {
+					s.logger.Log(log.LevelError, "persistence: sync encrypted "+op+" failed",
+						log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+				}
+				return err
+			}
+			return nil
+		}
+		if h.gc != nil {
+			if err := h.gc.enqueue(data); err != nil {
+				if s.logger.Enabled(log.LevelError) {
+					s.logger.Log(log.LevelError, "persistence: group commit encrypted "+op+" failed",
+						log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+				}
+				return err
+			}
+			return nil
+		}
+		// fallback
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if _, err := h.file.Write(data); err != nil {
+			return err
+		}
+		if err := h.file.Sync(); err != nil {
+			return err
+		}
+		return nil
 	}
-	if _, err := h.file.WriteString(key); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write "+op+" key failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+
+	// plaintext
+	data := make([]byte, 0, 16+len(key)+len(value))
+	data = append(data, header[:]...)
+	data = append(data, key...)
+	data = append(data, value...)
+
+	if mode == SyncModePerCommit {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if _, err := h.file.Write(data); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "persistence: write "+op+" failed",
+					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+			}
+			return err
 		}
-		return err
+		if err := h.file.Sync(); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "persistence: sync "+op+" failed",
+					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+			}
+			return err
+		}
+		return nil
 	}
-	if _, err := h.file.Write(value); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write "+op+" value failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+	if h.gc != nil {
+		if err := h.gc.enqueue(data); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "persistence: group commit "+op+" failed",
+					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+			}
+			return err
 		}
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, err := h.file.Write(data); err != nil {
 		return err
 	}
 	if err := h.file.Sync(); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: sync "+op+" failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
 		return err
 	}
 	return nil
+}
+
+func (s *Storage) prepareEncryptedRecord(h *shardHandle, shardID uint32, header [16]byte, key string, value []byte, op string) ([]byte, error) {
+	plainLen := 16 + len(key) + len(value)
+	plaintext := make([]byte, plainLen)
+	copy(plaintext, header[:])
+	copy(plaintext[16:], key)
+	copy(plaintext[16+len(key):], value)
+
+	ctr := h.nonceCtr.Add(1) - 1
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[:8], ctr)
+	binary.LittleEndian.PutUint32(nonce[8:12], shardID)
+
+	ciphertext, err := h.crypto.SealWithCounter(nonce[:], plaintext)
+	if err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: encrypt "+op+" failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return nil, err
+	}
+
+	recLen := int64(12) + int64(len(ciphertext))
+	if recLen > int64(^uint32(0)) {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: encrypted "+op+" record too large",
+				log.Uint("shard", shardID), log.String("key", key), log.Int64("bytes", recLen))
+		}
+		return nil, fmt.Errorf("persistence: encrypted record too large (%d bytes, max %d)", recLen, ^uint32(0))
+	}
+	out := make([]byte, 4+12+len(ciphertext))
+	binary.LittleEndian.PutUint32(out[0:4], uint32(recLen))
+	copy(out[4:16], nonce[:])
+	copy(out[16:], ciphertext)
+	return out, nil
 }
 
 // appendRecordEncrypted writes an encrypted WAL record. Format on disk:
@@ -246,58 +341,15 @@ func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, valu
 // The nonce is [counter:8B LE][shardID:4B LE]. The counter is atomic and
 // recovered from WAL replay on restart so nonces never repeat across crashes.
 func (s *Storage) appendRecordEncrypted(h *shardHandle, shardID uint32, header [16]byte, key string, value []byte, op string) error {
-	// Assemble plaintext record: header + key + value.
-	plainLen := 16 + len(key) + len(value)
-	plaintext := make([]byte, plainLen)
-	copy(plaintext, header[:])
-	copy(plaintext[16:], key)
-	copy(plaintext[16+len(key):], value)
-
-	// Build counter-based nonce: [counter:8B][shardID:4B].
-	ctr := h.nonceCtr.Add(1) - 1
-	var nonce [12]byte
-	binary.LittleEndian.PutUint64(nonce[:8], ctr)
-	binary.LittleEndian.PutUint32(nonce[8:12], shardID)
-
-	// Encrypt: ciphertext = Seal(nonce, plaintext) which includes 16-byte tag.
-	ciphertext, err := h.crypto.SealWithCounter(nonce[:], plaintext)
+	data, err := s.prepareEncryptedRecord(h, shardID, header, key, value, op)
 	if err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: encrypt "+op+" failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
 		return err
 	}
-
-	// On-disk record: [recLen:4B LE][nonce:12B][ciphertext].
-	recLen := int64(12) + int64(len(ciphertext))
-	if recLen > int64(^uint32(0)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, err := h.file.Write(data); err != nil {
 		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: encrypted "+op+" record too large",
-				log.Uint("shard", shardID), log.String("key", key), log.Int64("bytes", recLen))
-		}
-		return fmt.Errorf("persistence: encrypted record too large (%d bytes, max %d)", recLen, ^uint32(0))
-	}
-	var recLenBuf [4]byte
-	binary.LittleEndian.PutUint32(recLenBuf[:], uint32(recLen))
-
-	if _, err := h.file.Write(recLenBuf[:]); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write encrypted "+op+" length failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	if _, err := h.file.Write(nonce[:]); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write encrypted "+op+" nonce failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
-	}
-	if _, err := h.file.Write(ciphertext); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write encrypted "+op+" ciphertext failed",
+			s.logger.Log(log.LevelError, "persistence: write encrypted "+op+" failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
 		}
 		return err
@@ -400,7 +452,7 @@ func (s *Storage) OpenShard(shardID uint32, cryptoEng *crypto.Engine) error {
 		}
 		return err
 	}
-	h := &shardHandle{file: f, shardID: shardID}
+	h := &shardHandle{file: f, shardID: shardID, syncMode: s.syncCfg.Mode}
 	fi, err := f.Stat()
 	if err != nil {
 		_ = f.Close()
@@ -447,8 +499,14 @@ func (s *Storage) OpenShard(shardID uint32, cryptoEng *crypto.Engine) error {
 			return err
 		}
 	}
+	if h.syncMode == SyncModeGroupCommit && h.needsMigrate == false {
+		h.gc = newGroupCommitter(s, h, s.syncCfg.BatchSize, s.syncCfg.Timeout, s.syncCfg.UseFdatasync)
+	}
 	s.mapMu.Lock()
 	if old, ok := s.shards[shardID]; ok {
+		if old.gc != nil {
+			old.gc.stop()
+		}
 		_ = old.file.Close()
 	}
 	s.shards[shardID] = h
@@ -946,6 +1004,11 @@ func (s *Storage) Snapshot(shardID uint32, engine *storage.Engine) error {
 // never causes nonce counter regression: the sidecar already reflects the
 // counter at the time of truncation, even if the WAL records are gone.
 func (s *Storage) truncateWALLocked(h *shardHandle, shardID uint32, offset int64) error {
+	if h.gc != nil {
+		if err := h.gc.flush(); err != nil {
+			return err
+		}
+	}
 	if h.walVer == 1 {
 		if err := writeNonceSidecar(nonceSidecarPath(s.dir, shardID), h.nonceCtr.Load()); err != nil {
 			return fmt.Errorf("persistence: persist nonce sidecar before truncate: %w", err)
@@ -977,7 +1040,29 @@ func (s *Storage) TruncateWALTo(shardID uint32, offset int64) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.gc != nil {
+		if err := h.gc.flush(); err != nil {
+			return err
+		}
+	}
 	return s.truncateWALLocked(h, shardID, offset)
+}
+
+// Flush forces pending writes to be durably synced.
+func (s *Storage) Flush(shardID uint32) error {
+	if !s.enabled {
+		return nil
+	}
+	h := s.getShard(shardID)
+	if h == nil {
+		return nil
+	}
+	if h.gc != nil {
+		return h.gc.flush()
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.file.Sync()
 }
 
 // CloseShard closes the WAL file for the given shard.
@@ -985,6 +1070,10 @@ func (s *Storage) CloseShard(shardID uint32) error {
 	h := s.getShard(shardID)
 	if h == nil {
 		return nil
+	}
+	if h.gc != nil {
+		h.gc.stop()
+		h.gc = nil
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()

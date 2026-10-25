@@ -12,6 +12,7 @@ package sql
 
 import (
 	"fmt"
+	"math"
 	"slices"
 	"strconv"
 	"strings"
@@ -59,7 +60,7 @@ func exprNodeOf(node *pg_query.Node, name string) (*selectExpr, error) {
 func constExpr(c *pg_query.A_Const, name string) (*selectExpr, error) {
 	switch {
 	case c.GetIsnull():
-		return &selectExpr{Name: name, Kind: selectExprLiteral, Literal: "NULL", OID: oidText}, nil
+		return &selectExpr{Name: name, Kind: selectExprLiteral, Literal: "", OID: oidText, Null: true}, nil
 	case c.GetIval() != nil:
 		return &selectExpr{Name: name, Kind: selectExprLiteral,
 			Literal: strconv.FormatInt(int64(c.GetIval().GetIval()), 10), OID: oidInt4}, nil
@@ -240,8 +241,9 @@ func constNumber(node *pg_query.Node) (val float64, integral bool, err error) {
 
 // applyArith evaluates one supported operator over two numeric literals,
 // returning the result and whether it must be rendered as a float. Integer
-// operands stay integer for +, - and *; division is always float, as in
-// PostgreSQL, and division by zero is the standard error.
+// operands stay integer for +, - and *; integer division truncates toward zero
+// and stays integer only when both operands are integers. Division by zero is
+// the standard error.
 func applyArith(op string, l float64, lInt bool, r float64, rInt bool) (float64, bool, error) {
 	switch op {
 	case "+":
@@ -253,6 +255,14 @@ func applyArith(op string, l float64, lInt bool, r float64, rInt bool) (float64,
 	case "/":
 		if r == 0 {
 			return 0, false, &pgError{code: errDivisionByZero, msg: "division by zero"}
+		}
+		if lInt && rInt {
+			neg := (l < 0 && r > 0) || (l > 0 && r < 0)
+			res := math.Trunc(math.Abs(l)/math.Abs(r))
+			if neg {
+				res = -res
+			}
+			return res, false, nil
 		}
 		return l / r, true, nil
 	default:
@@ -288,7 +298,7 @@ func evalSelectExprs(exprs []*selectExpr, c *pgConn, now time.Time) ([][]byte, e
 func evalSelectExpr(ex *selectExpr, c *pgConn, now time.Time) ([]byte, error) {
 	switch ex.Kind {
 	case selectExprLiteral:
-		if ex.Literal == "NULL" {
+		if ex.Null {
 			return nil, nil
 		}
 		return []byte(ex.Literal), nil
@@ -306,8 +316,22 @@ func sessionFuncValue(ex *selectExpr, c *pgConn) ([]byte, error) {
 	switch ex.Func {
 	case "version":
 		return []byte(serverVersionString), nil
-	case "current_database", "current_schema":
+	case "current_database":
 		return []byte(DefaultDB), nil
+	case "current_schema":
+		if c != nil {
+			path := c.showValue("search_path")
+			for _, entry := range splitSearchPath(path) {
+				if entry == "\"$user\"" {
+					continue
+				}
+				if strings.EqualFold(entry, schemaPGCatalog) || strings.EqualFold(entry, schemaInfo) {
+					continue
+				}
+				return []byte(entry), nil
+			}
+		}
+		return []byte(schemaPublic), nil
 	case "current_user", "session_user":
 		u := c.user
 		if u == "" {

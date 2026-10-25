@@ -1808,7 +1808,11 @@ func (p *Plan) predicate() (Expr, error) {
 func (p *Plan) translateCases() error {
 	for i := range p.Cases {
 		if err := p.translateCaseConditions(&p.Cases[i], func(col string) (string, error) {
-			return stripColumnQualifier(col, p.Table), nil
+			col = stripColumnQualifier(col, p.Table)
+			if p.TableAlias != "" {
+				col = stripColumnQualifier(col, p.TableAlias)
+			}
+			return col, nil
 		}); err != nil {
 			return err
 		}

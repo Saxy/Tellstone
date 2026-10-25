@@ -654,10 +654,11 @@ func (c *pgConn) ready() error {
 // handleQuery runs the simple-query protocol: a Q message may carry several
 // statements separated by semicolons, and each is answered with its own
 // CommandComplete/ResultSet. The whole string is parsed once, then the plans
-// run in order. An error in one statement abandons the rest of the string and
-// skips to ReadyForQuery, which is PostgreSQL's behaviour for a simple-query
-// batch. An empty or semicolon-only string is answered with an
-// EmptyQueryResponse and no CommandComplete.
+// run in order. An error in one statement aborts the remaining statements in
+// that batch and skips to ReadyForQuery, which matches PostgreSQL behavior,
+// but earlier statements in a multi-statement simple query are not rolled back
+// on error (partial application remains). An empty or semicolon-only string is
+// answered with an EmptyQueryResponse and no CommandComplete. See ADR-016.
 func (c *pgConn) handleQuery(payload []byte) error {
 	query, _, err := consumeCString(payload)
 	if err != nil {
@@ -1009,6 +1010,10 @@ func maxParam(p *Plan) int {
 				if t.Val.Param > m {
 					m = t.Val.Param
 				}
+			case *RegexExpr:
+				if t.Val.Param > m {
+					m = t.Val.Param
+				}
 			}
 			return true
 		})
@@ -1026,6 +1031,10 @@ func maxParam(p *Plan) int {
 						m = t.Val.Param
 					}
 				case *LikeExpr:
+					if t.Val.Param > m {
+						m = t.Val.Param
+					}
+				case *RegexExpr:
 					if t.Val.Param > m {
 						m = t.Val.Param
 					}

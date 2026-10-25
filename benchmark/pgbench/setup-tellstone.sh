@@ -75,10 +75,10 @@ command -v psql >/dev/null 2>&1 || die "psql is required"
 
 psql_cmd() {
 	if [ "$TLS" = "1" ]; then
-		PGPASSWORD="$PASSWORD" PGSSLMODE="$SSLMODE" \
+		PGPASSWORD="$PASSWORD" PGSSLMODE="${SSLMODE:-require}" \
 			psql -h 127.0.0.1 -p "$PORT" -U "$DBUSER" -d "$DB" -X "$@"
 	else
-		PGSSLMODE="$SSLMODE" \
+		PGSSLMODE="${SSLMODE:-disable}" \
 			psql -h 127.0.0.1 -p "$PORT" -U "$DBUSER" -d "$DB" -X "$@"
 	fi
 }
@@ -206,8 +206,8 @@ start_single() {
 		--pg-addr "127.0.0.1:$PORT" \
 		--shards "$SHARDS" \
 		--max-mem-bytes "$MEM_LIMIT" \
-		"${persist_flags[@]}" \
-		"${auth_flags[@]}" \
+		${persist_flags[@]+"${persist_flags[@]}"} \
+		${auth_flags[@]+"${auth_flags[@]}"} \
 		>"$logfile" 2>&1 &
 	echo $! >"$pidfile"
 	sleep 2
@@ -218,7 +218,11 @@ if [ "$MODE" = "single" ]; then
 else
 	if [ "$SKIP_UP" != 1 ]; then
 		log "starting cluster (data dir: $DATA_DIR, pg port: $PG_BASE)"
-		DATA_DIR="$DATA_DIR" PG_BASE="$PG_BASE" "$repo/scripts/tools/local-cluster.sh" up
+		if [ "$TLS" = "1" ]; then
+			RBAC=1 DATA_DIR="$DATA_DIR" PG_BASE="$PG_BASE" "$repo/scripts/tools/local-cluster.sh" up
+		else
+			RBAC=0 DATA_DIR="$DATA_DIR" PG_BASE="$PG_BASE" "$repo/scripts/tools/local-cluster.sh" up
+		fi
 	fi
 fi
 

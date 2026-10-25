@@ -321,6 +321,8 @@ type selectExpr struct {
 	FuncArg bool
 	// OID is the result-column type OID the RowDescription advertises.
 	OID int32
+	// Null marks an explicit SQL NULL literal.
+	Null bool
 }
 
 type selectExprKind uint8
@@ -690,10 +692,26 @@ func castToOID(tc *pg_query.TypeCast) (int32, bool, error) {
 		return 0, false, nil
 	}
 	ac := tc.GetArg().GetAConst()
-	if ac == nil || ac.GetSval() == nil {
+	if ac == nil {
+		return 0, false, nil
+	}
+	if ac.GetIval() != nil {
+		return int32(ac.GetIval().GetIval()), true, nil
+	}
+	if ac.GetSval() == nil {
 		return 0, false, nil
 	}
 	name := ac.GetSval().GetSval()
+	// handle qualified regclass like schema.relation
+	if strings.Contains(name, ".") {
+		parts := strings.SplitN(name, ".", 2)
+		schema := strings.Trim(parts[0], "\"")
+		rname := strings.Trim(parts[1], "\"")
+		if rel := lookupCatalogRelation(schema, rname); rel != nil {
+			return rel.oid, true, nil
+		}
+		return objectOID(rname), true, nil
+	}
 	if rel := lookupCatalogRelation("", name); rel != nil {
 		return rel.oid, true, nil
 	}

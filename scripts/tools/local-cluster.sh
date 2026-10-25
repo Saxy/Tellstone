@@ -216,19 +216,29 @@ YAML
 # scripts use: it succeeds on Tellstone's SQL subset and returns zero rows.
 wait_ready() {
 	local i="$1" port n=0
-	local user="default" creds=()
+	local user="default"
+	local -a creds=()
 	port=$(node_pg_port "$i")
 	if [ "$rbac" = "1" ]; then
 		user="admin"
 		creds=(env PGPASSWORD=admin PGSSLMODE=require)
 	fi
 	if command -v psql >/dev/null 2>&1; then
-		while ! run_timeout 3 "${creds[@]}" psql -h 127.0.0.1 -p "$port" -U "$user" -d test -X -t \
-			-c "SELECT key FROM tellstone WHERE key = 'local-cluster-wait'" >/dev/null 2>&1; do
-			n=$((n + 1))
-			[ "$n" -ge 60 ] && return 1
-			sleep 0.5
-		done
+		if [ ${#creds[@]} -gt 0 ]; then
+			while ! run_timeout 3 "${creds[@]}" psql -h 127.0.0.1 -p "$port" -U "$user" -d test -X -t \
+				-c "SELECT key FROM tellstone WHERE key = 'local-cluster-wait'" >/dev/null 2>&1; do
+				n=$((n + 1))
+				[ "$n" -ge 60 ] && return 1
+				sleep 0.5
+			done
+		else
+			while ! run_timeout 3 psql -h 127.0.0.1 -p "$port" -U "$user" -d test -X -t \
+				-c "SELECT key FROM tellstone WHERE key = 'local-cluster-wait'" >/dev/null 2>&1; do
+				n=$((n + 1))
+				[ "$n" -ge 60 ] && return 1
+				sleep 0.5
+			done
+		fi
 		return 0
 	fi
 	while ! tcp_open "$port"; do
@@ -323,7 +333,7 @@ do_up() {
 			--persistence-dir "$(node_dir "$i")/data" \
 			--snapshot-interval "$snapshot_interval" \
 			--max-mem-bytes "$mem_limit" \
-			"${auth_flags[@]}" \
+			${auth_flags[@]+"${auth_flags[@]}"} \
 			>"$(node_log "$i")" 2>&1 &
 		echo $! >"$pf"
 		cd "$repo" || true

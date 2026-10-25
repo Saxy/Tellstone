@@ -289,7 +289,7 @@ func objectOID(name string) int32 {
 	_, _ = h.Write([]byte(name))
 	// The high bit is cleared so the value is a positive 31-bit identifier,
 	// which is what a client's signed integer can hold.
-	return int32(h.Sum32()&0x7fffffff)%catalogOIDBase + 16384
+	return int32(h.Sum32()&0x7fffffff)%(catalogOIDBase-16384) + 16384
 }
 
 // userTables lists the engine's tables with their schemas, in name order.

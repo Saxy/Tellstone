@@ -7,6 +7,10 @@ declares its columns and how it derives its rows from the live catalog.
 */
 package sql
 
+import (
+	"strconv"
+)
+
 // The column lists and row builders of the virtual relations. A relation
 // without a builder yields no rows: it is present so that a client which
 // names it gets an empty answer rather than an error, which is what ADR-016
@@ -352,6 +356,10 @@ func relPGIndex() *catalogRelation {
 			}
 			var out [][]rowValue
 			for _, t := range tables {
+				pk := 0
+				if t.PrimaryKey >= 0 {
+					pk = t.PrimaryKey
+				}
 				out = append(out, catRow(cols, map[string]rowValue{
 					"indexrelid": catInt(int64(objectOID("index:" + t.Table))),
 					"indrelid":   catInt(int64(objectOID(t.Table))),
@@ -359,7 +367,7 @@ func relPGIndex() *catalogRelation {
 					"indisprimary": catBool(true), "indisexclusion": catBool(false), "indimmediate": catBool(true),
 					"indisclustered": catBool(false), "indisvalid": catBool(true), "indcheckxmin": catBool(false),
 					"indisready": catBool(true), "indislive": catBool(true), "indisreplident": catBool(false),
-					"indkey": catText("1"), "indcollation": catText("0"), "indclass": catText("0"),
+					"indkey": catText(strconv.Itoa(pk + 1)), "indcollation": catText("0"), "indclass": catText("0"),
 					"indoption": catText("0"),
 				}))
 			}
@@ -407,6 +415,10 @@ func relPGConstraint() *catalogRelation {
 			}
 			var out [][]rowValue
 			for _, t := range tables {
+				pk := 0
+				if t.PrimaryKey >= 0 {
+					pk = t.PrimaryKey
+				}
 				out = append(out, catRow(cols, map[string]rowValue{
 					"oid":     catInt(int64(objectOID("constraint:" + t.Table))),
 					"conname": catText(t.Table + "_pkey"), "connamespace": catInt(oidPublicNamespace),
@@ -415,7 +427,7 @@ func relPGConstraint() *catalogRelation {
 					"contypid": catInt(0), "conindid": catInt(int64(objectOID("index:" + t.Table))),
 					"conparentid": catInt(0), "confrelid": catInt(0), "confupdtype": catText("a"),
 					"confdeltype": catText("a"), "confmatchtype": catText("s"), "conislocal": catBool(true),
-					"coninhcount": catInt(0), "connoinherit": catBool(false), "conkey": catText("1"),
+					"coninhcount": catInt(0), "connoinherit": catBool(false), "conkey": catText(strconv.Itoa(pk + 1)),
 				}))
 			}
 			return out, nil
@@ -611,9 +623,9 @@ func relPGSettings() *catalogRelation {
 					m["reset_val"] = catText(c.user)
 				}
 				if s.name == "is_superuser" {
-					m["setting"] = catBool(true)
-					m["boot_val"] = catBool(true)
-					m["reset_val"] = catBool(true)
+					m["setting"] = catText("on")
+					m["boot_val"] = catText("on")
+					m["reset_val"] = catText("on")
 				}
 				out = append(out, catRow(cols, m))
 			}
@@ -1076,11 +1088,15 @@ func relInfoKeyColumnUsage() *catalogRelation {
 				if len(t.Columns) == 0 {
 					continue
 				}
+				pk := 0
+				if t.PrimaryKey >= 0 && t.PrimaryKey < len(t.Columns) {
+					pk = t.PrimaryKey
+				}
 				out = append(out, catRow(cols, map[string]rowValue{
 					"constraint_catalog": catText(c.db), "constraint_schema": catText(schemaPublic),
 					"constraint_name": catText(t.Table + "_pkey"), "table_catalog": catText(c.db),
 					"table_schema": catText(schemaPublic), "table_name": catText(t.Table),
-					"column_name": catText(t.Columns[0].Name), "ordinal_position": catInt(1),
+					"column_name": catText(t.Columns[pk].Name), "ordinal_position": catInt(int64(pk + 1)),
 				}))
 			}
 			return out, nil
