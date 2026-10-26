@@ -1,8 +1,9 @@
-//go:build !windows
+//go:build !windows && (aix || linux || solaris || zos)
 
 package persistence
 
 import (
+	"errors"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -13,8 +14,12 @@ func fdatasyncFile(f *os.File) error {
 }
 
 func runtimeFSync(f *os.File) error {
-	if err := fdatasyncFile(f); err == nil {
+	err := fdatasyncFile(f)
+	if err == nil {
 		return nil
 	}
-	return f.Sync()
+	if errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) {
+		return f.Sync()
+	}
+	return err
 }

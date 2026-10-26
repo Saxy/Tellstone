@@ -26,6 +26,7 @@ import (
 	"hash/fnv"
 	"sort"
 	"strings"
+	"sync"
 )
 
 // The schema names a client sees. The engine's own default database is called
@@ -284,12 +285,49 @@ func isCatalogSchema(name string) bool {
 // the session after it -- without a counter that has to be written on every
 // DDL. The identifiers of user objects live below catalogOIDBase so that they
 // cannot collide with the catalog's own.
+var (
+	objectOIDMu  sync.RWMutex
+	objectOIDMap = map[string]int32{}
+	objectOIDRev = map[int32]string{}
+)
+
 func objectOID(name string) int32 {
+	objectOIDMu.RLock()
+	if oid, ok := objectOIDMap[name]; ok {
+		objectOIDMu.RUnlock()
+		return oid
+	}
+	objectOIDMu.RUnlock()
+
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(name))
-	// The high bit is cleared so the value is a positive 31-bit identifier,
-	// which is what a client's signed integer can hold.
-	return int32(h.Sum32()&0x7fffffff)%(catalogOIDBase-16384) + 16384
+	base := int32(h.Sum32()&0x7fffffff)%(catalogOIDBase-16384) + 16384
+
+	objectOIDMu.Lock()
+	defer objectOIDMu.Unlock()
+	if oid, ok := objectOIDMap[name]; ok {
+		return oid
+	}
+	limit := catalogOIDBase - 16384
+	for i := int32(0); i < int32(limit); i++ {
+		cand := base + (i % int32(limit))
+		if cand < 16384 {
+			cand += 16384
+		}
+		if existing, ok := objectOIDRev[cand]; ok {
+			if existing == name {
+				objectOIDMap[name] = cand
+				return cand
+			}
+			continue
+		}
+		objectOIDMap[name] = cand
+		objectOIDRev[cand] = name
+		return cand
+	}
+	objectOIDMap[name] = base
+	objectOIDRev[base] = name
+	return base
 }
 
 // userTables lists the engine's tables with their schemas, in name order.

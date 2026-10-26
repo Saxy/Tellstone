@@ -7,16 +7,15 @@ import (
 )
 
 const (
-	SyncModeGroupCommit  = "group_commit"
-	SyncModePerCommit    = "per_commit_sync"
-	SyncModeAsync        = "async"
+	SyncModeGroupCommit = "group_commit"
+	SyncModePerCommit   = "per_commit_sync"
 )
 
 type SyncConfig struct {
-	Mode      string
-	BatchSize int
-	Timeout   time.Duration
-	UseFdatasync bool
+	Mode          string
+	BatchSize     int
+	Timeout       time.Duration
+	UseFdatasync  bool
 }
 
 func loadSyncConfig() SyncConfig {
@@ -27,10 +26,19 @@ func loadSyncConfig() SyncConfig {
 		UseFdatasync: true,
 	}
 	if v := os.Getenv("TSD_WAL_SYNC_MODE"); v != "" {
-		cfg.Mode = v
+		switch v {
+		case SyncModeGroupCommit, SyncModePerCommit:
+			cfg.Mode = v
+		default:
+			// Unsupported/invalid modes fall back to per-commit for safety (do not silently use async)
+			cfg.Mode = SyncModePerCommit
+		}
 	}
 	if v := os.Getenv("TSD_WAL_GROUP_BATCH_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			if n > 4096 {
+				n = 4096
+			}
 			cfg.BatchSize = n
 		}
 	}

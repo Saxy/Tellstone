@@ -219,9 +219,12 @@ else
 	if [ "$SKIP_UP" != 1 ]; then
 		log "starting cluster (data dir: $DATA_DIR, pg port: $PG_BASE)"
 		if [ "$TLS" = "1" ]; then
+			if [ "${RBAC:-1}" = "0" ]; then
+				die "TLS with RBAC disabled is not supported by local-cluster.sh"
+			fi
 			RBAC=1 DATA_DIR="$DATA_DIR" PG_BASE="$PG_BASE" "$repo/scripts/tools/local-cluster.sh" up
 		else
-			RBAC=0 DATA_DIR="$DATA_DIR" PG_BASE="$PG_BASE" "$repo/scripts/tools/local-cluster.sh" up
+			RBAC="${RBAC:-0}" DATA_DIR="$DATA_DIR" PG_BASE="$PG_BASE" "$repo/scripts/tools/local-cluster.sh" up
 		fi
 	fi
 fi

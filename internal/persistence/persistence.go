@@ -976,10 +976,19 @@ func (s *Storage) Snapshot(shardID uint32, engine *storage.Engine) error {
 	if h := s.getShard(shardID); h != nil && h.crypto != nil {
 		fp = h.crypto.KeyFingerprint()
 	}
+	h := s.getShard(shardID)
+	if h == nil {
+		return fmt.Errorf("persistence: shard %d not opened", shardID)
+	}
+	if h.gc != nil {
+		if err := h.gc.flush(); err != nil {
+			return err
+		}
+	}
 	if err := snapshotForkDump(s.dir, shardID, engine, fp, s.logger); err != nil {
 		return err
 	}
-	h := s.getShard(shardID)
+	h = s.getShard(shardID)
 	if h == nil {
 		return fmt.Errorf("persistence: shard %d not opened", shardID)
 	}
@@ -1004,11 +1013,6 @@ func (s *Storage) Snapshot(shardID uint32, engine *storage.Engine) error {
 // never causes nonce counter regression: the sidecar already reflects the
 // counter at the time of truncation, even if the WAL records are gone.
 func (s *Storage) truncateWALLocked(h *shardHandle, shardID uint32, offset int64) error {
-	if h.gc != nil {
-		if err := h.gc.flush(); err != nil {
-			return err
-		}
-	}
 	if h.walVer == 1 {
 		if err := writeNonceSidecar(nonceSidecarPath(s.dir, shardID), h.nonceCtr.Load()); err != nil {
 			return fmt.Errorf("persistence: persist nonce sidecar before truncate: %w", err)
@@ -1038,13 +1042,13 @@ func (s *Storage) TruncateWALTo(shardID uint32, offset int64) error {
 	if h == nil {
 		return fmt.Errorf("persistence: shard %d not opened", shardID)
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	if h.gc != nil {
 		if err := h.gc.flush(); err != nil {
 			return err
 		}
 	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	return s.truncateWALLocked(h, shardID, offset)
 }
 
@@ -1067,13 +1071,19 @@ func (s *Storage) Flush(shardID uint32) error {
 
 // CloseShard closes the WAL file for the given shard.
 func (s *Storage) CloseShard(shardID uint32) error {
-	h := s.getShard(shardID)
+	s.mapMu.Lock()
+	h := s.shards[shardID]
 	if h == nil {
+		s.mapMu.Unlock()
 		return nil
 	}
-	if h.gc != nil {
-		h.gc.stop()
+	delete(s.shards, shardID)
+	s.mapMu.Unlock()
+
+	gc := h.gc
+	if gc != nil {
 		h.gc = nil
+		gc.stop()
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1085,10 +1095,5 @@ func (s *Storage) CloseShard(shardID uint32) error {
 	if err := h.file.Close(); err != nil {
 		return err
 	}
-	s.mapMu.Lock()
-	if cur, ok := s.shards[shardID]; ok && cur == h {
-		delete(s.shards, shardID)
-	}
-	s.mapMu.Unlock()
 	return nil
 }

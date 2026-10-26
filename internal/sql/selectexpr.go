@@ -321,13 +321,22 @@ func sessionFuncValue(ex *selectExpr, c *pgConn) ([]byte, error) {
 	case "current_schema":
 		if c != nil {
 			path := c.showValue("search_path")
+			user := c.catalogUser()
 			for _, entry := range splitSearchPath(path) {
 				if entry == "\"$user\"" {
+					if user != "" {
+						if rel := lookupCatalogRelation(user, ""); rel != nil {
+							return []byte(user), nil
+						}
+						// if schema named by user doesn't exist, skip
+						continue
+					}
 					continue
 				}
 				if strings.EqualFold(entry, schemaPGCatalog) || strings.EqualFold(entry, schemaInfo) {
 					continue
 				}
+				// skip nonexistent schemas if possible - best effort: only check known system ones skipped
 				return []byte(entry), nil
 			}
 		}

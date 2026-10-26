@@ -718,6 +718,15 @@ func castToOID(tc *pg_query.TypeCast) (int32, bool, error) {
 	if rel := lookupCatalogRelation(schemaPGCatalog, name); rel != nil {
 		return rel.oid, true, nil
 	}
+	if strings.Contains(name, ".") {
+		parts := strings.SplitN(name, ".", 2)
+		schema := strings.Trim(parts[0], "\"")
+		rname := strings.Trim(parts[1], "\"")
+		if rel := lookupCatalogRelation(schema, rname); rel != nil {
+			return rel.oid, true, nil
+		}
+		return 0, false, fmt.Errorf("relation %q does not exist", name)
+	}
 	// A table of the engine's own catalog is named the way the catalog
 	// reports it: under the public schema, with the identifier the derived
 	// naming gives it.

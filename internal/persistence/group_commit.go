@@ -12,17 +12,19 @@ type commitReq struct {
 }
 
 type groupCommitter struct {
-	h        *shardHandle
-	stg      *Storage
-	ch       chan *commitReq
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	batchSz  int
-	timeout  time.Duration
-	useFsync bool
+	h            *shardHandle
+	stg          *Storage
+	ch           chan *commitReq
+	stopCh       chan struct{}
+	stopOnce     sync.Once
+	exited       chan struct{}
+	wg           sync.WaitGroup
+	batchSz      int
+	timeout      time.Duration
+	useFdatasync bool
 }
 
-func newGroupCommitter(stg *Storage, h *shardHandle, batchSz int, timeout time.Duration, useFsync bool) *groupCommitter {
+func newGroupCommitter(stg *Storage, h *shardHandle, batchSz int, timeout time.Duration, useFdatasync bool) *groupCommitter {
 	if batchSz <= 0 {
 		batchSz = 128
 	}
@@ -30,13 +32,14 @@ func newGroupCommitter(stg *Storage, h *shardHandle, batchSz int, timeout time.D
 		timeout = 500 * time.Microsecond
 	}
 	gc := &groupCommitter{
-		h:        h,
-		stg:      stg,
-		ch:       make(chan *commitReq, batchSz*4),
-		stopCh:   make(chan struct{}),
-		batchSz:  batchSz,
-		timeout:  timeout,
-		useFsync: useFsync,
+		h:            h,
+		stg:          stg,
+		ch:           make(chan *commitReq, batchSz*4),
+		stopCh:       make(chan struct{}),
+		exited:       make(chan struct{}),
+		batchSz:      batchSz,
+		timeout:      timeout,
+		useFdatasync: useFdatasync,
 	}
 	gc.wg.Add(1)
 	go gc.run()
@@ -45,6 +48,7 @@ func newGroupCommitter(stg *Storage, h *shardHandle, batchSz int, timeout time.D
 
 func (gc *groupCommitter) run() {
 	defer gc.wg.Done()
+	defer close(gc.exited)
 	batch := make([]*commitReq, 0, gc.batchSz)
 	timer := time.NewTimer(gc.timeout)
 	defer timer.Stop()
@@ -67,13 +71,11 @@ func (gc *groupCommitter) run() {
 				}
 			}
 			if writeErr == nil {
-				if gc.useFsync {
-					writeErr = gc.h.file.Sync()
-				} else {
-					if err := runtimeFSync(gc.h.file); err != nil {
-						writeErr = gc.h.file.Sync()
-					}
-				}
+			if gc.useFdatasync {
+				writeErr = runtimeFSync(gc.h.file)
+			} else {
+				writeErr = gc.h.file.Sync()
+			}
 			}
 		}
 		for _, req := range batch {
@@ -104,12 +106,6 @@ func (gc *groupCommitter) run() {
 					}
 				default:
 					flush()
-					for _, req := range batch {
-						if req.done != nil {
-							req.done <- errors.New("persistence: closed")
-							close(req.done)
-						}
-					}
 					return
 				}
 			}
@@ -138,10 +134,20 @@ func (gc *groupCommitter) enqueue(data []byte) error {
 	select {
 	case gc.ch <- req:
 	case <-gc.stopCh:
+		select {
+		case <-gc.exited:
+		default:
+		}
+		return errors.New("persistence: closed")
+	case <-gc.exited:
 		return errors.New("persistence: closed")
 	}
-	err := <-done
-	return err
+	select {
+	case err := <-done:
+		return err
+	case <-gc.exited:
+		return errors.New("persistence: closed")
+	}
 }
 
 func (gc *groupCommitter) flush() error {
@@ -151,11 +157,20 @@ func (gc *groupCommitter) flush() error {
 	case gc.ch <- req:
 	case <-gc.stopCh:
 		return errors.New("persistence: closed")
+	case <-gc.exited:
+		return errors.New("persistence: closed")
 	}
-	return <-done
+	select {
+	case err := <-done:
+		return err
+	case <-gc.exited:
+		return errors.New("persistence: closed")
+	}
 }
 
 func (gc *groupCommitter) stop() {
-	close(gc.stopCh)
+	gc.stopOnce.Do(func() {
+		close(gc.stopCh)
+	})
 	gc.wg.Wait()
 }
