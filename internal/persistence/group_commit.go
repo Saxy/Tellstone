@@ -54,7 +54,6 @@ func (gc *groupCommitter) run() {
 			return
 		}
 		var writeErr error
-		gc.h.mu.Lock()
 		if gc.h.needsMigrate {
 			writeErr = errors.New("persistence: shard migration in progress")
 		} else {
@@ -71,13 +70,12 @@ func (gc *groupCommitter) run() {
 				if gc.useFsync {
 					writeErr = gc.h.file.Sync()
 				} else {
-					if runtimeFSync(gc.h.file) != nil {
+					if err := runtimeFSync(gc.h.file); err != nil {
 						writeErr = gc.h.file.Sync()
 					}
 				}
 			}
 		}
-		gc.h.mu.Unlock()
 		for _, req := range batch {
 			if req.done != nil {
 				req.done <- writeErr
