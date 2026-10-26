@@ -1,0 +1,43 @@
+internal/sql/pgcat.go
+  s_cfecb6188b07ff::t_0773b5ebb77c35 312-313
+  s_cfecb6188b07ff::t_ecb2ff59952838 29
+  s_cfecb6188b07ff::t_4359cef06d2eb2 288-293,295-301,304-311,314-330
+internal/persistence/config.go
+  s_cfecb6188b07ff::t_976b8d76ecde41 10-11,15-18,29-35,39-41
+internal/persistence/persistence.go
+  s_cfecb6188b07ff::t_ff5d0273c36b0c 1074-1075,1077,1080-1084,1086
+  s_cfecb6188b07ff::t_3987e8cf008861 979-987,991
+  s_cfecb6188b07ff::t_86a4ae5afbe7b3 1050-1051
+benchmark/pgbench/setup-tellstone.sh
+  s_cfecb6188b07ff::t_92dd3fd6f14ba5 222-224,227
+internal/sql/translate.go
+  s_cfecb6188b07ff::t_b2bac02334684d 721-727,729
+  s_cfecb6188b07ff::t_3b4c90edd9bb9f 728
+internal/persistence/fdatasync_fallback.go
+  s_cfecb6188b07ff::t_bc8f0695a08980 1-11
+internal/persistence/group_commit.go
+  s_cfecb6188b07ff::t_0a609565cb51af 74-78
+  s_cfecb6188b07ff::t_b3ad99f0a6e5d9 15-24,27,35-42
+  s_cfecb6188b07ff::t_089464fa26fe54 137-148,160-167,172-174
+  s_cfecb6188b07ff::t_dbf89bc13f98ea 51
+internal/persistence/fdatasync_unix.go
+  s_cfecb6188b07ff::t_de77d4663f9239 1,6,17-18,21-24
+internal/sql/selectexpr.go
+  s_cfecb6188b07ff::t_c4585a07ac4e33 324,327-333,339
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "bed1011e76e2707d37b1fa3936486c2076c22ad8",
+  "prompts": {},
+  "sessions": {
+    "s_cfecb6188b07ff": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e97008517ffe8SEd2FI2vigFBw",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
