@@ -1,0 +1,19 @@
+internal/persistence/group_commit.go
+  s_cfecb6188b07ff::t_c87d218399e67f 73
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "af21c7867cf4d1d27b0d0142bdfb0a13dccb2796",
+  "prompts": {},
+  "sessions": {
+    "s_cfecb6188b07ff": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_e97008517ffe8SEd2FI2vigFBw",
+        "model": "big-pickle"
+      },
+      "human_author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
