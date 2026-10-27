@@ -105,6 +105,11 @@ func (k PlanKind) String() string {
 type joinProj struct {
 	Idx int    // index of the column's cell in the merged row
 	Col Column // the declaration, for RowDescription and the wire render
+	// Case is the index of the CASE target this position computes, or -1
+	// when the position projects a column. A CASE is computed from the
+	// merged row rather than read from it, so it carries its own index
+	// rather than a cell's.
+	Case int
 }
 
 // JoinPlan is the physical form of PlanHashJoin: the two child plans, the
@@ -120,6 +125,11 @@ type JoinPlan struct {
 	// this phase's statistics may not exist at all. A future ANALYZE-aware
 	// choice belongs here and changes nothing above it.
 	Build, Probe *physicalPlan
+	// BuildPlan is the plan of the build side when that side is itself a
+	// join: a statement that joins three tables is a chain of two joins, and
+	// the first of them is this plan. The executor runs it and joins its
+	// rows with the probe side's.
+	BuildPlan *Plan
 	// BuildKey and ProbeKey are the join key ordinals within their own
 	// sides' schemas.
 	BuildKey, ProbeKey int
@@ -133,9 +143,20 @@ type JoinPlan struct {
 	// probe side's.
 	Merged *Schema
 	Proj   []joinProj
+	// Outer is the join's kind: which sides keep their rows when the equality
+	// finds no match. The executor reads it to decide what an unmatched row --
+	// and a NULL join key, which matches nothing ever -- still owes the output.
+	Outer JoinPreserve
 	// OutWidth is the projected row's byte width, carried because a join node
 	// has no schema of its own for EXPLAIN's width column to read.
 	OutWidth float64
+	// MatchFilter is the ON clause's remainder: the conditions of the join
+	// condition that are not the hash equality. They are tested against a
+	// matched pair only, because an ON clause decides which rows are joined
+	// and a WHERE clause decides which rows are returned -- a left row whose
+	// only match fails the ON clause is a left row that matched nothing, and
+	// the outer join owes it a row with the other side NULL.
+	MatchFilter Expr
 }
 
 // physicalPlan is the planner's output: an access method over one table, or a
@@ -269,6 +290,10 @@ func (o *optimizer) checkColumns(e Expr) error {
 // the type alone, and both are ones a client writes by accident: `id >
 // 9223372036854775807` and `id < -9223372036854775808`.
 func (o *optimizer) domainIsEmpty(conj []Expr) bool {
+	if o.sch.PrimaryKey < 0 {
+		// A relation with no primary key has no key domain to reason about.
+		return false
+	}
 	pk := o.sch.PrimaryKeyName()
 	for _, c := range conj {
 		cmp, ok := c.(*CmpExpr)
@@ -319,6 +344,11 @@ func conjuncts(e Expr) []Expr {
 // pins the row; the conjuncts it cannot absorb survive as a residual filter that
 // decides whether that row qualifies.
 func (o *optimizer) pointLookup(conj []Expr) *physicalPlan {
+	if o.sch.PrimaryKey < 0 {
+		// No column identifies a row on its own, so no equality can address
+		// one. The relation is read with a scan.
+		return nil
+	}
 	pk := o.sch.PrimaryKeyName()
 	for i, c := range conj {
 		cmp, ok := c.(*CmpExpr)
@@ -363,6 +393,10 @@ func rowIDIsOrderPreserving(c *Column) bool {
 // rowIDIsOrderPreserving above: text primary keys are refused, integer ones are
 // planned.
 func (o *optimizer) rangeScan(conj []Expr) *physicalPlan {
+	if o.sch.PrimaryKey < 0 {
+		// A relation with no primary key has no key order to range over.
+		return nil
+	}
 	pkCol, ok := o.sch.Column(o.sch.PrimaryKeyName())
 	if !ok {
 		return nil

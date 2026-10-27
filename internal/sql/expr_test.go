@@ -12,7 +12,6 @@ planner test.
 package sql
 
 import (
-	"strings"
 	"testing"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
@@ -155,20 +154,133 @@ func TestExprLikePrefix(t *testing.T) {
 	if !ok || e.Col != "a" || string(e.Val.Literal) != "ab%" {
 		t.Fatalf("a LIKE 'ab%%' = %#v, want LikeExpr on a with pattern ab%%", e)
 	}
-	// A pattern with no wildcard is a prefix match too (it matches one exact
-	// value), and must not be refused.
-	if err := checkLikePrefix([]byte("abc")); err != nil {
-		t.Errorf("wildcard-free pattern refused: %v", err)
+	// A pattern with no wildcard matches exactly one value, which is a prefix
+	// of itself, so it must still classify as a prefix pattern.
+	if pref, ok := likePrefixPattern([]byte("abc")); !ok || string(pref) != "abc" {
+		t.Errorf("likePrefixPattern(abc) = (%q, %v), want (abc, true)", pref, ok)
 	}
 }
 
-func TestExprLikeNonPrefixRefused(t *testing.T) {
+// A non-prefix pattern used to be refused; it is now answered by the general
+// matcher, because a client writing `LIKE '%ab'` is asking a question the
+// engine should answer rather than one it should reject.
+func TestExprLikeNonPrefixAccepted(t *testing.T) {
 	for _, pat := range []string{"%ab", "a%b", "a_b%", "a__", "_a"} {
 		q := "a LIKE '" + pat + "'"
-		if _, err := translateExpr(mustWhere(t, q)); err == nil {
-			t.Errorf("%q was accepted, want refused as a non-prefix pattern", q)
-		} else if !strings.Contains(err.Error(), "prefix match") {
-			t.Errorf("%q = %v, want a prefix-match refusal", q, err)
+		e, err := translateExpr(mustWhere(t, q))
+		if err != nil {
+			t.Errorf("%q refused: %v", q, err)
+			continue
+		}
+		le, ok := e.(*LikeExpr)
+		if !ok {
+			t.Errorf("%q = %T, want *LikeExpr", q, e)
+			continue
+		}
+		if pref, ok := likePrefixPattern(le.Val.Literal); ok {
+			t.Errorf("likePrefixPattern(%q) = (%q, true), want (nil, false)", pat, pref)
+		}
+	}
+}
+
+// The prefix classification is what separates HasPrefix from the matcher: only
+// an unescaped trailing % (or no wildcard at all) is answerable as a prefix.
+func TestLikePrefixPatternShapes(t *testing.T) {
+	for _, tc := range []struct {
+		pat  string
+		pref string
+		ok   bool
+	}{
+		{"pg%", "pg", true},
+		{"abc", "abc", true},
+		{"", "", true},
+		{"%ab", "", false},
+		{"a%b", "", false},
+		{"a_b", "", false},
+		{`\ab%`, "ab", true},
+		{`pg\_temp%`, "pg_temp", true},
+		{`a\`, `a\`, true},
+	} {
+		pref, ok := likePrefixPattern([]byte(tc.pat))
+		if ok != tc.ok || (ok && string(pref) != tc.pref) {
+			t.Errorf("likePrefixPattern(%q) = (%q, %v), want (%q, %v)", tc.pat, pref, ok, tc.pref, tc.ok)
+		}
+	}
+}
+
+// NOT LIKE must invert the match. The parser reports it as the LIKE
+// expression kind with the `!~~` operator, so reading only the kind would
+// return precisely the rows the client excluded.
+func TestExprNotLike(t *testing.T) {
+	e, ok := parseWhere(t, "a NOT LIKE 'pg%'").(*LikeExpr)
+	if !ok || !e.Not || string(e.Val.Literal) != "pg%" {
+		t.Fatalf("a NOT LIKE pg%% = %#v, want Not LikeExpr", e)
+	}
+	e, ok = parseWhere(t, "a LIKE 'pg%'").(*LikeExpr)
+	if !ok || e.Not {
+		t.Fatalf("a LIKE pg%% = %#v, want Not=false", e)
+	}
+	// A pattern that is not LIKE at all is refused rather than read as LIKE.
+	if _, err := translateExpr(mustWhere(t, "a SIMILAR TO 'x'")); err == nil {
+		t.Error("SIMILAR TO was accepted, want refused")
+	}
+}
+
+// `<>` and `!=` are one inequality node, and the value may arrive on either
+// side just as `=` may.
+func TestExprInequality(t *testing.T) {
+	for _, q := range []string{"a <> 5", "a != 5", "5 <> a"} {
+		e, ok := parseWhere(t, q).(*NeExpr)
+		if !ok || e.Col != "a" || string(e.Val.Literal) != "5" {
+			t.Errorf("%q = %#v, want NeExpr on a = 5", q, parseWhere(t, q))
+		}
+	}
+	if _, ok := parseWhere(t, "a <> NULL").(*FalseExpr); !ok {
+		t.Errorf("a <> NULL = %T, want *FalseExpr (no row qualifies)", parseWhere(t, "a <> NULL"))
+	}
+	if !exprHasLiteralOnly(parseWhere(t, "a <> 5")) {
+		t.Error("a <> 5 reported not literal-only")
+	}
+	if exprHasLiteralOnly(parseWhere(t, "a <> $1")) {
+		t.Error("a <> $1 reported literal-only; the value is a parameter")
+	}
+}
+
+// IN desugars to the OR it means; NOT IN to the AND of inequalities. A NULL
+// item in the list makes NOT IN never true, whatever the column holds.
+func TestExprInListDesugars(t *testing.T) {
+	e := parseWhere(t, "a IN (1, 2)")
+	b, ok := e.(*BoolExpr)
+	if !ok || b.Op != BoolOr || len(b.Args) != 2 {
+		t.Fatalf("a IN (1, 2) = %#v, want OR of two equalities", e)
+	}
+	for _, arg := range b.Args {
+		if c, ok := arg.(*CmpExpr); !ok || c.Col != "a" || c.Op != OpEq {
+			t.Errorf("IN operand = %#v, want equality on a", arg)
+		}
+	}
+	// One item collapses to the comparison itself.
+	if c, ok := parseWhere(t, "a IN (7)").(*CmpExpr); !ok || string(c.Val.Literal) != "7" {
+		t.Errorf("a IN (7) = %#v, want a = 7", parseWhere(t, "a IN (7)"))
+	}
+	e = parseWhere(t, "a NOT IN (1, 2)")
+	b, ok = e.(*BoolExpr)
+	if !ok || b.Op != BoolAnd || len(b.Args) != 2 {
+		t.Fatalf("a NOT IN (1, 2) = %#v, want AND of two inequalities", e)
+	}
+	for _, arg := range b.Args {
+		if _, ok := arg.(*NeExpr); !ok {
+			t.Errorf("NOT IN operand = %T, want *NeExpr", arg)
+		}
+	}
+	if _, ok := parseWhere(t, "a NOT IN (NULL)").(*FalseExpr); !ok {
+		t.Errorf("a NOT IN (NULL) = %T, want *FalseExpr (never true)", parseWhere(t, "a NOT IN (NULL)"))
+	}
+	e = parseWhere(t, "a IN (NULL)")
+	if b, ok := e.(*BoolExpr); !ok || b.Op != BoolOr || len(b.Args) != 0 {
+		// all-NULL IN folds to FALSE via dropFalse
+		if _, ok := e.(*FalseExpr); !ok {
+			t.Errorf("a IN (NULL) = %#v, want *FalseExpr", e)
 		}
 	}
 }
@@ -243,11 +355,36 @@ func TestExprUnsupportedRefused(t *testing.T) {
 		"a + 1 = 2", // arithmetic is not a comparison
 		"a = ANY(ARRAY[1])",
 		"(SELECT 1) = 1", // subquery
-		"a = b",          // two columns
 	} {
 		if _, err := translateExpr(mustWhere(t, q)); err == nil {
 			t.Errorf("%q was accepted, want refused", q)
 		}
+	}
+}
+
+// A comparison between two columns is a comparison the engine answers: the
+// bytes of one cell against the bytes of the other. It is what a comma join
+// writes in its WHERE clause, and what a compound ON clause names beyond its
+// join key.
+func TestExprColumnToColumn(t *testing.T) {
+	e, err := translateExpr(mustWhere(t, "a = b"))
+	if err != nil {
+		t.Fatalf("a = b was refused: %v", err)
+	}
+	c, ok := e.(*ColCmpExpr)
+	if !ok {
+		t.Fatalf("a = b translated to %T, want *ColCmpExpr", e)
+	}
+	if c.Left != "a" || c.Right != "b" || c.Op != OpEq || c.Not {
+		t.Errorf("a = b translated to %+v", c)
+	}
+	e, err = translateExpr(mustWhere(t, "a <> b"))
+	if err != nil {
+		t.Fatalf("a <> b was refused: %v", err)
+	}
+	c, ok = e.(*ColCmpExpr)
+	if !ok || !c.Not {
+		t.Fatalf("a <> b translated to %T, want a negated *ColCmpExpr", e)
 	}
 }
 

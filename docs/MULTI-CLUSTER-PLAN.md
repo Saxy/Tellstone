@@ -523,6 +523,12 @@ if T2 started after T1.
 (not full scan). Write performance with indexes within 20% of
 write without indexes.
 
+**Status: deferred.** Secondary indexes are a performance feature, not
+a client-compatibility requirement. The PostgreSQL compatibility work
+(Phase 16) needs only an empty or derived `pg_index` relation, so
+Phase 13 is not on the critical path to DataGrip. Revisit after client
+compatibility ships. See [PG-COMPAT-PLAN.md](PG-COMPAT-PLAN.md).
+
 ### Phase 14: Extended Query Protocol
 
 **Goal:** Full PostgreSQL wire protocol. ORM-compatible.
@@ -697,13 +703,34 @@ pgJDBC startup and introspection transcripts — the exact SQL the driver
 emits — replay green in CI as golden tests, and a `scripts/` smoke test
 asserts a clean connect against each tool's query set.
 
-**Sequencing and dependencies:** depends on Phase 13 (for `pg_index`
-fidelity), Phase 14 (extended query protocol for prepared introspection
-statements) and Phase 15 (joins, aggregates, `ORDER BY`, subqueries,
-set operations). The session/GUC work and FROM-less `SELECT` can land
-early and independently; the catalog work needs the SQL surface from
-Phase 15. A companion ADR should record the catalog-emulation approach,
-the OID scheme, and the fidelity boundary.
+**Sequencing and dependencies:** Phase 16 does **not** depend on
+Phase 13: `pg_index` can be an empty or derived stub, and secondary
+indexes are deferred (see Phase 13). It does rely on Phase 14's
+extended query protocol and on Phase 15's SQL surface (joins,
+aggregates, `ORDER BY`, subqueries), but only the part of that surface
+the clients actually use. The work is split so the independent part
+lands first:
+
+- **16a — Connect handshake and session GUCs.** Independent of the
+  catalog work, and the first thing every client needs: it is what
+  stops a client failing at its startup statements.
+- **16b — Introspection transcript harness, then the SQL surface subset
+  those transcripts need.** Record the exact SQL DataGrip and pgJDBC
+  emit as golden tests, then implement only the constructs they use
+  rather than all of Phase 15.
+- **16c: `pg_catalog` and `information_schema` emulation.** The long
+  pole, projected from the existing schema catalog so it cannot diverge.
+  [PG-COMPAT-PLAN.md](PG-COMPAT-PLAN.md) covers this stage and its
+  milestones in detail.
+
+`psql` (`\dt`, `\d <table>`, `\l`) is the recommended intermediate
+milestone: it needs far less SQL surface than DataGrip and de-risks the
+catalog work before the IDE is attempted.
+
+See [PG-COMPAT-PLAN.md](PG-COMPAT-PLAN.md) for the concrete stages,
+milestones, code touchpoints and the open decisions. A companion ADR
+should record the catalog-emulation approach, the OID scheme, and the
+fidelity boundary.
 
 **Non-goals:** byte-for-byte fidelity of every `pg_catalog` column;
 exotic catalogs (`pg_stat_*`, replication, extensions) may be static or
@@ -833,3 +860,11 @@ changes. Data is the same — only the interface changes.
 - [ADR-006: Geo-Based Routing](adr/006-geo-based-routing.md)
 - [ADR-007: Drop Redis Compatibility](adr/007-drop-redis-compatibility.md)
 - [ADR-008: Phase 1 Implementation Decisions](adr/008-phase1-implementation-decisions.md)
+- [ADR-009: Phase 1 Transport Status](adr/009-phase1-transport-status.md)
+- [ADR-010: Phase 2 PD/TSO Decisions](adr/010-phase2-pd-tso-decisions.md)
+- [ADR-011: Cross-Cluster Gateway](adr/011-cross-cluster-gateway.md)
+- [ADR-012: PostgreSQL Wire (Phase 8)](adr/012-postgresql-wire-phase8.md)
+- [ADR-013: Table Namespaces (Phase 9)](adr/013-table-namespaces-phase9.md)
+- [ADR-014: Phase 10 Optimizer](adr/014-phase10-optimizer.md)
+- [ADR-015: Serialized TSO for MVCC Ordering (Phase 12)](adr/015-serialized-tso-mvcc-ordering.md)
+- [ADR-016: PostgreSQL Client Compatibility for DataGrip](adr/016-postgresql-client-compatibility.md)

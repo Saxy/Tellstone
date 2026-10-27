@@ -24,6 +24,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"regexp"
 )
 
 // ---- Chunk framing ----
@@ -176,7 +177,9 @@ func (ts *tableScan) run(emit func(*Chunk) error) error {
 	return nil
 }
 
-func (ts *tableScan) projLen() uint16 { return uint16(len(ts.proj)) }
+// projLen is the chunk's column count: the projected schema columns plus the
+// trailing CASE cells the flush appends after them.
+func (ts *tableScan) projLen() uint16 { return uint16(len(ts.proj) + len(ts.cases)) }
 
 // matchNameBytes reports whether a column name equals a key suffix, without
 // materializing either side. It is the zero-allocation lookup the assembler
@@ -253,9 +256,146 @@ func (as *rowAssembler) flush() error {
 		}
 		as.dst.appendVal(cell.value)
 	}
+	// A CASE cell is appended after the projection, in the chunk's trailing
+	// columns, so the projected layout and the join's stay untouched. A nil
+	// result is NULL -- the absence of a key, not an empty value (ADR-013).
+	for k, cc := range as.cases {
+		v := cc.eval(as.cells)
+		if v == nil {
+			as.dst.setNull(row, uint32(len(as.proj)+k))
+			continue
+		}
+		as.dst.appendVal(v)
+	}
 	as.dst.Rows++
 	as.cur = as.cur[:0]
 	return nil
+}
+
+// compiledCase is one CASE target lowered for execution: its conditions as
+// compiled filters over schema-width row cells and its branch results in the
+// result type's storage encoding, so evaluation is a byte-level walk with no
+// decode -- the same discipline the residual filter follows (D5).
+type compiledCase struct {
+	typ     ColumnType
+	whens   []compiledCaseWhen
+	elseVal []byte
+	// elseSub is the ELSE branch's own CASE, when the branch is one.
+	elseSub *compiledCase
+}
+
+type compiledCaseWhen struct {
+	node *compiledNode
+	val  []byte
+	// sub is the branch's own CASE, when the branch is one rather than a
+	// literal.
+	sub *compiledCase
+}
+
+// compileCase binds a CASE's conditions and encodes its branch literals.
+// A nil result encodes as nil, which every consumer reads as NULL; an empty
+// string encodes as a zero-length value, which is a present cell (ADR-013).
+func (s *Server) compileCase(ct *caseTarget, sch *Schema, params []paramVal) (*compiledCase, error) {
+	cc := &compiledCase{typ: ct.Type}
+	for i := range ct.Whens {
+		if ct.Whens[i].expr == nil {
+			// planAccess translates conditions before anything executes; a
+			// nil one means that step was skipped, which is a bug to report
+			// rather than a query to mis-answer.
+			return nil, &pgError{code: errInternal, msg: "CASE condition was not translated"}
+		}
+		n, err := s.compileFilter(ct.Whens[i].expr, sch, params)
+		if err != nil {
+			return nil, err
+		}
+		if ct.Whens[i].sub != nil {
+			// The branch is a CASE of its own, so its value is computed
+			// from the same row.
+			sub, err := s.compileCase(ct.Whens[i].sub, sch, params)
+			if err != nil {
+				return nil, err
+			}
+			cc.whens = append(cc.whens, compiledCaseWhen{node: n, sub: sub})
+			continue
+		}
+		v, err := ct.encodeCaseResult(ct.Whens[i].lit)
+		if err != nil {
+			return nil, err
+		}
+		cc.whens = append(cc.whens, compiledCaseWhen{node: n, val: v})
+	}
+	if ct.ElseSub != nil {
+		sub, err := s.compileCase(ct.ElseSub, sch, params)
+		if err != nil {
+			return nil, err
+		}
+		cc.elseSub = sub
+	}
+	if ct.Else != nil {
+		v, err := ct.encodeCaseResult(*ct.Else)
+		if err != nil {
+			return nil, err
+		}
+		cc.elseVal = v
+	}
+	return cc, nil
+}
+
+// encodeCaseResult renders one branch literal in the result type's storage
+// encoding: raw bytes for text, the orderable 8-byte form for integers (both
+// int4- and int8-typed results store the same way, as every integer column
+// does), one byte for a boolean, nil for NULL.
+func (ct *caseTarget) encodeCaseResult(l caseLit) ([]byte, error) {
+	if l.null {
+		return nil, nil
+	}
+	switch ct.Type {
+	case TypeVarchar:
+		return []byte(l.s), nil
+	case TypeInt, TypeBigInt:
+		return EncodeValue(ct.Type, l.i)
+	case TypeBool:
+		return EncodeValue(TypeBool, l.b)
+	}
+	return nil, &pgError{code: errInternal, msg: "unreachable CASE result type"}
+}
+
+// eval runs one row through the CASE: the first condition that evaluates true
+// yields its branch's bytes, else the ELSE branch, else NULL.
+func (cc *compiledCase) eval(cells rowCells) []byte {
+	for _, w := range cc.whens {
+		if w.node.eval(cells) {
+			if w.sub != nil {
+				return w.sub.eval(cells)
+			}
+			return w.val
+		}
+	}
+	if cc.elseSub != nil {
+		return cc.elseSub.eval(cells)
+	}
+	return cc.elseVal
+}
+
+// compileCases lowers every CASE target of a plan and reports the output
+// positions each one fills. Both the scan and the point-lookup path compile
+// the same way, so a condition's errors (a missing column, an unbindable
+// parameter) surface identically however the row is reached.
+func (s *Server) compileCases(plan *Plan, sch *Schema, params []paramVal) ([]*compiledCase, map[int]int, error) {
+	if len(plan.Cases) == 0 {
+		return nil, nil, nil
+	}
+	ccases := make([]*compiledCase, 0, len(plan.Cases))
+	at := make(map[int]int, len(plan.Cases))
+	for k := range plan.Cases {
+		cc, err := s.compileCase(&plan.Cases[k], sch, params)
+		if err != nil {
+			return nil, nil, err
+		}
+		ccases = append(ccases, cc)
+		at[plan.Cases[k].Pos] = len(ccases) - 1
+	}
+	return ccases, at, nil
 }
 
 // ---- residual filter ----
@@ -315,7 +455,79 @@ func (s *Server) compileFilter(e Expr, sch *Schema, params []paramVal) (*compile
 		if err != nil {
 			return nil, err
 		}
-		return &compiledNode{f: &compiledFilter{col: idx, like: pat}}, nil
+		// A trailing-wildcard-only pattern answers by HasPrefix; anything wider
+		// answers by the matcher. Both are decided here, where the bytes are
+		// known, so a bound parameter takes the same path a literal does.
+		if pref, ok := likePrefixPattern(pat); ok {
+			return &compiledNode{f: &compiledFilter{col: idx, like: pref, not: t.Not}}, nil
+		}
+		return &compiledNode{f: &compiledFilter{col: idx, pat: pat, not: t.Not}}, nil
+	case *NeExpr:
+		idx, ok := sch.columnIndex(t.Col)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", t.Col)}
+		}
+		if paramBoundNull(t.Val, params) {
+			// `col <> NULL` is UNKNOWN: no row qualifies.
+			return &compiledNode{lit: true, val: false}, nil
+		}
+		enc, isNull, err := resolveColumnRef(&sch.Columns[idx], t.Val, params)
+		if err != nil {
+			return nil, err
+		}
+		if isNull {
+			return &compiledNode{lit: true, val: false}, nil
+		}
+		return &compiledNode{f: &compiledFilter{col: idx, enc: enc, ne: true}}, nil
+	case *ColCmpExpr:
+		// A comparison between two columns of the same row. The bytes are
+		// only comparable when both columns share a type, because the
+		// comparison is a byte compare over the storage encoding.
+		li, ok := sch.columnIndex(t.Left)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", t.Left)}
+		}
+		ri, ok := sch.columnIndex(t.Right)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", t.Right)}
+		}
+		if sch.Columns[li].Type != sch.Columns[ri].Type {
+			return nil, &pgError{code: errFeatureNotSupported, msg: fmt.Sprintf("cannot compare columns of types %s and %s", sch.Columns[li].Type.String(), sch.Columns[ri].Type.String())}
+		}
+		return &compiledNode{f: &compiledFilter{col: li, col2: ri, twoCol: true, ne: t.Not, op: t.Op}}, nil
+	case *RegexExpr:
+		idx, ok := sch.columnIndex(t.Col)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", t.Col)}
+		}
+		if paramBoundNull(t.Val, params) {
+			// `col ~ NULL` is UNKNOWN: no row qualifies.
+			return &compiledNode{lit: true, val: false}, nil
+		}
+		pat, isNull, err := resolveColumnRef(&sch.Columns[idx], t.Val, params)
+		if err != nil {
+			return nil, err
+		}
+		if isNull {
+			return &compiledNode{lit: true, val: false}, nil
+		}
+		if sch.Columns[idx].Type != TypeVarchar {
+			return nil, &pgError{code: errDatatypeMismatch, msg: fmt.Sprintf("a regular expression match needs a text column, not type %s", sch.Columns[idx].Type.String())}
+		}
+		re, err := regexp.Compile(string(pat))
+		if err != nil {
+			return nil, &pgError{code: errInvalidTextRepresentation, msg: fmt.Sprintf("invalid regular expression: %v", err)}
+		}
+		return &compiledNode{f: &compiledFilter{col: idx, re: re, not: t.Not}}, nil
+	case *BoolColExpr:
+		idx, ok := sch.columnIndex(t.Col)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", t.Col)}
+		}
+		if sch.Columns[idx].Type != TypeBool {
+			return nil, &pgError{code: errDatatypeMismatch, msg: fmt.Sprintf("argument of a condition must be type boolean, not type %s", sch.Columns[idx].Type.String())}
+		}
+		return &compiledNode{f: &compiledFilter{col: idx, boolCol: true}}, nil
 	case *BoolExpr:
 		args := make([]*compiledNode, 0, len(t.Args))
 		for _, a := range t.Args {
@@ -344,10 +556,10 @@ func paramBoundNull(v ValRef, params []paramVal) bool {
 // NULL was the value's state, not a mistake.
 var errLikePatternNull = fmt.Errorf("sql: LIKE pattern is NULL")
 
-// likePattern resolves a LIKE pattern to its prefix bytes: the compiled value a
-// row's storage bytes are checked against with HasPrefix. The trailing '%' is
-// what makes it a prefix; the translator already rejected any other wildcard
-// shape for a literal, and a parameterized pattern is checked when it is bound.
+// likePattern resolves a LIKE pattern to the bytes the matcher reads. The shape
+// (prefix or general) is decided by the caller with likePrefixPattern, at plan
+// time for a literal and here for a parameter, where the bound bytes are known
+// for both alike.
 func (s *Server) likePattern(col *Column, v ValRef, params []paramVal) ([]byte, error) {
 	pat, isNull, err := resolveColumnRef(col, v, params)
 	if err != nil {
@@ -355,18 +567,11 @@ func (s *Server) likePattern(col *Column, v ValRef, params []paramVal) ([]byte, 
 	}
 	if isNull {
 		// `col LIKE NULL` is UNKNOWN, so no row qualifies. An always-false node
-		// is invented rather than a zero-length prefix, which would match every
+		// is invented rather than a zero-length pattern, which would match every
 		// value.
 		return nil, errLikePatternNull
 	}
-	if v.Param > 0 {
-		// A parameterized pattern's shape cannot be checked at translation,
-		// only here, where the bound bytes are known.
-		if err := checkLikePrefix(pat); err != nil {
-			return nil, err
-		}
-	}
-	return bytes.TrimSuffix(pat, []byte("%")), nil
+	return pat, nil
 }
 
 // alwaysFalse reports whether a compiled filter matches no row at all. It lets
@@ -416,11 +621,60 @@ func (f *compiledFilter) eval(cells rowCells) bool {
 	}
 	if !cells[f.col].set {
 		// A comparison against an absent column (NULL) is UNKNOWN, so the row
-		// does not qualify.
+		// does not qualify -- for an inequality as much as for an equality.
 		return false
 	}
-	if f.like != nil {
-		return bytes.HasPrefix(cells[f.col].value, f.like)
+	if f.re != nil {
+		matched := f.re.Match(cells[f.col].value)
+		if f.not {
+			return !matched
+		}
+		return matched
+	}
+	if f.boolCol {
+		// The cell is the condition. A boolean is stored as one byte, and a
+		// NULL cell has already been rejected above: it is UNKNOWN, which
+		// drops the row.
+		return len(cells[f.col].value) > 0 && cells[f.col].value[0] != 0
+	}
+	if f.twoCol {
+		// Two columns of the same row. A NULL on either side is UNKNOWN, so
+		// the row does not qualify -- the same answer `=` gives when one
+		// side is NULL.
+		if !cells[f.col2].set {
+			return false
+		}
+		if f.ne {
+			return !bytes.Equal(cells[f.col].value, cells[f.col2].value)
+		}
+		switch f.op {
+		case OpEq:
+			return bytes.Equal(cells[f.col].value, cells[f.col2].value)
+		case OpLt:
+			return bytes.Compare(cells[f.col].value, cells[f.col2].value) < 0
+		case OpLe:
+			return bytes.Compare(cells[f.col].value, cells[f.col2].value) <= 0
+		case OpGt:
+			return bytes.Compare(cells[f.col].value, cells[f.col2].value) > 0
+		case OpGe:
+			return bytes.Compare(cells[f.col].value, cells[f.col2].value) >= 0
+		}
+		return false
+	}
+	if f.ne {
+		return !bytes.Equal(cells[f.col].value, f.enc)
+	}
+	if f.like != nil || f.pat != nil {
+		var matched bool
+		if f.pat != nil {
+			matched = likeMatch(cells[f.col].value, f.pat)
+		} else {
+			matched = bytes.HasPrefix(cells[f.col].value, f.like)
+		}
+		if f.not {
+			return !matched
+		}
+		return matched
 	}
 	switch f.op {
 	case OpEq:

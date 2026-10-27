@@ -220,6 +220,12 @@ func selectivityOf(e Expr, rows float64, allowGeneric bool) float64 {
 		return 0
 	case *CmpExpr:
 		return selGenericCompare
+	case *NeExpr:
+		// An inequality excludes little -- every value but one -- and with no
+		// histograms the honest figure is "most rows". selGenericCompare is
+		// used rather than 1 because NOT over the estimate has to stay high:
+		// `NOT (a <> 1)` matches about as rarely as `a = 1`.
+		return selGenericCompare
 	case *NullTestExpr:
 		return selNullTest
 	case *LikeExpr:

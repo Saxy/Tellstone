@@ -147,22 +147,89 @@ type NullTestExpr struct {
 
 func (*NullTestExpr) exprNode() {}
 
-// LikeExpr is `column LIKE pattern`, restricted to a trailing-wildcard pattern.
+// LikeExpr is `column LIKE pattern` and `column NOT LIKE pattern`.
 //
-// Only a pattern whose sole wildcard is a trailing `%` is accepted. `_` matches
-// exactly one byte and is therefore not a prefix, and a `%` anywhere but the end
-// constrains the middle of the value, which no key range can express. Widening
-// either into a range would return rows the client did not ask for, which is a
-// wrong answer rather than a slow one (ADR-014 guardrail 6).
+// Any pattern shape is accepted: a pattern whose only wildcard is a trailing
+// `%` compiles to a prefix test the planner may also use as a key range, and
+// anything wider (`_`, a `%` in the middle, a leading wildcard) compiles to a
+// residual matcher that tests every row the scan yields. Neither shape can
+// return rows the client did not ask for: the wide one is slower, not wrong
+// (ADR-014 guardrail 6). A backslash escapes the next pattern byte, which is
+// how `LIKE 'pg\_temp%'` names a literal underscore.
 type LikeExpr struct {
 	Col string
 	// Val is the pattern. It is a ValRef rather than a string so that a
-	// parameterized pattern (`LIKE $1`) can be carried, but such a pattern
-	// cannot be resolved to a range at plan time and stays a residual filter.
+	// parameterized pattern (`LIKE $1`) can be carried; its shape is decided
+	// when the value is known, at plan time for a literal and at Bind for a
+	// parameter.
 	Val ValRef
+	// Not inverts the match, which is what NOT LIKE means. It lives on the
+	// node rather than in a wrapper because the parser reports NOT LIKE as
+	// the same expression kind as LIKE with the opposite operator.
+	Not bool
 }
 
 func (*LikeExpr) exprNode() {}
+
+// NeExpr is `column <> value`, the inequality the comparison set deliberately
+// does not include: it cannot narrow a key range, so it exists only as a
+// residual leaf that tests one cell against the literal's encoding. A NULL
+// column yields UNKNOWN and so matches no row, exactly as `=` does.
+type NeExpr struct {
+	Col string
+	Val ValRef
+}
+
+func (*NeExpr) exprNode() {}
+
+// ColCmpExpr is `column <op> column`: a comparison between two columns of the
+// same row. It exists because a client's introspection queries join tables
+// with the condition written in the WHERE clause rather than in an ON -- the
+// comma join `FROM a, b WHERE a.x = b.y` is the shape PostgreSQL's own
+// metadata queries use -- and because a compound ON clause names more than
+// one pair of columns. The two sides are compared as bytes, which is only
+// meaningful when both columns share a type; the compiler refuses the
+// comparison otherwise rather than comparing encodings that do not order the
+// same way.
+type ColCmpExpr struct {
+	Left  string
+	Right string
+	Op    CmpOp
+	// Not marks the inequality `<>`, which the comparison operator set does
+	// not carry: a residual leaf can express it, a key range cannot.
+	Not bool
+}
+
+func (*ColCmpExpr) exprNode() {}
+
+// RegexExpr is `column ~ pattern` and `column !~ pattern`: the regular
+// expression match.
+//
+// The pattern is a POSIX regular expression, which is what PostgreSQL's own
+// metadata queries use to exclude the system schemas (`nspname !~ '^pg_'`).
+// The match is decided against the column's text, so it is a match on a text
+// column rather than on an arbitrary value's encoding.
+type RegexExpr struct {
+	Col string
+	Val ValRef
+	// Not inverts the match, which is what !~ means.
+	Not bool
+}
+
+func (*RegexExpr) exprNode() {}
+
+// BoolColExpr is a boolean column used as a predicate in its own right:
+// `WHERE dropped`, or the `NOT dropped` that is its negation.
+//
+// PostgreSQL allows a boolean column where a condition is expected, and a
+// client's introspection queries use it: `AND NOT a.attisdropped` is how a
+// column's own flag is consulted. The cell decides: a NULL flag is UNKNOWN
+// and so matches no row, exactly as a comparison against NULL does.
+type BoolColExpr struct {
+	Col string
+}
+
+func (*BoolColExpr) exprNode() {}
 
 // TrueExpr matches every row. It exists so that a filter the planner proves
 // always true is representable without collapsing the tree to a nil Expr: nil
@@ -190,6 +257,14 @@ func translateExpr(node *pg_query.Node) (Expr, error) {
 		return translateNullTest(node.GetNullTest())
 	case node.GetAExpr() != nil:
 		return translateAExpr(node.GetAExpr())
+	case node.GetColumnRef() != nil:
+		// A column in a condition's own right: PostgreSQL reads a boolean
+		// column as the condition it holds.
+		name, ok := plainColumn(node)
+		if !ok {
+			return nil, fmt.Errorf("%w: a condition must name a plain column", errUnsupported)
+		}
+		return &BoolColExpr{Col: name}, nil
 	}
 	// A bare boolean constant is a filter in its own right: `WHERE TRUE` admits
 	// every row and `WHERE FALSE` admits none. The parser spells these as an
@@ -336,6 +411,13 @@ func translateAExpr(ae *pg_query.A_Expr) (Expr, error) {
 	if ae.GetKind() == pg_query.A_Expr_Kind_AEXPR_LIKE {
 		return translateLike(ae)
 	}
+	// IN and NOT IN are one parser kind distinguished by the operator: `IN`
+	// arrives with `=`, NOT IN with `<>`. Both are desugared into the
+	// comparisons they mean, which is what PostgreSQL defines them as, so the
+	// tree, the planner and the filter each keep one representation of them.
+	if ae.GetKind() == pg_query.A_Expr_Kind_AEXPR_IN {
+		return translateInList(ae)
+	}
 	if ae.GetKind() != pg_query.A_Expr_Kind_AEXPR_OP {
 		return nil, fmt.Errorf("%w: unsupported operator expression", errUnsupported)
 	}
@@ -343,19 +425,60 @@ func translateAExpr(ae *pg_query.A_Expr) (Expr, error) {
 	if len(names) != 1 || names[0].GetString_() == nil {
 		return nil, fmt.Errorf("%w: operator is not a simple name", errUnsupported)
 	}
-	op, ok := cmpOpFor(names[0].GetString_().GetSval())
-	if !ok {
-		return nil, fmt.Errorf("%w: comparison operator %q is not supported", errUnsupported, names[0].GetString_().GetSval())
-	}
+	name := names[0].GetString_().GetSval()
 	lexpr, rexpr := ae.GetLexpr(), ae.GetRexpr()
 
 	// The column may be on either side. Reading only the left would reject
 	// `5 = id`, which is the same question asked the other way round.
 	lcol, lIsCol := plainColumn(lexpr)
 	rcol, rIsCol := plainColumn(rexpr)
+	if name == "<>" || name == "!=" {
+		switch {
+		case lIsCol && rIsCol:
+			return &ColCmpExpr{Left: lcol, Right: rcol, Op: OpEq, Not: true}, nil
+		case rIsCol:
+			ref, err := valueRefOrNull(lexpr, rcol)
+			if err != nil {
+				return nil, err
+			}
+			return newNe(rcol, ref)
+		case lIsCol:
+			ref, err := valueRefOrNull(rexpr, lcol)
+			if err != nil {
+				return nil, err
+			}
+			return newNe(lcol, ref)
+		}
+		return nil, fmt.Errorf("%w: a comparison needs one column and one value", errUnsupported)
+	}
+	if name == "~" || name == "!~" {
+		// The regular expression match. The column may be on either side, as
+		// with a comparison.
+		switch {
+		case lIsCol && rIsCol:
+			return nil, fmt.Errorf("%w: a regular expression match needs one column and one pattern", errUnsupported)
+		case rIsCol:
+			ref, err := valueRefOrNull(lexpr, rcol)
+			if err != nil {
+				return nil, err
+			}
+			return newRegex(rcol, ref, name == "!~")
+		case lIsCol:
+			ref, err := valueRefOrNull(rexpr, lcol)
+			if err != nil {
+				return nil, err
+			}
+			return newRegex(lcol, ref, name == "!~")
+		}
+		return nil, fmt.Errorf("%w: a regular expression match needs one column and one pattern", errUnsupported)
+	}
+	op, ok := cmpOpFor(name)
+	if !ok {
+		return nil, fmt.Errorf("%w: comparison operator %q is not supported", errUnsupported, name)
+	}
 	switch {
 	case lIsCol && rIsCol:
-		return nil, fmt.Errorf("%w: a comparison needs one column and one value", errUnsupported)
+		return &ColCmpExpr{Left: lcol, Right: rcol, Op: op}, nil
 	case rIsCol:
 		// Value on the left. Invert so the tree always reads column-first.
 		op, _ = op.invert()
@@ -372,6 +495,91 @@ func translateAExpr(ae *pg_query.A_Expr) (Expr, error) {
 		return newCmp(lcol, op, ref)
 	}
 	return nil, fmt.Errorf("%w: a comparison needs one column and one value", errUnsupported)
+}
+
+// newNe builds an inequality, collapsing `col <> NULL` the same way newCmp
+// collapses a comparison against NULL: the result is UNKNOWN, and a filter
+// that admits no row is the honest form of that.
+func newNe(col string, ref ValRef) (Expr, error) {
+	if ref.Null {
+		return &FalseExpr{}, nil
+	}
+	return &NeExpr{Col: col, Val: ref}, nil
+}
+
+// newRegex builds a regular expression match, collapsing `col ~ NULL` the
+// same way newCmp collapses a comparison against NULL: the result is UNKNOWN,
+// and a filter that admits no row is the honest form of that.
+func newRegex(col string, ref ValRef, not bool) (Expr, error) {
+	if ref.Null {
+		return &FalseExpr{}, nil
+	}
+	return &RegexExpr{Col: col, Val: ref, Not: not}, nil
+}
+
+// translateInList reads `column IN (...)` and `column NOT IN (...)` into the
+// OR of equalities and the AND of inequalities they mean. A NULL item in the
+// list makes `IN` contribute nothing where it does not match (UNKNOWN is
+// false in a WHERE clause) and makes NOT IN never true at all, so the whole
+// term collapses to FALSE before it can return a row PostgreSQL would not.
+// Each item may be a literal or a parameter; a subquery in the list is a
+// different node and never reaches here.
+func translateInList(ae *pg_query.A_Expr) (Expr, error) {
+	col, ok := plainColumn(ae.GetLexpr())
+	if !ok {
+		return nil, fmt.Errorf("%w: IN needs a plain column on the left", errUnsupported)
+	}
+	list := ae.GetRexpr().GetList()
+	if list == nil || len(list.GetItems()) == 0 {
+		return nil, fmt.Errorf("%w: IN needs at least one value", errUnsupported)
+	}
+	not := false
+	if names := ae.GetName(); len(names) == 1 && names[0].GetString_() != nil {
+		not = names[0].GetString_().GetSval() == "<>"
+	}
+	args := make([]Expr, 0, len(list.GetItems()))
+	for _, item := range list.GetItems() {
+		ref, err := valueRefOrNull(item, col)
+		if err != nil {
+			return nil, err
+		}
+		if ref.Null {
+			if not {
+				return &FalseExpr{}, nil
+			}
+			args = append(args, &FalseExpr{})
+			continue
+		}
+		if not {
+			n, err := newNe(col, ref)
+			if err != nil {
+				return nil, err
+			}
+			args = append(args, n)
+			continue
+		}
+		args = append(args, &CmpExpr{Col: col, Op: OpEq, Val: ref})
+	}
+	if not {
+		// NOT IN never yields a NULL operand here: a NULL item returned FALSE
+		// above, and newNe collapses an inequality against NULL for the same
+		// reason -- UNKNOWN is not a row the filter admits.
+		if len(args) == 1 {
+			return args[0], nil
+		}
+		return &BoolExpr{Op: BoolAnd, Args: args}, nil
+	}
+	// `x IN (a b)` means `x = a OR x = b`, with the UNKNOWN operands a NULL
+	// item contributes dropped: in a WHERE clause UNKNOWN and FALSE both
+	// reject the row, which is what dropping them does.
+	args = dropFalse(args)
+	switch len(args) {
+	case 0:
+		return &FalseExpr{}, nil
+	case 1:
+		return args[0], nil
+	}
+	return &BoolExpr{Op: BoolOr, Args: args}, nil
 }
 
 // newCmp builds a comparison, collapsing the cases that carry no information for
@@ -429,9 +637,23 @@ func translateLike(ae *pg_query.A_Expr) (Expr, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: LIKE needs a plain column on the left", errUnsupported)
 	}
+	not := false
+	if names := ae.GetName(); len(names) == 1 && names[0].GetString_() != nil {
+		switch names[0].GetString_().GetSval() {
+		case "~~":
+		case "!~~":
+			// The parser reports NOT LIKE as this expression kind with the
+			// opposite operator; reading it as LIKE would silently return
+			// exactly the rows the client excluded.
+			not = true
+		default:
+			return nil, fmt.Errorf("%w: only LIKE and NOT LIKE are supported", errUnsupported)
+		}
+	}
 	// The pattern is taken as a value reference rather than a string so a
-	// parameter is representable. Only a literal can be checked for the
-	// trailing-wildcard shape here; a parameter is checked when it is bound.
+	// parameter is representable. Its shape (prefix or general) is decided at
+	// compile time, where the bytes are known for both a literal and a bound
+	// parameter.
 	pat, err := valueRefOrNull(ae.GetRexpr(), col)
 	if err != nil {
 		return nil, err
@@ -440,32 +662,81 @@ func translateLike(ae *pg_query.A_Expr) (Expr, error) {
 		// `col LIKE NULL` is UNKNOWN, so no row qualifies.
 		return &FalseExpr{}, nil
 	}
-	if pat.Param == 0 {
-		if err := checkLikePrefix(pat.Literal); err != nil {
-			return nil, err
-		}
-	}
-	return &LikeExpr{Col: col, Val: pat}, nil
+	return &LikeExpr{Col: col, Val: pat, Not: not}, nil
 }
 
-// checkLikePrefix enforces that a literal pattern is a prefix match. The rule
-// is deliberately narrow: the only wildcard allowed is a single `%` at the very
-// end. `_` is one-byte-wildcard, and a `%` in the middle constrains a byte range
-// that no key prefix can express.
-func checkLikePrefix(pattern []byte) error {
-	seen := false
-	for i, b := range pattern {
-		switch b {
-		case '_':
-			return fmt.Errorf("%w: LIKE pattern %q is not a prefix match: _ matches one byte", errUnsupported, pattern)
-		case '%':
-			if seen || i != len(pattern)-1 {
-				return fmt.Errorf("%w: LIKE pattern %q is not a prefix match: %% must be the last character", errUnsupported, pattern)
+// likePrefixPattern reports whether a LIKE pattern matches only a prefix of
+// the value -- its sole wildcard an unescaped trailing `%`, no `_` anywhere --
+// and returns that prefix with the trailing `%` and any escape backslashes
+// removed. Such a pattern compiles to a HasPrefix test the planner may also
+// turn into a key range; every other shape returns ok=false and compiles to
+// the general matcher instead. A backslash escapes the next byte in both
+// directions, so `pg\_temp%` prefixes literally on `pg_temp`.
+func likePrefixPattern(pattern []byte) (prefix []byte, ok bool) {
+	var b []byte
+	for i := 0; i < len(pattern); i++ {
+		switch pattern[i] {
+		case '\\':
+			if i+1 >= len(pattern) {
+				// A trailing backslash is a literal backslash.
+				b = append(b, '\\')
+				continue
 			}
-			seen = true
+			i++
+			b = append(b, pattern[i])
+		case '_':
+			return nil, false
+		case '%':
+			if i != len(pattern)-1 {
+				return nil, false
+			}
+			return b, true
+		default:
+			b = append(b, pattern[i])
 		}
 	}
-	return nil
+	// No wildcard at all: the pattern matches exactly, which is a prefix of
+	// itself and therefore answerable by HasPrefix.
+	return b, true
+}
+
+// likeMatch reports whether a value matches a LIKE pattern: `%` matches any
+// run of bytes (including none), `_` matches exactly one, a backslash escapes
+// the byte after it, and everything else matches itself. A trailing backslash
+// is a literal backslash, as PostgreSQL reads one.
+//
+// The recursion tries every split point a `%` allows, so a pattern of n
+// wildcards over a value of m bytes costs O(n*m) in the usual case and can
+// degenerate worse on adversarial input like `a%a%a%a%b` against a long run of
+// `a`. That is bounded by the statement's own pattern, is the cost of
+// answering the shape at all, and is what keeps the answer correct: a
+// non-prefix pattern is answered by the matcher rather than refused.
+func likeMatch(s, pat []byte) bool {
+	if len(pat) == 0 {
+		return len(s) == 0
+	}
+	switch pat[0] {
+	case '%':
+		// Consecutive percent signs are one wildcard.
+		for len(pat) > 1 && pat[1] == '%' {
+			pat = pat[1:]
+		}
+		for i := 0; i <= len(s); i++ {
+			if likeMatch(s[i:], pat[1:]) {
+				return true
+			}
+		}
+		return false
+	case '_':
+		return len(s) > 0 && likeMatch(s[1:], pat[1:])
+	case '\\':
+		if len(pat) == 1 {
+			return len(s) > 0 && s[0] == '\\' && likeMatch(s[1:], pat[1:])
+		}
+		return len(s) > 0 && s[0] == pat[1] && likeMatch(s[1:], pat[2:])
+	default:
+		return len(s) > 0 && s[0] == pat[0] && likeMatch(s[1:], pat[1:])
+	}
 }
 
 // plainColumn reports the column a node names, and false for anything else --
@@ -530,10 +801,26 @@ func exprColumns(e Expr) []string {
 		switch t := n.(type) {
 		case *CmpExpr:
 			col = t.Col
+		case *NeExpr:
+			col = t.Col
 		case *NullTestExpr:
 			col = t.Col
 		case *LikeExpr:
 			col = t.Col
+		case *BoolColExpr:
+			col = t.Col
+		case *RegexExpr:
+			col = t.Col
+		case *ColCmpExpr:
+			// Both sides are read, so both are reported: a reference to
+			// either one has to resolve against the schema.
+			for _, c := range []string{t.Left, t.Right} {
+				if c != "" && !seen[c] {
+					seen[c] = true
+					out = append(out, c)
+				}
+			}
+			return true
 		default:
 			return true
 		}
@@ -569,12 +856,40 @@ func mapExprCols(e Expr, fn func(string) (string, error)) (Expr, error) {
 			return nil, err
 		}
 		return &NullTestExpr{Col: col, Not: t.Not}, nil
+	case *NeExpr:
+		col, err := fn(t.Col)
+		if err != nil {
+			return nil, err
+		}
+		return &NeExpr{Col: col, Val: t.Val}, nil
 	case *LikeExpr:
 		col, err := fn(t.Col)
 		if err != nil {
 			return nil, err
 		}
-		return &LikeExpr{Col: col, Val: t.Val}, nil
+		return &LikeExpr{Col: col, Val: t.Val, Not: t.Not}, nil
+	case *BoolColExpr:
+		col, err := fn(t.Col)
+		if err != nil {
+			return nil, err
+		}
+		return &BoolColExpr{Col: col}, nil
+	case *RegexExpr:
+		col, err := fn(t.Col)
+		if err != nil {
+			return nil, err
+		}
+		return &RegexExpr{Col: col, Val: t.Val, Not: t.Not}, nil
+	case *ColCmpExpr:
+		left, err := fn(t.Left)
+		if err != nil {
+			return nil, err
+		}
+		right, err := fn(t.Right)
+		if err != nil {
+			return nil, err
+		}
+		return &ColCmpExpr{Left: left, Right: right, Op: t.Op, Not: t.Not}, nil
 	case *BoolExpr:
 		args := make([]Expr, 0, len(t.Args))
 		for _, a := range t.Args {
@@ -598,6 +913,11 @@ func exprHasLiteralOnly(e Expr) bool {
 	walkExpr(e, func(n Expr) bool {
 		switch t := n.(type) {
 		case *CmpExpr:
+			if t.Val.Param != 0 {
+				ok = false
+				return false
+			}
+		case *NeExpr:
 			if t.Val.Param != 0 {
 				ok = false
 				return false

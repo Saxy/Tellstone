@@ -128,14 +128,20 @@ type txnState struct {
 	// statement after a failure is refused until the block ends, and a COMMIT
 	// of a failed block is reported as ROLLBACK.
 	failed bool
+
+	// localGUCs holds the SET LOCAL overrides issued during the block. They are
+	// discarded when the block ends, whether by COMMIT or ROLLBACK, so the
+	// session value set before the block shows through again (ADR-016 D6).
+	localGUCs map[string]string
 }
 
 func newTxnState(startTS uint64, base Store) *txnState {
 	return &txnState{
-		startTS: startTS,
-		base:    base,
-		writes:  map[string]*txnWrite{},
-		reads:   map[string]struct{}{},
+		startTS:   startTS,
+		base:      base,
+		writes:    map[string]*txnWrite{},
+		reads:     map[string]struct{}{},
+		localGUCs: map[string]string{},
 	}
 }
 

@@ -39,6 +39,24 @@ type execOutcome struct {
 	tag        string
 	rows       [][][]byte
 	selectRows bool
+	// notices carries non-fatal NoticeResponse messages the statement wants
+	// the client to see, such as the warning for a SET LOCAL outside a
+	// transaction block. Execution produces them; the wire layer emits them
+	// before the CommandComplete so a client sees them in order.
+	notices []noticeInfo
+	// paramStatus carries the ParameterStatus updates a SET produced for a
+	// variable PostgreSQL reports over the wire (application_name, TimeZone,
+	// ...). The wire layer sends them with the statement's result so a client
+	// that changed a reported setting learns the engine accepted it.
+	paramStatus [][2]string
+}
+
+// noticeInfo is one NoticeResponse: its SQLSTATE code and message text. The
+// severity is always WARNING; no supported statement raises a notice at any
+// other severity.
+type noticeInfo struct {
+	code string
+	msg  string
 }
 
 // isDDL reports whether a statement changes the schema.
@@ -157,12 +175,27 @@ func authKeys(plan *Plan, params []paramVal) (keys [][]byte, tables []string, er
 		}
 		return [][]byte{key}, []string{plan.Table}, nil
 	}
-	return [][]byte{
-			[]byte(TablePrefix(DefaultDB, plan.Join.Left)),
-			[]byte(TablePrefix(DefaultDB, plan.Join.Right)),
-		},
-		[]string{plan.Join.Left, plan.Join.Right},
-		nil
+	tables = joinTables(plan)
+	keys = make([][]byte, len(tables))
+	for i, t := range tables {
+		keys[i] = []byte(TablePrefix(DefaultDB, t))
+	}
+	return keys, tables, nil
+}
+
+// joinTables names the tables a join reads, in the order their keys are
+// given: the two it joins, and the tables of the join it is built on, when the
+// left side is itself a join. A statement that joins three tables reads three,
+// and a session must be allowed to read each of them.
+func joinTables(plan *Plan) []string {
+	if plan.Join == nil {
+		return nil
+	}
+	tables := []string{plan.Join.Left, plan.Join.Right}
+	if plan.Join.Inner != nil {
+		tables = append(joinTables(plan.Join.Inner), tables...)
+	}
+	return tables
 }
 
 // authorize applies the session's command bit and key prefixes to a plan and
@@ -173,7 +206,29 @@ func authKeys(plan *Plan, params []paramVal) (keys [][]byte, tables []string, er
 // types, which means reading the table's schema, and that must not happen for a
 // statement the session is not allowed to run.
 func (s *Server) authorize(c *pgConn, plan *Plan, params []paramVal) error {
+	// Whether the plan reads a virtual catalog relation is settled here,
+	// before the session's grants are consulted: a catalog read is not a
+	// read of the client's own data, and it has no key to match a grant
+	// against. The decision is also needed by the execution path, which asks
+	// the store for the projection, so it is recorded on the plan.
+	s.markVirtual(plan)
 	if c.auth == nil || c.auth.session == nil {
+		return nil
+	}
+	// A statement that names no table has no key to authorize against: SET,
+	// SHOW, a FROM-less SELECT and an empty query touch no catalog data, so
+	// there is nothing a role could be denied. They are accepted regardless
+	// of the session's grants, matching a client's expectation that a
+	// connection probe works.
+	switch plan.Kind {
+	case StmtSet, StmtShow, StmtSelectExpr, StmtEmpty:
+		return nil
+	}
+	// A read of the virtual catalog relations is not a read of the client's
+	// own data: it exposes the engine's schema, which every session may
+	// inspect. The grants name tables, and a catalog relation is not one of
+	// them, so there is no key to match a grant against.
+	if plan.Virtual {
 		return nil
 	}
 	keys, tables, err := authKeys(plan, params)
@@ -225,6 +280,12 @@ func (s *Server) executeStmt(c *pgConn, plan *Plan, params []paramVal) (*execOut
 		return s.execCommit(c)
 	case StmtRollback:
 		return s.execRollback(c)
+	case StmtSet:
+		return s.execSet(c, plan)
+	case StmtShow:
+		return s.execShow(c, plan)
+	case StmtSelectExpr:
+		return s.execSelectExpr(c, plan)
 	}
 
 	// A block that has already failed refuses every statement until it ends.
@@ -269,7 +330,13 @@ func (s *Server) executeStmt(c *pgConn, plan *Plan, params []paramVal) (*execOut
 	// and stamps its writes with a commit timestamp (see mvcc.go). The implicit
 	// "tellstone" table is a raw single-key table shared with the binary
 	// frontend and keeps the plain store.
-	if plan.Kind.readsRows() && plan.usesCatalogRows() {
+	if plan.Virtual {
+		// A virtual catalog relation is projected from the live catalog rather
+		// than stored, so the statement reads it through the store that serves
+		// the projection. The MVCC view is not used: a projection has no
+		// versions, and it is not a snapshot of a table.
+		st = newCatalogStore(st, s.catalog(), DefaultDB, c.catalogUser())
+	} else if plan.Kind.readsRows() && plan.usesCatalogRows() {
 		var err error
 		if st, err = s.mvccStore(c, plan.Kind); err != nil {
 			return nil, err
@@ -364,6 +431,18 @@ func (s *Server) auditDenied(c *pgConn, command string, key []byte) {
 	)
 }
 
+// execSelectExpr evaluates a FROM-less SELECT (Stage A). It reads no store: the
+// result is a target list of constant and session-value expressions, evaluated
+// against the connection and the statement time. One row is always produced,
+// which is what a client's startup probe (SELECT 1) expects.
+func (s *Server) execSelectExpr(c *pgConn, plan *Plan) (*execOutcome, error) {
+	row, err := evalSelectExprs(plan.Exprs, c, time.Now())
+	if err != nil {
+		return nil, err
+	}
+	return &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}, nil
+}
+
 func (s *Server) execSelect(c *pgConn, st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
 	if plan.Schema != nil {
 		return s.execSelectRow(st, plan, params)
@@ -379,16 +458,34 @@ func (s *Server) execSelect(c *pgConn, st Store, plan *Plan, params []paramVal) 
 	if !found {
 		return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
 	}
-	row := make([][]byte, len(plan.Cols))
+	cols := make([]Column, len(plan.Cols))
 	for i, col := range plan.Cols {
-		switch col {
-		case colKey:
-			row[i] = key
-		case colValue:
-			row[i] = encodeByteaText(val)
+		cols[i] = Column{Name: col, Type: implicitColumnType(col)}
+	}
+	keys, hidden, err := implicitSortKeys(plan, cols)
+	if err != nil {
+		return nil, err
+	}
+	row := make([][]byte, len(plan.Cols)+len(hidden))
+	cell := func(name string) []byte {
+		if name == colValue {
+			return encodeByteaText(val)
+		}
+		return key
+	}
+	for i, col := range plan.Cols {
+		if col == colKey || col == colValue {
+			row[i] = cell(col)
 		}
 	}
-	return &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}, nil
+	for j, h := range hidden {
+		row[len(plan.Cols)+j] = cell(h)
+	}
+	out := &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}
+	if err := finalizeResult(plan, out, cols, keys, len(plan.Cols)); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *Server) execInsert(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
@@ -651,6 +748,15 @@ func (s *Server) execSelectRow(st Store, plan *Plan, params []paramVal) (*execOu
 	case plan.Phys.Kind == PlanRangeScan, plan.Phys.Kind == PlanFullScan:
 		return s.execScan(st, plan, params)
 	}
+	if plan.grouped() {
+		return s.execSelectRowGrouped(st, plan, params)
+	}
+	// CASE targets compile before the lookup, so a condition's errors surface
+	// whether or not the addressed row exists.
+	ccases, caseAt, err := s.compileCases(plan, sch, params)
+	if err != nil {
+		return nil, err
+	}
 	// The equality a point lookup walks is on the physical plan: translate only
 	// sets the plan key for a predicate it can prove to be a single equality,
 	// while a lookup with a residual filter arrives as an AND.
@@ -678,11 +784,22 @@ func (s *Server) execSelectRow(st Store, plan *Plan, params []paramVal) (*execOu
 		}
 	}
 	row := make([][]byte, len(plan.Cols))
+	cols := make([]Column, len(plan.Cols))
 	for i, name := range plan.Cols {
+		if ci, isCase := caseAt[i]; isCase {
+			cell, err := wireCell(ccases[ci].typ, ccases[ci].eval(cells))
+			if err != nil {
+				return nil, &pgError{code: errDataCorrupt, msg: fmt.Sprintf("column %q: %v", name, err)}
+			}
+			cols[i] = Column{Name: name, Type: ccases[ci].typ}
+			row[i] = cell
+			continue
+		}
 		idx, ok := sch.columnIndex(name)
 		if !ok {
 			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", name)}
 		}
+		cols[i] = sch.Columns[idx]
 		cell, err := wireCell(sch.Columns[idx].Type, cells[idx].value)
 		if err != nil {
 			// The bytes are in the store but do not decode as the column's
@@ -692,35 +809,152 @@ func (s *Server) execSelectRow(st Store, plan *Plan, params []paramVal) (*execOu
 		}
 		row[i] = cell
 	}
-	return &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}, nil
+	// A point lookup returns one row, but ORDER BY over a column the projection
+	// does not return, DISTINCT and OFFSET/LIMIT still decide what that one row
+	// is, so the same resolution and finalization a scan does run here too.
+	keys, hidden, err := tableSortKeys(plan, sch, cols)
+	if err != nil {
+		return nil, err
+	}
+	if len(hidden) > 0 {
+		wide := make([][]byte, len(plan.Cols)+len(hidden))
+		copy(wide, row)
+		row = wide
+		for j, ord := range hidden {
+			cell, err := wireCell(sch.Columns[ord].Type, cells[ord].value)
+			if err != nil {
+				return nil, &pgError{code: errDataCorrupt, msg: fmt.Sprintf("column %q: %v", sch.Columns[ord].Name, err)}
+			}
+			row[len(plan.Cols)+j] = cell
+		}
+	}
+	out := &execOutcome{tag: "SELECT 1", rows: [][][]byte{row}, selectRows: true}
+	if err := finalizeResult(plan, out, cols, keys, len(plan.Cols)); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// execSelectRowGrouped folds the one row a point lookup addresses. A missing
+// or filtered-out row is an empty input to the fold, which still yields the
+// single row of an ungrouped aggregate or no rows at all under GROUP BY.
+func (s *Server) execSelectRowGrouped(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
+	sch := plan.Schema
+	rowID, err := canonicalRowID(plan.Phys.Key, sch, params)
+	if err != nil {
+		return nil, err
+	}
+	cells, found, err := readRow(st, sch, rowID)
+	if err != nil {
+		return nil, &pgError{code: errIoError, msg: err.Error()}
+	}
+	if found && plan.Phys.Filter != nil {
+		filt, err := s.compileFilter(plan.Phys.Filter, sch, params)
+		if err != nil {
+			return nil, err
+		}
+		if filt.alwaysFalse() || !filt.eval(cells) {
+			found = false
+		}
+	}
+	proj := make([]int, 0, len(plan.Cols))
+	cols := make([]Column, 0, len(plan.Cols))
+	for i, name := range plan.Cols {
+		if plan.isAggPos(i) {
+			continue
+		}
+		idx, ok := sch.columnIndex(name)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", name)}
+		}
+		proj = append(proj, idx)
+		cols = append(cols, sch.Columns[idx])
+	}
+	refCell := func(qual, col string) (int, Column, error) {
+		si, err := tableOrderColumn(sch, plan, qual, col)
+		if err != nil {
+			return 0, Column{}, err
+		}
+		for i, p := range proj {
+			if p == si {
+				return i, sch.Columns[si], nil
+			}
+		}
+		proj = append(proj, si)
+		cols = append(cols, sch.Columns[si])
+		return len(proj) - 1, sch.Columns[si], nil
+	}
+	gw, err := resolveGroupWork(plan, refCell)
+	if err != nil {
+		return nil, err
+	}
+	var rows [][][]byte
+	if found {
+		wide := make([][]byte, len(proj))
+		for i, si := range proj {
+			w, werr := wireCell(sch.Columns[si].Type, cells[si].value)
+			if werr != nil {
+				return nil, &pgError{code: errDataCorrupt, msg: fmt.Sprintf("column %q: %v", sch.Columns[si].Name, werr)}
+			}
+			wide[i] = w
+		}
+		rows = [][][]byte{wide}
+	}
+	out := &execOutcome{selectRows: true}
+	if err := gw.apply(plan, out, rows); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // execScan runs a full-table or primary-key-range SELECT end to end, filling
 // the outcome's result set from the scan's batches.
 func (s *Server) execScan(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
+	if plan.grouped() {
+		return s.execScanGrouped(st, plan, params)
+	}
 	sch := plan.Schema
 	phys := plan.Phys
+	// CASE targets compile first, before any early answer, so a condition's
+	// errors surface whether or not the range holds a row.
+	ccases, caseAt, err := s.compileCases(plan, sch, params)
+	if err != nil {
+		return nil, err
+	}
 	// A range that provably covers nothing (its bound overflowed the column's
 	// domain) or a filter that admits no row is answered without touching the
 	// store.
 	if phys.EmptyRange {
 		return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
 	}
-	proj := make([]int, len(plan.Cols))
+	// The projection skips the CASE positions: their cells are computed by the
+	// flush into the chunk's trailing columns, not read from the schema.
+	proj := make([]int, 0, len(plan.Cols))
+	cols := make([]Column, len(plan.Cols))
 	for i, name := range plan.Cols {
+		if ci, isCase := caseAt[i]; isCase {
+			cols[i] = Column{Name: name, Type: ccases[ci].typ}
+			continue
+		}
 		idx, ok := sch.columnIndex(name)
 		if !ok {
 			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", name)}
 		}
-		proj[i] = idx
+		proj = append(proj, idx)
+		cols[i] = sch.Columns[idx]
 	}
-	// The batch carries the projection with the column declarations attached,
-	// which is what the drain that renders it reads. A join reuses the same
-	// drain with the join's own projection declarations.
-	cols := make([]Column, len(proj))
-	for i, ord := range proj {
-		cols[i] = sch.Columns[ord]
+	// ORDER BY is resolved now, while the schema is known: a key the projection
+	// returns indexes cols as built above, and a key it does not becomes a
+	// hidden trailing column the sort reads and the client never sees.
+	keys, hidden, err := tableSortKeys(plan, sch, cols)
+	if err != nil {
+		return nil, err
 	}
+	for _, ord := range hidden {
+		proj = append(proj, ord)
+		cols = append(cols, sch.Columns[ord])
+	}
+	vis := len(plan.Cols)
 	filt, err := s.compileFilter(phys.Filter, sch, params)
 	if err != nil {
 		return nil, err
@@ -728,17 +962,104 @@ func (s *Server) execScan(st Store, plan *Plan, params []paramVal) (*execOutcome
 	if filt.alwaysFalse() {
 		return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
 	}
+	// wireAt maps each chunk column onto its position in the wire row. The
+	// chunk is laid out as [projected columns: visible, then hidden sort
+	// keys][CASE cells at the trailing edge]; the wire row is [visible columns
+	// in select-list order][hidden sort keys]. Without CASE the map is the
+	// identity and the plain drain serves unchanged.
+	wireAt := make([]int, 0, len(proj)+len(ccases))
+	for i := range plan.Cols {
+		if _, isCase := caseAt[i]; isCase {
+			continue
+		}
+		wireAt = append(wireAt, i)
+	}
+	for j := range hidden {
+		wireAt = append(wireAt, len(plan.Cols)+j)
+	}
+	for k := range ccases {
+		wireAt = append(wireAt, plan.Cases[k].Pos)
+	}
 	out := &execOutcome{selectRows: true}
 	// As the scan fills each batch, drain it into the outcome's result set:
 	// each surviving cell is rendered to its wire form exactly once, and the
 	// bytes are the sink's (they outlive the scan's reused buffers).
-	err = newScan(st, phys, sch, proj, filt).run(func(c *Chunk) error {
-		return drainChunk(c, cols, out)
+	err = newScan(st, phys, sch, proj, filt, ccases).run(func(c *Chunk) error {
+		if len(ccases) == 0 {
+			return drainChunk(c, cols, out)
+		}
+		return drainChunkMapped(c, cols, wireAt, out)
 	})
 	if err != nil {
 		return nil, &pgError{code: errDataCorrupt, msg: err.Error()}
 	}
-	out.tag = fmt.Sprintf("SELECT %d", len(out.rows))
+	if err := finalizeResult(plan, out, cols, keys, vis); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// execScanGrouped runs a grouped SELECT over a full-table or range scan. The
+// scan materializes the plain projection plus, as hidden trailing cells, the
+// columns the aggregates and grouping keys read; the fold then turns those
+// rows into one output row per group, and the ordering, DISTINCT and bounding
+// apply to the folded result. A range or filter that admits no row still
+// produces a result: an ungrouped aggregate over an empty input is one row of
+// counts and NULLs, which only the fold can compute.
+func (s *Server) execScanGrouped(st Store, plan *Plan, params []paramVal) (*execOutcome, error) {
+	sch := plan.Schema
+	phys := plan.Phys
+	proj := make([]int, 0, len(plan.Cols))
+	cols := make([]Column, 0, len(plan.Cols))
+	for i, name := range plan.Cols {
+		if plan.isAggPos(i) {
+			continue
+		}
+		idx, ok := sch.columnIndex(name)
+		if !ok {
+			return nil, &pgError{code: errUndefinedColumn, msg: fmt.Sprintf("column %q does not exist", name)}
+		}
+		proj = append(proj, idx)
+		cols = append(cols, sch.Columns[idx])
+	}
+	refCell := func(qual, col string) (int, Column, error) {
+		si, err := tableOrderColumn(sch, plan, qual, col)
+		if err != nil {
+			return 0, Column{}, err
+		}
+		for i, p := range proj {
+			if p == si {
+				return i, sch.Columns[si], nil
+			}
+		}
+		proj = append(proj, si)
+		cols = append(cols, sch.Columns[si])
+		return len(proj) - 1, sch.Columns[si], nil
+	}
+	gw, err := resolveGroupWork(plan, refCell)
+	if err != nil {
+		return nil, err
+	}
+	out := &execOutcome{selectRows: true}
+	var rows [][][]byte
+	if !phys.EmptyRange {
+		filt, err := s.compileFilter(phys.Filter, sch, params)
+		if err != nil {
+			return nil, err
+		}
+		if !filt.alwaysFalse() {
+			err = newScan(st, phys, sch, proj, filt, nil).run(func(c *Chunk) error {
+				return drainChunk(c, cols, out)
+			})
+			if err != nil {
+				return nil, &pgError{code: errDataCorrupt, msg: err.Error()}
+			}
+			rows = out.rows
+		}
+	}
+	if err := gw.apply(plan, out, rows); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -752,7 +1073,7 @@ func (s *Server) execScan(st Store, plan *Plan, params []paramVal) (*execOutcome
 // prefix; the callback's bound filters do the rest, so the yielded set is exact
 // either way. A single-table scan and each side of a join share this operator;
 // they differ only in what they do with each batch.
-func newScan(st Store, phys *physicalPlan, sch *Schema, proj []int, filt *compiledNode) *tableScan {
+func newScan(st Store, phys *physicalPlan, sch *Schema, proj []int, filt *compiledNode, cases []*compiledCase) *tableScan {
 	beg := phys.Lo
 	if beg == nil {
 		// A plan without a lower bound must not scan the store from its start,
@@ -774,6 +1095,7 @@ func newScan(st Store, phys *physicalPlan, sch *Schema, proj []int, filt *compil
 		hi:    phys.Hi,
 		proj:  proj,
 		filt:  filt,
+		cases: cases,
 		as: &rowAssembler{
 			sch:    sch,
 			prefix: TablePrefix(sch.DB, sch.Table),
@@ -781,6 +1103,7 @@ func newScan(st Store, phys *physicalPlan, sch *Schema, proj []int, filt *compil
 			owned:  make([][]byte, len(sch.Columns)),
 			proj:   proj,
 			filt:   filt,
+			cases:  cases,
 		},
 	}
 	ts.chunk = newChunk(int(ts.projLen()))
@@ -803,22 +1126,39 @@ func newChunk(ncols int) *Chunk {
 // columns by projection, and a join passes the join projection's declarations,
 // which may come from either side's schema.
 func drainChunk(c *Chunk, cols []Column, out *execOutcome) error {
+	return drainChunkMapped(c, cols, nil, out)
+}
+
+// drainChunkMapped renders one filled batch into the outcome's result set,
+// with an explicit chunk-column-to-wire-column map. A nil map is the identity,
+// which is what every layout without CASE needs; a scan that computes CASE
+// cells passes the map, because its chunk carries those cells at the trailing
+// edge while the wire row wants them at their select-list position.
+func drainChunkMapped(c *Chunk, cols []Column, wireAt []int, out *execOutcome) error {
 	off := 0
+	n := len(cols)
+	if wireAt != nil {
+		n = int(c.NCols)
+	}
 	for row := uint32(0); row < c.Rows; row++ {
 		wire := make([][]byte, len(cols))
-		for j := range cols {
+		for j := 0; j < n; j++ {
+			dst := j
+			if wireAt != nil {
+				dst = wireAt[j]
+			}
 			if c.isNull(row, uint32(j)) {
-				wire[j] = nil
+				wire[dst] = nil
 				continue
 			}
 			l := binary.BigEndian.Uint32(c.data[off:])
 			off += 4
-			cell, err := wireCell(cols[j].Type, c.data[off:off+int(l)])
+			cell, err := wireCell(cols[dst].Type, c.data[off:off+int(l)])
 			if err != nil {
-				return fmt.Errorf("column %q: %v", cols[j].Name, err)
+				return fmt.Errorf("column %q: %v", cols[dst].Name, err)
 			}
 			off += int(l)
-			wire[j] = cell
+			wire[dst] = cell
 		}
 		out.rows = append(out.rows, wire)
 	}
@@ -1140,6 +1480,10 @@ func resolveColumnRef(col *Column, ref ValRef, params []paramVal) ([]byte, bool,
 // the catalog for the same plan would make a single statement's answer depend on
 // when it was asked.
 func (s *Server) resolvePlan(plan *Plan) error {
+	// Whether the plan reads a virtual catalog relation is settled here as
+	// well as in the authorization path, because the plan may be resolved
+	// without one -- an EXPLAIN's inner plan is resolved on its own.
+	s.markVirtual(plan)
 	switch plan.Kind {
 	case StmtSelect, StmtInsert, StmtUpdate, StmtDelete:
 	default:
@@ -1152,14 +1496,26 @@ func (s *Server) resolvePlan(plan *Plan) error {
 		return nil
 	}
 	if plan.Schema == nil {
-		sch, err := s.catalog().Get(plan.Table)
+		// A join's left side carries its qualifier on the join, not on the
+		// plan, because the plan's own table name is only one of the two.
+		qual := plan.TableSchema
+		if plan.Join != nil {
+			qual = plan.Join.LeftSchema
+		}
+		sch, err := s.resolveRelation(qual, plan.Table)
 		if err != nil {
-			if errors.Is(err, ErrNoSuchTable) {
-				return &pgError{code: errUndefinedTable, msg: fmt.Sprintf("relation %q does not exist", plan.Table)}
-			}
-			return s.schemaError(err)
+			return err
 		}
 		plan.Schema = sch
+	}
+	switch plan.Kind {
+	case StmtInsert, StmtUpdate, StmtDelete:
+		if plan.Virtual {
+			// The catalog relations are projected from the live catalog, so
+			// there is nothing to write them to. The refusal is explicit
+			// rather than the accident of a failed write.
+			return &pgError{code: errFeatureNotSupported, msg: "the catalog relations are read-only"}
+		}
 	}
 	switch plan.Kind {
 	case StmtSelect, StmtUpdate, StmtDelete:
@@ -1197,7 +1553,98 @@ func (s *Server) resolvePlan(plan *Plan) error {
 		}
 		plan.Key = plan.Values[idx]
 	}
+	// A grouped statement's result columns include aggregates, whose types no
+	// schema declares; RowDescription needs them before any row exists.
+	if err := resolveAggOIDs(plan); err != nil {
+		return err
+	}
 	return nil
+}
+
+// resolveRelation resolves a named relation to the schema it is read with: a
+// virtual catalog relation when the statement names one, a table of the
+// engine's own catalog otherwise.
+//
+// The two are told apart by the qualifier, and by the catalog itself when the
+// statement did not qualify the name: PostgreSQL searches pg_catalog ahead of
+// the search path, so an unqualified name that matches no table of the
+// engine's is looked for there.
+func (s *Server) resolveRelation(qual, table string) (*Schema, error) {
+	if isCatalogSchema(qual) {
+		rel := lookupCatalogRelation(qual, table)
+		if rel == nil {
+			return nil, &pgError{code: errUndefinedTable, msg: fmt.Sprintf("relation %q does not exist", qualifiedName(qual, table))}
+		}
+		return rel.asSchema(), nil
+	}
+	if qual == "" {
+		sch, err := s.catalog().Get(table)
+		if err == nil {
+			return sch, nil
+		}
+		if !errors.Is(err, ErrNoSuchTable) {
+			return nil, s.schemaError(err)
+		}
+		if rel := lookupUnqualified(table); rel != nil {
+			return rel.asSchema(), nil
+		}
+		return nil, &pgError{code: errUndefinedTable, msg: fmt.Sprintf("relation %q does not exist", table)}
+	}
+	sch, err := s.catalog().Get(table)
+	if err != nil {
+		if errors.Is(err, ErrNoSuchTable) {
+			return nil, &pgError{code: errUndefinedTable, msg: fmt.Sprintf("relation %q does not exist", table)}
+		}
+		return nil, s.schemaError(err)
+	}
+	return sch, nil
+}
+
+// relationIsVirtual reports whether a named relation is one of the virtual
+// catalog relations rather than a table of the engine's own catalog.
+//
+// It is the decision the access control needs before the relation is resolved:
+// a catalog read touches no table of the client's own, so it is not the kind
+// of read a grant can refuse.
+func (s *Server) relationIsVirtual(qual, table string) bool {
+	switch {
+	case isCatalogSchema(qual):
+		return true
+	case qual != "":
+		return false
+	default:
+		if _, err := s.catalog().Get(table); err == nil {
+			return false
+		}
+		return lookupUnqualified(table) != nil
+	}
+}
+
+// markVirtual records on a plan whether it reads a virtual catalog relation.
+// It is idempotent, and it is called from both the authorization and the
+// resolution path because the authorization happens first and has to know.
+func (s *Server) markVirtual(plan *Plan) {
+	if plan.Virtual {
+		return
+	}
+	if plan.Join != nil {
+		if s.relationIsVirtual(plan.Join.LeftSchema, plan.Join.Left) ||
+			s.relationIsVirtual(plan.Join.RightSchema, plan.Join.Right) {
+			plan.Virtual = true
+		}
+		return
+	}
+	if s.relationIsVirtual(plan.TableSchema, plan.Table) {
+		plan.Virtual = true
+	}
+}
+
+// qualifiedName renders a relation's qualified name for an error message.
+func qualifiedName(qual, table string) string {
+	if qual == "" {
+		return table
+	}
+	return qual + "." + table
 }
 
 // planAccess chooses the access method for a data statement and records it on
@@ -1226,7 +1673,7 @@ func (s *Server) planAccess(plan *Plan) error {
 	// some other table is left in place, to be refused with 42703 rather than
 	// silently read from the wrong table.
 	var err error
-	plan.Cols, err = stripOwnQualifier(plan.Cols, plan.Schema)
+	plan.Cols, err = stripOwnQualifier(plan.Cols, plan.Schema, plan.TableAlias)
 	if err != nil {
 		return err
 	}
@@ -1238,9 +1685,12 @@ func (s *Server) planAccess(plan *Plan) error {
 	// is what this phase executes. It is planned too, so EXPLAIN reports it and
 	// the refusal below has something to compare against.
 	filter, err = mapExprCols(filter, func(col string) (string, error) {
-		return stripColumnQualifier(col, plan.Table), nil
+		return stripColumnQualifier(col, plan.Table, plan.TableAlias), nil
 	})
 	if err != nil {
+		return err
+	}
+	if err := plan.translateCases(); err != nil {
 		return err
 	}
 	o := &optimizer{sch: plan.Schema, stats: s.statsFor(plan.Schema)}
@@ -1258,10 +1708,19 @@ func (s *Server) planAccess(plan *Plan) error {
 // it with 42703 instead of reading the bare name from the wrong table. The
 // comparison is case-insensitive, matching PostgreSQL's normalization of
 // identifiers (`WHERE USERS.ID = 1` names the same column).
-func stripColumnQualifier(col, table string) string {
+// stripColumnQualifier drops a qualifier that names this table.
+//
+// The table's alias counts as its name. PostgreSQL hides the table's own name
+// behind the alias, so a client that wrote `FROM pg_catalog.pg_class c` names
+// the relation "c" and never "pg_class"; a client that wrote `FROM users u`
+// names it "u". A qualifier naming neither is left in place, to be refused
+// with 42703 rather than silently read from the wrong table.
+func stripColumnQualifier(col string, tables ...string) string {
 	if i := strings.IndexByte(col, '.'); i > 0 {
-		if strings.EqualFold(col[:i], table) {
-			return col[i+1:]
+		for _, t := range tables {
+			if t != "" && strings.EqualFold(col[:i], t) {
+				return col[i+1:]
+			}
 		}
 	}
 	return col
@@ -1273,7 +1732,7 @@ func stripColumnQualifier(col, table string) string {
 // expands to the table's columns. The star rules are the target list's own,
 // applied a second time now that the qualifier can be recognized: one star and
 // nothing else, or the projection is ambiguous.
-func stripOwnQualifier(cols []string, sch *Schema) ([]string, error) {
+func stripOwnQualifier(cols []string, sch *Schema, alias ...string) ([]string, error) {
 	if len(cols) == 0 {
 		return cols, nil
 	}
@@ -1286,7 +1745,7 @@ func stripOwnQualifier(cols []string, sch *Schema) ([]string, error) {
 		if len(cols) != 1 {
 			return nil, fmt.Errorf("%w: * cannot be combined with named columns", errUnsupported)
 		}
-		if q := cols[0][:len(cols[0])-2]; strings.EqualFold(q, sch.Table) {
+		if q := cols[0][:len(cols[0])-2]; qualifierNames(q, sch.Table, alias...) {
 			return sch.RowIDColumns(), nil
 		}
 		// A starred qualifier naming some other table is left for column
@@ -1299,7 +1758,7 @@ func stripOwnQualifier(cols []string, sch *Schema) ([]string, error) {
 	seen := map[string]bool{}
 	out := make([]string, 0, len(cols))
 	for _, c := range cols {
-		c = stripColumnQualifier(c, sch.Table)
+		c = stripColumnQualifier(c, append([]string{sch.Table}, alias...)...)
 		if seen[c] {
 			continue
 		}
@@ -1309,12 +1768,83 @@ func stripOwnQualifier(cols []string, sch *Schema) ([]string, error) {
 	return out, nil
 }
 
+// qualifierNames reports whether a qualifier names the relation: its own name
+// or the alias it was given.
+func qualifierNames(qual, table string, alias ...string) bool {
+	if strings.EqualFold(qual, table) {
+		return true
+	}
+	for _, a := range alias {
+		if a != "" && strings.EqualFold(qual, a) {
+			return true
+		}
+	}
+	return false
+}
+
 // predicate returns the statement's WHERE clause as an expression tree.
+//
+// The errors it reports are statement-shape errors, not store failures, so
+// they are mapped to their SQLSTATE here rather than at the wire, where a
+// plain error's fallback is the I/O code. A WHERE clause the translator cannot
+// read is a syntax-class rejection (42601), and reporting it as an I/O error
+// would send the client looking at the connection instead of the query.
 func (p *Plan) predicate() (Expr, error) {
 	if p.Where == nil {
 		return nil, nil
 	}
-	return translateExpr(p.Where)
+	filter, err := translateExpr(p.Where)
+	if err != nil {
+		return nil, errOrSyntax(err)
+	}
+	return filter, nil
+}
+
+// translateCases translates every CASE condition once the schema is known and
+// strips the statement's own table qualifier from the column references it
+// found, the same two steps the WHERE clause takes in planAccess. A condition
+// that cannot be translated reports through errOrSyntax, so a client sees the
+// same 42601 it would see for an unsupported WHERE at the same moment.
+func (p *Plan) translateCases() error {
+	for i := range p.Cases {
+		if err := p.translateCaseConditions(&p.Cases[i], func(col string) (string, error) {
+			col = stripColumnQualifier(col, p.Table)
+			if p.TableAlias != "" {
+				col = stripColumnQualifier(col, p.TableAlias)
+			}
+			return col, nil
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// translateCaseConditions translates the conditions of a CASE and of the CASEs
+// nested inside it, resolving their columns with the function given.
+func (p *Plan) translateCaseConditions(ct *caseTarget, resolve func(string) (string, error)) error {
+	for j := range ct.Whens {
+		e, err := translateExpr(ct.Whens[j].cond)
+		if err != nil {
+			return errOrSyntax(err)
+		}
+		e, err = mapExprCols(e, resolve)
+		if err != nil {
+			return err
+		}
+		ct.Whens[j].expr = e
+		if ct.Whens[j].sub != nil {
+			if err := p.translateCaseConditions(ct.Whens[j].sub, resolve); err != nil {
+				return err
+			}
+		}
+	}
+	if ct.ElseSub != nil {
+		if err := p.translateCaseConditions(ct.ElseSub, resolve); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // executable reports whether this phase can run a plan.

@@ -63,6 +63,19 @@ func (t *explainTree) render(p *physicalPlan, depth int) {
 		return
 	}
 	name := p.Kind.explainName()
+	if p.Join != nil {
+		// PostgreSQL names the node by what it preserves -- "Hash Left Join"
+		// -- so the kind rides the name rather than a separate line, and the
+		// four kinds read differently at a glance.
+		switch p.Join.Outer {
+		case PreserveLeft:
+			name = "Hash Left Join"
+		case PreserveRight:
+			name = "Hash Right Join"
+		case PreserveBoth:
+			name = "Hash Full Join"
+		}
+	}
 	ind := ""
 	if p.Schema != nil {
 		ind = fmt.Sprintf(" on %s", p.Schema.Table)
@@ -209,12 +222,29 @@ func exprText(e Expr) string {
 		return "false"
 	case *CmpExpr:
 		return fmt.Sprintf("%s %s %s", t.Col, t.Op.SQL(), valRefText(t.Val))
+	case *NeExpr:
+		return fmt.Sprintf("%s <> %s", t.Col, valRefText(t.Val))
+	case *ColCmpExpr:
+		if t.Not {
+			return fmt.Sprintf("%s %s %s", t.Left, invertCmpOpSQL(t.Op), t.Right)
+		}
+		return fmt.Sprintf("%s %s %s", t.Left, t.Op.SQL(), t.Right)
+	case *RegexExpr:
+		if t.Not {
+			return fmt.Sprintf("%s !~ %s", t.Col, valRefText(t.Val))
+		}
+		return fmt.Sprintf("%s ~ %s", t.Col, valRefText(t.Val))
+	case *BoolColExpr:
+		return t.Col
 	case *NullTestExpr:
 		if t.Not {
 			return t.Col + " IS NOT NULL"
 		}
 		return t.Col + " IS NULL"
 	case *LikeExpr:
+		if t.Not {
+			return fmt.Sprintf("%s NOT LIKE %s", t.Col, valRefText(t.Val))
+		}
 		return fmt.Sprintf("%s LIKE %s", t.Col, valRefText(t.Val))
 	case *BoolExpr:
 		var inner []string
@@ -241,4 +271,20 @@ func valRefText(v ValRef) string {
 		return fmt.Sprintf("$%d", v.Param)
 	}
 	return string(v.Literal)
+}
+
+func invertCmpOpSQL(o CmpOp) string {
+	switch o {
+	case OpEq:
+		return "<>"
+	case OpLt:
+		return ">="
+	case OpLe:
+		return ">"
+	case OpGt:
+		return "<="
+	case OpGe:
+		return "<"
+	}
+	return "<>"
 }

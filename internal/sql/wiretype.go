@@ -29,6 +29,10 @@ const (
 	oidFloat8      = 701
 	oidTimestamptz = 1184
 	oidJSONB       = 3802
+	// oidNameArray is name[], the type current_schemas(include) answers with.
+	// It is here rather than in translate.go because the RowDescription and
+	// the text bytes of the array value must both name it.
+	oidNameArray = 1003
 )
 
 // oidOf maps a column type onto its wire OID.

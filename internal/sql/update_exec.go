@@ -35,7 +35,7 @@ func (s *Server) execUpdateMulti(st Store, plan *Plan, params []paramVal) (*exec
 		return nil, err
 	}
 	n := int64(0)
-	err = newScan(st, phys, sch, proj, filt).run(func(c *Chunk) error {
+	err = newScan(st, phys, sch, proj, filt, nil).run(func(c *Chunk) error {
 		off := 0
 		for i := uint32(0); i < c.Rows; i++ {
 			j := uint32(0)

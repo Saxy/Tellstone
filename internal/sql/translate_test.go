@@ -161,7 +161,7 @@ func TestTranslateInsertWithoutAColumnList(t *testing.T) {
 func TestTranslateRejected(t *testing.T) {
 	cases := []string{
 		"",
-		"SELECT 1",
+		// "SELECT 1" is supported since Stage A (ADR-016): a FROM-less SELECT.
 		"SELECT key FROM tellstone",
 		"SELECT key FROM tellstone WHERE key > 'a'",
 		"SELECT key INTO x FROM tellstone WHERE key = 'a'",

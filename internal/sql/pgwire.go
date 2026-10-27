@@ -143,6 +143,22 @@ type pgConn struct {
 	// inError suspends extended-protocol processing until the client Syncs,
 	// which is how the protocol recovers from an error mid-transaction.
 	inError bool
+
+	// gucs holds the session-level GUC overrides this connection has set
+	// (ADR-016 decision 6). They are per-connection state, not shared, so one
+	// client's SET never affects another. guc.go reads and writes them.
+	gucs map[string]string
+}
+
+// catalogUser names the session's user for the catalog relations, which report
+// the roles and the session authorization. A connection that has not
+// authenticated has no user of its own, and the name PostgreSQL would report
+// for an unauthenticated session is used instead.
+func (c *pgConn) catalogUser() string {
+	if c.user != "" {
+		return c.user
+	}
+	return "postgres"
 }
 
 // store is the store the current statement executes against: the transaction's
@@ -298,6 +314,7 @@ func (s *Server) serveConn(raw net.Conn) {
 		w:          bufio.NewWriterSize(raw, 32<<10),
 		stmts:      map[string]*Plan{},
 		portals:    map[string]*portalState{},
+		gucs:       map[string]string{},
 	}
 	defer raw.Close()
 	// Close walks s.conns to interrupt every live connection, so a connection
@@ -363,7 +380,10 @@ func (c *pgConn) startup() error {
 		// A client that skips the SSLRequest and goes straight to the startup
 		// packet is reaching the listener in plaintext. When TLS is mandatory
 		// the connection is refused here, before any credential is read.
-		if s.requireTLS && code != sslRequestCode && c.tlsConn == nil {
+		// GSSENCRequest is exempt: it carries no credentials and PostgreSQL
+		// answers it with 'N' so a JDBC client (which sends one before it
+		// asks for TLS) can fall back to SSL.
+		if s.requireTLS && code != sslRequestCode && code != gssEncRequestCode && c.tlsConn == nil {
 			return &pgError{
 				code: errInvalidAuthorizationSpec,
 				msg:  "SSL is required on this connection (server refuses non-TLS clients)",
@@ -436,6 +456,12 @@ func (c *pgConn) authorize(params map[string]string) error {
 	if c.user == "" {
 		c.user = auth.user
 	}
+	// The StartupMessage carries a handful of GUCs the client wants set for the
+	// session (Stage A). They seed the session state so a later SHOW reports
+	// what the client asked for. Only known names are stored, matching SET's
+	// accept-and-ignore rule; an application_name and search_path every client
+	// sends are the ones that matter.
+	c.seedStartupGUCs(params)
 	// Each frame is encoded into a reset builder and flushed separately; a
 	// shared builder would smear cumulative lengths into the wire.
 	var buf msgBuilder
@@ -625,43 +651,96 @@ func (c *pgConn) ready() error {
 
 // ---- message handlers ----
 
+// handleQuery runs the simple-query protocol: a Q message may carry several
+// statements separated by semicolons, and each is answered with its own
+// CommandComplete/ResultSet. The whole string is parsed once, then the plans
+// run in order. An error in one statement aborts the remaining statements in
+// that batch and skips to ReadyForQuery, which matches PostgreSQL behavior,
+// but earlier statements in a multi-statement simple query are not rolled back
+// on error (partial application remains). An empty or semicolon-only string is
+// answered with an EmptyQueryResponse and no CommandComplete. See ADR-016.
 func (c *pgConn) handleQuery(payload []byte) error {
 	query, _, err := consumeCString(payload)
 	if err != nil {
 		return &pgError{code: errProtocolViolation, msg: "malformed query message"}
 	}
 	if strings.TrimSpace(query) == "" {
-		var buf msgBuilder
-		buf.begin(msgEmptyQuery)
-		buf.end()
-		if err := c.writeMsg(&buf); err != nil {
-			return err
-		}
-		return c.ready()
+		return c.emptyQuery()
 	}
-	plan, err := Translate(query)
+	plans, err := TranslateAll(query)
 	if err != nil {
 		if perr := c.srv.sendError(c, errOrSyntax(err), "ERROR"); perr != nil {
 			return perr
 		}
 		return c.ready()
 	}
-	out, xerr := c.srv.execute(c, plan, nil)
-	if xerr != nil {
-		if perr := c.srv.sendError(c, asPGError(xerr), "ERROR"); perr != nil {
-			return perr
-		}
-		return c.ready()
+	if len(plans) == 0 {
+		return c.emptyQuery()
 	}
-	if out.selectRows {
-		if err = c.sendRowDescription(plan); err != nil {
+	for _, plan := range plans {
+		out, xerr := c.srv.execute(c, plan, nil)
+		if xerr != nil {
+			if perr := c.srv.sendError(c, asPGError(xerr), "ERROR"); perr != nil {
+				return perr
+			}
+			return c.ready()
+		}
+		if err = c.emitNotices(out); err != nil {
+			return err
+		}
+		if err = c.emitParamStatus(out); err != nil {
+			return err
+		}
+		if out.selectRows {
+			if err = c.sendRowDescription(plan); err != nil {
+				return err
+			}
+		}
+		if err = c.emitOutcome(out); err != nil {
 			return err
 		}
 	}
-	if err = c.emitOutcome(out); err != nil {
+	return c.ready()
+}
+
+// emptyQuery answers a blank or semicolon-only simple query with the protocol's
+// EmptyQueryResponse instead of a CommandComplete.
+func (c *pgConn) emptyQuery() error {
+	var buf msgBuilder
+	buf.begin(msgEmptyQuery)
+	buf.end()
+	if err := c.writeMsg(&buf); err != nil {
 		return err
 	}
 	return c.ready()
+}
+
+// emitNotices writes any NoticeResponse messages a statement produced, in the
+// order execution recorded them, before its CommandComplete.
+func (c *pgConn) emitNotices(out *execOutcome) error {
+	for _, n := range out.notices {
+		if err := c.srv.sendNotice(c, n.code, n.msg); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// emitParamStatus writes the ParameterStatus updates a SET produced for a
+// reportable variable, so a client that changed a setting learns the engine
+// accepted it. They go out before the CommandComplete, as on a real backend.
+func (c *pgConn) emitParamStatus(out *execOutcome) error {
+	for _, kv := range out.paramStatus {
+		var buf msgBuilder
+		buf.begin(msgParameterStatus)
+		buf.cstring(kv[0])
+		buf.cstring(kv[1])
+		buf.end()
+		if err := c.writeMsg(&buf); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *pgConn) handleParse(payload []byte) error {
@@ -676,8 +755,14 @@ func (c *pgConn) handleParse(payload []byte) error {
 	if len(rest) < 2 {
 		return &pgError{code: errProtocolViolation, msg: "malformed Parse message"}
 	}
-	plan, err := Translate(query)
-	if err != nil {
+	// A blank query string parses as an empty statement: PostgreSQL answers
+	// it with EmptyQueryResponse at Execute, and a client that parses "" as
+	// a validation round-trip (DataGrip does) closes the connection on the
+	// error answer instead.
+	var plan *Plan
+	if strings.TrimSpace(query) == "" {
+		plan = &Plan{Kind: StmtEmpty}
+	} else if plan, err = Translate(query); err != nil {
 		return errOrSyntax(err)
 	}
 	c.stmts[stmtName] = plan
@@ -793,7 +878,7 @@ func (c *pgConn) handleDescribe(payload []byte) error {
 		}
 		if perr := c.sendStatementParamDesc(plan); perr != nil {
 			return perr
-		} else if plan.Kind == StmtSelect {
+		} else if plan.Kind.producesRows() {
 			return c.sendRowDescription(plan)
 		}
 		var buf msgBuilder
@@ -806,7 +891,7 @@ func (c *pgConn) handleDescribe(payload []byte) error {
 			return &pgError{code: errInvalidCursorName, msg: fmt.Sprintf("portal %q does not exist", name)}
 		}
 		portal.rowDesc = true
-		if portal.plan.Kind == StmtSelect {
+		if portal.plan.Kind.producesRows() {
 			return c.sendRowDescription(portal.plan)
 		}
 		var buf msgBuilder
@@ -917,13 +1002,46 @@ func maxParam(p *Plan) int {
 				if t.Val.Param > m {
 					m = t.Val.Param
 				}
+			case *NeExpr:
+				if t.Val.Param > m {
+					m = t.Val.Param
+				}
 			case *LikeExpr:
+				if t.Val.Param > m {
+					m = t.Val.Param
+				}
+			case *RegexExpr:
 				if t.Val.Param > m {
 					m = t.Val.Param
 				}
 			}
 			return true
 		})
+	}
+	for i := range p.Cases {
+		for j := range p.Cases[i].Whens {
+			walkExpr(p.Cases[i].Whens[j].expr, func(e Expr) bool {
+				switch t := e.(type) {
+				case *CmpExpr:
+					if t.Val.Param > m {
+						m = t.Val.Param
+					}
+				case *NeExpr:
+					if t.Val.Param > m {
+						m = t.Val.Param
+					}
+				case *LikeExpr:
+					if t.Val.Param > m {
+						m = t.Val.Param
+					}
+				case *RegexExpr:
+					if t.Val.Param > m {
+						m = t.Val.Param
+					}
+				}
+				return true
+			})
+		}
 	}
 	return m
 }
@@ -946,8 +1064,21 @@ func (c *pgConn) sendRowDescription(plan *Plan) error {
 	buf.begin(msgRowDescription)
 	buf.int16(int16(len(plan.Cols)))
 	for i, col := range plan.Cols {
+		// An alias renames the column the client is told, not the column it
+		// reads: every lookup below keeps using the projected name, and only
+		// the name that goes on the wire is the alias.
+		name := col
+		if plan.OutNames != nil && i < len(plan.OutNames) {
+			name = plan.OutNames[i]
+		}
 		oid := int32(oidText)
-		if plan.Phys != nil && plan.Phys.Join != nil {
+		if plan.ColOIDs != nil && i < len(plan.ColOIDs) && plan.ColOIDs[i] != 0 {
+			// A projection that is not a catalog column carries its output
+			// OIDs on the plan: a FROM-less SELECT's expressions, SHOW's
+			// columns, and a grouped statement's aggregates and shifted plain
+			// positions. The schema lookup below cannot type them.
+			oid = plan.ColOIDs[i]
+		} else if plan.Phys != nil && plan.Phys.Join != nil {
 			// A join's output columns come from both sides' schemas, so the
 			// single-table lookup below cannot type them -- a bare name like
 			// "id" may only exist on one side. The join projection carries the
@@ -966,7 +1097,7 @@ func (c *pgConn) sendRowDescription(plan *Plan) error {
 		} else if col == colValue {
 			oid = oidBytea
 		}
-		buf.cstring(col)
+		buf.cstring(name)
 		buf.int32(0) // table OID (implicit table, none)
 		buf.int16(int16(i + 1))
 		buf.int32(oid)
@@ -993,10 +1124,26 @@ func (c *pgConn) handleExecute(payload []byte) error {
 	if !ok {
 		return &pgError{code: errInvalidCursorName, msg: fmt.Sprintf("portal %q does not exist", portalName)}
 	}
+	// An empty query answers EmptyQueryResponse and nothing else: no
+	// CommandComplete, no row description (Describe already sent NoData).
+	// This matches PostgreSQL byte for byte, which is what a client parsing
+	// "" as a round-trip check reads to decide the session is healthy.
+	if portal.plan.Kind == StmtEmpty {
+		var buf msgBuilder
+		buf.begin(msgEmptyQuery)
+		buf.end()
+		return c.writeMsg(&buf)
+	}
 	out, xerr := c.srv.execute(c, portal.plan, portal.params)
 	if xerr != nil {
 		// On error the portal remains bound; only Sync destroys it.
 		return xerr
+	}
+	if err := c.emitNotices(out); err != nil {
+		return err
+	}
+	if err := c.emitParamStatus(out); err != nil {
+		return err
 	}
 	if out.selectRows {
 		if !portal.rowDesc {
@@ -1159,6 +1306,23 @@ func (s *Server) sendError(c *pgConn, pe *pgError, severity string) error {
 	buf.byte('M')
 	buf.cstring(pe.msg)
 	buf.byte(0) // message terminator: a trailing NUL after the last field
+	buf.end()
+	return c.writeMsg(&buf)
+}
+
+// sendNotice writes a non-fatal NoticeResponse with the given severity and
+// SQLSTATE. PostgreSQL reports a SET LOCAL outside a transaction block this
+// way, as a warning, rather than failing the statement.
+func (s *Server) sendNotice(c *pgConn, code, msg string) error {
+	var buf msgBuilder
+	buf.begin(msgNotice)
+	buf.byte('S')
+	buf.cstring("WARNING")
+	buf.byte('C')
+	buf.cstring(code)
+	buf.byte('M')
+	buf.cstring(msg)
+	buf.byte(0)
 	buf.end()
 	return c.writeMsg(&buf)
 }
