@@ -2,7 +2,7 @@
 Package storage
 Tellstone Cloud-Native In-Memory Database
 File: engine.go
-Description: Single-map, lock-protected in-memory key-value store with optional TTL eviction, memory ceiling enforcement, and at-rest encryption. In shared-nothing mode each shard owns one Engine instance.
+Description: In-memory key-value store whose reads are lock-free and whose writes are serialized, with optional TTL eviction with optional TTL eviction, memory ceiling enforcement, and at-rest encryption. In shared-nothing mode each shard owns one Engine instance.
 
 Authors:
 
@@ -67,11 +67,14 @@ var defaultMaxBytes = func() uint64 {
 	return 0
 }()
 
-// Engine is a single-map, lock-protected in-memory key-value store.
-// In SN mode it is owned by exactly one goroutine so the lock is uncontended.
+// Engine is an in-memory key-value store. Get and GetInto take no lock: they read
+// the items table through atomic pointers. Writers are serialized on wmu, and
+// the ordered index has its own RWMutex so scans do not block point reads.
 type Engine struct {
-	mu             sync.RWMutex
-	items          map[string]Item
+	// wmu serializes every writer and gives the multi-key readers (ForEach, Scan)
+	// one consistent view. Get and GetInto never take it.
+	wmu            sync.Mutex
+	items          *itemTable
 	chronometer    TimelineWheel
 	cryptoEngine   *crypto.Engine
 	logger         log.Logger
@@ -92,10 +95,11 @@ type Engine struct {
 	cryptoDecryptedBytes uint64
 
 	// index is the ordered index over live keys, backing prefix range reads
-	// (ADR-013 guardrail 1). It carries no lock of its own: every mutation
-	// site below updates it while already holding mu, and ScanPrefix holds a
-	// read lock for the duration of a walk because the tree restructures in
-	// place on insert, split and compaction.
+	// (ADR-013 guardrail 1). Writers update it while holding wmu and also hold
+	// imu for the write; ScanPrefix holds imu for reading for the duration of a
+	// walk, because the tree restructures in place on insert, split and
+	// compaction. Lock order: wmu, then imu.
+	imu   sync.RWMutex
 	index *btree
 }
 
@@ -109,7 +113,7 @@ func NewEngine(interval time.Duration, numSlots uint32, maxBytes uint64, logger 
 	if e.maxBytes == 0 {
 		e.maxBytes = defaultMaxBytes
 	}
-	e.items = make(map[string]Item)
+	e.items = newItemTable(0)
 	e.index = newBTree()
 	if interval <= 0 || numSlots == 0 {
 		e.chronometer = &NoOpChronometer{}
@@ -164,7 +168,7 @@ func (e *Engine) Set(key string, value []byte, ttl time.Duration) error {
 
 // SetIfAbsent writes key only when it is currently absent, and reports what it
 // did. The precondition and the write are evaluated under a single engine
-// lock, so two concurrent callers racing on the same key cannot both observe
+// write lock, so two concurrent callers racing on the same key cannot both observe
 // "absent" and both create it.
 func (e *Engine) SetIfAbsent(key string, value []byte, ttl time.Duration) (SetOutcome, error) {
 	return e.set(key, value, ttl, condAbsent)
@@ -178,7 +182,7 @@ func (e *Engine) SetIfPresent(key string, value []byte, ttl time.Duration) (SetO
 }
 
 // cond is the precondition a conditional write evaluates inside the engine
-// lock. An expired-but-present entry counts as absent, matching Get and Delete.
+// write lock. An expired-but-present entry counts as absent, matching Get and Delete.
 type cond uint8
 
 const (
@@ -239,8 +243,8 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 		storedKey = unsafe.String(unsafe.SliceData(buf), len(key))
 		value = buf[len(key):]
 	}
-	e.mu.Lock()
-	oldItem, isUpdate := e.items[storedKey]
+	e.wmu.Lock()
+	oldItem, isUpdate := e.items.load(storedKey)
 	// An expired-but-still-resident entry counts as absent, so the precondition
 	// is evaluated on the same liveness rule Get and Delete use.
 	expired := isUpdate && !oldItem.Expiration.IsZero() && time.Now().After(oldItem.Expiration)
@@ -248,23 +252,23 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 	if c != condAny && present != (c == condPresent) {
 		// Precondition unsatisfied: leave the map untouched and report the
 		// write as not applied. Nothing was allocated, so nothing to account.
-		e.mu.Unlock()
+		e.wmu.Unlock()
 		atomic.AddUint64(&e.totalCommands, 1)
 		return SetOutcome{}, nil
 	}
 	// Versions come from one engine-wide sequence, so every stored value is
 	// uniquely attributable to the write that produced it.
 	version := e.nextVersion()
-	e.items[storedKey] = Item{
+	e.items.put(storedKey, Item{
 		Value:      value,
 		Expiration: exp,
 		Version:    version,
-	}
+	})
 	// The index keeps the stored value, which is the representation a reader
 	// gets back: encrypted when crypto is on, so ScanPrefix decrypts the same
 	// way Get does rather than handing out ciphertext.
-	e.index.set(storedKey, value, exp)
-	e.mu.Unlock()
+	e.indexSet(storedKey, value, exp)
+	e.wmu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
 	if isUpdate {
 		oldSize := uint64(len(key) + len(oldItem.Value))
@@ -296,10 +300,24 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 }
 
 // nextVersion returns the next engine-wide item version. It must be called
-// with e.mu held, which every writer and RestoreIf does.
+// with wmu held, which every writer and RestoreIf does.
 func (e *Engine) nextVersion() uint64 {
 	e.versionSeq++
 	return e.versionSeq
+}
+
+// indexSet and indexRemove update the ordered index. Writers call them with wmu
+// held, which is what lets them take imu without ordering against a reader.
+func (e *Engine) indexSet(key string, val []byte, exp time.Time) {
+	e.imu.Lock()
+	e.index.set(key, val, exp)
+	e.imu.Unlock()
+}
+
+func (e *Engine) indexRemove(key string) {
+	e.imu.Lock()
+	e.index.remove(key)
+	e.imu.Unlock()
 }
 
 // RestoreIf rolls back a conditional write whose durability record could not be
@@ -311,18 +329,18 @@ func (e *Engine) RestoreIf(key string, out SetOutcome) bool {
 	if !out.Applied {
 		return false
 	}
-	e.mu.Lock()
-	item, exists := e.items[key]
+	e.wmu.Lock()
+	item, exists := e.items.load(key)
 	if !exists || item.Version != out.Version {
-		e.mu.Unlock()
+		e.wmu.Unlock()
 		return false
 	}
 	expired := !item.Expiration.IsZero() && time.Now().After(item.Expiration)
 	if !out.PrevOK {
 		// The write created the key, so undoing it removes the key again.
-		delete(e.items, key)
-		e.index.remove(key)
-		e.mu.Unlock()
+		e.items.remove(key)
+		e.indexRemove(key)
+		e.wmu.Unlock()
 		e.releaseKey(key, item)
 		return true
 	}
@@ -331,9 +349,9 @@ func (e *Engine) RestoreIf(key string, out SetOutcome) bool {
 	// replaced entry's version would let a token from an earlier write match
 	// this state and roll back a write that never failed.
 	restored.Version = e.nextVersion()
-	e.items[key] = restored
-	e.index.set(key, restored.Value, restored.Expiration)
-	e.mu.Unlock()
+	e.items.put(key, restored)
+	e.indexSet(key, restored.Value, restored.Expiration)
+	e.wmu.Unlock()
 	oldSize := uint64(len(key) + len(item.Value))
 	newSize := uint64(len(key) + len(restored.Value))
 	if newSize > oldSize {
@@ -388,15 +406,15 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	}
 	storedKey := unsafe.String(unsafe.SliceData(buf), keyLen)
 	value := buf[keyLen:]
-	e.mu.Lock()
-	oldItem, isUpdate := e.items[storedKey]
-	e.items[storedKey] = Item{
+	e.wmu.Lock()
+	oldItem, isUpdate := e.items.load(storedKey)
+	e.items.put(storedKey, Item{
 		Value:      value,
 		Expiration: exp,
 		Version:    e.nextVersion(),
-	}
-	e.index.set(storedKey, value, exp)
-	e.mu.Unlock()
+	})
+	e.indexSet(storedKey, value, exp)
+	e.wmu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
 	if isUpdate {
 		oldSize := uint64(len(oldItem.Value) + keyLen)
@@ -436,15 +454,15 @@ func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
 		}
 	}
 	storedKey := strings.Clone(key)
-	e.mu.Lock()
-	oldItem, isUpdate := e.items[storedKey]
-	e.items[storedKey] = Item{
+	e.wmu.Lock()
+	oldItem, isUpdate := e.items.load(storedKey)
+	e.items.put(storedKey, Item{
 		Value:      value,
 		Expiration: exp,
 		Version:    e.nextVersion(),
-	}
-	e.index.set(storedKey, value, exp)
-	e.mu.Unlock()
+	})
+	e.indexSet(storedKey, value, exp)
+	e.wmu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
 	if isUpdate {
 		oldSize := uint64(len(oldItem.Value) + len(storedKey))
@@ -475,16 +493,16 @@ func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
 // evicted physically but counts as absent, mirroring Get's lazy eviction, so
 // callers can derive "did the key exist" without a separate Get lookup.
 func (e *Engine) Delete(key string) bool {
-	e.mu.Lock()
-	item, exists := e.items[key]
+	e.wmu.Lock()
+	item, exists := e.items.load(key)
 	if !exists {
-		e.mu.Unlock()
+		e.wmu.Unlock()
 		return false
 	}
 	expired := !item.Expiration.IsZero() && time.Now().After(item.Expiration)
-	delete(e.items, key)
-	e.index.remove(key)
-	e.mu.Unlock()
+	e.items.remove(key)
+	e.indexRemove(key)
+	e.wmu.Unlock()
 	e.releaseKey(key, item)
 	if expired {
 		atomic.AddUint64(&e.expiredCount, 1)
@@ -499,15 +517,15 @@ func (e *Engine) Delete(key string) bool {
 }
 
 func (e *Engine) deleteIfExpired(key string) bool {
-	e.mu.Lock()
-	item, exists := e.items[key]
+	e.wmu.Lock()
+	item, exists := e.items.load(key)
 	if !exists || item.Expiration.IsZero() || !time.Now().After(item.Expiration) {
-		e.mu.Unlock()
+		e.wmu.Unlock()
 		return false
 	}
-	delete(e.items, key)
-	e.index.remove(key)
-	e.mu.Unlock()
+	e.items.remove(key)
+	e.indexRemove(key)
+	e.wmu.Unlock()
 	e.releaseKey(key, item)
 	return true
 }
@@ -522,9 +540,7 @@ func (e *Engine) releaseKey(key string, item Item) {
 }
 
 func (e *Engine) Get(key string) ([]byte, bool) {
-	e.mu.RLock()
-	item, exist := e.items[key]
-	e.mu.RUnlock()
+	item, exist := e.items.load(key)
 	if !exist {
 		atomic.AddUint64(&e.missCount, 1)
 		atomic.AddUint64(&e.totalCommands, 1)
@@ -561,9 +577,7 @@ func (e *Engine) Get(key string) ([]byte, bool) {
 }
 
 func (e *Engine) GetInto(buf []byte, key string) (int, bool) {
-	e.mu.RLock()
-	item, exist := e.items[key]
-	e.mu.RUnlock()
+	item, exist := e.items.load(key)
 	if !exist {
 		atomic.AddUint64(&e.missCount, 1)
 		atomic.AddUint64(&e.totalCommands, 1)
@@ -621,10 +635,10 @@ func (e *Engine) CryptoEnabled() bool          { return e.cryptoEngine.Enabled()
 func (e *Engine) TotalCommands() uint64        { return atomic.LoadUint64(&e.totalCommands) }
 func (e *Engine) Chronometer() TimelineWheel   { return e.chronometer }
 
-// ForEach snapshots all live (non-expired) entries under a read lock, releases
-// the lock, then calls fn for each captured entry. The callback may perform
-// arbitrary work without holding the shard lock. Expired entries are skipped
-// (not evicted) to keep the lock duration bounded.
+// ForEach snapshots all live (non-expired) entries under the write lock, so the
+// snapshot is consistent, releases it, then calls fn for each captured entry.
+// The callback may perform arbitrary work without holding the engine lock.
+// Expired entries are skipped (not evicted) to keep the lock duration bounded.
 func (e *Engine) ForEach(fn func(key string, value []byte, expiration time.Time)) {
 	type entry struct {
 		key string
@@ -632,52 +646,52 @@ func (e *Engine) ForEach(fn func(key string, value []byte, expiration time.Time)
 		exp time.Time
 	}
 	now := time.Now()
-	e.mu.RLock()
-	snap := make([]entry, 0, len(e.items))
-	for k, v := range e.items {
+	e.wmu.Lock()
+	snap := make([]entry, 0, e.items.n)
+	e.items.each(func(k string, v Item) {
 		if !v.Expiration.IsZero() && now.After(v.Expiration) {
-			continue
+			return
 		}
 		// Copy value bytes under the lock so the snapshot survives mutations.
 		vc := make([]byte, len(v.Value))
 		copy(vc, v.Value)
 		snap = append(snap, entry{key: k, val: vc, exp: v.Expiration})
-	}
-	e.mu.RUnlock()
+	})
+	e.wmu.Unlock()
 	for i := range snap {
 		fn(snap[i].key, snap[i].val, snap[i].exp)
 	}
 }
 
-// Scan snapshots all live (non-expired) entries under a read lock, releases
-// the lock, sorts keys lexicographically, then calls fn for every entry whose
+// Scan snapshots all live (non-expired) entries under the write lock, releases
+// it, sorts keys lexicographically, then calls fn for every entry whose
 // key satisfies start <= key < end. An empty start means negative infinity; an
 // empty end means positive infinity. The callback may perform arbitrary work
-// without holding the shard lock. Expired entries are skipped (not evicted).
+// without holding the engine lock. Expired entries are skipped (not evicted).
 func (e *Engine) Scan(start, end []byte, fn func(key string, value []byte)) {
 	type entry struct {
 		key string
 		val []byte
 	}
 	now := time.Now()
-	e.mu.RLock()
-	snap := make([]entry, 0, len(e.items))
-	for k, v := range e.items {
+	e.wmu.Lock()
+	snap := make([]entry, 0, e.items.n)
+	e.items.each(func(k string, v Item) {
 		if !v.Expiration.IsZero() && now.After(v.Expiration) {
-			continue
+			return
 		}
 		kb := []byte(k)
 		if len(start) > 0 && bytes.Compare(kb, start) < 0 {
-			continue
+			return
 		}
 		if len(end) > 0 && bytes.Compare(kb, end) >= 0 {
-			continue
+			return
 		}
 		vc := make([]byte, len(v.Value))
 		copy(vc, v.Value)
 		snap = append(snap, entry{key: k, val: vc})
-	}
-	e.mu.RUnlock()
+	})
+	e.wmu.Unlock()
 	sort.Slice(snap, func(i, j int) bool {
 		return snap[i].key < snap[j].key
 	})
@@ -700,14 +714,14 @@ func (e *Engine) Scan(start, end []byte, fn func(key string, value []byte)) {
 // index's decoded key to a string would allocate once per key and undo the point
 // of the index. Callers that want a string copy it themselves.
 //
-// The callback runs under the engine's read lock, because the index restructures
+// The callback runs under the index's read lock, because the index restructures
 // in place on insert, split and compaction and cannot be walked while that
 // happens. The callback must not call back into a mutating engine method.
 func (e *Engine) ScanPrefix(prefix string, fn func(key, value []byte) bool) int {
 	now := time.Now()
 	cryptoEnabled := e.cryptoEngine.Enabled()
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.imu.RLock()
+	defer e.imu.RUnlock()
 	delivered := 0
 	e.index.ScanPrefix(prefix, func(key, val []byte, exp time.Time) bool {
 		if !exp.IsZero() && now.After(exp) {

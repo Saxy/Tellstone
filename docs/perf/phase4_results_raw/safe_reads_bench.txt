@@ -1,0 +1,2 @@
+BenchmarkPhase4LinearizableRead-16    	raft2026/10/29 08:53:02 INFO: 1 switched to configuration voters=()
+   30979	    114244 ns/op	    3768 B/op	      95 allocs/op

@@ -1,0 +1,11 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Saxy/Tellstone/internal/protocol
+cpu: AMD Ryzen 9 9950X 16-Core Processor            
+BenchmarkParseSQL_Select_Sequential-32    	42971040	        26.04 ns/op	       0 B/op	       0 allocs/op
+BenchmarkParseSQL_Insert_Sequential-32    	16500861	        73.80 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/Saxy/Tellstone/internal/protocol	2.448s
+PASS
+ok  	github.com/Saxy/Tellstone/internal/sql	0.018s
+EXIT=0

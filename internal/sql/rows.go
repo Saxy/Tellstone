@@ -3,27 +3,18 @@ Package sql
 Tellstone PostgreSQL Wire Frontend
 File: rows.go
 Description: Reading and writing one multi-column row against a catalog schema.
-A row is a contiguous key range, so a read is a single range scan and a write is
-one store operation per column. That asymmetry is the whole difficulty here:
-the store offers atomic single-key conditional writes and no transaction
-spanning several keys, so this file decides which key represents the row and in
-what order the rest are written.
 
-The decision is that a row is identified by its primary key column alone. The
-primary key key is written first, conditionally, and that single operation is the
-row's commit: a duplicate insert loses, and a delete takes effect before its
-remaining columns are removed. It also makes existence a one-key read, so the
-common SELECT and UPDATE paths never scan a row that is not there.
-
-The cost of that choice is stated plainly rather than hidden: a row is several
-keys, and a crash between two column writes can leave a row that exists without
-all of its columns. There is no rollback to lean on here, so the write path
-compensates on a *reported* failure and the crash case is left to a future
-transaction, which is the one thing the store does not have.
+A row is a single key holding a packed value (ADR-013, Phase 5 D1-A): the key is
+the row's prefix (`db/table/<row-id>/`), and the value is every column's encoded
+bytes in schema order with a per-column presence flag. This is the KV fast-path
+shape the Phase 5 plan chose over the earlier one-key-per-column layout: a point
+read is one Get, a write is one Set/SetIfAbsent, and the row is written and read
+atomically rather than as several keys that a crash could split.
 */
 package sql
 
 import (
+	"encoding/binary"
 	"fmt"
 	"strings"
 )
@@ -49,19 +40,88 @@ type rowValue struct {
 // rowCells are indexed by schema column ordinal.
 type rowCells []rowValue
 
-// rowKey is the key of one column of one row.
-func rowKey(s *Schema, rowID string, col int) string {
-	return ColumnKey(s.DB, s.Table, rowID, s.Columns[col].Name)
+// rowVersion is the leading byte of a packed row value. It exists so a future
+// change to the encoding can be told apart from an old value.
+const rowVersion = 0x01
+
+// packRow serializes a full row's cells into one value. The schema fixes the
+// column order, so the encoding is a per-column presence flag followed by the
+// value bytes: a present column is [0x01][u32 len][bytes], an absent (NULL)
+// column is [0x00]. A present empty string is 0x01 with length zero, distinct
+// from NULL. A cell that is set but nil (an explicit NULL) encodes as absent.
+func packRow(cells rowCells) []byte {
+	buf := make([]byte, 0, 16+len(cells))
+	buf = append(buf, rowVersion)
+	var hdr [4]byte
+	for i := range cells {
+		cell := cells[i]
+		if cell.set && cell.value != nil {
+			buf = append(buf, 0x01)
+			binary.BigEndian.PutUint32(hdr[:], uint32(len(cell.value)))
+			buf = append(buf, hdr[:]...)
+			buf = append(buf, cell.value...)
+		} else {
+			buf = append(buf, 0x00)
+		}
+	}
+	return buf
 }
 
-// primaryKeyKey is the key that represents the row. Its absence means the row
-// does not exist.
-func primaryKeyKey(s *Schema, rowID string) string { return rowKey(s, rowID, s.PrimaryKey) }
+// unpackRowInto decodes a packed value into cells, copying each present value
+// into the owned buffers so the cells outlive the store's value buffer. cells
+// and owned must both be pre-sized to the schema width (owned[i] backs cells[i]
+// and is reused across rows). It returns the cells for convenience.
+func unpackRowInto(buf []byte, cells rowCells, owned [][]byte) (rowCells, error) {
+	if len(buf) == 0 || buf[0] != rowVersion {
+		return nil, fmt.Errorf("%w: row value is not a packed row", ErrBadSchema)
+	}
+	p := 1
+	for i := range cells {
+		if p >= len(buf) {
+			return nil, fmt.Errorf("%w: truncated packed row", ErrBadSchema)
+		}
+		switch buf[p] {
+		case 0x00:
+			cells[i] = rowValue{}
+			p++
+		case 0x01:
+			p++
+			if p+4 > len(buf) {
+				return nil, fmt.Errorf("%w: truncated length in packed row", ErrBadSchema)
+			}
+			l := int(binary.BigEndian.Uint32(buf[p:]))
+			p += 4
+			if p+l > len(buf) {
+				return nil, fmt.Errorf("%w: truncated value in packed row", ErrBadSchema)
+			}
+			v := append(owned[i][:0], buf[p:p+l]...)
+			owned[i] = v
+			cells[i] = rowValue{value: v, set: true}
+			p += l
+		default:
+			return nil, fmt.Errorf("%w: corrupt presence flag in packed row", ErrBadSchema)
+		}
+	}
+	return cells, nil
+}
+
+// unpackRow decodes a packed value into a fresh, schema-width cell set.
+func unpackRow(buf []byte, ncols int) (rowCells, error) {
+	cells := make(rowCells, ncols)
+	return unpackRowInto(buf, cells, make([][]byte, ncols))
+}
+
+// rowKey is the single key a catalog row lives under: the row prefix with no
+// column suffix. Its empty final segment can never collide with a real column
+// name (which may not be empty), so the key is unambiguous.
+func rowKey(s *Schema, rowID string) string {
+	return RowPrefix(s.DB, s.Table, rowID)
+}
 
 // rowExists reports whether a row is present, which is a single read of the
-// primary key rather than a scan of the row's range.
+// row's key.
 func rowExists(st Store, sch *Schema, rowID string) (bool, error) {
-	_, ok, err := st.GetErr(primaryKeyKey(sch, rowID))
+	_, ok, err := st.GetErr(rowKey(sch, rowID))
 	if err != nil {
 		return false, err
 	}
@@ -69,86 +129,49 @@ func rowExists(st Store, sch *Schema, rowID string) (bool, error) {
 }
 
 // readRow assembles one row, reporting whether it exists. Cells come back in
-// schema column order with nil for a column that has no key.
-//
-// The cells are placed by looking each scanned column name up in the schema, not
-// by position. Key order is lexicographic, so the range scan returns columns
-// sorted by name and in no particular relation to declaration order: a table
-// declared (id, age, name) scans back age, id, name.
-func readRow(st Store, sch *Schema, rowID string) (rowCells, bool, error) {
-	ok, err := rowExists(st, sch, rowID)
-	if err != nil {
+// schema column order with a nil value for a column that is NULL. If scratch is
+// non-nil, the row cells and owned buffers are reused from it, eliminating
+// allocations on the hot path.
+func readRow(st Store, sch *Schema, rowID string, scratch *readScratch) (rowCells, bool, error) {
+	value, ok, err := st.GetErr(rowKey(sch, rowID))
+	if err != nil || !ok {
 		return nil, false, err
 	}
-	if !ok {
-		return nil, false, nil
-	}
-	prefix := RowPrefix(sch.DB, sch.Table, rowID)
-	cells := make(rowCells, len(sch.Columns))
-	_, err = st.ScanPrefix(prefix, func(key, value []byte) bool {
-		name := columnNameFromKey(prefix, key)
-		if col, found := sch.columnIndex(name); found {
-			// The value is copied because the scan's buffers are only valid for
-			// the duration of the callback, and these outlive it.
-			cells[col] = rowValue{value: append([]byte(nil), value...), set: true}
+	if scratch != nil {
+		// Reuse the pre-allocated buffers.
+		cells, err := unpackRowInto(value, scratch.cells, scratch.owned)
+		if err != nil {
+			return nil, false, err
 		}
-		// A key that names no declared column is not part of the row. The
-		// schema defines the row's shape, and this phase has no ALTER TABLE, so
-		// such a key can only be a leftover; refusing to read the row because
-		// one is present would make a table unreadable by an unrelated write.
-		return true
-	})
+		// Reset owned buffers for next use: clear the backing arrays so the
+		// next unpackRowInto can append into them without growing.
+		for i := range scratch.owned {
+			scratch.owned[i] = scratch.owned[i][:0]
+		}
+		return cells, true, nil
+	}
+	cells, err := unpackRow(value, len(sch.Columns))
 	if err != nil {
 		return nil, false, err
 	}
 	return cells, true, nil
 }
 
-// columnNameFromKey strips a row prefix off a key, yielding the column name.
-// The prefix ends at the row id's separator, and a column name cannot contain a
-// separator, so the remainder is exactly the name.
-func columnNameFromKey(prefix string, key []byte) string {
-	return string(key[len(prefix):])
-}
-
 // insertRow writes a row that must not already exist, and reports a duplicate
-// rather than overwriting one.
-//
-// The primary key is written first and conditionally. That is what makes the
-// insert atomic in the only sense the store can offer: two concurrent inserts of
-// the same row id cannot both report success. Writing the other columns first
-// would be worse than non-atomic -- a losing insert would have already
-// overwritten the winner's columns before discovering the conflict.
+// rather than overwriting one. The whole row is written as one conditional
+// write, so the insert is atomic in the strongest sense the store offers: two
+// concurrent inserts of the same row id cannot both report success, and there
+// is no window in which a partially written row is visible.
 func insertRow(st Store, sch *Schema, rowID string, cells rowCells) error {
 	if err := validateRowCells(sch, cells, true); err != nil {
 		return err
 	}
-	pk := primaryKeyKey(sch, rowID)
-	applied, err := st.SetIfAbsent(pk, cells[sch.PrimaryKey].value, 0)
+	applied, err := st.SetIfAbsent(rowKey(sch, rowID), packRow(cells), 0)
 	if err != nil {
 		return err
 	}
 	if !applied {
 		return ErrDuplicateRow
-	}
-	// The row is now committed. A failure below leaves it committed but
-	// incomplete, so the written columns are removed again before the error is
-	// reported. This covers a reported store failure, which is the case a
-	// client can retry; it does not cover a crash, which no compensation in
-	// this process could survive.
-	for i, cell := range cells {
-		if i == sch.PrimaryKey || !cell.set || cell.value == nil {
-			continue
-		}
-		// A plain Set, not SetIfPresent. The primary key has already been
-		// claimed, so this row is ours and these keys are being created rather
-		// than updated; a conditional update would simply decline to write keys
-		// that do not exist yet, leaving a row that existed but had none of its
-		// non-key columns.
-		if err := st.Set(rowKey(sch, rowID, i), cell.value, 0); err != nil {
-			compensateRow(st, sch, rowID)
-			return err
-		}
 	}
 	return nil
 }
@@ -164,100 +187,34 @@ func updateRow(st Store, sch *Schema, rowID string, cells rowCells) (bool, error
 	if err := validateRowCells(sch, cells, false); err != nil {
 		return false, err
 	}
-	ok, err := rowExists(st, sch, rowID)
+	key := rowKey(sch, rowID)
+	value, ok, err := st.GetErr(key)
 	if err != nil {
 		return false, err
 	}
 	if !ok {
 		return false, nil
 	}
+	cur, err := unpackRow(value, len(sch.Columns))
+	if err != nil {
+		return false, err
+	}
 	for i, cell := range cells {
-		// A column the statement did not name keeps whatever it has, so its
-		// key is neither written nor removed.
+		// A column the statement did not name keeps whatever it has.
 		if i == sch.PrimaryKey || !cell.set {
 			continue
 		}
-		key := rowKey(sch, rowID, i)
-		if cell.value == nil {
-			if _, err := st.Delete(key); err != nil {
-				return false, err
-			}
-			continue
-		}
-		// A plain Set, not SetIfPresent. The row is known to exist by now --
-		// rowExists checked the primary key above -- but the column being named
-		// may have no key yet, because a nullable column the INSERT omitted was
-		// never written. A write conditional on that column's own existence would
-		// decline, and a per-column decline could not be told apart from a real
-		// failure, so the UPDATE would silently skip the column and still succeed.
-		if err := st.Set(key, cell.value, 0); err != nil {
-			return false, err
-		}
+		cur[i] = cell
+	}
+	if err := st.Set(key, packRow(cur), 0); err != nil {
+		return false, err
 	}
 	return true, nil
 }
 
 // deleteRow removes a row, reporting whether it existed.
-//
-// The primary key is deleted first so the row stops existing immediately, before
-// its remaining columns are swept. Doing it the other way round would leave a
-// window in which the row is still visible but has lost columns, which is the
-// worse failure: a reader would see a truncated row rather than none.
 func deleteRow(st Store, sch *Schema, rowID string) (bool, error) {
-	pk := primaryKeyKey(sch, rowID)
-	ok, err := st.Delete(pk)
-	if err != nil || !ok {
-		return false, err
-	}
-	if _, err := sweepRow(st, sch, rowID); err != nil {
-		return true, err
-	}
-	return true, nil
-}
-
-// sweepRow removes every key of a row except the primary key, which the caller
-// has already dealt with.
-//
-// The key set is taken from the schema rather than from a scan of the row
-// prefix. A range read may be served best-effort and miss a key, and a missed
-// column would then survive as an orphan that a later reader or the DROP TABLE
-// emptiness guard would still see. Iterating the schema makes the sweep
-// complete by construction. Any column key that is already absent is deleted
-// harmlessly, which also cleans up orphans left by an earlier partial sweep.
-func sweepRow(st Store, sch *Schema, rowID string) (int, error) {
-	deleted := 0
-	var firstErr error
-	for i := range sch.Columns {
-		if i == sch.PrimaryKey {
-			continue
-		}
-		ok, err := st.Delete(ColumnKey(sch.DB, sch.Table, rowID, sch.Columns[i].Name))
-		if err != nil {
-			// A delete failure mid-sweep leaves orphan column keys. They are
-			// invisible because the primary key is gone, so this is reported
-			// but not compensated: there is no row left to protect. The rest of
-			// the sweep still runs, because stopping would leave more orphans
-			// for no benefit.
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if ok {
-			deleted++
-		}
-	}
-	return deleted, firstErr
-}
-
-// compensateRow removes a partially inserted row, best effort. It is called when
-// insertRow has already committed the primary key and then failed, so the row
-// must not be left behind.
-func compensateRow(st Store, sch *Schema, rowID string) {
-	if _, err := st.Delete(primaryKeyKey(sch, rowID)); err != nil {
-		return
-	}
-	_, _ = sweepRow(st, sch, rowID)
+	return st.Delete(rowKey(sch, rowID))
 }
 
 // validateRowCells rejects a cell set that could not be stored as a row: the
@@ -305,7 +262,8 @@ var ErrNotNull = fmt.Errorf("%w: not-null violation", ErrBadSchema)
 
 // rowIDFromKey recovers the row id from a key under a table prefix, undoing the
 // escaping a row id may have needed. It is the inverse used by scans that walk a
-// whole table rather than one row.
+// whole table rather than one row. The packed row key's empty column suffix is
+// ignored, so the row id is still recovered from `db/table/<row-id>/`.
 func rowIDFromKey(tablePrefix string, key []byte) (string, bool) {
 	rest := string(key[len(tablePrefix):])
 	i := strings.IndexByte(rest, '/')

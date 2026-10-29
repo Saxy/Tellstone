@@ -1,0 +1,20 @@
+goos: linux
+goarch: amd64
+cpu: AMD Ryzen 9 9950X 16-Core Processor            
+BenchmarkCoreGet-32      	53470069	        23.13 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreGet-32      	53563590	        22.45 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreGet-32      	48022329	        23.10 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreGet-32      	51230958	        22.74 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreGet-32      	50664416	        23.05 ns/op	       0 B/op	       0 allocs/op
+BenchmarkCoreSet-32      	17124487	        68.09 ns/op	      64 B/op	       1 allocs/op
+BenchmarkCoreSet-32      	16947704	        68.41 ns/op	      64 B/op	       1 allocs/op
+BenchmarkCoreSet-32      	16565391	        68.08 ns/op	      64 B/op	       1 allocs/op
+BenchmarkCoreSet-32      	17598238	        67.72 ns/op	      64 B/op	       1 allocs/op
+BenchmarkCoreSet-32      	17416549	        68.24 ns/op	      64 B/op	       1 allocs/op
+BenchmarkCoreBatch-32    	 2417546	       481.2 ns/op	      64 B/op	       1 allocs/op
+BenchmarkCoreBatch-32    	 2460609	       488.9 ns/op	      64 B/op	       1 allocs/op
+BenchmarkCoreBatch-32    	 2354739	       491.7 ns/op	      65 B/op	       1 allocs/op
+BenchmarkCoreBatch-32    	 2377891	       492.5 ns/op	      65 B/op	       1 allocs/op
+BenchmarkCoreBatch-32    	 2497395	       496.2 ns/op	      64 B/op	       1 allocs/op
+PASS
+ok  	command-line-arguments	20.744s

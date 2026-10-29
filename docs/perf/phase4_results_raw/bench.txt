@@ -1,0 +1,11 @@
+BenchmarkPhase4ProposeSequential-16           	raft2026/10/29 08:51:28 INFO: 1 switched to configuration voters=()
+   16552	    230215 ns/op	    9055 B/op	     239 allocs/op
+BenchmarkPhase4ProposeParallel-16             	raft2026/10/29 08:51:40 INFO: 1 switched to configuration voters=()
+  150163	     23173 ns/op	    7815 B/op	     179 allocs/op
+BenchmarkPhase4LinearizableRead-16            	raft2026/10/29 08:51:48 INFO: 1 switched to configuration voters=()
+ 1486821	      2459 ns/op	     841 B/op	      13 allocs/op
+BenchmarkPhase4LinearizableReadParallel-16    	raft2026/10/29 08:52:00 INFO: 1 switched to configuration voters=()
+ 1000000	     10388 ns/op	     885 B/op	      12 allocs/op
+BenchmarkPhase4LocalRead-16                   	raft2026/10/29 08:52:16 INFO: 1 switched to configuration voters=()
+329177868	        10.75 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPhase4FSMApply-16                    	79132117	        45.63 ns/op	      16 B/op	       1 allocs/op

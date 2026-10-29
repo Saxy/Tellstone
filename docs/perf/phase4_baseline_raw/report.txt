@@ -1,0 +1,12 @@
+    phase4_bench_test.go:383: sequential write (500 samples): mean=753µs p50=337µs p95=2.237ms p99=2.352ms
+    phase4_bench_test.go:385: replication traffic per write: msgs=8.06 frames=4.65 bytes=333
+    phase4_bench_test.go:427: concurrent write (32 clients, 1.5s): 63152 ops/s, 94728 ops total, errors=0
+    phase4_bench_test.go:429: concurrent replication traffic per write: msgs=8.00 frames=0.41
+    phase4_bench_test.go:443: linearizable read (500 samples): mean=804µs p50=1.102ms p95=2.258ms p99=2.358ms
+    phase4_bench_test.go:456: local state-machine read (500 samples): mean=29ns p50=29ns p95=30ns p99=30ns
+    phase4_bench_test.go:489: concurrent linearizable read (32 clients, 1.5s): 74141 ops/s, 111212 ops, errors=0
+    phase4_bench_test.go:491: concurrent read traffic per op: msgs=4.00 frames=0.25
+    phase4_bench_test.go:511: fsm apply (2000 samples): mean=59ns p50=59ns p95=59ns p99=118ns
+    phase4_bench_test.go:520: idle cluster traffic (2s): 40.0 msgs/s, 45.5 frames/s
+--- PASS: TestPhase4BaselineReport (6.82s)
+PASS

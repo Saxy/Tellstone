@@ -42,6 +42,8 @@ type Config struct {
 	maxMemBytes       uint64
 	shutdownTimeout   time.Duration
 	numShards         int
+	shardActor        bool
+	pinShards         bool
 	enablePersistence bool
 	persistenceDir    string
 	tlsCert           string
@@ -67,6 +69,17 @@ type Config struct {
 	nodeID      uint64
 	peerAddr    string
 	peers       string
+	// raftSafeReads forces quorum-confirmed linearizable reads. The default
+	// uses leader-lease reads, which skip the per-read heartbeat round trip
+	// and assume bounded clock drift between nodes (single datacenter / NTP).
+	raftSafeReads bool
+	// raftHeartbeatTick/raftElectionTick/raftTickInterval configure the Raft
+	// clock. HeartbeatTick 2 at TickInterval 100ms sends a heartbeat every
+	// 200ms, giving five heartbeats per 1s election timeout while halving the
+	// idle chatter of the old 1-tick heartbeat.
+	raftHeartbeatTick int
+	raftElectionTick  int
+	raftTickInterval  time.Duration
 	// Placement driver / TSO (phase 2). nodeRole selects the deployment
 	// topology per ADR-010 §5: hybrid runs data shards plus an embedded
 	// etcd member, pd runs only the embedded member, data skips the embed
@@ -315,6 +328,21 @@ func LoadConfig(args []string) *Config {
 		getEnv("TSD_NUM_SHARDS", 0),
 		"Number of shared-nothing shards (0 = GOMAXPROCS). Each shard = 1 goroutine + 1 lock-free map",
 	)
+	// Route each shard's mutations through its actor goroutine instead of the
+	// caller's goroutine.
+	fs.BoolVar(
+		&cfg.shardActor,
+		"shard-actor",
+		getEnv("TSD_SHARD_ACTOR", false),
+		"Serialize each shard's mutations on a dedicated actor goroutine (default: false)",
+	)
+	// Pin each shard's actor goroutine to a CPU, chosen from the shard ID.
+	fs.BoolVar(
+		&cfg.pinShards,
+		"pin-shards",
+		getEnv("TSD_PIN_SHARDS", false),
+		"Pin each shard's actor goroutine to a CPU; requires --shard-actor (default: false)",
+	)
 	// Optional write-ahead log persistence per shard.
 	fs.BoolVar(
 		&cfg.enablePersistence,
@@ -457,6 +485,30 @@ func LoadConfig(args []string) *Config {
 		"peers",
 		getEnv("TSD_PEERS", ""),
 		"Comma-separated list of peer addresses for initial cluster bootstrap (default: none)",
+	)
+	fs.BoolVar(
+		&cfg.raftSafeReads,
+		"raft-safe-reads",
+		getEnv("TSD_RAFT_SAFE_READS", false),
+		"Serve linearizable reads through a quorum heartbeat round trip instead of leader-lease reads (default: false; lease reads assume bounded clock drift)",
+	)
+	fs.IntVar(
+		&cfg.raftHeartbeatTick,
+		"raft-heartbeat-tick",
+		getEnv("TSD_RAFT_HEARTBEAT_TICK", 2),
+		"Raft heartbeat interval in ticks; must be smaller than --raft-election-tick (default: 2)",
+	)
+	fs.IntVar(
+		&cfg.raftElectionTick,
+		"raft-election-tick",
+		getEnv("TSD_RAFT_ELECTION_TICK", 10),
+		"Raft election timeout in ticks (default: 10)",
+	)
+	fs.DurationVar(
+		&cfg.raftTickInterval,
+		"raft-tick-interval",
+		getEnv("TSD_RAFT_TICK_INTERVAL", 100*time.Millisecond),
+		"Raft logical clock tick interval (default: 100ms)",
 	)
 	// Placement driver / TSO (phase 2, ADR-010).
 	fs.StringVar(
@@ -625,6 +677,18 @@ func LoadConfig(args []string) *Config {
 		}
 		if !localFound {
 			panic("tellstone: --node-id is not present in --peers; the local node must be part of the bootstrap membership")
+		}
+		// Raft clock sanity: raft requires a heartbeat interval smaller than
+		// the election timeout, and a non-positive tick interval would make
+		// the ticker panic at startup.
+		if cfg.raftHeartbeatTick <= 0 {
+			panic("tellstone: --raft-heartbeat-tick must be positive")
+		}
+		if cfg.raftElectionTick <= cfg.raftHeartbeatTick {
+			panic("tellstone: --raft-election-tick must be greater than --raft-heartbeat-tick")
+		}
+		if cfg.raftTickInterval <= 0 {
+			panic("tellstone: --raft-tick-interval must be positive")
 		}
 	}
 
@@ -872,6 +936,8 @@ func (cfg *Config) GetMaxMsgSize() uint64             { return cfg.maxMsgSize }
 func (cfg *Config) GetMaxMemBytes() uint64            { return cfg.maxMemBytes }
 func (cfg *Config) GetShutdownTimeout() time.Duration { return cfg.shutdownTimeout }
 func (cfg *Config) GetNumShards() int                 { return cfg.numShards }
+func (cfg *Config) ShardActorEnabled() bool           { return cfg.shardActor }
+func (cfg *Config) PinShardsEnabled() bool            { return cfg.pinShards }
 func (cfg *Config) PersistenceEnabled() bool          { return cfg.enablePersistence }
 func (cfg *Config) GetPersistenceDir() string         { return cfg.persistenceDir }
 func (cfg *Config) TLSEnabled() bool                  { return cfg.tlsCert != "" && cfg.tlsKey != "" }
@@ -898,6 +964,10 @@ func (cfg *Config) ClusterMode() bool                  { return cfg.clusterMode 
 func (cfg *Config) GetNodeID() uint64                  { return cfg.nodeID }
 func (cfg *Config) GetPeerAddr() string                { return cfg.peerAddr }
 func (cfg *Config) GetPeers() string                   { return cfg.peers }
+func (cfg *Config) RaftSafeReads() bool                { return cfg.raftSafeReads }
+func (cfg *Config) RaftHeartbeatTick() int             { return cfg.raftHeartbeatTick }
+func (cfg *Config) RaftElectionTick() int              { return cfg.raftElectionTick }
+func (cfg *Config) RaftTickInterval() time.Duration    { return cfg.raftTickInterval }
 func (cfg *Config) GetNodeRole() string                { return cfg.nodeRole }
 func (cfg *Config) GetPDAddr() string                  { return cfg.pdAddr }
 func (cfg *Config) GetPDClientAddr() string            { return cfg.pdClientAddr }

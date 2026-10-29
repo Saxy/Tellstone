@@ -124,9 +124,9 @@ func TestExplainDistinguishesEstimatedFromAnalyzed(t *testing.T) {
 	}
 }
 
-// ANALYZE has to count rows, not keys. A four-column row is four keys, so a
-// counter that tallies keys would report 160 for 40 rows -- and a cost model
-// fed that would price every query four times too high.
+// ANALYZE has to count rows, not keys. In the packed layout a row is one key,
+// so Keys equals Rows; the count is still by row id, which is what keeps a
+// future layout change from mispricing the estimator.
 func TestAnalyzeCountsRowsNotKeys(t *testing.T) {
 	srv, _ := newTestServer(t, srvOpts{})
 	cl := dialServer(t, srv.Addr())
@@ -141,8 +141,8 @@ func TestAnalyzeCountsRowsNotKeys(t *testing.T) {
 	if st.Rows != 40 {
 		t.Fatalf("ANALYZE counted %d rows, want 40 (it counted keys: %d)", st.Rows, st.Keys)
 	}
-	if uint64(st.Keys) <= st.Rows {
-		t.Fatalf("Keys (%d) should exceed Rows (%d); the two are not being tracked separately", st.Keys, st.Rows)
+	if uint64(st.Keys) != st.Rows {
+		t.Fatalf("Keys (%d) should equal Rows (%d) in the packed layout", st.Keys, st.Rows)
 	}
 	if !st.Analyzed || st.AtUnix == 0 {
 		t.Fatalf("statistics not marked as collected: %+v", st)

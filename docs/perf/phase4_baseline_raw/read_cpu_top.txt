@@ -1,0 +1,26 @@
+# BenchmarkPhase4LinearizableRead, CPU
+Build ID: 24f46b4ce10969fea36d12d054811d7951998126
+Type: cpu
+Time: 2026-10-29 08:17:09 CET
+Duration: 7.06s, Total samples = 1.66s (23.51%)
+Showing nodes accounting for 1.45s, 87.35% of 1.66s total
+Showing top 20 nodes out of 141
+      flat  flat%   sum%        cum   cum%
+     0.56s 33.73% 33.73%      0.56s 33.73%  runtime.futex
+     0.52s 31.33% 65.06%      0.52s 31.33%  internal/runtime/syscall/linux.Syscall6
+     0.05s  3.01% 68.07%      0.06s  3.61%  runtime.unlock2
+     0.04s  2.41% 70.48%      0.22s 13.25%  runtime.selectgo
+     0.03s  1.81% 72.29%      0.03s  1.81%  runtime.read
+     0.03s  1.81% 74.10%      0.10s  6.02%  runtime.stealWork
+     0.02s  1.20% 75.30%      0.02s  1.20%  go.etcd.io/raft/v3/raftpb.(*HardState).GetTerm
+     0.02s  1.20% 76.51%      0.07s  4.22%  runtime.(*timers).check
+     0.02s  1.20% 77.71%      0.42s 25.30%  runtime.findRunnable
+     0.02s  1.20% 78.92%      0.02s  1.20%  runtime.lock2
+     0.02s  1.20% 80.12%      0.02s  1.20%  runtime.mapassign_fast64
+     0.02s  1.20% 81.33%      0.02s  1.20%  runtime.nanotime (inline)
+     0.02s  1.20% 82.53%      0.03s  1.81%  runtime.runqgrab
+     0.02s  1.20% 83.73%      0.02s  1.20%  runtime.write1
+     0.01s   0.6% 84.34%      0.03s  1.81%  github.com/Saxy/Tellstone/internal/cluster.(*Node).processReady
+     0.01s   0.6% 84.94%      0.40s 24.10%  github.com/Saxy/Tellstone/internal/cluster/network.(*Transport).readLoop
+     0.01s   0.6% 85.54%      0.01s   0.6%  github.com/Saxy/Tellstone/internal/cluster/network.decodeMsg
+     0.01s   0.6% 86.14%      0.15s  9.04%  go.etcd.io/raft/v3.(*node).Step

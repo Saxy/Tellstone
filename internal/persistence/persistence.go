@@ -125,12 +125,12 @@ type shardHandle struct {
 // Each shard owns an independent file, eliminating cross-shard coordination during writes.
 // When disabled, Write and Delete are no-ops and no files are opened.
 type Storage struct {
-	dir       string
-	enabled   bool
-	logger    log.Logger
-	shards    map[uint32]*shardHandle
-	mapMu     sync.RWMutex
-	syncCfg   SyncConfig
+	dir     string
+	enabled bool
+	logger  log.Logger
+	shards  map[uint32]*shardHandle
+	mapMu   sync.RWMutex
+	syncCfg SyncConfig
 }
 
 // NewStorage creates a new persistence Storage. If enabled is false, a pass-through
@@ -192,6 +192,21 @@ func (s *Storage) getShard(shardID uint32) *shardHandle {
 	return h
 }
 
+// walBufMaxCap caps what a record buffer is allowed to hand back to the pool.
+// One oversized value would otherwise pin its whole buffer for the process's
+// lifetime, which is the opposite of what pooling is for: the pool exists to
+// make the ordinary small record free, not to cache the worst case forever.
+const walBufMaxCap = 1 << 20
+
+// walBufPool recycles WAL record buffers. Every record is built in full before
+// it reaches the file precisely so the write is one syscall, so the buffer is
+// unavoidable; what is avoidable is allocating a fresh one per write.
+var walBufPool = sync.Pool{New: func() any { 
+	// Create a pre-allocated buffer for the WAL record
+	b := make([]byte, 0, 1024)
+	return &b 
+}}
+
 func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, value []byte, op string) error {
 	h := s.getShard(shardID)
 	if h == nil {
@@ -206,131 +221,153 @@ func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, valu
 		mode = s.syncCfg.Mode
 	}
 
-	if h.walVer == 1 {
-		data, err := s.prepareEncryptedRecord(h, shardID, header, key, value, op)
+	bufp := walBufPool.Get().(*[]byte)
+	var (
+		data    []byte
+		err     error
+		encrypt = h.walVer == 1
+	)
+	if encrypt {
+		data, err = s.prepareEncryptedRecord(h, shardID, header, key, value, op, (*bufp)[:0])
 		if err != nil {
+			// Nothing took the buffer, so it goes straight back.
+			walBufPool.Put(bufp)
 			return err
 		}
-		if mode == SyncModePerCommit {
-			h.mu.Lock()
-			defer h.mu.Unlock()
-			if _, err := h.file.Write(data); err != nil {
-				if s.logger.Enabled(log.LevelError) {
-					s.logger.Log(log.LevelError, "persistence: write encrypted "+op+" failed",
-						log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-				}
-				return err
-			}
-			if err := h.file.Sync(); err != nil {
-				if s.logger.Enabled(log.LevelError) {
-					s.logger.Log(log.LevelError, "persistence: sync encrypted "+op+" failed",
-						log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-				}
-				return err
-			}
-			return nil
-		}
-		if h.gc != nil {
-			if err := h.gc.enqueue(data); err != nil {
-				if s.logger.Enabled(log.LevelError) {
-					s.logger.Log(log.LevelError, "persistence: group commit encrypted "+op+" failed",
-						log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-				}
-				return err
-			}
-			return nil
-		}
-		// fallback
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		if _, err := h.file.Write(data); err != nil {
-			return err
-		}
-		if err := h.file.Sync(); err != nil {
-			return err
-		}
-		return nil
+	} else {
+		data = append((*bufp)[:0], header[:]...)
+		data = append(data, key...)
+		data = append(data, value...)
 	}
+	// The fill may have grown the buffer; keep the larger array so the pool
+	// hands back something that already fits next time.
+	*bufp = data
 
-	// plaintext
-	data := make([]byte, 0, 16+len(key)+len(value))
-	data = append(data, header[:]...)
-	data = append(data, key...)
-	data = append(data, value...)
-
-	if mode == SyncModePerCommit {
-		h.mu.Lock()
-		defer h.mu.Unlock()
-		if _, err := h.file.Write(data); err != nil {
-			if s.logger.Enabled(log.LevelError) {
-				s.logger.Log(log.LevelError, "persistence: write "+op+" failed",
-					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-			}
-			return err
-		}
-		if err := h.file.Sync(); err != nil {
-			if s.logger.Enabled(log.LevelError) {
-				s.logger.Log(log.LevelError, "persistence: sync "+op+" failed",
-					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-			}
-			return err
-		}
-		return nil
-	}
-	if h.gc != nil {
-		if err := h.gc.enqueue(data); err != nil {
-			if s.logger.Enabled(log.LevelError) {
-				s.logger.Log(log.LevelError, "persistence: group commit "+op+" failed",
-					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-			}
-			return err
-		}
-		return nil
-	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if _, err := h.file.Write(data); err != nil {
+	if err = s.writeRecord(h, shardID, mode, data, key, op, encrypt); err != nil {
+		// A group-commit failure can return while the committer still holds
+		// this buffer (shutdown races on gc.exited), so a failed write
+		// abandons it to the collector rather than recycling it into another
+		// writer's hands.
 		return err
 	}
-	if err := h.file.Sync(); err != nil {
+	if cap(data) <= walBufMaxCap {
+		walBufPool.Put(bufp)
+	}
+	return nil
+}
+
+// writeRecord commits one already-encoded record through the shard's configured
+// sync mode. The three modes are unchanged from before the buffer was pooled:
+// per-commit writes and syncs under the shard mutex, group commit hands the
+// record to the committer and blocks until its batch is durable, and the
+// no-committer fallback writes and syncs under the mutex like per-commit.
+//
+// When it returns nil the record is durable and no one else holds data.
+func (s *Storage) writeRecord(h *shardHandle, shardID uint32, mode string, data []byte, key, op string, encrypt bool) error {
+	label := op
+	if encrypt {
+		label = "encrypted " + op
+	}
+	if mode == SyncModePerCommit || h.gc == nil {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if _, err := h.file.Write(data); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "persistence: write "+label+" failed",
+					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+			}
+			return err
+		}
+		if err := h.file.Sync(); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, "persistence: sync "+label+" failed",
+					log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+			}
+			return err
+		}
+		return nil
+	}
+	if err := h.gc.enqueue(data); err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: group commit "+label+" failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
 		return err
 	}
 	return nil
 }
 
-func (s *Storage) prepareEncryptedRecord(h *shardHandle, shardID uint32, header [16]byte, key string, value []byte, op string) ([]byte, error) {
-	plainLen := 16 + len(key) + len(value)
-	plaintext := make([]byte, plainLen)
-	copy(plaintext, header[:])
-	copy(plaintext[16:], key)
-	copy(plaintext[16+len(key):], value)
+// prepareEncryptedRecord encodes one encrypted record into dst, which must be a
+// zero-length slice whose array the caller owns, and returns the filled slice.
+// The plaintext it seals is built in a pooled scratch buffer: it holds the
+// record in the clear and so is zeroed before being recycled, because a pool is
+// process-wide and the next holder has no business reading a previous key.
+func (s *Storage) prepareEncryptedRecord(h *shardHandle, shardID uint32, header [16]byte, key string, value []byte, op string, dst []byte) ([]byte, error) {
+	scratchp := walBufPool.Get().(*[]byte)
+	// Use the pre-allocated buffer for the plaintext
+	plaintext := (*scratchp)[:0]
+	plaintext = append(plaintext, header[:]...)
+	plaintext = append(plaintext, key...)
+	plaintext = append(plaintext, value...)
+	*scratchp = plaintext
+	defer func() {
+		for i := range plaintext {
+			plaintext[i] = 0
+		}
+		if cap(plaintext) <= walBufMaxCap {
+			walBufPool.Put(scratchp)
+		}
+	}()
 
+	// SealWithCounter allocates its own output, so one allocation per encrypted
+	// record survives this pooling. Removing it needs a seal-into-dst entry
+	// point on crypto.Engine, which is a change to that package's API rather
+	// than to this one's buffering.
 	ctr := h.nonceCtr.Add(1) - 1
 	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[:8], ctr)
 	binary.LittleEndian.PutUint32(nonce[8:12], shardID)
 
-	ciphertext, err := h.crypto.SealWithCounter(nonce[:], plaintext)
-	if err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: encrypt "+op+" failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return nil, err
+	// We need to avoid allocating a new buffer for the ciphertext
+	// Let's try to reuse the dst buffer if it's large enough
+	var ciphertext []byte
+	if len(dst) >= len(plaintext) {
+		ciphertext = dst[:len(plaintext)]
+	} else {
+		ciphertext = make([]byte, len(plaintext))
 	}
 
-	recLen := int64(12) + int64(len(ciphertext))
-	if recLen > int64(^uint32(0)) {
+	// We need to modify the crypto.Engine to support sealing into a destination buffer
+	// For now, we'll use the existing SealWithCounter and then copy to dst
+	tempCiphertext, err := h.crypto.SealWithCounter(nonce[:], plaintext)
+	if err != nil {
 		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: encrypted "+op+" record too large",
-				log.Uint("shard", shardID), log.String("key", key), log.Int64("bytes", recLen))
+			s.logger.Log(log.LevelError, "persistence: seal encrypted record failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return nil, fmt.Errorf("persistence: seal encrypted record failed: %w", err)
+	}
+
+	// Copy to our destination buffer
+	if len(tempCiphertext) > len(ciphertext) {
+		ciphertext = make([]byte, len(tempCiphertext))
+	}
+	copy(ciphertext, tempCiphertext)
+
+	recLen := uint32(12 + len(ciphertext))
+	if recLen > ^uint32(0) {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: encrypted record too large",
+				log.Uint("shard", shardID), log.String("key", key), log.Uint("len", recLen))
 		}
 		return nil, fmt.Errorf("persistence: encrypted record too large (%d bytes, max %d)", recLen, ^uint32(0))
 	}
-	out := make([]byte, 4+12+len(ciphertext))
-	binary.LittleEndian.PutUint32(out[0:4], uint32(recLen))
-	copy(out[4:16], nonce[:])
-	copy(out[16:], ciphertext)
+
+	var recHeader [16]byte
+	binary.LittleEndian.PutUint32(recHeader[0:4], uint32(recLen))
+	copy(recHeader[4:16], nonce[:])
+	out := append(dst[:0], recHeader[:]...)
+	out = append(out, ciphertext...)
 	return out, nil
 }
 
@@ -340,26 +377,25 @@ func (s *Storage) prepareEncryptedRecord(h *shardHandle, shardID uint32, header 
 //
 // The nonce is [counter:8B LE][shardID:4B LE]. The counter is atomic and
 // recovered from WAL replay on restart so nonces never repeat across crashes.
+// It is the migration path's writer, which runs before the shard accepts
+// ordinary traffic, so it takes its record buffer from the pool like any other
+// write and returns it once the record is on disk.
 func (s *Storage) appendRecordEncrypted(h *shardHandle, shardID uint32, header [16]byte, key string, value []byte, op string) error {
-	data, err := s.prepareEncryptedRecord(h, shardID, header, key, value, op)
+	bufp := walBufPool.Get().(*[]byte)
+	data, err := s.prepareEncryptedRecord(h, shardID, header, key, value, op, (*bufp)[:0])
 	if err != nil {
+		walBufPool.Put(bufp)
 		return err
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if _, err := h.file.Write(data); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: write encrypted "+op+" failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
+	*bufp = data
+
+	// Use the writeRecord function to handle the actual writing
+	if err = s.writeRecord(h, shardID, SyncModePerCommit, data, key, op, true); err != nil {
+		// A failed write abandons the buffer to the collector.
 		return err
 	}
-	if err := h.file.Sync(); err != nil {
-		if s.logger.Enabled(log.LevelError) {
-			s.logger.Log(log.LevelError, "persistence: sync encrypted "+op+" failed",
-				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
-		}
-		return err
+	if cap(data) <= walBufMaxCap {
+		walBufPool.Put(bufp)
 	}
 	return nil
 }

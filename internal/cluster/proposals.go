@@ -28,18 +28,36 @@ import (
 // proposalIDSize is the 8-byte prefix prepended to tagged proposals.
 const proposalIDSize = 8
 
+// proposalShards splits the pending-proposal map so concurrent proposals
+// rarely contend on the same lock. The count must stay a power of two so the
+// shard index is a mask instead of a division.
+const proposalShards = 16
+
+// proposalShard is one lock-protected slice of the pending proposal map. A
+// typed map avoids the interface boxing that sync.Map performs for every
+// Store, which showed up as a per-write allocation in the Phase 4 profile.
+type proposalShard struct {
+	mu      sync.Mutex
+	pending map[uint64]chan error
+}
+
 // proposalTracker manages pending synchronous proposals. Each proposal is
 // assigned a monotonically increasing ID. The readyLoop signals completion
 // when the corresponding committed entry is applied.
 type proposalTracker struct {
-	nextID  atomic.Uint64
-	pending sync.Map // map[uint64]chan error
-	count   atomic.Int64
+	nextID atomic.Uint64
+	count  atomic.Int64
+	shards [proposalShards]proposalShard
 }
 
 // newProposalTracker creates a new proposal tracker.
 func newProposalTracker() *proposalTracker {
 	return &proposalTracker{}
+}
+
+// shardFor returns the shard that owns id.
+func (pt *proposalTracker) shardFor(id uint64) *proposalShard {
+	return &pt.shards[id&(proposalShards-1)]
 }
 
 // add registers a new pending proposal and returns its unique ID. The
@@ -48,7 +66,13 @@ func newProposalTracker() *proposalTracker {
 func (pt *proposalTracker) add() (uint64, chan error) {
 	id := pt.nextID.Add(1)
 	ch := make(chan error, 1)
-	pt.pending.Store(id, ch)
+	sh := pt.shardFor(id)
+	sh.mu.Lock()
+	if sh.pending == nil {
+		sh.pending = make(map[uint64]chan error, 64)
+	}
+	sh.pending[id] = ch
+	sh.mu.Unlock()
 	pt.count.Add(1)
 	return id, ch
 }
@@ -57,19 +81,33 @@ func (pt *proposalTracker) add() (uint64, chan error) {
 // the apply error (nil on success) then closes the channel. Safe to call for
 // unknown IDs (no-op).
 func (pt *proposalTracker) complete(id uint64, err error) {
-	if v, ok := pt.pending.LoadAndDelete(id); ok {
-		pt.count.Add(-1)
-		ch := v.(chan error)
-		ch <- err
-		close(ch)
+	sh := pt.shardFor(id)
+	sh.mu.Lock()
+	ch, ok := sh.pending[id]
+	if ok {
+		delete(sh.pending, id)
 	}
+	sh.mu.Unlock()
+	if !ok {
+		return
+	}
+	pt.count.Add(-1)
+	ch <- err
+	close(ch)
 }
 
 // remove cancels a pending proposal (e.g. on context timeout). The channel
 // is deleted but NOT closed — the readyLoop may still send to it, and
 // receiving from a closed channel returns the zero value, which is safe.
 func (pt *proposalTracker) remove(id uint64) {
-	if _, loaded := pt.pending.LoadAndDelete(id); loaded {
+	sh := pt.shardFor(id)
+	sh.mu.Lock()
+	_, loaded := sh.pending[id]
+	if loaded {
+		delete(sh.pending, id)
+	}
+	sh.mu.Unlock()
+	if loaded {
 		pt.count.Add(-1)
 	}
 }

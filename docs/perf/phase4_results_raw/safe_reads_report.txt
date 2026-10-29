@@ -1,0 +1,5 @@
+    phase4_bench_test.go:468: linearizable read (500 samples): mean=109µs p50=107µs p95=187µs p99=240µs
+    phase4_bench_test.go:514: concurrent linearizable read (32 clients, 1.5s): 93599 ops/s, 140399 ops, errors=0
+    phase4_bench_test.go:516: concurrent read traffic per op: msgs=4.00 frames=0.41
+--- PASS: TestPhase4BaselineReport (6.19s)
+PASS

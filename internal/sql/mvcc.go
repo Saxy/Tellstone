@@ -47,14 +47,18 @@ type mvccView struct {
 }
 
 // appendLocked versions a key at the view's write timestamp, reading the current
-// value and writing it back. The caller holds commit.mu for an autocommit write;
-// a buffered write never reaches here.
+// value and writing it back. The caller holds the key's stripe lock for an
+// autocommit write; a buffered write never reaches here.
 func (v *mvccView) appendLocked(key string, value []byte, tomb bool) error {
 	raw, _, err := v.base.GetErr(key)
 	if err != nil {
 		return err
 	}
-	return v.base.Set(key, mvcc.Append(raw, v.writeTS, value, tomb), 0)
+	var horizon uint64
+	if v.commit != nil {
+		horizon = v.commit.horizon()
+	}
+	return v.base.Set(key, mvcc.Append(raw, v.writeTS, value, tomb, horizon), 0)
 }
 
 func (v *mvccView) GetErr(key string) ([]byte, bool, error) {
@@ -76,19 +80,21 @@ func (v *mvccView) GetErr(key string) ([]byte, bool, error) {
 }
 
 // Set/SetIfAbsent/SetIfPresent/Delete serialize an autocommit mutation against
-// every other catalog writer on the node: a version append reads the current
-// value and writes it back, and a conditional write reads existence and then
-// writes, so without the lock two autocommit statements could lose a version or
-// both claim the same key. A buffered write inside a block touches nothing and
-// takes no lock; the commit path takes it instead.
+// every other writer of the same key: a version append reads the current value
+// and writes it back, and a conditional write reads existence and then writes,
+// so without the lock two autocommit statements could lose a version or both
+// claim the same key. The lock is the key's stripe, not a global lock, so
+// autocommit writes to different keys proceed concurrently. A buffered write
+// inside a block touches nothing and takes no lock; the commit path takes it
+// instead.
 func (v *mvccView) Set(key string, value []byte, _ time.Duration) error {
 	if v.overlay != nil {
 		v.overlay.record(key, &txnWrite{value: append([]byte(nil), value...), mvcc: true})
 		return nil
 	}
 	if v.commit != nil {
-		v.commit.mu.Lock()
-		defer v.commit.mu.Unlock()
+		v.commit.locks.lock(key)
+		defer v.commit.locks.unlock(key)
 	}
 	return v.appendLocked(key, value, false)
 }
@@ -108,8 +114,8 @@ func (v *mvccView) SetIfAbsent(key string, value []byte, _ time.Duration) (bool,
 		return true, nil
 	}
 	if v.commit != nil {
-		v.commit.mu.Lock()
-		defer v.commit.mu.Unlock()
+		v.commit.locks.lock(key)
+		defer v.commit.locks.unlock(key)
 	}
 	if _, ok, err := v.GetErr(key); err != nil || ok {
 		return false, err
@@ -128,8 +134,8 @@ func (v *mvccView) SetIfPresent(key string, value []byte, _ time.Duration) (bool
 		return true, nil
 	}
 	if v.commit != nil {
-		v.commit.mu.Lock()
-		defer v.commit.mu.Unlock()
+		v.commit.locks.lock(key)
+		defer v.commit.locks.unlock(key)
 	}
 	if _, ok, err := v.GetErr(key); err != nil || !ok {
 		return false, err
@@ -147,8 +153,8 @@ func (v *mvccView) Delete(key string) (bool, error) {
 		return existed, nil
 	}
 	if v.commit != nil {
-		v.commit.mu.Lock()
-		defer v.commit.mu.Unlock()
+		v.commit.locks.lock(key)
+		defer v.commit.locks.unlock(key)
 	}
 	// Write the tombstone even when the read said the key was absent. That read
 	// may have been served best-effort and gone stale, and skipping the version

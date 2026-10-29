@@ -140,6 +140,7 @@ func main() {
 	totalRequests := flag.Int("n", 1000000, "Total number of requests to execute")
 	readRatio := flag.Float64("read-ratio", 0.95, "Ratio of GET requests")
 	zipfSkew := flag.Float64("skew", 1.5, "Power-law skew")
+	pipeline := flag.Int("pipeline", 1, "Requests pipelined per connection before reading (1 = synchronous)")
 	flag.Parse()
 	reqsPerWorker := *totalRequests / *concurrency
 	fmt.Printf("Benchmarking %s with %d workers (%d reqs each)...\n", *addr, *concurrency, reqsPerWorker)
@@ -171,33 +172,80 @@ func main() {
 			}
 			defer conn.Close()
 			var buf [1024]byte
-			var wbuf [1100]byte // reused request frame buffer (keeps the load generator zero-alloc)
 			var staticKey [32]byte
 			prefix := []byte("key-")
-			for r := 0; r < reqsPerWorker; r++ {
-				copy(staticKey[0:4], prefix)
-				keyEnd := strconv.AppendUint(staticKey[4:4], rng.Zipf(50000, *zipfSkew), 10)
-				totalKeyLen := 4 + len(keyEnd)
-				activeKeySlice := staticKey[:totalKeyLen]
-				isRead := rng.Float64() < *readRatio
-				var n int
-				if isRead {
-					n = encodeRequest(wbuf[:], network.OpGet, activeKeySlice, nil, 0)
-				} else {
-					n = encodeRequest(wbuf[:], network.OpSet, activeKeySlice, dummyValue, ttls[i])
+			if *pipeline > 1 {
+				depth := *pipeline
+				// One buffer holds a whole batch of request frames, so a batch
+				// is a single Write and the server can batch its responses.
+				pipeBuf := make([]byte, 0, depth*1100)
+				for r := 0; r < reqsPerWorker; r += depth {
+					nBatch := depth
+					if reqsPerWorker-r < nBatch {
+						nBatch = reqsPerWorker - r
+					}
+					pipeBuf = pipeBuf[:0]
+					for j := 0; j < nBatch; j++ {
+						copy(staticKey[0:4], prefix)
+						keyEnd := strconv.AppendUint(staticKey[4:4], rng.Zipf(50000, *zipfSkew), 10)
+						totalKeyLen := 4 + len(keyEnd)
+						activeKeySlice := staticKey[:totalKeyLen]
+						isRead := rng.Float64() < *readRatio
+						off := len(pipeBuf)
+						var n int
+						if isRead {
+							n = encodeRequest(pipeBuf[off:cap(pipeBuf)], network.OpGet, activeKeySlice, nil, 0)
+						} else {
+							n = encodeRequest(pipeBuf[off:cap(pipeBuf)], network.OpSet, activeKeySlice, dummyValue, ttls[i])
+						}
+						pipeBuf = pipeBuf[:off+n]
+					}
+					opStart := time.Now()
+					if _, err := conn.Write(pipeBuf); err != nil {
+						wStats.errorOps += uint64(nBatch)
+						continue
+					}
+					ok := true
+					for j := 0; j < nBatch; j++ {
+						var resp network.Message
+						if err := network.Read(conn, buf[:], &resp); err != nil {
+							wStats.errorOps++
+							ok = false
+							break
+						}
+					}
+					if ok {
+						wStats.hist.Record(time.Since(opStart))
+						wStats.successOps += uint64(nBatch)
+					}
 				}
-				opStart := time.Now()
-				if _, err := conn.Write(wbuf[:n]); err != nil {
-					wStats.errorOps++
-					continue
+			} else {
+				var wbuf [1100]byte // reused request frame buffer (keeps the load generator zero-alloc)
+				for r := 0; r < reqsPerWorker; r++ {
+					copy(staticKey[0:4], prefix)
+					keyEnd := strconv.AppendUint(staticKey[4:4], rng.Zipf(50000, *zipfSkew), 10)
+					totalKeyLen := 4 + len(keyEnd)
+					activeKeySlice := staticKey[:totalKeyLen]
+					isRead := rng.Float64() < *readRatio
+					var n int
+					if isRead {
+						n = encodeRequest(wbuf[:], network.OpGet, activeKeySlice, nil, 0)
+					} else {
+						n = encodeRequest(wbuf[:], network.OpSet, activeKeySlice, dummyValue, ttls[i])
+					}
+					opStart := time.Now()
+					if _, err := conn.Write(wbuf[:n]); err != nil {
+						wStats.errorOps++
+						continue
+					}
+					var resp network.Message
+					if err := network.Read(conn, buf[:], &resp); err != nil {
+						wStats.errorOps++
+						continue
+					}
+					wStats.hist.Record(time.Since(opStart))
+					wStats.successOps++
 				}
-				var resp network.Message
-				if err := network.Read(conn, buf[:], &resp); err != nil {
-					wStats.errorOps++
-					continue
-				}
-				wStats.hist.Record(time.Since(opStart))
-				wStats.successOps++
 			}
 		}(i)
 	}

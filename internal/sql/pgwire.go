@@ -129,6 +129,10 @@ type pgConn struct {
 	tlsConn    net.Conn // non-nil after an SSLRequest handshake
 	r          *bufio.Reader
 	w          *bufio.Writer
+	// scratch is a reusable frame buffer for the hot response paths, so
+	// RowDescription, DataRow and CommandComplete frames do not allocate a
+	// fresh backing array on every query.
+	scratch []byte
 	remoteAddr string
 	user       string
 
@@ -136,6 +140,24 @@ type pgConn struct {
 
 	stmts   map[string]*Plan        // prepared statements by name
 	portals map[string]*portalState // bound portals by name
+	// simplePlans caches the translation of a simple-query string, keyed by the
+	// exact query text, so a repeated Q message skips pg_query parse and
+	// translate. The cached plans are resolved again on every execute (the same
+	// idempotent resolve prepared statements already rely on), so a hit only
+	// avoids the parse/translate work, not resolution against the live catalog.
+	simplePlans map[string][]*Plan
+	// simpleGen is the server schemaGen the simplePlans cache was populated at.
+	// When a DDL bumps schemaGen, the whole cache is dropped and rebuilt, so a
+	// cached plan can never be served against a schema that no longer exists.
+	simpleGen uint64
+
+	// bindPool reuses the Bind message's param and format slices, so repeated
+	// Executes of the same prepared statement do not allocate on every round trip.
+	bindPool sync.Pool
+
+	// execPool reuses scratch for the Execute message handler, so the hot path
+	// of re-executing a prepared statement does not allocate per-call.
+	execPool sync.Pool
 	// txn is the open transaction block, or nil outside one. It is the store
 	// statements in the block read and write through (Phase 12), and its state
 	// is what the ReadyForQuery transaction status byte reports.
@@ -223,6 +245,23 @@ type Server struct {
 	// local and not replicated (ADR-014 decision 5); see stats.go for why that
 	// is safe and what it costs.
 	stats *statsStore
+
+	// schemaGen is bumped whenever a DDL changes the catalog, so per-connection
+	// plan caches can tell a stale cached plan from a current one. It is an
+	// atomic because DDL on one connection invalidates every connection's cache.
+	schemaGen atomic.Uint64
+
+	// readPool reuses row cells and owned buffers across readRow calls, so the
+	// point-read path does not allocate on every query. It is a sync.Pool so
+	// that connections can garbage-collect their scratch when idle.
+	readPool sync.Pool
+}
+
+// readScratch holds reusable row cells and owned buffers so readRow does not
+// allocate on every query. It is stored per-connection via Server.readPool.
+type readScratch struct {
+	cells rowCells
+	owned [][]byte
 }
 
 // NewServer wires the PG listener to the shared store and identity stack.
@@ -245,6 +284,14 @@ func NewServer(addr string, store Store, policy *rbac.Store, oauthProvider oauth
 		stats:           newStatsStore(),
 		tso:             &localOracle{},
 		commit:          newCommitTable(),
+		readPool: sync.Pool{
+			New: func() any {
+				return &readScratch{
+					cells: make(rowCells, 0, 8),
+					owned: make([][]byte, 0, 8),
+				}
+			},
+		},
 	}
 }
 
@@ -667,12 +714,25 @@ func (c *pgConn) handleQuery(payload []byte) error {
 	if strings.TrimSpace(query) == "" {
 		return c.emptyQuery()
 	}
-	plans, err := TranslateAll(query)
-	if err != nil {
-		if perr := c.srv.sendError(c, errOrSyntax(err), "ERROR"); perr != nil {
-			return perr
+	// A DDL elsewhere invalidates every cached translation on this connection.
+	if gen := c.srv.schemaGen.Load(); c.simpleGen != gen {
+		c.simpleGen = gen
+		c.simplePlans = map[string][]*Plan{}
+	}
+	plans, ok := c.simplePlans[query]
+	if !ok {
+		var err error
+		plans, err = TranslateAll(query)
+		if err != nil {
+			if perr := c.srv.sendError(c, errOrSyntax(err), "ERROR"); perr != nil {
+				return perr
+			}
+			return c.ready()
 		}
-		return c.ready()
+		if c.simplePlans == nil {
+			c.simplePlans = make(map[string][]*Plan)
+		}
+		c.simplePlans[query] = plans
 	}
 	if len(plans) == 0 {
 		return c.emptyQuery()
@@ -790,7 +850,12 @@ func (c *pgConn) handleBind(payload []byte) error {
 	}
 	nf := int(binary.BigEndian.Uint16(rest[:2]))
 	rest = rest[2:]
-	formats := make([]int16, 0, nf)
+	formats, hadPool := c.bindPool.Get().([]int16)
+	if hadPool && nf <= cap(formats) {
+	formats = formats[:nf]  // reset length, keep capacity
+	} else {
+	formats = make([]int16, 0, nf)
+	}
 	for i := 0; i < nf; i++ {
 		if len(rest) < 2 {
 			return &pgError{code: errProtocolViolation, msg: "malformed Bind message"}
@@ -815,7 +880,16 @@ func (c *pgConn) handleBind(payload []byte) error {
 	}
 	nparams := int(binary.BigEndian.Uint16(rest[:2]))
 	rest = rest[2:]
-	params := make([]paramVal, nparams)
+	// Reuse params slice from connection pool to avoid allocating on every Bind.
+	params, hadPool := c.bindPool.Get().([]paramVal)
+	if hadPool && nparams <= cap(params) {
+		for i := range params {
+			params[i] = paramVal{}
+		}
+		params = params[:nparams]
+	} else {
+		params = make([]paramVal, nparams)
+	}
 	for i := 0; i < nparams; i++ {
 		if len(rest) < 4 {
 			return &pgError{code: errProtocolViolation, msg: "malformed Bind message"}
@@ -855,6 +929,8 @@ func (c *pgConn) handleBind(payload []byte) error {
 		rest = rest[2:]
 	}
 	c.portals[portalName] = &portalState{plan: plan, params: params}
+	c.bindPool.Put(formats)
+	c.bindPool.Put(params)
 	var buf msgBuilder
 	buf.begin(msgBindComplete)
 	buf.end()
@@ -1060,7 +1136,7 @@ func (c *pgConn) sendRowDescription(plan *Plan) error {
 	if err := c.srv.resolvePlan(plan); err != nil {
 		return err
 	}
-	var buf msgBuilder
+	buf := msgBuilder{buf: c.scratch[:0]}
 	buf.begin(msgRowDescription)
 	buf.int16(int16(len(plan.Cols)))
 	for i, col := range plan.Cols {
@@ -1186,7 +1262,7 @@ func (c *pgConn) handleClose(payload []byte) error {
 // delivery the multi-row pipeline was built around: execution fills execOutcome
 // up front, and this drains it without holding a per-row cursor onto the scan.
 func (c *pgConn) emitOutcome(out *execOutcome) error {
-	var buf msgBuilder
+	buf := msgBuilder{buf: c.scratch[:0]}
 	if out.selectRows {
 		for _, row := range out.rows {
 			buf.begin(msgDataRow)
@@ -1209,6 +1285,9 @@ func (c *pgConn) emitOutcome(out *execOutcome) error {
 	if err := buf.flush(c.w); err != nil {
 		return err
 	}
+	// The row buffer was copied into the connection's write buffer by flush, so
+	// its backing array is free to reuse for the next result.
+	c.scratch = buf.buf[:0]
 	if err := tbuf.flush(c.w); err != nil {
 		return err
 	}
@@ -1324,7 +1403,11 @@ func (s *Server) sendNotice(c *pgConn, code, msg string) error {
 	buf.cstring(msg)
 	buf.byte(0)
 	buf.end()
-	return c.writeMsg(&buf)
+	if err := c.writeMsg(&buf); err != nil {
+		return err
+	}
+	c.scratch = buf.buf[:0]
+	return nil
 }
 
 // sendMessage writes one complete frame out and flushes the write buffer.

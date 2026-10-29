@@ -120,17 +120,23 @@ func (s *Storage) Entries(lo, hi, maxSize uint64) ([]*pb.Entry, error) {
 	if hiIdx > uint64(len(s.entries)) {
 		hiIdx = uint64(len(s.entries))
 	}
-	var result []*pb.Entry
+	if loIdx == hiIdx {
+		return nil, nil
+	}
+	// Return a sub-slice of the stored entries instead of copying the window.
+	// raft treats the result as immutable, and Append copies on a conflicting
+	// truncation (see Append), so a window handed out here stays valid even
+	// while later appends grow the log.
+	end := hiIdx
 	var size uint64
 	for i := loIdx; i < hiIdx; i++ {
-		e := s.entries[i]
-		size += uint64(len(e.GetData()))
-		if len(result) > 0 && size > maxSize {
+		size += uint64(len(s.entries[i].GetData()))
+		if i > loIdx && size > maxSize {
+			end = i
 			break
 		}
-		result = append(result, e)
 	}
-	return result, nil
+	return s.entries[loIdx:end], nil
 }
 
 // Term returns the term of the entry at index i. Index 0 is a sentinel used
@@ -207,7 +213,13 @@ func (s *Storage) Append(entries []*pb.Entry) {
 			if cutPoint > uint64(len(s.entries)) {
 				cutPoint = uint64(len(s.entries))
 			}
-			s.entries = s.entries[:cutPoint]
+			// Copy instead of reslicing in place. Entries returns a sub-slice
+			// of s.entries, and raft messages may still reference that window
+			// (the transport sends them asynchronously). Overwriting those
+			// slots with replacement entries would corrupt the queued frame.
+			kept := make([]*pb.Entry, cutPoint, cutPoint+uint64(len(entries)))
+			copy(kept, s.entries[:cutPoint])
+			s.entries = kept
 		}
 	}
 	s.entries = append(s.entries, entries...)

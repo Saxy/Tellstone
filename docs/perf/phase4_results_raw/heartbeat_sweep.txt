@@ -1,0 +1,12 @@
+##### heartbeat=2
+    phase4_bench_test.go:394: sequential write (500 samples): mean=219µs p50=184µs p95=365µs p99=1.248ms
+    phase4_bench_test.go:440: concurrent write (32 clients, 1.5s): 72176 ops/s, 108264 ops total, errors=0
+    phase4_bench_test.go:545: idle cluster traffic (2s): 20.0 msgs/s, 26.0 frames/s
+--- PASS: TestPhase4BaselineReport (6.23s)
+PASS
+##### heartbeat=1
+    phase4_bench_test.go:394: sequential write (500 samples): mean=241µs p50=191µs p95=491µs p99=1.29ms
+    phase4_bench_test.go:440: concurrent write (32 clients, 1.5s): 72314 ops/s, 108471 ops total, errors=0
+    phase4_bench_test.go:545: idle cluster traffic (2s): 40.0 msgs/s, 46.0 frames/s
+--- PASS: TestPhase4BaselineReport (6.35s)
+PASS

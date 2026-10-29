@@ -32,12 +32,10 @@ func newScanEngine() *Engine {
 // every mutation site has to preserve.
 func indexAgrees(t *testing.T, e *Engine, stage string) {
 	t.Helper()
-	e.mu.RLock()
-	want := make(map[string]Item, len(e.items))
-	for k, v := range e.items {
-		want[k] = v
-	}
-	e.mu.RUnlock()
+	want := make(map[string]Item)
+	e.wmu.Lock()
+	e.items.each(func(k string, v Item) { want[k] = v })
+	e.wmu.Unlock()
 
 	got := make(map[string]Item)
 	var gotKeys []string

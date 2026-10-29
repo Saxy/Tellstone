@@ -1,0 +1,58 @@
+# Phase 4 baseline — exploratory measurements
+
+Every number in this file comes from a 3-node Raft cluster on localhost with the
+production timing (ElectionTick 10, HeartbeatTick 1, TickInterval 100 ms), run
+with the server pinned to cores 0–15 (`taskset -c 0-15`).
+
+**The leader-lease and flush-interval rows are prototypes.** The code changes
+behind them were applied temporarily to size the opportunity and then reverted;
+the committed tree is the baseline: `ReadOnlySafe` reads and a 100 µs transport
+flush interval.
+
+## Concurrency sweep (`TestPhase4BaselineReport`, 1.5 s window)
+
+The write client count was varied to see when etcd raft starts batching
+proposals into shared AppendEntries.
+
+| Writers | Write ops/s | msgs/write | frames/write | Read ops/s | msgs/read |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 63 219 | 8.00 | 0.42 | 77 857 | 4.00 |
+| 128 | 72 882 | 7.96 | 0.35 | 111 229 | 4.00 |
+| 512 | 89 239 | **3.19** | 0.21 | 101 044 | 4.00 |
+
+Entry batching only appears at very high concurrency (512 clients). Below that,
+each write still costs a full 8-message exchange (two round trips per follower).
+Reads are never coalesced: every read costs 4 messages no matter the concurrency.
+
+## Transport flush interval vs sequential write latency
+
+`BenchmarkPhase4ProposeSequential`, 3 s per run, one client:
+
+| `batchFlushInterval` | ns/op | Relative |
+|---:|---:|---:|
+| 20 µs | 202 870 | 1.0× |
+| **100 µs (committed)** | **593 656 – 719 363** | **~3×** |
+| 250 µs | 1 127 461 | 5.6× |
+
+The flush timer is the dominant term in single-client write latency. The 100 µs
+batching delay buys packet aggregation under load but costs ~2–3× latency when
+the client is not pipelining.
+
+## Leader-lease read prototype
+
+Temporary change: `raft.Config.ReadOnlyOption = raft.ReadOnlyLeaseBased`
+(`CheckQuorum` is already true). Everything else unchanged.
+
+| Metric | Baseline (`ReadOnlySafe`) | Lease prototype |
+|---|---:|---:|
+| Read p50 | 266–350 µs | **2 µs** |
+| Read p95 | 1.3–2.3 ms | **5 µs** |
+| Read p99 | 2.3 ms | **19 µs** |
+| `BenchmarkPhase4LinearizableRead` | 648 937 ns/op | **2 388 ns/op** |
+| Read allocs/op | 95 | **13** |
+| Concurrent read, 32 clients | 74–78 k ops/s | **181 k ops/s** |
+| Read messages/op | 4.00 | **0.00** |
+| Sequential write | 8.04 msgs/write | 8.04 msgs/write (unchanged) |
+
+The lease option removes the quorum heartbeat round trip from reads entirely.
+The residual ~2 µs is the raft node goroutine hop plus the applied-index check.

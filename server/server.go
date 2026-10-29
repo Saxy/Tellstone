@@ -861,11 +861,12 @@ func (s *Server) initCluster() error {
 		GroupID:       1, // bootstrap region (region 1) until splits create more
 		PeerAddr:      cfg.GetPeerAddr(),
 		Peers:         peers,
-		ElectionTick:  10,
-		HeartbeatTick: 1,
-		TickInterval:  100 * time.Millisecond,
+		ElectionTick:  cfg.RaftElectionTick(),
+		HeartbeatTick: cfg.RaftHeartbeatTick(),
+		TickInterval:  cfg.RaftTickInterval(),
 		Dispatcher:    newShardDispatcher(s.shards, logger),
 		Logger:        logger,
+		SafeReads:     cfg.RaftSafeReads(),
 	}
 
 	n, err := cluster.NewNode(nodeCfg)
@@ -969,6 +970,8 @@ func (s *Server) initCluster() error {
 		resolver,
 	)
 	s.regionCoord = coord
+	coord.safeReads = cfg.RaftSafeReads()
+	coord.heartbeatTick = cfg.RaftHeartbeatTick()
 	rm.SetLeadershipProvider(coord.LeadershipProvider())
 	go coord.Run(rmCtx)
 	s.geoMgr = cluster.NewGeoManager(s.pdNode.Client(), cfg.GetNodeID())

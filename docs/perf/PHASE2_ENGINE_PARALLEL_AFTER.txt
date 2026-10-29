@@ -1,0 +1,61 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Saxy/Tellstone/internal/bench
+cpu: AMD Ryzen 9 9950X 16-Core Processor            
+BenchmarkRouterParallelGetDirect       	38991632	        30.99 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect       	38670339	        31.23 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect       	38511346	        30.79 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect-4     	100000000	        10.22 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect-4     	100000000	        10.22 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect-4     	100000000	        10.16 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect-16    	180472234	         6.583 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect-16    	173035143	         6.606 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetDirect-16    	179514480	         6.602 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor        	38488495	        31.44 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor        	38431404	        31.35 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor        	38771318	        31.41 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor-4      	100000000	        10.36 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor-4      	100000000	        10.60 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor-4      	100000000	        10.61 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor-16     	173946321	         6.974 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor-16     	177104551	         6.576 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelGetActor-16     	175884571	         6.643 ns/op	       0 B/op	       0 allocs/op
+BenchmarkRouterParallelSetDirect       	 2223798	       522.1 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect       	 2209921	       521.4 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect       	 2258554	       519.3 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect-4     	 2458272	       424.3 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect-4     	 2556855	       462.9 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect-4     	 2352090	       431.1 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect-16    	 7522860	       166.1 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect-16    	 7185118	       162.7 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetDirect-16    	 7312636	       163.8 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor        	 1224974	       953.9 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor        	 1250485	       964.2 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor        	 1254632	       973.2 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor-4      	 1232112	       918.7 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor-4      	 1241038	       948.5 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor-4      	 1217955	       944.6 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor-16     	 4465320	       268.5 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor-16     	 4397500	       263.9 ns/op	     112 B/op	       2 allocs/op
+BenchmarkRouterParallelSetActor-16     	 4160122	       270.6 ns/op	     112 B/op	       2 allocs/op
+BenchmarkMapParallelGetRWMutex         	99757041	        12.05 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex         	100000000	        12.20 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex         	91894990	        11.90 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex-4       	67741210	        19.24 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex-4       	62552905	        19.07 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex-4       	63288291	        17.44 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex-16      	49126525	        23.78 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex-16      	51886172	        24.18 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetRWMutex-16      	51426330	        23.76 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree        	89159476	        13.33 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree        	87394850	        13.23 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree        	88579228	        13.21 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree-4      	358352019	         3.439 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree-4      	346868840	         3.476 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree-4      	350141829	         5.807 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree-16     	1000000000	         3.282 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree-16     	367402867	         3.287 ns/op	       0 B/op	       0 allocs/op
+BenchmarkMapParallelGetLockFree-16     	1000000000	         1.116 ns/op	       0 B/op	       0 allocs/op
+PASS
+ok  	github.com/Saxy/Tellstone/internal/bench	90.248s
+EXIT=0

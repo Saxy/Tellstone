@@ -1,0 +1,9 @@
+##### writers=32
+    phase4_bench_test.go:440: concurrent write (32 clients, 1.5s): 66936 ops/s, 100404 ops total, errors=0
+    phase4_bench_test.go:454: leader batching: entries/ready=2.16 entries/appendEntries=0.50 appends/write=4.00
+##### writers=128
+    phase4_bench_test.go:440: concurrent write (128 clients, 1.5s): 84517 ops/s, 126775 ops total, errors=0
+    phase4_bench_test.go:454: leader batching: entries/ready=3.93 entries/appendEntries=0.50 appends/write=3.97
+##### writers=512
+    phase4_bench_test.go:440: concurrent write (512 clients, 1.5s): 72201 ops/s, 108302 ops total, errors=0
+    phase4_bench_test.go:454: leader batching: entries/ready=9.82 entries/appendEntries=1.29 appends/write=1.55

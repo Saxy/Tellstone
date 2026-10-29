@@ -1,0 +1,42 @@
+goos: linux
+goarch: amd64
+pkg: github.com/Saxy/Tellstone/internal/storage
+cpu: AMD Ryzen 9 9950X 16-Core Processor            
+BenchmarkEngineGetWithEncryptionNoAlloc-32           	 7591626	       161.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEngineScanRow/rows=1000/cols=3-32           	   15477	     76006 ns/op	  219371 B/op	    2009 allocs/op
+BenchmarkEngineScanRow/rows=10000/cols=3-32          	    1338	    891738 ns/op	 2165146 B/op	   20009 allocs/op
+BenchmarkEngineScanRow/rows=100000/cols=3-32         	      38	  34020438 ns/op	21602577 B/op	  200009 allocs/op
+BenchmarkEngineScanTable/rows=1000/cols=3-32         	    2102	    583128 ns/op	  516344 B/op	    6004 allocs/op
+BenchmarkEngineScanTable/rows=10000/cols=3-32        	     174	   7133439 ns/op	 4189693 B/op	   51004 allocs/op
+BenchmarkEngineScanPrefixRow/rows=1000/cols=3-32     	 3428427	       329.9 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEngineScanPrefixRow/rows=100000/cols=3-32   	 2040332	       603.2 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEngineSetNoTTL-32                           	 2771168	       424.6 ns/op	      32 B/op	       1 allocs/op
+BenchmarkEngineSetGetParallelNoTTL-32                	  998929	      1210 ns/op	     265 B/op	       2 allocs/op
+BenchmarkEngineSetFromBufferNoTTL-32                 	 2869816	       424.0 ns/op	      32 B/op	       1 allocs/op
+BenchmarkEngineSetVsSetFromBuffer/Set-32             	16637283	        71.21 ns/op	      64 B/op	       1 allocs/op
+BenchmarkEngineSetVsSetFromBuffer/SetFromBuffer-32   	17833592	        65.30 ns/op	      64 B/op	       1 allocs/op
+BenchmarkEngineSetFromBufferZeroCopy-32              	17637956	        68.08 ns/op	      64 B/op	       1 allocs/op
+BenchmarkEngineGetNoAlloc-32                         	54700500	        22.09 ns/op	       0 B/op	       0 allocs/op
+BenchmarkEngineGetDeleteHit-32                       	 4894362	       245.1 ns/op	     288 B/op	       8 allocs/op
+BenchmarkEngineDeleteHit-32                          	 5311534	       226.0 ns/op	     288 B/op	       7 allocs/op
+BenchmarkEngineDeleteMiss-32                         	61941301	        19.31 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBTreeSeekPrefix/rows=1000/cols=3-32         	 3139804	       390.2 ns/op	     256 B/op	       4 allocs/op
+BenchmarkBTreeSeekPrefix/rows=10000/cols=3-32        	 2849071	       419.9 ns/op	     256 B/op	       4 allocs/op
+BenchmarkBTreeSeekPrefix/rows=100000/cols=3-32       	 3072384	       388.7 ns/op	     256 B/op	       4 allocs/op
+BenchmarkBTreeSet-32                                 	 1784318	       618.8 ns/op	      22 B/op	       1 allocs/op
+BenchmarkBTreeScanPrefix/rows=1000/cols=3-32         	 3956624	       297.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkBTreeScanPrefix/rows=100000/cols=3-32       	 2292182	       536.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkChronometerEvictionPipeline-32              	 1000000	      1502 ns/op	     329 B/op	       3 allocs/op
+BenchmarkChronometerEvictionPipelineSequential-32    	  238778	      4686 ns/op	    5856 B/op	      55 allocs/op
+PASS
+ok  	github.com/Saxy/Tellstone/internal/storage	62.211s
+PASS
+ok  	github.com/Saxy/Tellstone/internal/shard	0.029s
+goos: linux
+goarch: amd64
+pkg: github.com/Saxy/Tellstone/internal/persistence
+cpu: AMD Ryzen 9 9950X 16-Core Processor            
+BenchmarkWriteSequential-32                	     380	   3134563 ns/op	     237 B/op	       4 allocs/op
+BenchmarkWriteParallel-32                  	   11942	     99679 ns/op	     201 B/op	       5 allocs/op
+BenchmarkWriteWithTTL-32                   	     380	   3124268 ns/op	     226 B/op	       4 allocs/op
+BenchmarkLoadShardSequential-32            	
