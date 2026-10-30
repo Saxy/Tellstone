@@ -1,2 +1,0 @@
-FAIL	github.com/Saxy/Tellstone/internal/bench [build failed]
-FAIL
