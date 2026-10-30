@@ -1,0 +1,20 @@
+cmd/benchmark/main.go
+  h_31b8ea865a30bd 90-93,218,225,234-236,264-267
+internal/network/iouring/iouring.go
+  h_31b8ea865a30bd 125-131
+internal/shard/core_pinning_other.go
+  h_31b8ea865a30bd 5-6,8,19-20,22
+internal/sql/pgwire.go
+  h_31b8ea865a30bd 872
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "798bee143fbd0094a10a469d6f4ea3eeedf15c55",
+  "prompts": {},
+  "humans": {
+    "h_31b8ea865a30bd": {
+      "author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
