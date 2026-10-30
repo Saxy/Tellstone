@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Script to capture "after" numbers for Phase 1 optimizations
 
 # Set up the environment

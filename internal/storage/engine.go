@@ -205,18 +205,13 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 	if cryptoEnabled {
 		neededSize = 12 + len(value) + 16
 	}
-	if e.maxBytes > 0 {
-		totalEntrySize := uint64(len(key) + neededSize)
-		if atomic.LoadUint64(&e.allocatedBytes)+totalEntrySize > e.maxBytes {
-			if e.logger.Enabled(log.LevelWarn) {
-				e.logger.Log(log.LevelWarn, "storage engine memory ceiling reached, write rejected",
-					log.String("key", key),
-					log.Uint64("allocated_bytes", atomic.LoadUint64(&e.allocatedBytes)),
-					log.Uint64("max_bytes", e.maxBytes),
-				)
-			}
-			return SetOutcome{}, ErrEngineFull
-		}
+	// A replacement gives back the bytes of the entry it overwrites, so the
+	// exact capacity decision is made under wmu once the old size is known.
+	// This early check only rejects an entry that could not fit even in an
+	// empty engine, before paying to copy or encrypt it.
+	if e.maxBytes > 0 && uint64(len(key)+neededSize) > e.maxBytes {
+		e.logMemoryCeiling(key)
+		return SetOutcome{}, ErrEngineFull
 	}
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)
@@ -256,6 +251,16 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 		atomic.AddUint64(&e.totalCommands, 1)
 		return SetOutcome{}, nil
 	}
+	oldSize := uint64(0)
+	if isUpdate {
+		oldSize = entrySize(storedKey, oldItem.Value)
+	}
+	newSize := entrySize(storedKey, value)
+	if !e.canAllocate(oldSize, newSize) {
+		e.wmu.Unlock()
+		e.logMemoryCeiling(key)
+		return SetOutcome{}, ErrEngineFull
+	}
 	// Versions come from one engine-wide sequence, so every stored value is
 	// uniquely attributable to the write that produced it.
 	version := e.nextVersion()
@@ -268,20 +273,9 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 	// gets back: encrypted when crypto is on, so ScanPrefix decrypts the same
 	// way Get does rather than handing out ciphertext.
 	e.indexSet(storedKey, value, exp)
+	e.accountWrite(isUpdate, oldSize, newSize)
 	e.wmu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
-	if isUpdate {
-		oldSize := uint64(len(key) + len(oldItem.Value))
-		newSize := uint64(len(key) + len(value))
-		if newSize > oldSize {
-			atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
-		} else if oldSize > newSize {
-			atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
-		}
-	} else {
-		atomic.AddUint64(&e.allocatedBytes, uint64(len(key)+len(value)))
-		atomic.AddUint64(&e.keyCount, 1)
-	}
 	if cryptoEnabled {
 		atomic.AddUint64(&e.cryptoEncryptedBytes, uint64(len(value)))
 	}
@@ -297,6 +291,58 @@ func (e *Engine) set(key string, value []byte, ttl time.Duration, c cond) (SetOu
 	// An expired predecessor is not offered as a rollback target: putting it
 	// back would resurrect a value the liveness rule had already retired.
 	return SetOutcome{Applied: true, PrevOK: present, Prev: oldItem, Version: version}, nil
+}
+
+// entrySize is the number of bytes a key/value pair occupies in the engine's
+// memory accounting. value is the stored representation, so it is ciphertext
+// when encryption is enabled.
+func entrySize(key string, value []byte) uint64 {
+	return uint64(len(key) + len(value))
+}
+
+// canAllocate reports whether a write of newSize bytes can replace oldSize
+// bytes under the configured ceiling. The caller must hold wmu, so the old
+// entry cannot change between the decision and the accounting that follows it.
+func (e *Engine) canAllocate(oldSize, newSize uint64) bool {
+	if e.maxBytes == 0 {
+		return true
+	}
+	used := atomic.LoadUint64(&e.allocatedBytes)
+	if used < oldSize {
+		// Defensive: accounting should never be below the entry being
+		// replaced, but a reset must not wrap the comparison.
+		used = 0
+	} else {
+		used -= oldSize
+	}
+	return used+newSize <= e.maxBytes
+}
+
+// accountWrite applies a successful write's memory and key-count delta. The
+// caller must hold wmu: canAllocate reads allocatedBytes, so the accounting
+// has to become visible before the next writer checks the ceiling.
+func (e *Engine) accountWrite(isUpdate bool, oldSize, newSize uint64) {
+	if !isUpdate {
+		atomic.AddUint64(&e.allocatedBytes, newSize)
+		atomic.AddUint64(&e.keyCount, 1)
+		return
+	}
+	if newSize > oldSize {
+		atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
+	} else if oldSize > newSize {
+		atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
+	}
+}
+
+func (e *Engine) logMemoryCeiling(key string) {
+	if !e.logger.Enabled(log.LevelWarn) {
+		return
+	}
+	e.logger.Log(log.LevelWarn, "storage engine memory ceiling reached, write rejected",
+		log.String("key", key),
+		log.Uint64("allocated_bytes", atomic.LoadUint64(&e.allocatedBytes)),
+		log.Uint64("max_bytes", e.maxBytes),
+	)
 }
 
 // nextVersion returns the next engine-wide item version. It must be called
@@ -340,8 +386,8 @@ func (e *Engine) RestoreIf(key string, out SetOutcome) bool {
 		// The write created the key, so undoing it removes the key again.
 		e.items.remove(key)
 		e.indexRemove(key)
-		e.wmu.Unlock()
 		e.releaseKey(key, item)
+		e.wmu.Unlock()
 		return true
 	}
 	restored := out.Prev
@@ -351,14 +397,8 @@ func (e *Engine) RestoreIf(key string, out SetOutcome) bool {
 	restored.Version = e.nextVersion()
 	e.items.put(key, restored)
 	e.indexSet(key, restored.Value, restored.Expiration)
+	e.accountWrite(true, entrySize(key, item.Value), entrySize(key, restored.Value))
 	e.wmu.Unlock()
-	oldSize := uint64(len(key) + len(item.Value))
-	newSize := uint64(len(key) + len(restored.Value))
-	if newSize > oldSize {
-		atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
-	} else if oldSize > newSize {
-		atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
-	}
 	// The chronometer still holds the rolled-back write's schedule, so a
 	// restored TTL has to be re-armed for the time it has left.
 	if !restored.Expiration.IsZero() && !expired {
@@ -394,12 +434,6 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	if e.cryptoEngine.Enabled() {
 		return e.Set(string(buf[:keyLen]), buf[keyLen:], ttl)
 	}
-	if e.maxBytes > 0 {
-		totalEntrySize := uint64(len(buf))
-		if atomic.LoadUint64(&e.allocatedBytes)+totalEntrySize > e.maxBytes {
-			return ErrEngineFull
-		}
-	}
 	var exp time.Time
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)
@@ -408,26 +442,24 @@ func (e *Engine) SetFromBuffer(buf []byte, keyLen int, ttl time.Duration) error 
 	value := buf[keyLen:]
 	e.wmu.Lock()
 	oldItem, isUpdate := e.items.load(storedKey)
+	oldSize := uint64(0)
+	if isUpdate {
+		oldSize = entrySize(storedKey, oldItem.Value)
+	}
+	newSize := entrySize(storedKey, value)
+	if !e.canAllocate(oldSize, newSize) {
+		e.wmu.Unlock()
+		return ErrEngineFull
+	}
 	e.items.put(storedKey, Item{
 		Value:      value,
 		Expiration: exp,
 		Version:    e.nextVersion(),
 	})
 	e.indexSet(storedKey, value, exp)
+	e.accountWrite(isUpdate, oldSize, newSize)
 	e.wmu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
-	if isUpdate {
-		oldSize := uint64(len(oldItem.Value) + keyLen)
-		newSize := uint64(len(value) + keyLen)
-		if newSize > oldSize {
-			atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
-		} else if oldSize > newSize {
-			atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
-		}
-	} else {
-		atomic.AddUint64(&e.allocatedBytes, uint64(len(buf)))
-		atomic.AddUint64(&e.keyCount, 1)
-	}
 	if ttl > 0 {
 		e.chronometer.Register(storedKey, ttl)
 	}
@@ -447,35 +479,27 @@ func (e *Engine) SetRaw(key string, value []byte, ttl time.Duration) error {
 	if ttl > 0 {
 		exp = time.Now().Add(ttl)
 	}
-	if e.maxBytes > 0 {
-		totalEntrySize := uint64(len(key) + len(value))
-		if atomic.LoadUint64(&e.allocatedBytes)+totalEntrySize > e.maxBytes {
-			return ErrEngineFull
-		}
-	}
 	storedKey := strings.Clone(key)
 	e.wmu.Lock()
 	oldItem, isUpdate := e.items.load(storedKey)
+	oldSize := uint64(0)
+	if isUpdate {
+		oldSize = entrySize(storedKey, oldItem.Value)
+	}
+	newSize := entrySize(storedKey, value)
+	if !e.canAllocate(oldSize, newSize) {
+		e.wmu.Unlock()
+		return ErrEngineFull
+	}
 	e.items.put(storedKey, Item{
 		Value:      value,
 		Expiration: exp,
 		Version:    e.nextVersion(),
 	})
 	e.indexSet(storedKey, value, exp)
+	e.accountWrite(isUpdate, oldSize, newSize)
 	e.wmu.Unlock()
 	atomic.AddUint64(&e.totalCommands, 1)
-	if isUpdate {
-		oldSize := uint64(len(oldItem.Value) + len(storedKey))
-		newSize := uint64(len(value) + len(storedKey))
-		if newSize > oldSize {
-			atomic.AddUint64(&e.allocatedBytes, newSize-oldSize)
-		} else if oldSize > newSize {
-			atomic.AddUint64(&e.allocatedBytes, ^(oldSize - newSize - 1))
-		}
-	} else {
-		atomic.AddUint64(&e.allocatedBytes, uint64(len(key)+len(value)))
-		atomic.AddUint64(&e.keyCount, 1)
-	}
 	atomic.AddUint64(&e.cryptoEncryptedBytes, uint64(len(value)))
 	if e.logger.Enabled(log.LevelDebug) {
 		e.logger.Log(log.LevelDebug, "key written to engine state (raw)",
@@ -502,8 +526,8 @@ func (e *Engine) Delete(key string) bool {
 	expired := !item.Expiration.IsZero() && time.Now().After(item.Expiration)
 	e.items.remove(key)
 	e.indexRemove(key)
-	e.wmu.Unlock()
 	e.releaseKey(key, item)
+	e.wmu.Unlock()
 	if expired {
 		atomic.AddUint64(&e.expiredCount, 1)
 		return false
@@ -525,13 +549,14 @@ func (e *Engine) deleteIfExpired(key string) bool {
 	}
 	e.items.remove(key)
 	e.indexRemove(key)
-	e.wmu.Unlock()
 	e.releaseKey(key, item)
+	e.wmu.Unlock()
 	return true
 }
 
 // releaseKey adjusts the memory, command, and key counters after a successful
-// in-memory deletion. It must be called with the item that was just removed.
+// in-memory deletion. It must be called with wmu held and with the item that
+// was just removed, so the next capacity check sees the freed bytes.
 func (e *Engine) releaseKey(key string, item Item) {
 	releasedBytes := uint64(len(key) + len(item.Value))
 	atomic.AddUint64(&e.allocatedBytes, ^(releasedBytes - 1))

@@ -124,15 +124,15 @@ type paramVal struct {
 }
 
 type pgConn struct {
-	srv        *Server
-	raw        net.Conn
-	tlsConn    net.Conn // non-nil after an SSLRequest handshake
-	r          *bufio.Reader
-	w          *bufio.Writer
+	srv     *Server
+	raw     net.Conn
+	tlsConn net.Conn // non-nil after an SSLRequest handshake
+	r       *bufio.Reader
+	w       *bufio.Writer
 	// scratch is a reusable frame buffer for the hot response paths, so
 	// RowDescription, DataRow and CommandComplete frames do not allocate a
 	// fresh backing array on every query.
-	scratch []byte
+	scratch    []byte
 	remoteAddr string
 	user       string
 
@@ -140,19 +140,20 @@ type pgConn struct {
 
 	stmts   map[string]*Plan        // prepared statements by name
 	portals map[string]*portalState // bound portals by name
-	// simplePlans caches the translation of a simple-query string, keyed by the
-	// exact query text, so a repeated Q message skips pg_query parse and
-	// translate. The cached plans are resolved again on every execute (the same
-	// idempotent resolve prepared statements already rely on), so a hit only
-	// avoids the parse/translate work, not resolution against the live catalog.
-	simplePlans map[string][]*Plan
+	// simplePlans caches the parse tree of a simple-query string, keyed by the
+	// exact query text, so a repeated Q message skips pg_query parse. A fresh
+	// Plan is translated from the tree on every execution, so a schema change
+	// from another server cannot leave a stale resolved catalog schema behind.
+	simplePlans map[string]parsedStatements
 	// simpleGen is the server schemaGen the simplePlans cache was populated at.
-	// When a DDL bumps schemaGen, the whole cache is dropped and rebuilt, so a
-	// cached plan can never be served against a schema that no longer exists.
+	// A local DDL bumps schemaGen and drops the parse cache; translated plans
+	// are not cached, so correctness does not depend on this check.
 	simpleGen uint64
 
-	// bindPool reuses the Bind message's param and format slices, so repeated
-	// Executes of the same prepared statement do not allocate on every round trip.
+	// bindPool reuses the Bind message's format slice, so repeated Executes of
+	// the same prepared statement do not allocate on every round trip. Param
+	// slices are not pooled: a portal keeps its params slice for the lifetime
+	// of the portal, so returning it would let a later Bind overwrite it.
 	bindPool sync.Pool
 
 	// execPool reuses scratch for the Execute message handler, so the hot path
@@ -364,6 +365,15 @@ func (s *Server) serveConn(raw net.Conn) {
 		gucs:       map[string]string{},
 	}
 	defer raw.Close()
+	// A client that disappears mid-transaction never sends COMMIT or ROLLBACK.
+	// Release the snapshot it pinned here; COMMIT and ROLLBACK clear c.txn, so
+	// an already-ended block is not released twice.
+	defer func() {
+		if c.txn != nil {
+			s.commit.endSnapshot(c.txn.startTS)
+			c.txn = nil
+		}
+	}()
 	// Close walks s.conns to interrupt every live connection, so a connection
 	// registered after that walk would never be closed. Checking closing while
 	// still holding the lock closes the window: either Close sees this
@@ -717,12 +727,12 @@ func (c *pgConn) handleQuery(payload []byte) error {
 	// A DDL elsewhere invalidates every cached translation on this connection.
 	if gen := c.srv.schemaGen.Load(); c.simpleGen != gen {
 		c.simpleGen = gen
-		c.simplePlans = map[string][]*Plan{}
+		c.simplePlans = map[string]parsedStatements{}
 	}
-	plans, ok := c.simplePlans[query]
+	stmts, ok := c.simplePlans[query]
 	if !ok {
 		var err error
-		plans, err = TranslateAll(query)
+		stmts, err = ParseAll(query)
 		if err != nil {
 			if perr := c.srv.sendError(c, errOrSyntax(err), "ERROR"); perr != nil {
 				return perr
@@ -730,9 +740,16 @@ func (c *pgConn) handleQuery(payload []byte) error {
 			return c.ready()
 		}
 		if c.simplePlans == nil {
-			c.simplePlans = make(map[string][]*Plan)
+			c.simplePlans = make(map[string]parsedStatements)
 		}
-		c.simplePlans[query] = plans
+		c.simplePlans[query] = stmts
+	}
+	plans, err := TranslateParsed(stmts)
+	if err != nil {
+		if perr := c.srv.sendError(c, errOrSyntax(err), "ERROR"); perr != nil {
+			return perr
+		}
+		return c.ready()
 	}
 	if len(plans) == 0 {
 		return c.emptyQuery()
@@ -852,9 +869,9 @@ func (c *pgConn) handleBind(payload []byte) error {
 	rest = rest[2:]
 	formats, hadPool := c.bindPool.Get().([]int16)
 	if hadPool && nf <= cap(formats) {
-	formats = formats[:nf]  // reset length, keep capacity
+		formats = formats[:nf] // reset length, keep capacity
 	} else {
-	formats = make([]int16, 0, nf)
+		formats = make([]int16, 0, nf)
 	}
 	for i := 0; i < nf; i++ {
 		if len(rest) < 2 {
@@ -930,7 +947,6 @@ func (c *pgConn) handleBind(payload []byte) error {
 	}
 	c.portals[portalName] = &portalState{plan: plan, params: params}
 	c.bindPool.Put(formats)
-	c.bindPool.Put(params)
 	var buf msgBuilder
 	buf.begin(msgBindComplete)
 	buf.end()

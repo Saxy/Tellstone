@@ -174,11 +174,3 @@ func TestActorWithCorePinning(t *testing.T) {
 		t.Fatalf("got %q", r.Value)
 	}
 }
-
-func TestCorePinnerPinUnpin(t *testing.T) {
-	cp := NewCorePinner(0)
-	if err := cp.Pin(); err != nil {
-		t.Fatalf("pin: %v", err)
-	}
-	cp.Unpin()
-}

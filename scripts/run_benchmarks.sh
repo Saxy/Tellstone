@@ -1,5 +1,7 @@
 #!/bin/bash
 
+set -euo pipefail
+
 # Script to run all Phase 1 benchmarks and capture "before" numbers
 
 # Set up the environment

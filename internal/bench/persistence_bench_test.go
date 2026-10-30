@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -26,7 +27,7 @@ func BenchmarkWriteBatch(b *testing.B) {
 	defer eng.Close()
 	keys := make([]string, 1000)
 	for i := range keys {
-		keys[i] = "persistencebench:key:" + string(rune('0'+i%10))
+		keys[i] = "persistencebench:key:" + strconv.Itoa(i)
 	}
 	val := []byte("persistencebench-value-32-bytes-long-xxxx")
 	b.ResetTimer()
@@ -60,7 +61,7 @@ func BenchmarkReadBatch(b *testing.B) {
 	defer eng.Close()
 	keys := make([]string, 1000)
 	for i := range keys {
-		keys[i] = "persistencebench:key:" + string(rune('0'+i%10))
+		keys[i] = "persistencebench:key:" + strconv.Itoa(i)
 	}
 	val := []byte("persistencebench-value-32-bytes-long-xxxx")
 	for i := range keys {

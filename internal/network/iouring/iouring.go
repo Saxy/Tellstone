@@ -9,6 +9,7 @@ package iouring
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"syscall"
@@ -40,19 +41,19 @@ const cqeSize = 16
 
 type sqringOffsets struct {
 	head, tail, ringMask, ringEntries, flags, dropped, array, resv1 uint32
-	userAddr                                                       uint64
+	userAddr                                                        uint64
 }
 
 type cqringOffsets struct {
 	head, tail, ringMask, ringEntries, overflow, cqes, flags, resv1 uint32
-	userAddr                                                       uint64
+	userAddr                                                        uint64
 }
 
 type iouringParams struct {
 	sqEntries, cqEntries, flags, sqThreadCPU, sqThreadIdle, features, wqFd uint32
-	resv                                                                  [3]uint32
-	sqOff                                                                 sqringOffsets
-	cqOff                                                                 cqringOffsets
+	resv                                                                   [3]uint32
+	sqOff                                                                  sqringOffsets
+	cqOff                                                                  cqringOffsets
 }
 
 // ioUringSQE mirrors struct io_uring_sqe. Only the fields the echo path uses are
@@ -82,10 +83,12 @@ type ioUringCQE struct {
 
 // conn tracks the single in-flight operation for one accepted connection.
 type conn struct {
-	fd       int32
-	buf      []byte
-	sendBuf  []byte
-	pending  uint8 // op pending for this fd
+	fd      int32
+	buf     []byte
+	sendBuf []byte
+	sendOff int   // bytes of buf already handed to the kernel
+	sendLen int   // total bytes of buf to echo
+	pending uint8 // op pending for this fd
 }
 
 // Server is an io_uring echo server. Connections are accepted and echoed
@@ -96,23 +99,31 @@ type Server struct {
 	cqRing []byte
 	sqes   []byte
 
-	sqHead  *uint32
-	sqTail  *uint32
-	sqMask  *uint32
-	sqArr   unsafe.Pointer
-	cqHead  *uint32
-	cqTail  *uint32
-	cqMask  *uint32
-	cqCqes  unsafe.Pointer
+	sqHead *uint32
+	sqTail *uint32
+	sqMask *uint32
+	sqArr  unsafe.Pointer
+	cqHead *uint32
+	cqTail *uint32
+	cqMask *uint32
+	cqCqes unsafe.Pointer
 
-	ln   int
-	conns map[int32]*conn
+	ln      int
+	conns   map[int32]*conn
 	stopped atomic.Bool
 	pending int
 }
 
 // Listen creates a Server listening on addr. The ring is not set up until Serve.
 func Listen(addr string) (*Server, error) {
+	tcpAddr, err := net.ResolveTCPAddr("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	ip := tcpAddr.IP.To4()
+	if ip == nil {
+		return nil, fmt.Errorf("iouring: %q is not an IPv4 address", addr)
+	}
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
@@ -121,7 +132,8 @@ func Listen(addr string) (*Server, error) {
 		unix.Close(fd)
 		return nil, err
 	}
-	sa := &unix.SockaddrInet4{Port: portFromAddr(addr)}
+	sa := &unix.SockaddrInet4{Port: tcpAddr.Port}
+	copy(sa.Addr[:], ip)
 	if err := unix.Bind(fd, sa); err != nil {
 		unix.Close(fd)
 		return nil, err
@@ -131,14 +143,6 @@ func Listen(addr string) (*Server, error) {
 		return nil, err
 	}
 	return &Server{ln: fd, conns: make(map[int32]*conn)}, nil
-}
-
-func portFromAddr(addr string) int {
-	if tcp, err := net.ResolveTCPAddr("tcp", addr); err == nil {
-		return tcp.Port
-	}
-	// Fall back to a listener on :0 style address.
-	return 0
 }
 
 // setup creates the ring and mmaps its regions.
@@ -220,12 +224,13 @@ func (s *Server) submitRecv(c *conn) {
 	s.submit(&sqe)
 }
 
-func (s *Server) submitSend(c *conn, n int) {
+func (s *Server) submitSend(c *conn) {
+	remaining := c.sendLen - c.sendOff
 	sqe := ioUringSQE{
 		Opcode:   opSend,
 		Fd:       c.fd,
-		Addr:     uint64(uintptr(unsafe.Pointer(&c.buf[0]))),
-		Len:      uint32(n),
+		Addr:     uint64(uintptr(unsafe.Pointer(&c.buf[c.sendOff]))),
+		Len:      uint32(remaining),
 		UserData: uint64(c.fd),
 	}
 	c.pending = opSend
@@ -296,8 +301,26 @@ func (s *Server) handleCompletion(cqe *ioUringCQE) {
 			delete(s.conns, fd)
 			return
 		}
-		s.submitSend(c, int(n))
+		c.sendOff = 0
+		c.sendLen = int(n)
+		s.submitSend(c)
 	case opSend:
+		n := cqe.Res
+		if n <= 0 {
+			// The peer is gone or the send failed: drop the connection
+			// rather than spinning on a buffer the kernel will not accept.
+			unix.Close(int(fd))
+			delete(s.conns, fd)
+			return
+		}
+		c.sendOff += int(n)
+		if c.sendOff < c.sendLen {
+			// A short send leaves the rest of the echo in the buffer.
+			s.submitSend(c)
+			return
+		}
+		c.sendOff = 0
+		c.sendLen = 0
 		s.submitRecv(c)
 	}
 }

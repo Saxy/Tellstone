@@ -47,6 +47,7 @@ func encodeRequest(dst []byte, op network.OpCode, key, value []byte, ttl int64) 
 
 type histogram struct {
 	buckets [bucketCount]uint64
+	count   uint64
 }
 
 func (h *histogram) Record(d time.Duration) {
@@ -68,19 +69,25 @@ func (h *histogram) Record(d time.Duration) {
 		idx = bucketCount - 1
 	}
 	h.buckets[idx]++
+	h.count++
 }
 
 func (h *histogram) Add(other *histogram) {
 	for i := 0; i < bucketCount; i++ {
 		h.buckets[i] += other.buckets[i]
 	}
+	h.count += other.count
 }
 
-func (h *histogram) Percentile(p float64, total uint64) time.Duration {
-	if total == 0 {
+func (h *histogram) Count() uint64 {
+	return h.count
+}
+
+func (h *histogram) Percentile(p float64) time.Duration {
+	if h.count == 0 {
 		return 0
 	}
-	target := uint64(float64(total) * p)
+	target := uint64(float64(h.count) * p)
 	var count uint64
 	for i := 0; i < bucketCount; i++ {
 		count += h.buckets[i]
@@ -205,18 +212,25 @@ func main() {
 						wStats.errorOps += uint64(nBatch)
 						continue
 					}
-					ok := true
+					batchOK := true
 					for j := 0; j < nBatch; j++ {
 						var resp network.Message
 						if err := network.Read(conn, buf[:], &resp); err != nil {
-							wStats.errorOps++
-							ok = false
+							// The response at index j and every one still in
+							// flight were not observed successfully.
+							wStats.errorOps += uint64(nBatch - j)
+							batchOK = false
 							break
 						}
+						if resp.Type == network.MsgError {
+							wStats.errorOps++
+							batchOK = false
+							continue
+						}
+						wStats.successOps++
 					}
-					if ok {
+					if batchOK {
 						wStats.hist.Record(time.Since(opStart))
-						wStats.successOps += uint64(nBatch)
 					}
 				}
 			} else {
@@ -265,11 +279,15 @@ func main() {
 	fmt.Printf("Total Requests (Failed):  %d\n", totalErrors)
 	fmt.Printf("Duration:                 %s\n", duration)
 	fmt.Printf("Throughput:               %.2f RPS\n\n", rps)
-	if totalSuccess > 0 {
-		fmt.Println("--- Latency Percentiles (Histogram) ---")
-		fmt.Printf("p50 (Median): %s\n", globalHist.Percentile(0.50, totalSuccess))
-		fmt.Printf("p95:          %s\n", globalHist.Percentile(0.95, totalSuccess))
-		fmt.Printf("p99:          %s\n", globalHist.Percentile(0.99, totalSuccess))
-		fmt.Printf("p99.9:        %s\n", globalHist.Percentile(0.999, totalSuccess))
+	if globalHist.Count() > 0 {
+		label := "--- Latency Percentiles (Histogram) ---"
+		if *pipeline > 1 {
+			label = "--- Pipelined Latency Percentiles (Batch Round-Trip, Histogram) ---"
+		}
+		fmt.Println(label)
+		fmt.Printf("p50 (Median): %s\n", globalHist.Percentile(0.50))
+		fmt.Printf("p95:          %s\n", globalHist.Percentile(0.95))
+		fmt.Printf("p99:          %s\n", globalHist.Percentile(0.99))
+		fmt.Printf("p99.9:        %s\n", globalHist.Percentile(0.999))
 	}
 }

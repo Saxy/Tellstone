@@ -3,6 +3,7 @@
 package iouring
 
 import (
+	"io"
 	"net"
 	"testing"
 	"time"
@@ -41,7 +42,7 @@ func TestEchoRoundTrip(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 	buf := make([]byte, len(msg))
-	if _, err := c.Read(buf); err != nil {
+	if _, err := io.ReadFull(c, buf); err != nil {
 		t.Fatalf("read: %v", err)
 	}
 	if string(buf) != string(msg) {

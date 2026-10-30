@@ -435,16 +435,18 @@ func (n *Node) LeaderID() uint64 {
 }
 
 // applySoftState refreshes the cached leadership view. It runs on the
-// readyLoop goroutine, so no additional lock is needed for the swaps.
+// readyLoop goroutine. leaderLostMu is held across the isLeader swap and the
+// channel update so a proposer that observes regained leadership cannot
+// snapshot the previous (closed) channel.
 func (n *Node) applySoftState(ss *raft.SoftState) {
 	n.leaderID.Store(ss.Lead)
 	isLeader := ss.RaftState == raft.StateLeader
+	n.leaderLostMu.Lock()
+	defer n.leaderLostMu.Unlock()
 	wasLeader := n.isLeader.Swap(isLeader)
 	if wasLeader == isLeader {
 		return
 	}
-	n.leaderLostMu.Lock()
-	defer n.leaderLostMu.Unlock()
 	if isLeader {
 		// Regained leadership: install a fresh channel for the next loss.
 		select {

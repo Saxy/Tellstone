@@ -15,6 +15,7 @@ func BenchmarkActorModelGet(b *testing.B) {
 	// Create a shard with actor model
 	sh := shard.New(1, time.Millisecond, 64, 0, nil, nil)
 	defer sh.Close()
+	sh.EnableActor(false)
 
 	// Set up test data
 	key := "actorbench:key:1"
@@ -37,6 +38,7 @@ func BenchmarkActorModelSet(b *testing.B) {
 	// Create a shard with actor model
 	sh := shard.New(1, time.Millisecond, 64, 0, nil, nil)
 	defer sh.Close()
+	sh.EnableActor(false)
 
 	// Set up test data
 	key := "actorbench:key:1"
@@ -55,6 +57,7 @@ func BenchmarkActorModelBatch(b *testing.B) {
 	// Create a shard with actor model
 	sh := shard.New(1, time.Millisecond, 64, 0, nil, nil)
 	defer sh.Close()
+	sh.EnableActor(false)
 
 	// Set up test data
 	keys := make([]string, 1000)
@@ -62,12 +65,16 @@ func BenchmarkActorModelBatch(b *testing.B) {
 		keys[i] = fmt.Sprintf("actorbench:key:%d", i)
 	}
 	value := []byte("actorbench-value-32-bytes-long-xxxx")
+	ops := make([]shard.BatchOp, len(keys))
+	for i, key := range keys {
+		ops[i] = shard.BatchOp{Op: "SET", Key: key, Value: value}
+	}
 
 	b.ResetTimer()
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		for j := 0; j < 1000; j++ {
-			if resp := sh.Execute("SET", keys[j], value, 0); resp.Err != nil {
+		for _, resp := range sh.ExecuteBatch(ops) {
+			if resp.Err != nil {
 				b.Fatal(resp.Err)
 			}
 		}

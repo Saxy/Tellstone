@@ -421,13 +421,15 @@ func Translate(sql string) (*Plan, error) {
 	return translateNode(res.Stmts[0].GetStmt())
 }
 
-// TranslateAll parses a simple-query string into one plan per statement, in
-// the order the client sent them. The simple-query protocol may carry several
-// statements separated by semicolons, and answers each with its own
-// CommandComplete/ResultSet; the caller iterates the returned slice. An empty
-// or semicolon-only string parses to zero statements, which the caller reports
-// as an EmptyQueryResponse rather than an error.
-func TranslateAll(sql string) ([]*Plan, error) {
+// parsedStatements is the parse tree of a simple-query string. The simple-query
+// path caches this instead of translated Plans so every execution builds a
+// fresh plan against the live catalog; a cached Plan would keep the schema it
+// was first resolved with even after another server changes the catalog.
+type parsedStatements []*pg_query.RawStmt
+
+// ParseAll parses a simple-query string into its statements without translating
+// them. It is the cacheable half of TranslateAll.
+func ParseAll(sql string) (parsedStatements, error) {
 	if len(strings.TrimSpace(sql)) == 0 {
 		return nil, nil
 	}
@@ -435,8 +437,15 @@ func TranslateAll(sql string) ([]*Plan, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse error: %w", err)
 	}
-	plans := make([]*Plan, 0, len(res.Stmts))
-	for _, raw := range res.Stmts {
+	return parsedStatements(res.Stmts), nil
+}
+
+// TranslateParsed translates statements previously returned by ParseAll. Each
+// call produces a fresh plan, so nothing resolved against the catalog (schema,
+// expanded projection, physical plan) is carried over from an earlier call.
+func TranslateParsed(stmts parsedStatements) ([]*Plan, error) {
+	plans := make([]*Plan, 0, len(stmts))
+	for _, raw := range stmts {
 		plan, err := translateNode(raw.GetStmt())
 		if err != nil {
 			return nil, err
@@ -444,6 +453,20 @@ func TranslateAll(sql string) ([]*Plan, error) {
 		plans = append(plans, plan)
 	}
 	return plans, nil
+}
+
+// TranslateAll parses a simple-query string into one plan per statement, in
+// the order the client sent them. The simple-query protocol may carry several
+// statements separated by semicolons, and answers each with its own
+// CommandComplete/ResultSet; the caller iterates the returned slice. An empty
+// or semicolon-only string parses to zero statements, which the caller reports
+// as an EmptyQueryResponse rather than an error.
+func TranslateAll(sql string) ([]*Plan, error) {
+	stmts, err := ParseAll(sql)
+	if err != nil {
+		return nil, err
+	}
+	return TranslateParsed(stmts)
 }
 
 // translateNode maps one parse-tree statement onto a Plan.

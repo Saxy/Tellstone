@@ -775,9 +775,6 @@ func (s *Server) execSelectRow(st Store, plan *Plan, params []paramVal) (*execOu
 		return nil, err
 	}
 	cells, found, err := readRow(st, sch, rowID, nil)
-	if !found {
-		return &execOutcome{tag: "SELECT 0", selectRows: true}, nil
-	}
 	if err != nil {
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}

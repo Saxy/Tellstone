@@ -617,6 +617,11 @@ func LoadConfig(args []string) *Config {
 		cfg.maxMsgSize = 16 * 1024 * 1024
 	}
 	cfg.snapshotBytes = uint64(snapshotBytes)
+	// Core pinning applies to the per-shard actor goroutine, so the flag is
+	// meaningless (and would silently do nothing) without --shard-actor.
+	if cfg.pinShards && !cfg.shardActor {
+		panic("tellstone: --pin-shards requires --shard-actor")
+	}
 	// Validate TLS configuration: cert and key must be provided together.
 	if (cfg.tlsCert == "") != (cfg.tlsKey == "") {
 		panic("tellstone: --tls-cert and --tls-key must both be provided")

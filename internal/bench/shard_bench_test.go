@@ -169,9 +169,18 @@ func BenchmarkRCUMapGet(b *testing.B) {
 
 func BenchmarkRCUMapPut(b *testing.B) {
 	m := shard.NewRCUMap()
+	const keyCount = 100
+	keys := make([]string, keyCount)
+	values := make([][]byte, keyCount)
+	for i := 0; i < keyCount; i++ {
+		keys[i] = fmt.Sprintf("key-%d", i)
+		values[i] = []byte(fmt.Sprintf("value-%d", i))
+		m.Put(keys[i], values[i])
+	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		m.Put(fmt.Sprintf("key-%d", i), []byte(fmt.Sprintf("value-%d", i)))
+		j := i % keyCount
+		m.Put(keys[j], values[j])
 	}
 }
