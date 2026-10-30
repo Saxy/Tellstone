@@ -1,0 +1,48 @@
+cmd/benchmark/main.go
+  h_31b8ea865a30bd 50,72,79,82-87,90,215,219-222,225-230,232,282-291
+config/config.go
+  h_31b8ea865a30bd 620-624
+internal/bench/persistence_bench_test.go
+  h_31b8ea865a30bd 4,30,64,96
+internal/bench/phase2_bench_test.go
+  h_31b8ea865a30bd 18,41,60,68-71,76-77,82
+internal/bench/shard_bench_test.go
+  h_31b8ea865a30bd 172-179,183-184
+internal/cluster/node.go
+  h_31b8ea865a30bd 438-440,444-445
+internal/network/iouring/iouring.go
+  h_31b8ea865a30bd 12,44,49,54-56,86-91,102-112,119-126,135-136,227-228,232-233,304-306,308-323
+internal/network/iouring/iouring_test.go
+  h_31b8ea865a30bd 6,45
+internal/shard/core_pinning.go
+  h_31b8ea865a30bd 1-2
+internal/shard/core_pinning_linux_test.go
+  h_31b8ea865a30bd 1-31
+internal/shard/core_pinning_other.go
+  h_31b8ea865a30bd 1-26
+internal/sql/pgwire.go
+  h_31b8ea865a30bd 127-131,135,143-147,149-150,153-156,368-376,730,732,735,743-750,752,872,874
+internal/sql/translate.go
+  h_31b8ea865a30bd 424-432,440-448,458-471
+internal/storage/engine.go
+  h_31b8ea865a30bd 208-214,254-263,276,296-347,390,400,445-453,460,485-493,500,530,553,558-559
+internal/storage/memory_limit_test.go
+  h_31b8ea865a30bd 1-130
+scripts/capture_after_numbers.sh
+  h_31b8ea865a30bd 3-4
+scripts/capture_before_numbers.sh
+  h_31b8ea865a30bd 3-4,9
+scripts/run_benchmarks.sh
+  h_31b8ea865a30bd 3-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "68464812ac786bcf9c1e499ab958114e851386b9",
+  "prompts": {},
+  "humans": {
+    "h_31b8ea865a30bd": {
+      "author": "Maximilian Hagen <git@saxy.dev>"
+    }
+  }
+}
