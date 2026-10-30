@@ -187,3 +187,73 @@ func TestScanPrefixEarlyStop(t *testing.T) {
 		t.Fatalf("early stop delivered %d keys, want 5", n)
 	}
 }
+
+// TestDispatchBatchSpansShards sends one batch whose keys hash to every shard,
+// so the parallel dispatch path runs, and checks responses stay in input order
+// and every mutation is visible afterwards.
+func TestDispatchBatchSpansShards(t *testing.T) {
+	const numShards = 4
+	cfg := config.LoadConfig([]string{"-shards", fmt.Sprint(numShards)})
+	shards := make([]*shard.Shard, numShards)
+	for i := 0; i < numShards; i++ {
+		s, err := shard.Run(shard.ID(i), cfg, nil, nil, log.NewNoOpLogger(), nil)
+		if err != nil {
+			t.Fatalf("shard %d: %v", i, err)
+		}
+		t.Cleanup(func() { s.Stop(context.Background()) })
+		shards[i] = s
+	}
+	r := New(shards)
+
+	// One key per shard, so the batch is guaranteed to span all of them.
+	keys := make([]string, 0, numShards)
+	seen := make([]bool, numShards)
+	for i := 0; len(keys) < numShards; i++ {
+		k := fmt.Sprintf("batch:%d", i)
+		sid := hashKey(k) % numShards
+		if !seen[sid] {
+			seen[sid] = true
+			keys = append(keys, k)
+		}
+	}
+
+	if resp := r.Dispatch("SET", "to-delete", []byte("x"), 0); resp.Err != nil {
+		t.Fatalf("seed: %v", resp.Err)
+	}
+
+	ops := make([]shard.BatchOp, 0, numShards+2)
+	for i, k := range keys {
+		ops = append(ops, shard.BatchOp{Op: shard.CmdSet, Key: k, Value: []byte(fmt.Sprintf("v%d", i))})
+	}
+	ops = append(ops,
+		shard.BatchOp{Op: shard.CmdDel, Key: "to-delete"},
+		shard.BatchOp{Op: shard.CmdDel, Key: "never-existed"},
+	)
+
+	resps := r.DispatchBatch(ops)
+	if len(resps) != len(ops) {
+		t.Fatalf("got %d responses, want %d", len(resps), len(ops))
+	}
+	for i, resp := range resps {
+		if resp.Err != nil {
+			t.Fatalf("response %d: %v", i, resp.Err)
+		}
+		wantOK := i != len(ops)-1 // the last delete targets a missing key
+		if resp.OK != wantOK {
+			t.Fatalf("response %d OK = %v, want %v", i, resp.OK, wantOK)
+		}
+	}
+	for i, k := range keys {
+		got := r.Dispatch("GET", k, nil, 0)
+		if !got.OK || string(got.Value) != fmt.Sprintf("v%d", i) {
+			t.Fatalf("%s = %q, %v; want v%d", k, got.Value, got.OK, i)
+		}
+	}
+	if got := r.Dispatch("GET", "to-delete", nil, 0); got.OK {
+		t.Fatal("to-delete still present after batch")
+	}
+
+	if resps := r.DispatchBatch(nil); resps != nil {
+		t.Fatalf("empty batch returned %v, want nil", resps)
+	}
+}

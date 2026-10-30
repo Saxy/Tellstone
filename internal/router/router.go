@@ -13,6 +13,7 @@ package router
 import (
 	"bytes"
 	"container/heap"
+	"sync"
 	"time"
 
 	"github.com/Saxy/Tellstone/internal/shard"
@@ -42,6 +43,68 @@ func hashKey(key string) uint32 {
 func (r *Router) Dispatch(op string, key string, value []byte, ttl time.Duration) shard.Response {
 	sid := hashKey(key) % r.numShards
 	return r.shards[sid].Execute(op, key, value, ttl)
+}
+
+// batchGroup collects the positions in the input that one shard owns.
+type batchGroup struct {
+	shardID uint32
+	idx     []int
+}
+
+// DispatchBatch applies a batch of keyed mutations, grouping them by owning
+// shard and dispatching each shard's group in parallel. Shards are independent,
+// so their WAL flushes overlap: a transaction spanning three shards waits for
+// one round of flushes rather than three sequential ones.
+//
+// Responses are returned in input order regardless of completion order. A batch
+// that touches one shard is dispatched inline, without a goroutine.
+func (r *Router) DispatchBatch(ops []shard.BatchOp) []shard.Response {
+	if len(ops) == 0 {
+		return nil
+	}
+	out := make([]shard.Response, len(ops))
+
+	groups := make([]batchGroup, 0, r.numShards)
+	slot := make([]int, r.numShards)
+	for i := range slot {
+		slot[i] = -1
+	}
+	for i, op := range ops {
+		sid := hashKey(op.Key) % r.numShards
+		g := slot[sid]
+		if g < 0 {
+			g = len(groups)
+			slot[sid] = g
+			groups = append(groups, batchGroup{shardID: sid})
+		}
+		groups[g].idx = append(groups[g].idx, i)
+	}
+
+	run := func(g batchGroup) {
+		batch := make([]shard.BatchOp, len(g.idx))
+		for j, idx := range g.idx {
+			batch[j] = ops[idx]
+		}
+		resps := r.shards[g.shardID].ExecuteBatch(batch)
+		for j, idx := range g.idx {
+			out[idx] = resps[j]
+		}
+	}
+
+	if len(groups) == 1 {
+		run(groups[0])
+		return out
+	}
+	var wg sync.WaitGroup
+	wg.Add(len(groups))
+	for _, g := range groups {
+		go func(g batchGroup) {
+			defer wg.Done()
+			run(g)
+		}(g)
+	}
+	wg.Wait()
+	return out
 }
 
 func (r *Router) NumShards() int {

@@ -46,6 +46,28 @@ type Store interface {
 	ScanPrefix(prefix string, fn func(key, value []byte) bool) (int, error)
 }
 
+// BatchWrite is one mutation in a BatchStore.ApplyBatch call. Delete selects a
+// removal; otherwise Value is stored with the optional TTL.
+type BatchWrite struct {
+	Key    string
+	Value  []byte
+	TTL    time.Duration
+	Delete bool
+}
+
+// BatchStore is an optional capability a Store implements when it can make a
+// set of writes durable as one unit rather than one key at a time. It is
+// separate from Store so stores that cannot batch -- the cluster store, test
+// stores -- still satisfy Store and fall back to per-key writes, which is
+// correct and merely pays one durability flush per key.
+//
+// ApplyBatch applies every write or none; returning an error means the batch
+// was not fully applied. Implementations must preserve the plain path's
+// ordering guarantee that a value is durable before it is visible.
+type BatchStore interface {
+	ApplyBatch(writes []BatchWrite) error
+}
+
 // DDLStore is an optional capability a Store implements when it can replicate a
 // schema mutation as a purpose-built log entry rather than an ordinary
 // conditional write.

@@ -475,9 +475,13 @@ func (s *Server) commitTxn(t *txnState) error {
 			}
 		}
 	}
+	// Resolve the write set into concrete values before touching the store. An
+	// mvcc key needs its committed value read first so the append preserves the
+	// versions the conflict check just validated; doing that per key and then
+	// applying each key separately would also cost one durability flush per key.
+	writes := make([]BatchWrite, 0, len(t.order))
 	for _, key := range t.order {
 		w := t.writes[key]
-		var serr error
 		switch {
 		case w.mvcc:
 			// Append a version rather than overwrite: a reader at an older
@@ -486,15 +490,38 @@ func (s *Server) commitTxn(t *txnState) error {
 			if gerr != nil {
 				return &pgError{code: errIoError, msg: gerr.Error()}
 			}
-			serr = s.store.Set(key, mvcc.Append(raw, commitTS, w.value, w.deleted, horizon), 0)
+			writes = append(writes, BatchWrite{
+				Key:   key,
+				Value: mvcc.Append(raw, commitTS, w.value, w.deleted, horizon),
+			})
 		case w.deleted:
-			_, serr = s.store.Delete(key)
+			writes = append(writes, BatchWrite{Key: key, Delete: true})
 		default:
-			serr = s.store.Set(key, w.value, 0)
+			writes = append(writes, BatchWrite{Key: key, Value: w.value})
 		}
-		if serr != nil {
+	}
+
+	// Prefer the batch path: one durability flush per owning shard, in parallel,
+	// instead of one blocking flush per key. Stores without the capability (the
+	// cluster store, test stores) keep the per-key path.
+	if bs, ok := s.store.(BatchStore); ok {
+		if serr := bs.ApplyBatch(writes); serr != nil {
 			return &pgError{code: errIoError, msg: serr.Error()}
 		}
+	} else {
+		for _, w := range writes {
+			var serr error
+			if w.Delete {
+				_, serr = s.store.Delete(w.Key)
+			} else {
+				serr = s.store.Set(w.Key, w.Value, 0)
+			}
+			if serr != nil {
+				return &pgError{code: errIoError, msg: serr.Error()}
+			}
+		}
+	}
+	for _, key := range t.order {
 		s.commit.mu.Lock()
 		s.commit.lastCommit[key] = commitTS
 		s.commit.mu.Unlock()

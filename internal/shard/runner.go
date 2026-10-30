@@ -156,6 +156,109 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 	return s.execute(op, key, value, ttl)
 }
 
+// BatchOp is one mutation in an ExecuteBatch call. Op must be CmdSet or CmdDel;
+// Value and TTL are ignored for CmdDel.
+type BatchOp struct {
+	Op    string
+	Key   string
+	Value []byte
+	TTL   time.Duration
+}
+
+// ExecuteBatch applies a set of mutations to one shard.
+//
+// All of the batch's WAL records are made durable with a single flush before any
+// of them reaches the engine, so a multi-key transaction pays one flush for the
+// shard instead of one per key. The engine is only mutated after its durability
+// record is on disk, preserving the single-write path's ordering: replay never
+// observes a value the engine rejected.
+//
+// Responses are returned in input order. When the shard has an actor, the batch
+// falls back to one actor submission per operation, because the actor owns every
+// mutation; that is correct but loses the single-flush win.
+func (s *Shard) ExecuteBatch(ops []BatchOp) []Response {
+	if len(ops) == 0 {
+		return nil
+	}
+	if s.actor != nil {
+		out := make([]Response, len(ops))
+		for i, op := range ops {
+			out[i] = s.actor.submit(op.Op, op.Key, op.Value, op.TTL)
+		}
+		return out
+	}
+	return s.executeBatch(ops)
+}
+
+// executeBatch is the direct (non-actor) batch path. It runs on the caller's
+// goroutine and must not be called while the shard's actor owns mutations.
+func (s *Shard) executeBatch(ops []BatchOp) []Response {
+	out := make([]Response, len(ops))
+
+	records := make([]persistence.BatchRecord, len(ops))
+	for i, op := range ops {
+		switch op.Op {
+		case CmdSet:
+			var expiration time.Time
+			if op.TTL > 0 {
+				expiration = time.Now().Add(op.TTL)
+			}
+			records[i] = persistence.BatchRecord{Key: op.Key, Value: op.Value, Expiration: expiration}
+		case CmdDel:
+			records[i] = persistence.BatchRecord{Key: op.Key, Delete: true}
+		default:
+			err := fmt.Errorf("shard: unsupported batch operation %q", op.Op)
+			for j := range out {
+				out[j] = Response{Err: err}
+			}
+			return out
+		}
+	}
+
+	if s.Persistence != nil && s.Persistence.Enabled() {
+		if err := s.Persistence.WriteBatch(uint32(s.ID), records); err != nil {
+			for i := range out {
+				out[i] = Response{Err: err}
+			}
+			return out
+		}
+	}
+
+	for i, op := range ops {
+		switch op.Op {
+		case CmdSet:
+			if err := s.Engine.Set(op.Key, op.Value, op.TTL); err != nil {
+				// The record is already durable, so a rejected write would be
+				// resurrected on replay. Compensate with a tombstone, but only
+				// when the key is absent: if another writer stored its own
+				// value, a tombstone would discard it.
+				s.compensateFailedSet(op.Key, err)
+				out[i] = Response{Err: err}
+				continue
+			}
+			out[i] = Response{OK: true}
+		case CmdDel:
+			out[i] = Response{OK: s.Engine.Delete(op.Key)}
+		}
+	}
+	return out
+}
+
+// compensateFailedSet writes a compensating tombstone for a set whose engine
+// write was rejected, unless the key exists (another writer won the slot).
+func (s *Shard) compensateFailedSet(key string, cause error) {
+	if s.Persistence == nil || !s.Persistence.Enabled() {
+		return
+	}
+	if _, exists := s.Engine.Get(key); exists {
+		return
+	}
+	if delErr := s.Persistence.Delete(uint32(s.ID), key); delErr != nil && s.Logger.Enabled(log.LevelError) {
+		s.Logger.Log(log.LevelError, "persistence: compensation delete failed after batch engine rejection",
+			log.String("key", key), log.String("error", delErr.Error()), log.String("cause", cause.Error()))
+	}
+}
+
 // isMutation reports whether op changes shard state and so must be serialized
 // on the actor when one is enabled.
 func isMutation(op string) bool {

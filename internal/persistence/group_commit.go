@@ -7,8 +7,9 @@ import (
 )
 
 type commitReq struct {
-	data []byte
-	done chan error
+	data     []byte
+	done     chan error
+	flushNow bool
 }
 
 type groupCommitter struct {
@@ -71,11 +72,11 @@ func (gc *groupCommitter) run() {
 				}
 			}
 			if writeErr == nil {
-			if gc.useFdatasync {
-				writeErr = runtimeFSync(gc.h.file)
-			} else {
-				writeErr = gc.h.file.Sync()
-			}
+				if gc.useFdatasync {
+					writeErr = runtimeFSync(gc.h.file)
+				} else {
+					writeErr = gc.h.file.Sync()
+				}
 			}
 		}
 		for _, req := range batch {
@@ -111,7 +112,12 @@ func (gc *groupCommitter) run() {
 			}
 		case req := <-gc.ch:
 			batch = append(batch, req)
-			if len(batch) >= gc.batchSz {
+			// Flush on a full batch, or immediately when this request is the
+			// only one queued and asked for it. The second condition is what
+			// lets a lone transaction skip the group-commit window entirely
+			// without costing concurrency: as soon as another writer is
+			// waiting, the window is kept so the two can share one flush.
+			if len(batch) >= gc.batchSz || (req.flushNow && len(gc.ch) == 0) {
 				flush()
 				continue
 			}
@@ -128,9 +134,9 @@ func (gc *groupCommitter) run() {
 	}
 }
 
-func (gc *groupCommitter) enqueue(data []byte) error {
+func (gc *groupCommitter) enqueue(data []byte, flushNow bool) error {
 	done := make(chan error, 1)
-	req := &commitReq{data: data, done: done}
+	req := &commitReq{data: data, done: done, flushNow: flushNow}
 	select {
 	case gc.ch <- req:
 	case <-gc.stopCh:

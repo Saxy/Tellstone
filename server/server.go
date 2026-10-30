@@ -87,6 +87,30 @@ func (rs *RouterStore) Delete(key string) (bool, error) {
 	return resp.OK, resp.Err
 }
 
+// ApplyBatch routes a transaction's write set through the batch path: writes are
+// grouped by owning shard and each shard makes its group durable with one flush,
+// with the shards' flushes running in parallel. It satisfies sql.BatchStore, so
+// COMMIT costs one round of durability instead of one flush per key.
+func (rs *RouterStore) ApplyBatch(writes []sqlpkg.BatchWrite) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	ops := make([]shard.BatchOp, len(writes))
+	for i, w := range writes {
+		if w.Delete {
+			ops[i] = shard.BatchOp{Op: shard.CmdDel, Key: w.Key}
+			continue
+		}
+		ops[i] = shard.BatchOp{Op: shard.CmdSet, Key: w.Key, Value: w.Value, TTL: w.TTL}
+	}
+	for _, resp := range rs.router.DispatchBatch(ops) {
+		if resp.Err != nil {
+			return resp.Err
+		}
+	}
+	return nil
+}
+
 // binCmdGet, binCmdSet and binCmdDel are the data-command tokens the binary
 // frontend feeds to the shared command layer. They alias the catalog's
 // canonical spellings; appending them and the frame's key/value into the

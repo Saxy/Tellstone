@@ -201,10 +201,10 @@ const walBufMaxCap = 1 << 20
 // walBufPool recycles WAL record buffers. Every record is built in full before
 // it reaches the file precisely so the write is one syscall, so the buffer is
 // unavoidable; what is avoidable is allocating a fresh one per write.
-var walBufPool = sync.Pool{New: func() any { 
-	// Create a pre-allocated buffer for the WAL record
-	b := make([]byte, 0, 1024)
-	return &b 
+var walBufPool = sync.Pool{New: func() any {
+	// Create a pre-allocated buffer for the WAL record - 16KB to reduce allocation pressure
+	b := make([]byte, 0, 16384)
+	return &b
 }}
 
 func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, value []byte, op string) error {
@@ -243,7 +243,7 @@ func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, valu
 	// hands back something that already fits next time.
 	*bufp = data
 
-	if err = s.writeRecord(h, shardID, mode, data, key, op, encrypt); err != nil {
+	if err = s.writeRecord(h, shardID, mode, data, key, op, encrypt, false); err != nil {
 		// A group-commit failure can return while the committer still holds
 		// this buffer (shutdown races on gc.exited), so a failed write
 		// abandons it to the collector rather than recycling it into another
@@ -262,8 +262,13 @@ func (s *Storage) appendRecord(shardID uint32, header [16]byte, key string, valu
 // record to the committer and blocks until its batch is durable, and the
 // no-committer fallback writes and syncs under the mutex like per-commit.
 //
+// flushNow asks the group committer to release the batch immediately when no
+// other writer is queued, instead of idling for the batch window. It is a hint,
+// not a durability change; per-commit mode ignores it. Batched transaction
+// writes set it so a lone writer does not pay the group-commit timer.
+//
 // When it returns nil the record is durable and no one else holds data.
-func (s *Storage) writeRecord(h *shardHandle, shardID uint32, mode string, data []byte, key, op string, encrypt bool) error {
+func (s *Storage) writeRecord(h *shardHandle, shardID uint32, mode string, data []byte, key, op string, encrypt, flushNow bool) error {
 	label := op
 	if encrypt {
 		label = "encrypted " + op
@@ -287,7 +292,7 @@ func (s *Storage) writeRecord(h *shardHandle, shardID uint32, mode string, data 
 		}
 		return nil
 	}
-	if err := h.gc.enqueue(data); err != nil {
+	if err := h.gc.enqueue(data, flushNow); err != nil {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: group commit "+label+" failed",
 				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
@@ -319,26 +324,14 @@ func (s *Storage) prepareEncryptedRecord(h *shardHandle, shardID uint32, header 
 		}
 	}()
 
-	// SealWithCounter allocates its own output, so one allocation per encrypted
-	// record survives this pooling. Removing it needs a seal-into-dst entry
-	// point on crypto.Engine, which is a change to that package's API rather
-	// than to this one's buffering.
+	// Use counter from shard handle
 	ctr := h.nonceCtr.Add(1) - 1
 	var nonce [12]byte
 	binary.LittleEndian.PutUint64(nonce[:8], ctr)
 	binary.LittleEndian.PutUint32(nonce[8:12], shardID)
 
-	// We need to avoid allocating a new buffer for the ciphertext
-	// Let's try to reuse the dst buffer if it's large enough
-	var ciphertext []byte
-	if len(dst) >= len(plaintext) {
-		ciphertext = dst[:len(plaintext)]
-	} else {
-		ciphertext = make([]byte, len(plaintext))
-	}
-
-	// We need to modify the crypto.Engine to support sealing into a destination buffer
-	// For now, we'll use the existing SealWithCounter and then copy to dst
+	// Seal the record. The ciphertext is copied into dst below, so the plaintext
+	// scratch can be wiped and recycled as soon as the seal returns.
 	tempCiphertext, err := h.crypto.SealWithCounter(nonce[:], plaintext)
 	if err != nil {
 		if s.logger.Enabled(log.LevelError) {
@@ -348,27 +341,27 @@ func (s *Storage) prepareEncryptedRecord(h *shardHandle, shardID uint32, header 
 		return nil, fmt.Errorf("persistence: seal encrypted record failed: %w", err)
 	}
 
-	// Copy to our destination buffer
-	if len(tempCiphertext) > len(ciphertext) {
-		ciphertext = make([]byte, len(tempCiphertext))
-	}
-	copy(ciphertext, tempCiphertext)
-
-	recLen := uint32(12 + len(ciphertext))
-	if recLen > ^uint32(0) {
+	if len(tempCiphertext) > math.MaxUint32-12 {
 		if s.logger.Enabled(log.LevelError) {
 			s.logger.Log(log.LevelError, "persistence: encrypted record too large",
-				log.Uint("shard", shardID), log.String("key", key), log.Uint("len", recLen))
+				log.Uint("shard", shardID), log.String("key", key), log.Int("len", len(tempCiphertext)))
 		}
-		return nil, fmt.Errorf("persistence: encrypted record too large (%d bytes, max %d)", recLen, ^uint32(0))
+		return nil, fmt.Errorf("persistence: encrypted record too large (%d bytes)", len(tempCiphertext))
 	}
+	recLen := uint32(12 + len(tempCiphertext))
 
 	var recHeader [16]byte
-	binary.LittleEndian.PutUint32(recHeader[0:4], uint32(recLen))
+	binary.LittleEndian.PutUint32(recHeader[0:4], recLen)
 	copy(recHeader[4:16], nonce[:])
-	out := append(dst[:0], recHeader[:]...)
-	out = append(out, ciphertext...)
-	return out, nil
+
+	// Reuse dst when it can hold the header and ciphertext, otherwise grow it
+	// once. dst is the record buffer the caller will hand to writeRecord.
+	if cap(dst) < 16+len(tempCiphertext) {
+		dst = make([]byte, 0, 16+len(tempCiphertext))
+	}
+	dst = append(dst[:0], recHeader[:]...)
+	dst = append(dst, tempCiphertext...)
+	return dst, nil
 }
 
 // appendRecordEncrypted writes an encrypted WAL record. Format on disk:
@@ -390,7 +383,7 @@ func (s *Storage) appendRecordEncrypted(h *shardHandle, shardID uint32, header [
 	*bufp = data
 
 	// Use the writeRecord function to handle the actual writing
-	if err = s.writeRecord(h, shardID, SyncModePerCommit, data, key, op, true); err != nil {
+	if err = s.writeRecord(h, shardID, SyncModePerCommit, data, key, op, true, false); err != nil {
 		// A failed write abandons the buffer to the collector.
 		return err
 	}
@@ -398,6 +391,64 @@ func (s *Storage) appendRecordEncrypted(h *shardHandle, shardID uint32, header [
 		walBufPool.Put(bufp)
 	}
 	return nil
+}
+
+// encodeRecord appends one encoded record for shard h to dst and returns the
+// extended slice. It is the batch counterpart of prepareEncryptedRecord: a batch
+// owns a single buffer for all of its records, so this one does not take a
+// buffer from the pool.
+//
+// The plaintext layout is header+key+value. The encrypted layout is
+// [recLen:4B LE][nonce:12B][ciphertext+tag] with the nonce [counter:8B LE]
+// [shardID:4B LE], exactly like the single-record path, so replay reads both
+// identically.
+func (s *Storage) encodeRecord(h *shardHandle, shardID uint32, header [16]byte, key string, value []byte, dst []byte) ([]byte, error) {
+	if h.walVer != 1 {
+		dst = append(dst, header[:]...)
+		dst = append(dst, key...)
+		dst = append(dst, value...)
+		return dst, nil
+	}
+
+	ctr := h.nonceCtr.Add(1) - 1
+	var nonce [12]byte
+	binary.LittleEndian.PutUint64(nonce[:8], ctr)
+	binary.LittleEndian.PutUint32(nonce[8:12], shardID)
+
+	// The plaintext holds the key and value in the clear, so it is wiped before
+	// it is dropped, the same hygiene rule the single-record path follows.
+	plaintext := make([]byte, 0, len(header)+len(key)+len(value))
+	plaintext = append(plaintext, header[:]...)
+	plaintext = append(plaintext, key...)
+	plaintext = append(plaintext, value...)
+	sealed, err := h.crypto.SealWithCounter(nonce[:], plaintext)
+	for i := range plaintext {
+		plaintext[i] = 0
+	}
+	if err != nil {
+		if s.logger.Enabled(log.LevelError) {
+			s.logger.Log(log.LevelError, "persistence: seal encrypted record failed",
+				log.Uint("shard", shardID), log.String("key", key), log.String("error", err.Error()))
+		}
+		return nil, fmt.Errorf("persistence: seal encrypted record failed: %w", err)
+	}
+
+	var recHeader [16]byte
+	binary.LittleEndian.PutUint32(recHeader[0:4], uint32(12+len(sealed)))
+	copy(recHeader[4:16], nonce[:])
+	dst = append(dst, recHeader[:]...)
+	dst = append(dst, sealed...)
+	return dst, nil
+}
+
+// BatchRecord is one mutation in a WriteBatch. Delete selects a tombstone;
+// otherwise the record stores Key with Value and an optional absolute expiry.
+// The zero Expiration means "no TTL".
+type BatchRecord struct {
+	Key        string
+	Value      []byte
+	Expiration time.Time
+	Delete     bool
 }
 
 // Write appends a SET record to the shard's WAL file. The record includes a
@@ -463,6 +514,70 @@ func (s *Storage) Delete(shardID uint32, key string) error {
 			log.Uint("shard", shardID), log.String("key", key))
 	}
 	return s.appendRecord(shardID, header, key, nil, "delete")
+}
+
+// WriteBatch appends a set of records for one shard to its WAL and returns once
+// the whole batch is durable. All records are encoded into one buffer and handed
+// to the durability path as a single unit, so a multi-key transaction costs one
+// flush per owning shard instead of one flush per key. Shards are independent,
+// so a caller with writes on several shards can invoke WriteBatch for each in
+// parallel and overlap their flushes.
+//
+// WriteBatch only makes the records durable; it does not touch the in-memory
+// engine. A caller still applies them to its engine afterwards, exactly as the
+// single-write path does.
+//
+// Returns nil immediately when persistence is disabled, and for an empty batch.
+func (s *Storage) WriteBatch(shardID uint32, records []BatchRecord) error {
+	if !s.enabled || len(records) == 0 {
+		return nil
+	}
+	h := s.getShard(shardID)
+	if h == nil {
+		return fmt.Errorf("persistence: shard %d not opened", shardID)
+	}
+	if h.needsMigrate {
+		return fmt.Errorf("persistence: shard %d migration in progress, writes blocked", shardID)
+	}
+
+	mode := h.syncMode
+	if mode == "" {
+		mode = s.syncCfg.Mode
+	}
+
+	data := make([]byte, 0, 128*len(records))
+	var err error
+	for _, r := range records {
+		if uint64(len(r.Key)) > uint64(^uint32(0)) {
+			return fmt.Errorf("persistence: key too large (%d bytes, max %d)", len(r.Key), ^uint32(0))
+		}
+		if !r.Delete && uint64(len(r.Value)) > uint64(^uint32(0)) {
+			return fmt.Errorf("persistence: value too large (%d bytes, max %d)", len(r.Value), ^uint32(0))
+		}
+		var header [16]byte
+		if r.Delete {
+			binary.LittleEndian.PutUint32(header[0:4], uint32(len(r.Key)))
+			binary.LittleEndian.PutUint32(header[4:8], 0)
+			binary.LittleEndian.PutUint64(header[8:16], uint64(tombstoneTTL))
+			data, err = s.encodeRecord(h, shardID, header, r.Key, nil, data)
+		} else {
+			var ttlNano int64
+			if !r.Expiration.IsZero() {
+				ttlNano = r.Expiration.UnixNano()
+			}
+			binary.LittleEndian.PutUint32(header[0:4], uint32(len(r.Key)))
+			binary.LittleEndian.PutUint32(header[4:8], uint32(len(r.Value)))
+			binary.LittleEndian.PutUint64(header[8:16], uint64(ttlNano))
+			data, err = s.encodeRecord(h, shardID, header, r.Key, r.Value, data)
+		}
+		if err != nil {
+			return err
+		}
+	}
+	// One write and one sync for the whole batch. flushNow lets the group
+	// committer release the batch immediately when no other writer is queued,
+	// instead of idling for the batch window.
+	return s.writeRecord(h, shardID, mode, data, "<batch>", "batch", h.walVer == 1, true)
 }
 
 // OpenShard opens (or creates) the WAL file for the given shard.
