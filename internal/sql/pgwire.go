@@ -869,7 +869,7 @@ func (c *pgConn) handleBind(payload []byte) error {
 	rest = rest[2:]
 	formats, hadPool := c.bindPool.Get().([]int16)
 	if hadPool && nf <= cap(formats) {
-		formats = formats[:nf] // reset length, keep capacity
+		formats = formats[:0] // reset length, keep capacity
 	} else {
 		formats = make([]int16, 0, nf)
 	}

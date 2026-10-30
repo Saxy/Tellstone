@@ -122,7 +122,13 @@ func Listen(addr string) (*Server, error) {
 	}
 	ip := tcpAddr.IP.To4()
 	if ip == nil {
-		return nil, fmt.Errorf("iouring: %q is not an IPv4 address", addr)
+		if tcpAddr.IP == nil {
+			// A port-only address such as ":0" resolves with no host, which
+			// means the IPv4 wildcard rather than an invalid address.
+			ip = net.IPv4zero.To4()
+		} else {
+			return nil, fmt.Errorf("iouring: %q is not an IPv4 address", addr)
+		}
 	}
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK, 0)
 	if err != nil {

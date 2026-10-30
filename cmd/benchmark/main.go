@@ -87,7 +87,10 @@ func (h *histogram) Percentile(p float64) time.Duration {
 	if h.count == 0 {
 		return 0
 	}
-	target := uint64(float64(h.count) * p)
+	// Round up so a positive count always yields a target of at least one
+	// observation; truncating to zero would make the first bucket answer every
+	// small-percentile query.
+	target := uint64(math.Ceil(float64(h.count) * p))
 	var count uint64
 	for i := 0; i < bucketCount; i++ {
 		count += h.buckets[i]
@@ -212,24 +215,25 @@ func main() {
 						wStats.errorOps += uint64(nBatch)
 						continue
 					}
-					batchOK := true
+					readOK := true
 					for j := 0; j < nBatch; j++ {
 						var resp network.Message
 						if err := network.Read(conn, buf[:], &resp); err != nil {
 							// The response at index j and every one still in
 							// flight were not observed successfully.
 							wStats.errorOps += uint64(nBatch - j)
-							batchOK = false
+							readOK = false
 							break
 						}
 						if resp.Type == network.MsgError {
 							wStats.errorOps++
-							batchOK = false
 							continue
 						}
 						wStats.successOps++
 					}
-					if batchOK {
+					// A batch that was fully read has a meaningful round-trip
+					// time even if some responses were errors.
+					if readOK {
 						wStats.hist.Record(time.Since(opStart))
 					}
 				}
@@ -254,6 +258,10 @@ func main() {
 					}
 					var resp network.Message
 					if err := network.Read(conn, buf[:], &resp); err != nil {
+						wStats.errorOps++
+						continue
+					}
+					if resp.Type == network.MsgError {
 						wStats.errorOps++
 						continue
 					}
