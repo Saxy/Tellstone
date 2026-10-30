@@ -87,10 +87,11 @@ func (h *histogram) Percentile(p float64) time.Duration {
 	if h.count == 0 {
 		return 0
 	}
-	// Round up so a positive count always yields a target of at least one
-	// observation; truncating to zero would make the first bucket answer every
-	// small-percentile query.
+	// Round up and include at least one observation for a nonempty histogram.
 	target := uint64(math.Ceil(float64(h.count) * p))
+	if target == 0 {
+		target = 1
+	}
 	var count uint64
 	for i := 0; i < bucketCount; i++ {
 		count += h.buckets[i]
