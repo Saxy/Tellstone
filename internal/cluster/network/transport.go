@@ -60,9 +60,16 @@ const (
 	maxFrameSize uint32 = 16 << 20
 	// headerSize is the 4-byte big-endian length prefix.
 	headerSize = 4
-	// batchFlushInterval is how often the sender goroutine flushes pending
-	// messages. 100us groups bursty writes without adding meaningful latency.
+	// batchFlushInterval is the burst flush interval: while the sender is
+	// aggregating more than one message per batch, wait this long to group
+	// them into one TCP frame.
 	batchFlushInterval = 100 * time.Microsecond
+	// batchFlushIntervalSparse is the flush interval used for the next batch
+	// when the previous flush carried a single message. With no aggregation
+	// to gain, a full 100us timer would be pure added latency, so a sparse
+	// sender flushes after 20us instead. The timer re-arms with the burst
+	// interval as soon as a flush carries multiple messages.
+	batchFlushIntervalSparse = 20 * time.Microsecond
 	// batchMaxBytes flushes the buffer when it exceeds this size, even if
 	// the timer hasn't fired. 64 KiB keeps us well under typical MTU.
 	batchMaxBytes = 64 * 1024
@@ -747,6 +754,13 @@ func (bc *batchConn) run(done func()) {
 	countByGroup := make(map[uint64]int)
 	msgCount := 0
 	byteCount := 0
+	// lastFlush anchors the idle test: when a batch arrives after the sender
+	// has been quiet for at least batchFlushIntervalSparse there is nothing
+	// to aggregate, so it is flushed immediately instead of waiting for the
+	// 100us burst timer. Under load batches arrive well inside that window,
+	// so the timer still groups them. Seeded in the past so a freshly dialed
+	// connection does not pay one timer period for its first frame.
+	lastFlush := time.Now().Add(-batchFlushInterval)
 
 	// Pipe batch accumulates pipeline messages destined for this peer. They
 	// are flushed as a single pipelineGroupID-tagged frame alongside the raft
@@ -796,6 +810,7 @@ func (bc *batchConn) run(done func()) {
 		pipeCount = 0
 		msgCount = 0
 		byteCount = 0
+		lastFlush = time.Now()
 		return true
 	}
 
@@ -805,16 +820,18 @@ func (bc *batchConn) run(done func()) {
 			flush()
 			return
 		case pm := <-bc.pipeCh:
+			idle := msgCount == 0 && pipeCount == 0 && time.Since(lastFlush) >= batchFlushIntervalSparse
 			before := len(pipePayload)
 			pipePayload = encodePipeMsg(pipePayload, &pm)
 			pipeCount++
 			byteCount += len(pipePayload) - before
-			if byteCount >= batchMaxBytes || pipeCount >= maxBatchCount {
+			if idle || byteCount >= batchMaxBytes || pipeCount >= maxBatchCount {
 				if !flush() {
 					return
 				}
 			}
 		case gb := <-bc.sendCh:
+			idle := msgCount == 0 && pipeCount == 0 && time.Since(lastFlush) >= batchFlushIntervalSparse
 			for _, m := range gb.msgs {
 				payload := bufByGroup[gb.gid]
 				before := len(payload)
@@ -828,7 +845,7 @@ func (bc *batchConn) run(done func()) {
 			msgCount += len(gb.msgs)
 			// Flush before msgCount exceeds maxBatchCount (255): the frame
 			// stores the count in a single byte and would silently wrap.
-			if byteCount >= batchMaxBytes || msgCount >= maxBatchCount {
+			if idle || byteCount >= batchMaxBytes || msgCount >= maxBatchCount {
 				if !flush() {
 					return
 				}

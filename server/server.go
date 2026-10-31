@@ -87,6 +87,30 @@ func (rs *RouterStore) Delete(key string) (bool, error) {
 	return resp.OK, resp.Err
 }
 
+// ApplyBatch routes a transaction's write set through the batch path: writes are
+// grouped by owning shard and each shard makes its group durable with one flush,
+// with the shards' flushes running in parallel. It satisfies sql.BatchStore, so
+// COMMIT costs one round of durability instead of one flush per key.
+func (rs *RouterStore) ApplyBatch(writes []sqlpkg.BatchWrite) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	ops := make([]shard.BatchOp, len(writes))
+	for i, w := range writes {
+		if w.Delete {
+			ops[i] = shard.BatchOp{Op: shard.CmdDel, Key: w.Key}
+			continue
+		}
+		ops[i] = shard.BatchOp{Op: shard.CmdSet, Key: w.Key, Value: w.Value, TTL: w.TTL}
+	}
+	for _, resp := range rs.router.DispatchBatch(ops) {
+		if resp.Err != nil {
+			return resp.Err
+		}
+	}
+	return nil
+}
+
 // binCmdGet, binCmdSet and binCmdDel are the data-command tokens the binary
 // frontend feeds to the shared command layer. They alias the catalog's
 // canonical spellings; appending them and the frame's key/value into the
@@ -861,11 +885,12 @@ func (s *Server) initCluster() error {
 		GroupID:       1, // bootstrap region (region 1) until splits create more
 		PeerAddr:      cfg.GetPeerAddr(),
 		Peers:         peers,
-		ElectionTick:  10,
-		HeartbeatTick: 1,
-		TickInterval:  100 * time.Millisecond,
+		ElectionTick:  cfg.RaftElectionTick(),
+		HeartbeatTick: cfg.RaftHeartbeatTick(),
+		TickInterval:  cfg.RaftTickInterval(),
 		Dispatcher:    newShardDispatcher(s.shards, logger),
 		Logger:        logger,
+		SafeReads:     cfg.RaftSafeReads(),
 	}
 
 	n, err := cluster.NewNode(nodeCfg)
@@ -969,6 +994,8 @@ func (s *Server) initCluster() error {
 		resolver,
 	)
 	s.regionCoord = coord
+	coord.safeReads = cfg.RaftSafeReads()
+	coord.heartbeatTick = cfg.RaftHeartbeatTick()
 	rm.SetLeadershipProvider(coord.LeadershipProvider())
 	go coord.Run(rmCtx)
 	s.geoMgr = cluster.NewGeoManager(s.pdNode.Client(), cfg.GetNodeID())

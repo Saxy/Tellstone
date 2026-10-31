@@ -226,6 +226,18 @@ func Decode(data []byte, maxMsgSize uint64, out *Message) (int, error) {
 // second outbound-buffer operation under gnet.
 const writeFastPathMax = 512
 
+// appendFrame appends one complete frame to dst and returns the extended slice.
+// The frame is [4-byte big-endian length][type byte][payload], where length is
+// 1 + len(payload), matching Write. The caller must own dst and reuse it across
+// calls: building the frame in a buffer the caller already owns keeps the hot
+// path allocation-free instead of leaving a fresh frame behind each time.
+func appendFrame(dst []byte, msgType MessageType, payload []byte) []byte {
+	dst = binary.BigEndian.AppendUint32(dst, uint32(1+len(payload)))
+	dst = append(dst, byte(msgType))
+	dst = append(dst, payload...)
+	return dst
+}
+
 // Write transmits a message completely allocation-free.
 func Write(w io.Writer, msgType MessageType, payload []byte) error {
 	total := 1 + len(payload)

@@ -43,6 +43,15 @@ const (
 	logRetention = 4096
 )
 
+// readOnlyOption maps the SafeReads knob to the raft read-only mode. Lease
+// reads are the default; safe reads keep the quorum heartbeat round trip.
+func readOnlyOption(safe bool) raft.ReadOnlyOption {
+	if safe {
+		return raft.ReadOnlySafe
+	}
+	return raft.ReadOnlyLeaseBased
+}
+
 // NodeConfig holds the parameters for creating a new Raft node.
 type NodeConfig struct {
 	NodeID        uint64
@@ -62,6 +71,14 @@ type NodeConfig struct {
 	// transport.
 	Transport       *network.Transport
 	SharedTransport bool
+	// SafeReads forces quorum-confirmed (ReadOnlySafe) linearizable reads.
+	// The default (false) is leader-lease reads (ReadOnlyLeaseBased): the
+	// leader answers a ReadIndex from its local committed index while its
+	// lease is valid, which removes the per-read heartbeat round trip. Lease
+	// reads assume bounded clock drift between nodes; operators who cannot
+	// rely on that set --raft-safe-reads. CheckQuorum is always enabled,
+	// which raft requires for lease reads.
+	SafeReads bool
 }
 
 // Node wraps a raft.Node with its transport, storage, and FSM.
@@ -96,10 +113,30 @@ type Node struct {
 	// lastCompacted is the log index through which storage has been
 	// compacted. Only touched by the readyLoop goroutine, so no lock needed.
 	lastCompacted uint64
+	// Batching diagnostics (D3). These are atomics so the benchmark report can
+	// sample them from a different goroutine. Only the readyLoop writes them.
+	readyBatches         atomic.Int64
+	committedEntries     atomic.Int64
+	appendMsgs           atomic.Int64
+	appendEntriesEntries atomic.Int64
 	// readIndexChans maps a ReadIndex correlation id to the waiter that wants
 	// the committed index to wait for.
 	readIndexID    atomic.Uint64
 	readIndexChans sync.Map // correlation id (uint64) -> chan uint64
+	// isLeader caches the raft state so the hot write path does not call
+	// raftNode.Status(), which deep-copies the progress maps on every write.
+	// It is updated from Ready.SoftState by the readyLoop, i.e. within one
+	// Ready cycle of every leadership transition.
+	isLeader atomic.Bool
+	// leaderID caches Ready.SoftState.Lead for the same reason.
+	leaderID atomic.Uint64
+	// leaderLost holds a channel that is closed when this node stops being
+	// leader. ProposeAndWait selects on it so a proposal queued against a
+	// stale isLeader cache is released instead of blocking until ctx expires.
+	// The channel is replaced (under leaderLostMu) whenever leadership is
+	// regained. Guarded by leaderLostMu.
+	leaderLostMu sync.Mutex
+	leaderLost   chan struct{}
 	// peerAddrs resolves a peer node ID to its configured address (used by
 	// routing/forwarding to target the region leader).
 	peerAddrs map[uint64]string
@@ -131,13 +168,14 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 	}
 
 	n := &Node{
-		cfg:       cfg,
-		storage:   store,
-		fsm:       fsm,
-		stopCh:    make(chan struct{}),
-		stopped:   make(chan struct{}),
-		proposals: newProposalTracker(),
-		peerAddrs: addrs,
+		cfg:        cfg,
+		storage:    store,
+		fsm:        fsm,
+		stopCh:     make(chan struct{}),
+		stopped:    make(chan struct{}),
+		proposals:  newProposalTracker(),
+		peerAddrs:  addrs,
+		leaderLost: make(chan struct{}),
 	}
 
 	// Build the peer list for StartNode. On the initial bootstrap every node
@@ -156,6 +194,7 @@ func NewNode(cfg NodeConfig) (*Node, error) {
 		MaxInflightMsgs: 256,
 		PreVote:         true,
 		CheckQuorum:     true,
+		ReadOnlyOption:  readOnlyOption(cfg.SafeReads),
 	}
 	n.raftNode = raft.StartNode(&raftCfg, peers)
 
@@ -222,6 +261,11 @@ func (n *Node) Start() error {
 // running for the remaining region groups.
 func (n *Node) Stop() {
 	n.stopOnce.Do(func() {
+		// A stopped node is not a leader: without this, the cached view would
+		// keep reporting leadership because no further Ready arrives.
+		n.isLeader.Store(false)
+		n.leaderID.Store(0)
+		n.signalLeaderLost()
 		close(n.stopCh)
 		n.raftNode.Stop()
 		if n.ownsTransport {
@@ -280,6 +324,11 @@ func (n *Node) ProposeAndWait(ctx context.Context, data []byte) error {
 	if !n.IsLeader() {
 		return ErrNotLeader
 	}
+	// Snapshot the leadership-loss channel before proposing: if raft steps
+	// down between the cached check above and the propose (or while we wait),
+	// the close releases this proposal instead of letting it block until the
+	// caller's deadline. raft.Node.Propose does not report a dropped proposal.
+	lost := n.leaderLostChan()
 	id, done := n.proposals.add()
 	tagged := tagProposal(tagID(id), data)
 	if err := n.raftNode.Propose(ctx, tagged); err != nil {
@@ -289,6 +338,9 @@ func (n *Node) ProposeAndWait(ctx context.Context, data []byte) error {
 	select {
 	case err := <-done:
 		return err
+	case <-lost:
+		n.proposals.remove(id)
+		return ErrNotLeader
 	case <-ctx.Done():
 		n.proposals.remove(id)
 		return ctx.Err()
@@ -320,6 +372,9 @@ func (n *Node) ProposeChunked(ctx context.Context, chunks [][]byte) error {
 	// below are unchanged and run inside the locked section.
 	n.chunkMu.Lock()
 	defer n.chunkMu.Unlock()
+	// Snapshot the leadership-loss channel before proposing; see
+	// ProposeAndWait for why a stale cache needs this release path.
+	lost := n.leaderLostChan()
 	// Register a waiter and propose every chunk immediately. The caller only
 	// waits for the last chunk, which is when the value becomes complete.
 	ids := make([]uint64, 0, len(chunks))
@@ -341,6 +396,11 @@ func (n *Node) ProposeChunked(ctx context.Context, chunks [][]byte) error {
 	select {
 	case err := <-dones[len(dones)-1]:
 		return err
+	case <-lost:
+		for _, id := range ids {
+			n.proposals.remove(id)
+		}
+		return ErrNotLeader
 	case <-ctx.Done():
 		for _, id := range ids {
 			n.proposals.remove(id)
@@ -362,14 +422,67 @@ func (n *Node) Propose(data []byte) error {
 	return n.raftNode.Propose(ctx, data)
 }
 
-// IsLeader returns true if this node is the current Raft leader.
+// IsLeader returns true if this node is the current Raft leader. The answer is
+// cached from Ready.SoftState so the write path avoids raftNode.Status(), which
+// deep-copies the progress maps on every call.
 func (n *Node) IsLeader() bool {
-	return n.raftNode.Status().RaftState == raft.StateLeader
+	return n.isLeader.Load()
 }
 
 // LeaderID returns the node ID of the current Raft leader (0 if none yet).
 func (n *Node) LeaderID() uint64 {
-	return n.raftNode.Status().Lead
+	return n.leaderID.Load()
+}
+
+// applySoftState refreshes the cached leadership view. It runs on the
+// readyLoop goroutine. leaderLostMu is held across the isLeader swap and the
+// channel update so a proposer that observes regained leadership cannot
+// snapshot the previous (closed) channel.
+func (n *Node) applySoftState(ss *raft.SoftState) {
+	n.leaderID.Store(ss.Lead)
+	isLeader := ss.RaftState == raft.StateLeader
+	n.leaderLostMu.Lock()
+	defer n.leaderLostMu.Unlock()
+	wasLeader := n.isLeader.Swap(isLeader)
+	if wasLeader == isLeader {
+		return
+	}
+	if isLeader {
+		// Regained leadership: install a fresh channel for the next loss.
+		select {
+		case <-n.leaderLost:
+			n.leaderLost = make(chan struct{})
+		default:
+		}
+		return
+	}
+	// Lost leadership: release any proposal waiting on a stale leader cache.
+	select {
+	case <-n.leaderLost:
+	default:
+		close(n.leaderLost)
+	}
+}
+
+// signalLeaderLost closes the current leadership-loss channel so waiting
+// proposals observe the transition. Safe to call repeatedly.
+func (n *Node) signalLeaderLost() {
+	n.leaderLostMu.Lock()
+	select {
+	case <-n.leaderLost:
+	default:
+		close(n.leaderLost)
+	}
+	n.leaderLostMu.Unlock()
+}
+
+// leaderLostChan snapshots the current leadership-loss channel so a proposer
+// can select on it even if leadership changes again before the select runs.
+func (n *Node) leaderLostChan() <-chan struct{} {
+	n.leaderLostMu.Lock()
+	ch := n.leaderLost
+	n.leaderLostMu.Unlock()
+	return ch
 }
 
 // AppliedIndex returns the highest Raft log index applied to the local FSM.
@@ -582,6 +695,28 @@ func (n *Node) readyLoop() {
 
 // processReady handles a single Ready batch from the raft node.
 func (n *Node) processReady(rd raft.Ready) {
+	// 0. Refresh the cached leadership view before anything else; the write
+	//    path reads it instead of calling raftNode.Status(). Only the
+	//    readyLoop goroutine writes these fields.
+	if rd.SoftState != nil {
+		n.applySoftState(rd.SoftState)
+	}
+
+	// Batching instrumentation: one "Ready batch" per non-empty Ready, and
+	// the AppendEntries the leader emits for it. Entries-per-Ready shows how
+	// many proposals were coalesced together; entries-per-AppendEntries shows
+	// how much of the log travels per message.
+	if len(rd.CommittedEntries) > 0 || len(rd.Messages) > 0 {
+		n.readyBatches.Add(1)
+	}
+	n.committedEntries.Add(int64(len(rd.CommittedEntries)))
+	for _, msg := range rd.Messages {
+		if msg.GetType() == pb.MsgApp {
+			n.appendMsgs.Add(1)
+			n.appendEntriesEntries.Add(int64(len(msg.GetEntries())))
+		}
+	}
+
 	// 1. Persist hard state and log entries to stable storage.
 	if !raft.IsEmptyHardState(rd.HardState) {
 		n.storage.SetHardState(rd.HardState)
@@ -707,6 +842,29 @@ func (n *Node) processReady(rd raft.Ready) {
 // Done returns a channel that is closed when the node has fully stopped.
 func (n *Node) Done() <-chan struct{} {
 	return n.stopped
+}
+
+// BatchingStats reports how effectively the leader coalesces work into a
+// Ready batch and into AppendEntries. It is diagnostic only: the counters are
+// plain atomics updated by the readyLoop. Ratios matter, not absolute values —
+// entriesPerReady shows proposal aggregation, entriesPerAppend shows log-entry
+// batching on the wire, and appendsPerWrite shows how many AppendEntries a
+// single client write needs.
+type BatchingStats struct {
+	ReadyBatches         int64
+	CommittedEntries     int64
+	AppendMsgs           int64
+	AppendEntriesEntries int64
+}
+
+// BatchingStats returns a snapshot of the leader-side batching counters.
+func (n *Node) BatchingStats() BatchingStats {
+	return BatchingStats{
+		ReadyBatches:         n.readyBatches.Load(),
+		CommittedEntries:     n.committedEntries.Load(),
+		AppendMsgs:           n.appendMsgs.Load(),
+		AppendEntriesEntries: n.appendEntriesEntries.Load(),
+	}
 }
 
 // Status returns a snapshot of the raft node's status.

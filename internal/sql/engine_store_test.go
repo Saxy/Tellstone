@@ -66,12 +66,12 @@ func (s *engineStore) remaining(prefix string) int {
 	return n
 }
 
-// TestSweepRowDoesNotDeadlockUnderEngineLock is the regression test for the
-// hazard: a sweep that deletes from inside the scan callback would block
-// forever here, because the callback runs under the engine's read lock and
-// Delete needs the write lock. The test asserts completion rather than a value,
-// because a deadlock shows up as a test timeout.
-func TestSweepRowDoesNotDeadlockUnderEngineLock(t *testing.T) {
+// TestRowIsOneKey pins the packed-row invariant (Phase 5 D1-A): a row is a
+// single key holding a packed value, so insertRow writes exactly one key and
+// deleteRow removes exactly one key. This replaces the old sweep/compensate
+// hazards, which do not exist because there is no per-column key set to sweep
+// and no partial write to compensate.
+func TestRowIsOneKey(t *testing.T) {
 	store := newEngineStore(t)
 	srv := NewServer("127.0.0.1:0", store, nil, nil, nil, nil, nil, testLogger(), false)
 	t.Cleanup(srv.Close)
@@ -88,8 +88,6 @@ func TestSweepRowDoesNotDeadlockUnderEngineLock(t *testing.T) {
 	if err := sch.Validate(); err != nil {
 		t.Fatalf("schema: %v", err)
 	}
-	// The primary key cell carries the column's order-preserving encoding, the
-	// same bytes insertRow would write for a real statement.
 	id, err := EncodeValue(TypeBigInt, int64(7))
 	if err != nil {
 		t.Fatalf("encode pk: %v", err)
@@ -102,65 +100,31 @@ func TestSweepRowDoesNotDeadlockUnderEngineLock(t *testing.T) {
 	if err := insertRow(srv.store, sch, "7", cells); err != nil {
 		t.Fatalf("insertRow: %v", err)
 	}
-	// Four column keys, so the sweep has something to delete.
-	if got := store.remaining(RowPrefix(sch.DB, sch.Table, "7")); got != 4 {
-		t.Fatalf("row has %d keys, want 4", got)
-	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, _ = sweepRow(srv.store, sch, "7")
-	}()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("sweepRow did not return: it is deleting from inside the scan callback, " +
-			"which deadlocks against the engine's read lock")
-	}
-
 	if got := store.remaining(RowPrefix(sch.DB, sch.Table, "7")); got != 1 {
-		t.Fatalf("sweep left %d keys, want only the primary key", got)
-	}
-}
-
-// The same hazard on the other mutating path: insertRow compensates a partial
-// write by sweeping, and must not do it under the scan lock either.
-func TestCompensateRowDoesNotDeadlockUnderEngineLock(t *testing.T) {
-	store := newEngineStore(t)
-	srv := NewServer("127.0.0.1:0", store, nil, nil, nil, nil, nil, testLogger(), false)
-	t.Cleanup(srv.Close)
-
-	sch := &Schema{
-		DB: DefaultDB, Table: "t", PrimaryKey: 0,
-		Columns: []Column{{Name: "id", Type: TypeBigInt}, {Name: "a", Type: TypeVarchar}},
-	}
-	if err := sch.Validate(); err != nil {
-		t.Fatalf("schema: %v", err)
-	}
-	id, err := EncodeValue(TypeBigInt, int64(1))
-	if err != nil {
-		t.Fatalf("encode pk: %v", err)
-	}
-	cells := rowCells{
-		{value: id, set: true},
-		{value: []byte("x"), set: true},
-	}
-	if err := insertRow(srv.store, sch, "1", cells); err != nil {
-		t.Fatalf("insertRow: %v", err)
+		t.Fatalf("row has %d keys, want 1 (packed row)", got)
 	}
 
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		compensateRow(srv.store, sch, "1")
-	}()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("compensateRow did not return: it swept from inside a scan callback")
+	cells2, found, err := readRow(srv.store, sch, "7", nil)
+	if err != nil || !found {
+		t.Fatalf("readRow: found=%v err=%v", found, err)
 	}
-	if got := store.remaining(RowPrefix(sch.DB, sch.Table, "1")); got != 0 {
-		t.Fatalf("compensation left %d keys, want 0", got)
+	for i := range cells2 {
+		if !cells2[i].set {
+			t.Fatalf("cell %d is not set", i)
+		}
+		want := "v"
+		if i == sch.PrimaryKey {
+			want = string(id)
+		}
+		if string(cells2[i].value) != want {
+			t.Fatalf("cell %d = %q, want %q", i, cells2[i].value, want)
+		}
+	}
+
+	if ok, err := deleteRow(srv.store, sch, "7"); err != nil || !ok {
+		t.Fatalf("deleteRow: ok=%v err=%v", ok, err)
+	}
+	if got := store.remaining(RowPrefix(sch.DB, sch.Table, "7")); got != 0 {
+		t.Fatalf("delete left %d keys, want 0", got)
 	}
 }

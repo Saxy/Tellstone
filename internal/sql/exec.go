@@ -373,6 +373,7 @@ func (s *Server) execBegin(c *pgConn) (*execOutcome, error) {
 		return nil, err
 	}
 	c.txn = newTxnState(ts, s.store)
+	s.commit.beginSnapshot(ts)
 	return &execOutcome{tag: "BEGIN"}, nil
 }
 
@@ -385,6 +386,7 @@ func (s *Server) execCommit(c *pgConn) (*execOutcome, error) {
 	}
 	t := c.txn
 	c.txn = nil
+	s.commit.endSnapshot(t.startTS)
 	if t.failed {
 		return &execOutcome{tag: "ROLLBACK"}, nil
 	}
@@ -397,6 +399,9 @@ func (s *Server) execCommit(c *pgConn) (*execOutcome, error) {
 // execRollback discards a block's buffered writes. A ROLLBACK outside a block
 // is a successful no-op.
 func (s *Server) execRollback(c *pgConn) (*execOutcome, error) {
+	if c.txn != nil {
+		s.commit.endSnapshot(c.txn.startTS)
+	}
 	c.txn = nil
 	return &execOutcome{tag: "ROLLBACK"}, nil
 }
@@ -657,6 +662,9 @@ func (s *Server) execDDL(c *pgConn, plan *Plan) (*execOutcome, error) {
 			if err != nil {
 				return nil, s.schemaError(err)
 			}
+			if created {
+				s.schemaGen.Add(1)
+			}
 			if !created {
 				// The name is taken and the clause waives the error. Reporting
 				// "CREATE TABLE" rather than "CREATE TABLE 0" is what libpq
@@ -668,6 +676,7 @@ func (s *Server) execDDL(c *pgConn, plan *Plan) (*execOutcome, error) {
 		if err := cat.Create(plan.Schema); err != nil {
 			return nil, s.schemaError(err)
 		}
+		s.schemaGen.Add(1)
 		return &execOutcome{tag: "CREATE TABLE"}, nil
 	case StmtDropTable:
 		// The table's statistics are forgotten only once the drop has actually
@@ -688,6 +697,7 @@ func (s *Server) execDDL(c *pgConn, plan *Plan) (*execOutcome, error) {
 		}
 		if dropped {
 			s.stats.Forget(DefaultDB, plan.Table)
+			s.schemaGen.Add(1)
 		}
 		return &execOutcome{tag: "DROP TABLE"}, nil
 	default:
@@ -764,7 +774,7 @@ func (s *Server) execSelectRow(st Store, plan *Plan, params []paramVal) (*execOu
 	if err != nil {
 		return nil, err
 	}
-	cells, found, err := readRow(st, sch, rowID)
+	cells, found, err := readRow(st, sch, rowID, nil)
 	if err != nil {
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}
@@ -844,7 +854,7 @@ func (s *Server) execSelectRowGrouped(st Store, plan *Plan, params []paramVal) (
 	if err != nil {
 		return nil, err
 	}
-	cells, found, err := readRow(st, sch, rowID)
+	cells, found, err := readRow(st, sch, rowID, nil)
 	if err != nil {
 		return nil, &pgError{code: errIoError, msg: err.Error()}
 	}

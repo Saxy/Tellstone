@@ -66,6 +66,13 @@ type RegionCoordinator struct {
 	// biases per-region raft election timeouts: nodes in a region's preferred
 	// zone campaign first, so the leader stays in the data's "home" zone.
 	zone string
+	// safeReads mirrors --raft-safe-reads for every region group node this
+	// coordinator hosts. Region nodes are created after the bootstrap node,
+	// so the knob has to be carried here rather than read from the host node.
+	safeReads bool
+	// heartbeatTick mirrors --raft-heartbeat-tick for hosted region groups.
+	// Region nodes keep their own (faster) 50ms tick interval.
+	heartbeatTick int
 
 	mu          sync.Mutex
 	regionNodes map[uint64]*cluster.Node
@@ -167,6 +174,25 @@ func (rc *RegionCoordinator) electionTickFor(r cluster.Region) int {
 	return electionTickOffZone
 }
 
+// heartbeatTickFor returns the configured heartbeat interval clamped below the
+// region's election timeout. The configuration check cannot know the per-region
+// election clock (zone-biased nodes use 10 or 20 ticks at 50ms), so a value
+// that is legal for the bootstrap node but not for a region group is reduced
+// here rather than failing region hosting at startup.
+func (rc *RegionCoordinator) heartbeatTickFor(r cluster.Region) int {
+	hb := rc.heartbeatTick
+	if hb < 1 {
+		hb = 1
+	}
+	if election := rc.electionTickFor(r); hb >= election {
+		hb = election / 2
+		if hb < 1 {
+			hb = 1
+		}
+	}
+	return hb
+}
+
 // HostRegion creates and starts a local Raft group node for region r, sharing
 // the bootstrap node's transport. Idempotent: hosting an already-hosted region
 // is a no-op, because the raft library bakes the election clock in when the
@@ -190,12 +216,13 @@ func (rc *RegionCoordinator) HostRegion(_ context.Context, r cluster.Region) err
 		GroupID:         r.ID,
 		Peers:           rc.peers,
 		ElectionTick:    rc.electionTickFor(r),
-		HeartbeatTick:   1,
+		HeartbeatTick:   rc.heartbeatTickFor(r),
 		TickInterval:    50 * time.Millisecond,
 		Dispatcher:      rc.dispatcher,
 		Logger:          rc.logger,
 		Transport:       rc.host.Transport(),
 		SharedTransport: true,
+		SafeReads:       rc.safeReads,
 	}
 	n, err := cluster.NewNode(cfg)
 	if err != nil {

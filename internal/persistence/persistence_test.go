@@ -1477,3 +1477,192 @@ func TestV120PlaintextWALWriteAfterMigration(t *testing.T) {
 		}
 	}
 }
+
+// --- WriteBatch ---
+
+// TestWriteBatchRoundTrip writes several records in one batch, then replays the
+// WAL and verifies every record survived and the file is exactly the sum of the
+// records (one buffer, not one write per key).
+func TestWriteBatchRoundTrip(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	records := []BatchRecord{
+		{Key: "account:1", Value: []byte("100")},
+		{Key: "account:2", Value: []byte("200")},
+		{Key: "teller:1", Value: []byte("300")},
+	}
+	if err := s.WriteBatch(0, records); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+
+	path := filepath.Join(dir, "shard_000.db")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantSize := 0
+	for _, r := range records {
+		wantSize += 16 + len(r.Key) + len(r.Value)
+	}
+	if len(data) != wantSize {
+		t.Fatalf("WAL size = %d, want %d (one encoded record per entry)", len(data), wantSize)
+	}
+
+	// Close and reopen so replay reads the batch from disk.
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatalf("reopen OpenShard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if engine.KeyCount() != uint64(len(records)) {
+		t.Fatalf("expected %d keys, got %d", len(records), engine.KeyCount())
+	}
+	for _, r := range records {
+		v, ok := engine.Get(r.Key)
+		if !ok {
+			t.Fatalf("key %q not found after replay", r.Key)
+		}
+		if string(v) != string(r.Value) {
+			t.Fatalf("key %q = %q, want %q", r.Key, v, r.Value)
+		}
+	}
+}
+
+// TestWriteBatchDelete checks a tombstone inside a batch removes the key on
+// replay rather than resurrecting it.
+func TestWriteBatchDelete(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.CloseShard(0)
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Write(0, "gone", []byte("value"), time.Time{}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if err := s.WriteBatch(0, []BatchRecord{
+		{Key: "gone", Delete: true},
+		{Key: "kept", Value: []byte("still here")},
+	}); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	if _, ok := engine.Get("gone"); ok {
+		t.Fatal("deleted key was resurrected by replay")
+	}
+	if v, ok := engine.Get("kept"); !ok || string(v) != "still here" {
+		t.Fatalf("kept = %q, %v; want \"still here\", true", v, ok)
+	}
+}
+
+// TestWriteBatchEncryptedRoundTrip is the encrypted counterpart: the batch must
+// be sealed record-by-record and still replay through the normal decrypt path,
+// with no plaintext left on disk.
+func TestWriteBatchEncryptedRoundTrip(t *testing.T) {
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatalf("NewStorage: %v", err)
+	}
+	defer s.CloseShard(0)
+
+	ce := newCryptoEngine(t)
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("OpenShard: %v", err)
+	}
+
+	records := []BatchRecord{
+		{Key: "secret:alpha", Value: []byte("plaintext-alpha")},
+		{Key: "secret:beta", Value: []byte("plaintext-beta")},
+	}
+	if err := s.WriteBatch(0, records); err != nil {
+		t.Fatalf("WriteBatch: %v", err)
+	}
+	if err := s.CloseShard(0); err != nil {
+		t.Fatalf("CloseShard: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, "shard_000.db"))
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, r := range records {
+		if bytes.Contains(data, []byte(r.Key)) {
+			t.Errorf("plaintext key %q found on disk", r.Key)
+		}
+		if bytes.Contains(data, r.Value) {
+			t.Errorf("plaintext value %q found on disk", r.Value)
+		}
+	}
+
+	if err := s.OpenShard(0, ce); err != nil {
+		t.Fatalf("reopen OpenShard: %v", err)
+	}
+	engine := newTestEngine(t)
+	if err := s.LoadShard(0, engine); err != nil {
+		t.Fatalf("LoadShard: %v", err)
+	}
+	for _, r := range records {
+		v, ok := engine.Get(r.Key)
+		if !ok {
+			t.Fatalf("key %q not found after replay", r.Key)
+		}
+		if string(v) != string(r.Value) {
+			t.Fatalf("key %q = %q, want %q", r.Key, v, r.Value)
+		}
+	}
+}
+
+// TestWriteBatchDisabledAndEmpty covers the two no-op paths: batching on a
+// disabled storage must not error, and an empty batch must not touch the file.
+func TestWriteBatchDisabledAndEmpty(t *testing.T) {
+	disabled, err := NewStorage(false, nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := disabled.WriteBatch(0, []BatchRecord{{Key: "k", Value: []byte("v")}}); err != nil {
+		t.Fatalf("WriteBatch on disabled storage: %v", err)
+	}
+
+	dir := newTestDir(t)
+	s, err := NewStorage(true, nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.CloseShard(0)
+	if err := s.OpenShard(0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteBatch(0, nil); err != nil {
+		t.Fatalf("WriteBatch with empty batch: %v", err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "shard_000.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 0 {
+		t.Fatalf("empty batch wrote %d bytes", fi.Size())
+	}
+	if err := s.WriteBatch(99, []BatchRecord{{Key: "k", Value: []byte("v")}}); err == nil {
+		t.Fatal("expected error for unopened shard")
+	}
+}

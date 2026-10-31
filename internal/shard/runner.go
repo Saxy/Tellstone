@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -41,26 +42,28 @@ const (
 )
 
 type Shard struct {
-	ID               ID
-	Engine           *storage.Engine
-	Logger           log.Logger
-	Persistence      *persistence.Storage
-	connectedClients int64
-	totalConnections uint64
-	bytesRead        uint64
-	bytesWritten     uint64
+	ID          ID
+	Engine      *storage.Engine
+	Logger      log.Logger
+	Persistence *persistence.Storage
+	stats       shardCounters
+	// actor, when non-nil, owns every mutation of this shard. See EnableActor.
+	actor     *actor
+	closeOnce sync.Once
 }
 
-func (s *Shard) IncConnectedClients()     { atomic.AddInt64(&s.connectedClients, 1) }
-func (s *Shard) DecConnectedClients()     { atomic.AddInt64(&s.connectedClients, -1) }
-func (s *Shard) IncTotalConnections()     { atomic.AddUint64(&s.totalConnections, 1) }
-func (s *Shard) AddBytesRead(n uint64)    { atomic.AddUint64(&s.bytesRead, n) }
-func (s *Shard) AddBytesWritten(n uint64) { atomic.AddUint64(&s.bytesWritten, n) }
+func (s *Shard) IncConnectedClients()     { atomic.AddInt64(&s.stats.connectedClients, 1) }
+func (s *Shard) DecConnectedClients()     { atomic.AddInt64(&s.stats.connectedClients, -1) }
+func (s *Shard) IncTotalConnections()     { atomic.AddUint64(&s.stats.totalConnections, 1) }
+func (s *Shard) AddBytesRead(n uint64)    { atomic.AddUint64(&s.stats.bytesRead, n) }
+func (s *Shard) AddBytesWritten(n uint64) { atomic.AddUint64(&s.stats.bytesWritten, n) }
 
-func (s *Shard) ConnectedClients() uint64 { return uint64(atomic.LoadInt64(&s.connectedClients)) }
-func (s *Shard) TotalConnections() uint64 { return atomic.LoadUint64(&s.totalConnections) }
-func (s *Shard) BytesRead() uint64        { return atomic.LoadUint64(&s.bytesRead) }
-func (s *Shard) BytesWritten() uint64     { return atomic.LoadUint64(&s.bytesWritten) }
+func (s *Shard) ConnectedClients() uint64 {
+	return uint64(atomic.LoadInt64(&s.stats.connectedClients))
+}
+func (s *Shard) TotalConnections() uint64 { return atomic.LoadUint64(&s.stats.totalConnections) }
+func (s *Shard) BytesRead() uint64        { return atomic.LoadUint64(&s.stats.bytesRead) }
+func (s *Shard) BytesWritten() uint64     { return atomic.LoadUint64(&s.stats.bytesWritten) }
 
 func envelopeFileName(shardID uint32) string {
 	return fmt.Sprintf("shard-%d.env", shardID)
@@ -136,10 +139,139 @@ func Run(id ID, cfg *config.Config, key []byte, cryptoEngine *crypto.Engine, log
 			return nil, fmt.Errorf("shard %d: load persistence: %w", id, err)
 		}
 	}
+	if cfg.ShardActorEnabled() {
+		shard.EnableActor(cfg.PinShardsEnabled())
+	}
 	return shard, nil
 }
 
 func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) Response {
+	if op == CmdGet {
+		val, ok := s.Engine.Get(key)
+		return Response{Value: val, OK: ok}
+	}
+	if s.actor != nil && isMutation(op) {
+		return s.actor.submit(op, key, value, ttl)
+	}
+	return s.execute(op, key, value, ttl)
+}
+
+// BatchOp is one mutation in an ExecuteBatch call. Op must be CmdSet or CmdDel;
+// Value and TTL are ignored for CmdDel.
+type BatchOp struct {
+	Op    string
+	Key   string
+	Value []byte
+	TTL   time.Duration
+}
+
+// ExecuteBatch applies a set of mutations to one shard.
+//
+// All of the batch's WAL records are made durable with a single flush before any
+// of them reaches the engine, so a multi-key transaction pays one flush for the
+// shard instead of one per key. The engine is only mutated after its durability
+// record is on disk, preserving the single-write path's ordering: replay never
+// observes a value the engine rejected.
+//
+// Responses are returned in input order. When the shard has an actor, the batch
+// falls back to one actor submission per operation, because the actor owns every
+// mutation; that is correct but loses the single-flush win.
+func (s *Shard) ExecuteBatch(ops []BatchOp) []Response {
+	if len(ops) == 0 {
+		return nil
+	}
+	if s.actor != nil {
+		out := make([]Response, len(ops))
+		for i, op := range ops {
+			out[i] = s.actor.submit(op.Op, op.Key, op.Value, op.TTL)
+		}
+		return out
+	}
+	return s.executeBatch(ops)
+}
+
+// executeBatch is the direct (non-actor) batch path. It runs on the caller's
+// goroutine and must not be called while the shard's actor owns mutations.
+func (s *Shard) executeBatch(ops []BatchOp) []Response {
+	out := make([]Response, len(ops))
+
+	records := make([]persistence.BatchRecord, len(ops))
+	for i, op := range ops {
+		switch op.Op {
+		case CmdSet:
+			var expiration time.Time
+			if op.TTL > 0 {
+				expiration = time.Now().Add(op.TTL)
+			}
+			records[i] = persistence.BatchRecord{Key: op.Key, Value: op.Value, Expiration: expiration}
+		case CmdDel:
+			records[i] = persistence.BatchRecord{Key: op.Key, Delete: true}
+		default:
+			err := fmt.Errorf("shard: unsupported batch operation %q", op.Op)
+			for j := range out {
+				out[j] = Response{Err: err}
+			}
+			return out
+		}
+	}
+
+	if s.Persistence != nil && s.Persistence.Enabled() {
+		if err := s.Persistence.WriteBatch(uint32(s.ID), records); err != nil {
+			for i := range out {
+				out[i] = Response{Err: err}
+			}
+			return out
+		}
+	}
+
+	for i, op := range ops {
+		switch op.Op {
+		case CmdSet:
+			if err := s.Engine.Set(op.Key, op.Value, op.TTL); err != nil {
+				// The record is already durable, so a rejected write would be
+				// resurrected on replay. Compensate with a tombstone, but only
+				// when the key is absent: if another writer stored its own
+				// value, a tombstone would discard it.
+				s.compensateFailedSet(op.Key, err)
+				out[i] = Response{Err: err}
+				continue
+			}
+			out[i] = Response{OK: true}
+		case CmdDel:
+			out[i] = Response{OK: s.Engine.Delete(op.Key)}
+		}
+	}
+	return out
+}
+
+// compensateFailedSet writes a compensating tombstone for a set whose engine
+// write was rejected, unless the key exists (another writer won the slot).
+func (s *Shard) compensateFailedSet(key string, cause error) {
+	if s.Persistence == nil || !s.Persistence.Enabled() {
+		return
+	}
+	if _, exists := s.Engine.Get(key); exists {
+		return
+	}
+	if delErr := s.Persistence.Delete(uint32(s.ID), key); delErr != nil && s.Logger.Enabled(log.LevelError) {
+		s.Logger.Log(log.LevelError, "persistence: compensation delete failed after batch engine rejection",
+			log.String("key", key), log.String("error", delErr.Error()), log.String("cause", cause.Error()))
+	}
+}
+
+// isMutation reports whether op changes shard state and so must be serialized
+// on the actor when one is enabled.
+func isMutation(op string) bool {
+	switch op {
+	case CmdSet, CmdSetNX, CmdSetXX, CmdDel:
+		return true
+	}
+	return false
+}
+
+// execute runs one operation directly on the caller's goroutine. The actor
+// calls it for mutations, so it must not re-enter the actor.
+func (s *Shard) execute(op string, key string, value []byte, ttl time.Duration) Response {
 	switch op {
 	case CmdGet:
 		val, ok := s.Engine.Get(key)
@@ -149,14 +281,20 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		if ttl > 0 {
 			expiration = time.Now().Add(ttl)
 		}
-		_, keyExisted := s.Engine.Get(key)
-		if s.Persistence.Enabled() {
+		// keyExisted only decides whether a failed engine write needs a
+		// compensating tombstone below, which is a question that exists only
+		// when there is a durability record to compensate. Reading it
+		// unconditionally cost a second map lookup on every write, and with
+		// encryption on it decrypted a value that was then discarded.
+		var keyExisted bool
+		if s.Persistence != nil && s.Persistence.Enabled() {
+			_, keyExisted = s.Engine.Get(key)
 			if err := s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
 				return Response{Err: err}
 			}
 		}
 		if err := s.Engine.Set(key, value, ttl); err != nil {
-			if s.Persistence.Enabled() && !keyExisted {
+			if s.Persistence != nil && s.Persistence.Enabled() && !keyExisted {
 				if delErr := s.Persistence.Delete(uint32(s.ID), key); delErr != nil {
 					if s.Logger.Enabled(log.LevelError) {
 						s.Logger.Log(log.LevelError, "persistence: compensation delete failed after engine rejection",
@@ -195,7 +333,7 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		if !outcome.Applied {
 			return Response{}
 		}
-		if s.Persistence.Enabled() {
+		if s.Persistence != nil && s.Persistence.Enabled() {
 			if err = s.Persistence.Write(uint32(s.ID), key, value, expiration); err != nil {
 				s.Engine.RestoreIf(key, outcome)
 				return Response{Err: err}
@@ -203,7 +341,7 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 		}
 		return Response{OK: true}
 	case CmdDel:
-		if s.Persistence.Enabled() {
+		if s.Persistence != nil && s.Persistence.Enabled() {
 			if err := s.Persistence.Delete(uint32(s.ID), key); err != nil {
 				return Response{Err: err}
 			}
@@ -222,8 +360,58 @@ func (s *Shard) Execute(op string, key string, value []byte, ttl time.Duration) 
 	}
 }
 
+// New creates a Shard backed by an in-memory storage engine without
+// persistence or configuration. It is a convenience constructor used by
+// tests and benchmarks.
+func New(id int, evictTicker time.Duration, evictSlots int, maxBytes int, cryptoEngine *crypto.Engine, logger log.Logger) *Shard {
+	if logger == nil {
+		logger = log.NewNoOpLogger()
+	}
+	engine := storage.NewEngine(evictTicker, uint32(evictSlots), uint64(maxBytes), logger, cryptoEngine)
+	store, _ := persistence.NewStorage(false, logger, "")
+	return &Shard{
+		ID:          ID(id),
+		Engine:      engine,
+		Logger:      logger,
+		Persistence: store,
+	}
+}
+
+// EnableActor starts the shard's actor goroutine, which from then on executes
+// every mutation. With pin set, the actor pins itself to a CPU chosen from the
+// shard ID. Enable it before the shard serves traffic.
+func (s *Shard) EnableActor(pin bool) {
+	if s.actor != nil {
+		return
+	}
+	pinCore := -1
+	if pin {
+		pinCore = int(s.ID) % runtime.NumCPU()
+	}
+	logger := s.Logger
+	s.actor = newActor(s.execute, pinCore, func(err error) {
+		if logger != nil && logger.Enabled(log.LevelError) {
+			logger.Log(log.LevelError, "shard: core pinning failed",
+				log.String("shard", fmt.Sprintf("%d", s.ID)), log.String("error", err.Error()))
+		}
+	})
+}
+
+// Close stops the actor, if any, and the storage engine. It is safe to call
+// more than once.
+func (s *Shard) Close() {
+	s.closeOnce.Do(func() {
+		if s.actor != nil {
+			s.actor.stop()
+		}
+		if s.Engine != nil {
+			s.Engine.Close()
+		}
+	})
+}
+
 func (s *Shard) Stop(_ context.Context) error {
-	s.Engine.Close()
+	s.Close()
 	return nil
 }
 

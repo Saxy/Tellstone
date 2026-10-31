@@ -281,10 +281,118 @@ func (t *txnState) txnCount() int { return len(t.order) }
 type commitTable struct {
 	mu         sync.Mutex
 	lastCommit map[string]uint64
+	locks      keyedLocks
+	// active counts open transactions by start timestamp, so the oldest one is
+	// the snapshot horizon below which committed versions can be compacted away.
+	// minTS is the cached minimum, 0 when no transaction is open.
+	active map[uint64]int
+	minTS  uint64
 }
 
 func newCommitTable() *commitTable {
-	return &commitTable{lastCommit: map[string]uint64{}}
+	return &commitTable{
+		lastCommit: map[string]uint64{},
+		active:     map[uint64]int{},
+	}
+}
+
+// commitLockShards is the number of striped mutexes that serialize per-key
+// catalog writes. Writes to the same key (or to keys that hash to one stripe)
+// serialize; writes to different stripes proceed concurrently, which is what
+// lets read-write transactions on disjoint rows scale with clients instead of
+// queueing on one global lock.
+const commitLockShards = 256
+
+// keyedLocks is a fixed array of mutexes addressed by a key's hash. It replaces
+// the single global commit mutex so unrelated keys no longer contend.
+type keyedLocks struct {
+	shards [commitLockShards]sync.Mutex
+}
+
+// keyShard maps a key to its stripe index using FNV-1a, which spreads keys
+// evenly without allocating.
+func keyShard(key string) int {
+	h := uint64(14695981039346656037) // FNV-1a offset basis
+	for i := 0; i < len(key); i++ {
+		h ^= uint64(key[i])
+		h *= 1099511628211
+	}
+	return int(h % commitLockShards)
+}
+
+func (kl *keyedLocks) lockShard(shard int)   { kl.shards[shard].Lock() }
+func (kl *keyedLocks) unlockShard(shard int) { kl.shards[shard].Unlock() }
+func (kl *keyedLocks) lock(key string)       { kl.lockShard(keyShard(key)) }
+func (kl *keyedLocks) unlock(key string)     { kl.unlockShard(keyShard(key)) }
+
+// beginSnapshot registers an open transaction's start timestamp so the snapshot
+// horizon stays correct. endSnapshot reverses it. Both are cheap map updates
+// under the commit table's own mutex.
+func (ct *commitTable) beginSnapshot(ts uint64) {
+	ct.mu.Lock()
+	ct.active[ts]++
+	ct.recomputeMinLocked()
+	ct.mu.Unlock()
+}
+
+func (ct *commitTable) endSnapshot(ts uint64) {
+	ct.mu.Lock()
+	if n := ct.active[ts]; n <= 1 {
+		delete(ct.active, ts)
+	} else {
+		ct.active[ts] = n - 1
+	}
+	ct.recomputeMinLocked()
+	ct.mu.Unlock()
+}
+
+// recomputeMinLocked refreshes minTS from active. The caller holds mu.
+func (ct *commitTable) recomputeMinLocked() {
+	ct.minTS = 0
+	for ts := range ct.active {
+		if ct.minTS == 0 || ts < ct.minTS {
+			ct.minTS = ts
+		}
+	}
+}
+
+// horizon returns the oldest open transaction's start timestamp, or 0 when none
+// is open (0 means nothing constrains compaction: every snapshot can be dropped
+// except the newest frame).
+func (ct *commitTable) horizon() uint64 {
+	ct.mu.Lock()
+	h := ct.minTS
+	ct.mu.Unlock()
+	return h
+}
+
+// lockKeys locks the stripes every read and write key hashes to, in sorted
+// stripe order so two overlapping commits cannot deadlock, and returns the
+// stripes locked. The caller must pair it with unlockKeys.
+func (ct *commitTable) lockKeys(reads map[string]struct{}, writes []string) []int {
+	seen := make(map[int]struct{}, len(reads)+len(writes))
+	for key := range reads {
+		seen[keyShard(key)] = struct{}{}
+	}
+	for _, key := range writes {
+		seen[keyShard(key)] = struct{}{}
+	}
+	stripes := make([]int, 0, len(seen))
+	for s := range seen {
+		stripes = append(stripes, s)
+	}
+	sort.Ints(stripes)
+	for _, s := range stripes {
+		ct.locks.lockShard(s)
+	}
+	return stripes
+}
+
+// unlockKeys releases the stripes lockKeys acquired, in reverse order.
+func (ct *commitTable) unlockKeys(stripes []int) {
+	for i := len(stripes) - 1; i >= 0; i-- {
+		ct.locks.unlockShard(stripes[i])
+	}
 }
 
 // SetTimestampOracle installs the timestamp source transactions use. It must be
@@ -314,6 +422,12 @@ func (s *Server) nextTS() (uint64, error) {
 // uncontended is the write set applied, each key stamped with one commit
 // timestamp so a later transaction's start timestamp orders correctly against
 // it.
+//
+// The conflict check and the apply for each key are serialized on that key's
+// stripe (commitTable.locks), not on a single global lock: two commits touching
+// disjoint keys proceed concurrently. The lock order is the sorted set of
+// stripes the read and write keys hash to, so two overlapping commits cannot
+// deadlock.
 func (s *Server) commitTxn(t *txnState) error {
 	if t.txnCount() == 0 {
 		return nil
@@ -322,8 +436,12 @@ func (s *Server) commitTxn(t *txnState) error {
 	if err != nil {
 		return err
 	}
-	s.commit.mu.Lock()
-	defer s.commit.mu.Unlock()
+	// Lock the stripes of every read and write key, in a deterministic order.
+	locked := s.commit.lockKeys(t.reads, t.order)
+	defer s.commit.unlockKeys(locked)
+
+	horizon := s.commit.horizon()
+
 	// A key read during the block that another transaction committed after this
 	// one started makes the block's view stale, even if this block wrote a
 	// different key: committing would record a decision derived from a value
@@ -357,9 +475,13 @@ func (s *Server) commitTxn(t *txnState) error {
 			}
 		}
 	}
+	// Resolve the write set into concrete values before touching the store. An
+	// mvcc key needs its committed value read first so the append preserves the
+	// versions the conflict check just validated; doing that per key and then
+	// applying each key separately would also cost one durability flush per key.
+	writes := make([]BatchWrite, 0, len(t.order))
 	for _, key := range t.order {
 		w := t.writes[key]
-		var serr error
 		switch {
 		case w.mvcc:
 			// Append a version rather than overwrite: a reader at an older
@@ -368,16 +490,41 @@ func (s *Server) commitTxn(t *txnState) error {
 			if gerr != nil {
 				return &pgError{code: errIoError, msg: gerr.Error()}
 			}
-			serr = s.store.Set(key, mvcc.Append(raw, commitTS, w.value, w.deleted), 0)
+			writes = append(writes, BatchWrite{
+				Key:   key,
+				Value: mvcc.Append(raw, commitTS, w.value, w.deleted, horizon),
+			})
 		case w.deleted:
-			_, serr = s.store.Delete(key)
+			writes = append(writes, BatchWrite{Key: key, Delete: true})
 		default:
-			serr = s.store.Set(key, w.value, 0)
+			writes = append(writes, BatchWrite{Key: key, Value: w.value})
 		}
-		if serr != nil {
+	}
+
+	// Prefer the batch path: one durability flush per owning shard, in parallel,
+	// instead of one blocking flush per key. Stores without the capability (the
+	// cluster store, test stores) keep the per-key path.
+	if bs, ok := s.store.(BatchStore); ok {
+		if serr := bs.ApplyBatch(writes); serr != nil {
 			return &pgError{code: errIoError, msg: serr.Error()}
 		}
+	} else {
+		for _, w := range writes {
+			var serr error
+			if w.Delete {
+				_, serr = s.store.Delete(w.Key)
+			} else {
+				serr = s.store.Set(w.Key, w.Value, 0)
+			}
+			if serr != nil {
+				return &pgError{code: errIoError, msg: serr.Error()}
+			}
+		}
+	}
+	for _, key := range t.order {
+		s.commit.mu.Lock()
 		s.commit.lastCommit[key] = commitTS
+		s.commit.mu.Unlock()
 	}
 	return nil
 }
@@ -388,7 +535,10 @@ func (s *Server) commitTxn(t *txnState) error {
 // carries the timestamp of the last write, so an autocommit writer is caught
 // even though it never records into the map.
 func (s *Server) keyCommittedAfter(key string, startTS uint64) (bool, error) {
-	if last, ok := s.commit.lastCommit[key]; ok && last > startTS {
+	s.commit.mu.Lock()
+	last, ok := s.commit.lastCommit[key]
+	s.commit.mu.Unlock()
+	if ok && last > startTS {
 		return true, nil
 	}
 	raw, ok, err := s.store.GetErr(key)

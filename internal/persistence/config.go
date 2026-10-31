@@ -21,8 +21,8 @@ type SyncConfig struct {
 func loadSyncConfig() SyncConfig {
 	cfg := SyncConfig{
 		Mode:         SyncModeGroupCommit,
-		BatchSize:    128,
-		Timeout:      500 * time.Microsecond,
+		BatchSize:    2048,
+		Timeout:      100 * time.Microsecond,
 		UseFdatasync: true,
 	}
 	if v := os.Getenv("TSD_WAL_SYNC_MODE"); v != "" {

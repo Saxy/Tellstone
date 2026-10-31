@@ -33,7 +33,6 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/Saxy/Tellstone/internal/keyspace"
 	"github.com/Saxy/Tellstone/internal/log"
 	"github.com/Saxy/Tellstone/internal/rbac"
 	tlslib "github.com/Saxy/Tellstone/internal/tls"
@@ -1369,12 +1368,8 @@ func TestRBACAuthorizesCatalogTablesByTheirKeyPrefix(t *testing.T) {
 			t.Fatalf("seed catalog %s: %v", tbl.name, err)
 		}
 		// The row id is built with the same encoder the planner uses, so this
-		// seed keeps landing where `WHERE id = 1` will look. Hardcoding "1"
-		// would work only until the row-id encoding changed, and would fail as
-		// a silently empty result rather than as a compile error.
-		if err := store.Set(ColumnKey(DefaultDB, tbl.name, keyspace.EncodeIntRowID(1), "id"), EncodeOrderableInt(1), 0); err != nil {
-			t.Fatalf("seed row %s: %v", tbl.name, err)
-		}
+		// seed keeps landing where `WHERE id = 1` will look.
+		seedRowPK(t, store, &Schema{DB: DefaultDB, Table: tbl.name, Columns: tbl.cols, PrimaryKey: 0}, 1)
 	}
 
 	carol := dialServer(t, srv.Addr())
@@ -1497,9 +1492,8 @@ func TestParameterDescriptionCountsPhysicalKeyParameters(t *testing.T) {
 	if err := store.Set(MetaTableKey(DefaultDB, "users"), blob, 0); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Set(ColumnKey(DefaultDB, "users", keyspace.EncodeIntRowID(1), "id"), EncodeOrderableInt(1), 0); err != nil {
-		t.Fatal(err)
-	}
+	seedRowPK(t, store, &Schema{DB: DefaultDB, Table: "users",
+		Columns: []Column{{Name: "id", Type: TypeBigInt}, {Name: "name", Type: TypeVarchar, Nullable: true}}, PrimaryKey: 0}, 1)
 
 	sess := dialServer(t, srv.Addr())
 	sess.startupTrust("default")

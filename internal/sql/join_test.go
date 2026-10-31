@@ -13,8 +13,6 @@ package sql
 import (
 	"strings"
 	"testing"
-
-	"github.com/Saxy/Tellstone/internal/keyspace"
 )
 
 func TestJoinInnerBasic(t *testing.T) {
@@ -87,9 +85,7 @@ func TestJoinDeniedWithoutRightTableGrant(t *testing.T) {
 		if err := store.Set(MetaTableKey(DefaultDB, tbl.name), blob, 0); err != nil {
 			t.Fatalf("seed catalog %s: %v", tbl.name, err)
 		}
-		if err := store.Set(ColumnKey(DefaultDB, tbl.name, keyspace.EncodeIntRowID(1), "id"), EncodeOrderableInt(1), 0); err != nil {
-			t.Fatalf("seed row %s: %v", tbl.name, err)
-		}
+		seedRowPK(t, store, &Schema{DB: DefaultDB, Table: tbl.name, Columns: tbl.cols, PrimaryKey: 0}, 1)
 	}
 
 	carol := dialServer(t, srv.Addr())

@@ -68,6 +68,8 @@ type connState struct {
 	closeAfterReply bool
 	tlsConn         *tlslib.Conn
 	readBuf         []byte
+	writeBuf        []byte
+	msg             Message
 	ctxt            command.Ctx
 	cmdArgs         [3][]byte
 	reply           BinaryReply
@@ -299,7 +301,7 @@ func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 		n, err := st.tlsConn.Read(st.readBuf[len(st.readBuf):cap(st.readBuf)])
 		if n > 0 {
 			st.readBuf = st.readBuf[:len(st.readBuf)+n]
-			if action := s.handleDecryptedFrames(c, st); action != gnet.None {
+			if action := s.handleFrames(st.tlsConn, c, st, "failed to write tls response frame"); action != gnet.None {
 				return action
 			}
 		}
@@ -317,19 +319,20 @@ func (s *Server) onTrafficTLS(c gnet.Conn, st *connState) gnet.Action {
 	}
 }
 
-// handleDecryptedFrames parses zero or more Tellstone binary protocol frames
-// from plaintext data and dispatches each to the handler. Responses are written
-// through the TLS connection for automatic encryption. It returns gnet.Close
-// on decode, handler, or TLS write errors so the caller propagates the close.
-func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
-	if st.authPending {
-		return gnet.None
-	}
-	var msg Message
+// handleFrames decodes zero or more Tellstone binary protocol frames from the
+// connection's read buffer, executes each, and accumulates the responses into
+// the connection's write buffer so they go out in a single flush. w is the
+// transport writer (the gnet conn for plaintext, the TLS conn for TLS); c is
+// the gnet conn used for gating and accounting. writeError names the write path
+// for the error log.
+func (s *Server) handleFrames(w io.Writer, c gnet.Conn, st *connState, writeError string) gnet.Action {
 	offset := 0
+	out := st.writeBuf[:0]
+	closing := false
 	for offset < len(st.readBuf) {
-		msg = Message{}
-		payloadLen, err := Decode(st.readBuf[offset:], s.maxMsgSize, &msg)
+		msg := &st.msg
+		*msg = Message{}
+		payloadLen, err := Decode(st.readBuf[offset:], s.maxMsgSize, msg)
 		if err != nil {
 			if errors.Is(err, errShortRead) {
 				break
@@ -348,13 +351,25 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 			s.shards[st.shardID].AddBytesRead(uint64(totalPacketLen))
 		}
 		if s.handler != nil {
-			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, &msg)
+			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, msg)
 			if dispatched {
 				offset += totalPacketLen
 				break
 			}
-			if action := s.runHandler(st.tlsConn, st, &msg, respType, respPayload, skipHandler, "failed to write tls response frame"); action != gnet.None {
-				return action
+			var closeNow bool
+			respType, respPayload, closeNow = s.executeFrame(st, msg, respType, respPayload, skipHandler)
+			if respPayload != nil {
+				out = appendFrame(out, respType, respPayload)
+				n := uint64(5 + len(respPayload))
+				atomic.AddUint64(&s.bytesWritten, n)
+				if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
+					s.shards[st.shardID].AddBytesWritten(n)
+				}
+			}
+			if closeNow {
+				offset += totalPacketLen
+				closing = true
+				break
 			}
 		}
 		offset += totalPacketLen
@@ -363,62 +378,53 @@ func (s *Server) handleDecryptedFrames(c gnet.Conn, st *connState) gnet.Action {
 		remaining := copy(st.readBuf, st.readBuf[offset:])
 		st.readBuf = st.readBuf[:remaining]
 	}
+	st.writeBuf = out
+	if len(out) > 0 {
+		if _, err := w.Write(out); err != nil {
+			if s.logger.Enabled(log.LevelError) {
+				s.logger.Log(log.LevelError, writeError,
+					log.String("error", err.Error()),
+				)
+			}
+			return gnet.Close
+		}
+	}
+	if closing {
+		return gnet.Close
+	}
 	return gnet.None
 }
 
-// onTrafficPlaintext handles the original zero-copy plaintext path. Raw bytes
-// are peeked directly from the gnet ring buffer, parsed, and responses are
-// written back through gnet without any intermediate copies.
+// onTrafficPlaintext reads plaintext bytes into the connection's reusable
+// buffer and decodes them into frames. Reading through the buffer rather than
+// gnet's Peek avoids the allocation Peek makes when the ring buffer wraps.
 func (s *Server) onTrafficPlaintext(c gnet.Conn, st *connState) gnet.Action {
 	if st.authPending {
 		return gnet.None
 	}
-	var msg Message
+	if cap(st.readBuf) == 0 {
+		st.readBuf = make([]byte, 0, 4096)
+	}
 	for {
-		buf, err := c.Peek(-1)
-		if err != nil {
-			if s.logger.Enabled(log.LevelError) {
-				s.logger.Log(log.LevelError, "peek failed to return n bytes",
-					log.String("error", err.Error()),
-				)
-			}
-			return gnet.Close
+		if len(st.readBuf) == cap(st.readBuf) {
+			grown := make([]byte, len(st.readBuf), cap(st.readBuf)+4096)
+			copy(grown, st.readBuf)
+			st.readBuf = grown
 		}
-		msg = Message{}
-		payloadLen, err := Decode(buf, s.maxMsgSize, &msg)
-		if err != nil {
-			if errors.Is(err, errShortRead) {
-				break
-			}
-			atomic.AddUint64(&s.protocolErrors, 1)
-			if s.logger.Enabled(log.LevelError) {
-				s.logger.Log(log.LevelError, "protocol decoding failed catastrophically",
-					log.String("remote_addr", c.RemoteAddr().String()),
-					log.String("error", err.Error()),
-				)
-			}
-			return gnet.Close
-		}
-		totalPacketLen := 5 + payloadLen
-		atomic.AddUint64(&s.bytesRead, uint64(totalPacketLen))
-		if len(s.shards) > 0 {
-			if int(st.shardID) < len(s.shards) {
-				s.shards[st.shardID].AddBytesRead(uint64(totalPacketLen))
-			}
-		}
-		if s.handler != nil {
-			respType, respPayload, skipHandler, dispatched := s.gateMessage(c, st, &msg)
-			if dispatched {
-				s.discardFrame(c, totalPacketLen)
-				return gnet.None
-			}
-			if action := s.runHandler(c, st, &msg, respType, respPayload, skipHandler, "failed to write network response frame"); action != gnet.None {
+		n, err := c.Read(st.readBuf[len(st.readBuf):cap(st.readBuf)])
+		if n > 0 {
+			st.readBuf = st.readBuf[:len(st.readBuf)+n]
+			if action := s.handleFrames(c, c, st, "failed to write network response frame"); action != gnet.None {
 				return action
 			}
 		}
-		s.discardFrame(c, totalPacketLen)
+		if err != nil {
+			if errors.Is(err, io.ErrShortBuffer) {
+				return gnet.None
+			}
+			return gnet.Close
+		}
 	}
-	return gnet.None
 }
 
 // gateMessage authorizes one decoded frame against the connection state: it runs
@@ -472,21 +478,19 @@ func (s *Server) gateMessage(c gnet.Conn, st *connState, msg *Message) (respType
 	return 0, nil, false, false
 }
 
-// runHandler executes the application handler for one frame unless the gate
-// supplied a reply, then writes the response and accounts the bytes against the
-// connection and its shard. writeError names the failing path for the log. It
-// returns gnet.Close on handler or write errors and when the connection is
-// marked to close after the reply.
-func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType MessageType, respPayload []byte, skipHandler bool, writeError string) gnet.Action {
+// executeFrame runs the application handler for one frame unless the gate
+// supplied a reply, and returns the response to send plus whether the
+// connection must close after the pending responses are written. It performs
+// no I/O, so a batch of frames can be executed and then flushed together.
+func (s *Server) executeFrame(st *connState, msg *Message, respType MessageType, respPayload []byte, skipHandler bool) (MessageType, []byte, bool) {
 	if !skipHandler {
 		// PING is not gated by RBAC and never counted as a role command.
 		if s.policy != nil && st.sessionCtx != nil && msg.Type != MsgPing {
 			st.sessionCtx.CountCommand()
 		}
-		// The key is converted zero-copy (aliasing the gnet buffer) and consumed
-		// synchronously by the encoder, mirroring the dispatch path in server.go.
-		// The unsafe string holds a slice header over the buffer that stays valid
-		// until the frame is discarded below.
+		// The key is converted zero-copy (aliasing the connection buffer) and
+		// consumed synchronously by the encoder. The unsafe string holds a slice
+		// header over the buffer that stays valid until the frame is consumed.
 		keyStr := *(*string)(unsafe.Pointer(&msg.Key))
 		user := "default"
 		if st.sessionCtx != nil {
@@ -523,44 +527,10 @@ func (s *Server) runHandler(w io.Writer, st *connState, msg *Message, respType M
 					log.String("error", err.Error()),
 				)
 			}
-			return gnet.Close
+			return 0, nil, true
 		}
 	}
-	if respPayload != nil {
-		if err := Write(w, respType, respPayload); err != nil {
-			if s.logger.Enabled(log.LevelError) {
-				s.logger.Log(log.LevelError, writeError,
-					log.String("error", err.Error()),
-				)
-			}
-			return gnet.Close
-		}
-		n := uint64(5 + len(respPayload))
-		atomic.AddUint64(&s.bytesWritten, n)
-		if len(s.shards) > 0 && int(st.shardID) < len(s.shards) {
-			s.shards[st.shardID].AddBytesWritten(n)
-		}
-	}
-	if st.closeAfterReply {
-		return gnet.Close
-	}
-	return gnet.None
-}
-
-// discardFrame consumes one decoded frame from the gnet ring buffer and, when
-// that fails, counts a protocol error and logs a warning. totalPacketLen is the
-// full on-wire size including the 5-byte header.
-func (s *Server) discardFrame(c gnet.Conn, totalPacketLen int) {
-	_, err := c.Discard(totalPacketLen)
-	if err != nil {
-		atomic.AddUint64(&s.protocolErrors, 1)
-		if s.logger.Enabled(log.LevelWarn) {
-			s.logger.Log(log.LevelWarn, "discarding packages not possible",
-				log.Int("total packet length", totalPacketLen),
-				log.String("error", err.Error()),
-			)
-		}
-	}
+	return respType, respPayload, st.closeAfterReply
 }
 
 // authFailed records a rejected AUTH attempt in the ACL LOG buffer and the

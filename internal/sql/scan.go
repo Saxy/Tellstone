@@ -181,24 +181,11 @@ func (ts *tableScan) run(emit func(*Chunk) error) error {
 // trailing CASE cells the flush appends after them.
 func (ts *tableScan) projLen() uint16 { return uint16(len(ts.proj) + len(ts.cases)) }
 
-// matchNameBytes reports whether a column name equals a key suffix, without
-// materializing either side. It is the zero-allocation lookup the assembler
-// uses instead of a per-key string conversion.
-func matchNameBytes(name string, b []byte) bool {
-	if len(name) != len(b) {
-		return false
-	}
-	for i := 0; i < len(b); i++ {
-		if name[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// add absorbs one key of the scan stream. It opens a new row when the key's
-// row id differs from the row being assembled (flushing the completed one), and
-// places the key's value into the cell for its column.
+// add absorbs one key of the scan stream. In the packed layout each key is a
+// complete row, so a new row id flushes the row being assembled (if any) and the
+// key's value is decoded straight into the cells. A key with a non-empty column
+// suffix is a leftover from the pre-packing one-key-per-column layout and is
+// ignored: it cannot belong to any row the schema still describes.
 func (as *rowAssembler) add(key, value []byte) error {
 	rest := key[len(as.prefix):]
 	i := bytes.IndexByte(rest, '/')
@@ -207,35 +194,19 @@ func (as *rowAssembler) add(key, value []byte) error {
 		// row this scan can account for; the catalog counts ignore it too.
 		return nil
 	}
-	id := rest[:i]
-	if !bytes.Equal(id, as.cur) {
-		if as.cur != nil {
-			if err := as.flush(); err != nil {
-				return err
-			}
-		}
-		as.cur = append(as.cur[:0], id...)
-		for k := range as.cells {
-			as.cells[k].set = false
+	if len(rest) > i+1 {
+		// Legacy per-column key: the packed layout has one key per row with an
+		// empty column suffix.
+		return nil
+	}
+	if as.cur != nil {
+		if err := as.flush(); err != nil {
+			return err
 		}
 	}
-	// The column name is the key suffix after the row id's separator. Column
-	// names cannot contain a separator, so the remainder is exactly the name.
-	for ord := range as.sch.Columns {
-		if matchNameBytes(as.sch.Columns[ord].Name, rest[i+1:]) {
-			// The value is the store's callback buffer, which the next key may
-			// overwrite and which the scan may recycle when it returns, while
-			// this cell is read at the next row boundary (or after the scan for
-			// the last row). It is copied into the column's own buffer, which
-			// is reused across rows and so stops allocating once it has seen
-			// the column's widest value.
-			v := append(as.owned[ord][:0], value...)
-			as.owned[ord] = v
-			as.cells[ord] = rowValue{value: v, set: true}
-			break
-		}
-	}
-	return nil
+	as.cur = append(as.cur[:0], rest[:i]...)
+	_, err := unpackRowInto(value, as.cells, as.owned)
+	return err
 }
 
 // flush applies the residual filter to the completed row and, if it survives,

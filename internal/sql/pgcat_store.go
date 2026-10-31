@@ -138,7 +138,10 @@ func cut(s string, sep byte) (before, after string, ok bool) {
 }
 
 // GetErr reads one key. A catalog key is answered from the projection; every
-// other key is read from the store below.
+// other key is read from the store below. A packed row key (an empty column
+// segment) returns the whole projected row as one packed value, which is the
+// shape the point-read path now uses; a legacy single-column key still answers
+// that one column.
 func (s *catalogStore) GetErr(key string) ([]byte, bool, error) {
 	rel, rowID, col, ok := s.parseKey(key)
 	if !ok {
@@ -148,13 +151,17 @@ func (s *catalogStore) GetErr(key string) ([]byte, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	idx := rel.columnIndex(col)
-	if idx < 0 {
-		return nil, false, nil
-	}
 	for i, id := range rows.ids {
 		if keyspace.EscapeRowID(id) != rowID {
 			continue
+		}
+		if col == "" {
+			// The packed row key: the whole row as one value.
+			return packRow(rows.cells[i]), true, nil
+		}
+		idx := rel.columnIndex(col)
+		if idx < 0 {
+			return nil, false, nil
 		}
 		cell := rows.cells[i][idx]
 		if !cell.set {
@@ -184,21 +191,10 @@ func (s *catalogStore) ScanPrefix(prefix string, fn func(key, value []byte) bool
 		if !strings.HasPrefix(rowPrefix, prefix) {
 			continue
 		}
-		for j, col := range rel.columns {
-			cell := rows.cells[i][j]
-			if !cell.set {
-				// A null column has no key, so it is not written.
-				continue
-			}
-			key := keyspace.ColumnKey(rel.schema, rel.name, id, col.name)
-			if !strings.HasPrefix(key, prefix) {
-				continue
-			}
-			if !fn([]byte(key), cell.value) {
-				return n, nil
-			}
-			n++
+		if !fn([]byte(rowPrefix), packRow(rows.cells[i])) {
+			return n, nil
 		}
+		n++
 	}
 	return n, nil
 }

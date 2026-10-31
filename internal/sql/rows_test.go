@@ -15,6 +15,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Saxy/Tellstone/internal/keyspace"
 )
 
 // newRowServer builds a server over an in-memory store with one catalog table.
@@ -26,6 +28,23 @@ func newRowServer(t *testing.T, sch *Schema) (*Server, *testStore) {
 		t.Fatal(err)
 	}
 	return srv, store
+}
+
+// seedRowPK seeds one packed row holding only its primary key; every other
+// column is NULL. It writes straight into the store (bypassing insertRow) so
+// tests of authorization, parameter description and the like do not depend on
+// the row path under test.
+func seedRowPK(t *testing.T, store Store, sch *Schema, id int64) {
+	t.Helper()
+	pk, err := EncodeValue(sch.Columns[sch.PrimaryKey].Type, id)
+	if err != nil {
+		t.Fatalf("encode pk: %v", err)
+	}
+	cells := make(rowCells, len(sch.Columns))
+	cells[sch.PrimaryKey] = rowValue{value: pk, set: true}
+	if err := store.Set(rowKey(sch, keyspace.EncodeIntRowID(id)), packRow(cells), 0); err != nil {
+		t.Fatalf("seed row: %v", err)
+	}
 }
 
 func rowTestSchema() *Schema {
@@ -71,7 +90,7 @@ func TestRowRoundTrip(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	cells, found, err := readRow(srv.store, sch, "7")
+	cells, found, err := readRow(srv.store, sch, "7", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,24 +112,30 @@ func TestRowRoundTrip(t *testing.T) {
 }
 
 // TestRowExistenceIsThePrimaryKey pins the decision that makes inserts atomic:
-// a row is present exactly when its primary key column key is present. If this
-// ever changed to "any column present", a partial write would be visible as a
-// phantom row and INSERT would lose its single atomic commit point.
+// a row is present exactly when its single packed key is present. A stray
+// per-column key (from the pre-packing layout) must not make a row exist,
+// because the read path looks only at the row's own key.
 func TestRowExistenceIsThePrimaryKey(t *testing.T) {
 	sch := rowTestSchema()
 	srv, store := newRowServer(t, sch)
-	// A stray column key with no primary key must not make a row exist.
+	// A stray column key with no row key must not make a row exist.
 	if err := store.Set(ColumnKey(DefaultDB, "users", "7", "name"), []byte("orphan"), 0); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := rowExists(srv.store, sch, "7"); err != nil || ok {
 		t.Fatalf("a row with only an orphan column reported present: %v, %v", ok, err)
 	}
-	if _, found, err := readRow(srv.store, sch, "7"); err != nil || found {
+	if _, found, err := readRow(srv.store, sch, "7", nil); err != nil || found {
 		t.Fatalf("readRow returned a row built from an orphan column: %v, %v", found, err)
 	}
-	// Once the primary key lands, the same row is present.
-	if err := store.Set(ColumnKey(DefaultDB, "users", "7", "id"), []byte("x"), 0); err != nil {
+	// Once the row's own key lands, the same row is present.
+	pk, err := EncodeValue(TypeBigInt, int64(7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cells := make(rowCells, len(sch.Columns))
+	cells[sch.PrimaryKey] = rowValue{value: pk, set: true}
+	if err := store.Set(rowKey(sch, "7"), packRow(cells), 0); err != nil {
 		t.Fatal(err)
 	}
 	if ok, err := rowExists(srv.store, sch, "7"); err != nil || !ok {
@@ -134,7 +159,7 @@ func TestRowInsertRejectsDuplicate(t *testing.T) {
 	if !strings.Contains(err.Error(), "duplicate") {
 		t.Fatalf("duplicate insert reported %v", err)
 	}
-	cells, _, err := readRow(srv.store, sch, "1")
+	cells, _, err := readRow(srv.store, sch, "1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,7 +192,7 @@ func TestRowNullAndNotNull(t *testing.T) {
 	if err := insertRow(srv.store, sch, "2", cellsFor(t, sch, map[string]any{"id": int64(2), "age": int64(1)})); err != nil {
 		t.Fatal(err)
 	}
-	got, found, err := readRow(srv.store, sch, "2")
+	got, found, err := readRow(srv.store, sch, "2", nil)
 	if err != nil || !found {
 		t.Fatalf("read %v, %v", found, err)
 	}
@@ -194,7 +219,7 @@ func TestRowUpdateTouchesOnlyNamedColumns(t *testing.T) {
 	} else if !ok {
 		t.Fatal("UPDATE of an existing row reported it as missing")
 	}
-	got, _, err := readRow(srv.store, sch, "1")
+	got, _, err := readRow(srv.store, sch, "1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,10 +255,10 @@ func TestRowUpdateCreatesAnAbsentColumn(t *testing.T) {
 	})); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok, err := srv.store.GetErr(rowKey(sch, "1", 1)); err != nil {
+	if before, _, err := readRow(srv.store, sch, "1", nil); err != nil {
 		t.Fatal(err)
-	} else if ok {
-		t.Fatal("age unexpectedly has a key before the update")
+	} else if before[1].set {
+		t.Fatal("age unexpectedly has a value before the update")
 	}
 
 	cells := make(rowCells, len(sch.Columns))
@@ -244,7 +269,7 @@ func TestRowUpdateCreatesAnAbsentColumn(t *testing.T) {
 		t.Fatal("UPDATE of an existing row reported it as missing")
 	}
 
-	got, _, err := readRow(srv.store, sch, "1")
+	got, _, err := readRow(srv.store, sch, "1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +329,7 @@ func TestRowIDContainingTheSeparator(t *testing.T) {
 	}
 	// Each id must read back as its own row, not as a neighbour's.
 	for _, id := range []string{"a/b", "a%b", "%2F", "plain"} {
-		cells, found, err := readRow(srv.store, sch, id)
+		cells, found, err := readRow(srv.store, sch, id, nil)
 		if err != nil {
 			t.Fatalf("read %q: %v", id, err)
 		}
@@ -336,7 +361,7 @@ func TestRowIDIsNotConfusedWithALongerID(t *testing.T) {
 	if err := insertRow(srv.store, sch, "10", cellsFor(t, sch, map[string]any{"id": int64(10), "name": "ten"})); err != nil {
 		t.Fatal(err)
 	}
-	one, _, err := readRow(srv.store, sch, "1")
+	one, _, err := readRow(srv.store, sch, "1", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -346,20 +371,17 @@ func TestRowIDIsNotConfusedWithALongerID(t *testing.T) {
 	}
 }
 
-// TestRowInsertCompensatesOnFailure checks the row does not survive a write
-// that reported an error. The primary key is committed first, so a failure on a
-// later column has to remove what was already written.
-func TestRowInsertCompensatesOnFailure(t *testing.T) {
+// TestRowInsertLeavesNothingOnFailure checks the row does not survive a write
+// that reported an error. In the packed layout the whole row is one conditional
+// write, so a failure on that single write leaves nothing behind.
+func TestRowInsertLeavesNothingOnFailure(t *testing.T) {
 	sch := rowTestSchema()
 	store := newTestStore()
 	srv := &Server{store: store}
 	if err := NewCatalog(store, DefaultDB).Create(sch); err != nil {
 		t.Fatal(err)
 	}
-	// Fail every write after the first, which is the primary key claim. The
-	// claim uses SetIfAbsent and the remaining columns use Set, so both have to
-	// be intercepted for the failure to land where the compensation path runs.
-	fail := &failingStore{testStore: store, failAfter: 1}
+	fail := &failingStore{testStore: store, failAfter: 0}
 	srv.store = fail
 
 	cells := cellsFor(t, sch, map[string]any{"id": int64(1), "age": int64(30), "name": "ada"})
@@ -369,7 +391,7 @@ func TestRowInsertCompensatesOnFailure(t *testing.T) {
 	// Nothing may be left behind, or the next insert of the same row id would
 	// report a duplicate against a row that does not exist.
 	if ok, _ := rowExists(srv.store, sch, "1"); ok {
-		t.Fatal("a failed insert left the primary key behind")
+		t.Fatal("a failed insert left the row key behind")
 	}
 	remaining := 0
 	store.ScanPrefix(TablePrefix(DefaultDB, "users"), func(_, _ []byte) bool {

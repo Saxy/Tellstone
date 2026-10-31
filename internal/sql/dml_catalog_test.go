@@ -523,3 +523,29 @@ func TestCatalogTableMultiRowNonIntegerKey(t *testing.T) {
 		})
 	}
 }
+
+// TestSimpleQueryPlanCacheInvalidatedByDDL pins the plan-cache invalidation: a
+// repeated simple query must not be served from a cached plan whose schema a
+// later DDL invalidated. The same SELECT text is run before and after a
+// DROP+CREATE that removes the column it names; the second run must resolve the
+// new schema and refuse the missing column, not answer from the stale plan.
+func TestSimpleQueryPlanCacheInvalidatedByDDL(t *testing.T) {
+	srv, _ := newTestServer(t, srvOpts{})
+	cl := dialServer(t, srv.Addr())
+	cl.startupTrust("default")
+
+	queryOK(t, cl, `CREATE TABLE t (id BIGINT PRIMARY KEY, a VARCHAR)`, "CREATE TABLE")
+	queryOK(t, cl, `INSERT INTO t (id, a) VALUES (1, 'x')`, "INSERT 0 1")
+	// Populate the cache for this exact text against the [id, a] schema.
+	queryOK(t, cl, `SELECT a FROM t WHERE id = 1`, "SELECT 1")
+
+	queryOK(t, cl, `DELETE FROM t WHERE id = 1`, "DELETE 1")
+	queryOK(t, cl, `DROP TABLE t`, "DROP TABLE")
+	queryOK(t, cl, `CREATE TABLE t (id BIGINT PRIMARY KEY, b VARCHAR)`, "CREATE TABLE")
+	queryOK(t, cl, `INSERT INTO t (id, b) VALUES (1, 'y')`, "INSERT 0 1")
+
+	// The same text now names a column the new schema does not have. A stale
+	// cached plan would answer SELECT 1 from the old schema; the invalidated
+	// plan resolves the new one and refuses the column.
+	queryErr(t, cl, `SELECT a FROM t WHERE id = 1`, errUndefinedColumn)
+}

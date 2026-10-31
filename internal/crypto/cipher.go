@@ -207,8 +207,10 @@ func (e *Engine) SealWithCounter(nonce, plaintext []byte) ([]byte, error) {
 	if len(nonce) != e.aead.NonceSize() {
 		return nil, fmt.Errorf("crypto: nonce must be %d bytes, got %d", e.aead.NonceSize(), len(nonce))
 	}
+	// Pre-allocate the output buffer to avoid allocation in crypto operations
 	out := make([]byte, len(plaintext)+e.aead.Overhead())
-	return e.aead.Seal(out[:0], nonce, plaintext, nil), nil
+	result := e.aead.Seal(out[:0], nonce, plaintext, nil)
+	return result, nil
 }
 
 // OpenWithCounter decrypts ciphertext using a caller-provided nonce. This is

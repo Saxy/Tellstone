@@ -47,6 +47,7 @@ func encodeRequest(dst []byte, op network.OpCode, key, value []byte, ttl int64) 
 
 type histogram struct {
 	buckets [bucketCount]uint64
+	count   uint64
 }
 
 func (h *histogram) Record(d time.Duration) {
@@ -68,19 +69,29 @@ func (h *histogram) Record(d time.Duration) {
 		idx = bucketCount - 1
 	}
 	h.buckets[idx]++
+	h.count++
 }
 
 func (h *histogram) Add(other *histogram) {
 	for i := 0; i < bucketCount; i++ {
 		h.buckets[i] += other.buckets[i]
 	}
+	h.count += other.count
 }
 
-func (h *histogram) Percentile(p float64, total uint64) time.Duration {
-	if total == 0 {
+func (h *histogram) Count() uint64 {
+	return h.count
+}
+
+func (h *histogram) Percentile(p float64) time.Duration {
+	if h.count == 0 {
 		return 0
 	}
-	target := uint64(float64(total) * p)
+	// Round up and include at least one observation for a nonempty histogram.
+	target := uint64(math.Ceil(float64(h.count) * p))
+	if target == 0 {
+		target = 1
+	}
 	var count uint64
 	for i := 0; i < bucketCount; i++ {
 		count += h.buckets[i]
@@ -140,6 +151,7 @@ func main() {
 	totalRequests := flag.Int("n", 1000000, "Total number of requests to execute")
 	readRatio := flag.Float64("read-ratio", 0.95, "Ratio of GET requests")
 	zipfSkew := flag.Float64("skew", 1.5, "Power-law skew")
+	pipeline := flag.Int("pipeline", 1, "Requests pipelined per connection before reading (1 = synchronous)")
 	flag.Parse()
 	reqsPerWorker := *totalRequests / *concurrency
 	fmt.Printf("Benchmarking %s with %d workers (%d reqs each)...\n", *addr, *concurrency, reqsPerWorker)
@@ -171,33 +183,92 @@ func main() {
 			}
 			defer conn.Close()
 			var buf [1024]byte
-			var wbuf [1100]byte // reused request frame buffer (keeps the load generator zero-alloc)
 			var staticKey [32]byte
 			prefix := []byte("key-")
-			for r := 0; r < reqsPerWorker; r++ {
-				copy(staticKey[0:4], prefix)
-				keyEnd := strconv.AppendUint(staticKey[4:4], rng.Zipf(50000, *zipfSkew), 10)
-				totalKeyLen := 4 + len(keyEnd)
-				activeKeySlice := staticKey[:totalKeyLen]
-				isRead := rng.Float64() < *readRatio
-				var n int
-				if isRead {
-					n = encodeRequest(wbuf[:], network.OpGet, activeKeySlice, nil, 0)
-				} else {
-					n = encodeRequest(wbuf[:], network.OpSet, activeKeySlice, dummyValue, ttls[i])
+			if *pipeline > 1 {
+				depth := *pipeline
+				// One buffer holds a whole batch of request frames, so a batch
+				// is a single Write and the server can batch its responses.
+				pipeBuf := make([]byte, 0, depth*1100)
+				for r := 0; r < reqsPerWorker; r += depth {
+					nBatch := depth
+					if reqsPerWorker-r < nBatch {
+						nBatch = reqsPerWorker - r
+					}
+					pipeBuf = pipeBuf[:0]
+					for j := 0; j < nBatch; j++ {
+						copy(staticKey[0:4], prefix)
+						keyEnd := strconv.AppendUint(staticKey[4:4], rng.Zipf(50000, *zipfSkew), 10)
+						totalKeyLen := 4 + len(keyEnd)
+						activeKeySlice := staticKey[:totalKeyLen]
+						isRead := rng.Float64() < *readRatio
+						off := len(pipeBuf)
+						var n int
+						if isRead {
+							n = encodeRequest(pipeBuf[off:cap(pipeBuf)], network.OpGet, activeKeySlice, nil, 0)
+						} else {
+							n = encodeRequest(pipeBuf[off:cap(pipeBuf)], network.OpSet, activeKeySlice, dummyValue, ttls[i])
+						}
+						pipeBuf = pipeBuf[:off+n]
+					}
+					opStart := time.Now()
+					if _, err := conn.Write(pipeBuf); err != nil {
+						wStats.errorOps += uint64(nBatch)
+						continue
+					}
+					readOK := true
+					for j := 0; j < nBatch; j++ {
+						var resp network.Message
+						if err := network.Read(conn, buf[:], &resp); err != nil {
+							// The response at index j and every one still in
+							// flight were not observed successfully.
+							wStats.errorOps += uint64(nBatch - j)
+							readOK = false
+							break
+						}
+						if resp.Type == network.MsgError {
+							wStats.errorOps++
+							continue
+						}
+						wStats.successOps++
+					}
+					// A batch that was fully read has a meaningful round-trip
+					// time even if some responses were errors.
+					if readOK {
+						wStats.hist.Record(time.Since(opStart))
+					}
 				}
-				opStart := time.Now()
-				if _, err := conn.Write(wbuf[:n]); err != nil {
-					wStats.errorOps++
-					continue
+			} else {
+				var wbuf [1100]byte // reused request frame buffer (keeps the load generator zero-alloc)
+				for r := 0; r < reqsPerWorker; r++ {
+					copy(staticKey[0:4], prefix)
+					keyEnd := strconv.AppendUint(staticKey[4:4], rng.Zipf(50000, *zipfSkew), 10)
+					totalKeyLen := 4 + len(keyEnd)
+					activeKeySlice := staticKey[:totalKeyLen]
+					isRead := rng.Float64() < *readRatio
+					var n int
+					if isRead {
+						n = encodeRequest(wbuf[:], network.OpGet, activeKeySlice, nil, 0)
+					} else {
+						n = encodeRequest(wbuf[:], network.OpSet, activeKeySlice, dummyValue, ttls[i])
+					}
+					opStart := time.Now()
+					if _, err := conn.Write(wbuf[:n]); err != nil {
+						wStats.errorOps++
+						continue
+					}
+					var resp network.Message
+					if err := network.Read(conn, buf[:], &resp); err != nil {
+						wStats.errorOps++
+						continue
+					}
+					if resp.Type == network.MsgError {
+						wStats.errorOps++
+						continue
+					}
+					wStats.hist.Record(time.Since(opStart))
+					wStats.successOps++
 				}
-				var resp network.Message
-				if err := network.Read(conn, buf[:], &resp); err != nil {
-					wStats.errorOps++
-					continue
-				}
-				wStats.hist.Record(time.Since(opStart))
-				wStats.successOps++
 			}
 		}(i)
 	}
@@ -217,11 +288,15 @@ func main() {
 	fmt.Printf("Total Requests (Failed):  %d\n", totalErrors)
 	fmt.Printf("Duration:                 %s\n", duration)
 	fmt.Printf("Throughput:               %.2f RPS\n\n", rps)
-	if totalSuccess > 0 {
-		fmt.Println("--- Latency Percentiles (Histogram) ---")
-		fmt.Printf("p50 (Median): %s\n", globalHist.Percentile(0.50, totalSuccess))
-		fmt.Printf("p95:          %s\n", globalHist.Percentile(0.95, totalSuccess))
-		fmt.Printf("p99:          %s\n", globalHist.Percentile(0.99, totalSuccess))
-		fmt.Printf("p99.9:        %s\n", globalHist.Percentile(0.999, totalSuccess))
+	if globalHist.Count() > 0 {
+		label := "--- Latency Percentiles (Histogram) ---"
+		if *pipeline > 1 {
+			label = "--- Pipelined Latency Percentiles (Batch Round-Trip, Histogram) ---"
+		}
+		fmt.Println(label)
+		fmt.Printf("p50 (Median): %s\n", globalHist.Percentile(0.50))
+		fmt.Printf("p95:          %s\n", globalHist.Percentile(0.95))
+		fmt.Printf("p99:          %s\n", globalHist.Percentile(0.99))
+		fmt.Printf("p99.9:        %s\n", globalHist.Percentile(0.999))
 	}
 }
